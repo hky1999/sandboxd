@@ -27,6 +27,10 @@ const (
 	RuntimeNameKata        = "kata"
 	RuntimeNameRunc        = "runc"
 	RuntimeNameFirecracker = "firecracker"
+
+	GVisorCheckpointDirName          = "gvisor-checkpoints"
+	GVisorCheckpointPathAnnotation   = "dev.gvisor.internal.checkpoint.path"
+	GVisorCheckpointEnableAnnotation = "dev.gvisor.internal.checkpoint.enable"
 )
 
 // Sandbox service related constants.
@@ -86,8 +90,6 @@ var RuntimeResources = map[string][]string{
 
 const (
 	RecycleBin = "_recycle"
-
-	NotifyFile = "/ready.signal"
 )
 
 const (

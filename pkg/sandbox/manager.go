@@ -49,6 +49,9 @@ type Manager struct {
 	recyclePath string
 
 	sandboxes cmap.ConcurrentMap[string, *Sandbox]
+	// physicalIntents caches durable INTENT metadata without publishing it
+	// through Get/List. meta.pb remains authoritative across restart.
+	physicalIntents *cmap.ConcurrentMap[string, *Sandbox]
 	// serviceHandler maps a configured runtime name to its runsc or Kata
 	// implementation. Handlers are loaded before Manager is constructed.
 	serviceHandler cmap.ConcurrentMap[string, svc.Handler]
@@ -144,6 +147,11 @@ func NewManager(
 	for sandboxID := range m.sandboxes.Items() {
 		m.idGenerator.Reserve(sandboxID)
 	}
+	if m.physicalIntents != nil {
+		for sandboxID := range m.physicalIntents.Items() {
+			m.idGenerator.Reserve(sandboxID)
+		}
+	}
 
 	// Start monitors for recovered sandboxes immediately (don't wait for housekeeping).
 	for item := range m.sandboxes.IterBuffered() {
@@ -229,8 +237,10 @@ func (m *Manager) syncEvent(event Event) {
 	}
 }
 
-// StoreMetadata store all sandbox metadata to disk.
-func (m *Manager) StoreMetadata(id string, data *runtime.SandboxMetadata) error {
+// PersistMetadata atomically records sandboxd's physical identity before the
+// runtime is exposed. It deliberately does not publish the sandbox through
+// List until ActivateMetadata observes the runtime status/spec files.
+func (m *Manager) PersistMetadata(id string, data *runtime.SandboxMetadata) error {
 	if data == nil || data.ID != id {
 		return fmt.Errorf("sandbox metadata ID does not match %q", id)
 	}
@@ -254,13 +264,49 @@ func (m *Manager) StoreMetadata(id string, data *runtime.SandboxMetadata) error 
 	if err := util.AtomicWriteFile(dataFile, bytes, 0600); err != nil {
 		return fmt.Errorf("save sandbox metadata %s: %w", data.ID, err)
 	}
+	if data.PhysicalPhase == runtime.SandboxPhysicalPhase_SANDBOX_PHYSICAL_PHASE_INTENT &&
+		m.physicalIntents != nil {
+		metadata := proto.Clone(data).(*runtime.SandboxMetadata)
+		m.physicalIntents.Set(id, &Sandbox{Metadata: metadata, PATH: sandboxRoot})
+	}
+	logrus.Debugf("persist sandbox %s metadata success, cost %v", data.ID, time.Since(start).String())
+	return nil
+}
+
+// ActivateMetadata publishes a persisted, physically created sandbox through
+// the manager. PersistMetadata remains the durable source used after restart.
+func (m *Manager) ActivateMetadata(id string) error {
+	sandboxRoot, err := util.JoinWithinRoot(m.root, id)
+	if err != nil {
+		return fmt.Errorf("resolve sandbox %q root: %w", id, err)
+	}
 	stored, err := m.loadSandbox(sandboxRoot)
 	if err != nil {
-		return fmt.Errorf("load stored sandbox metadata %s: %w", data.ID, err)
+		return fmt.Errorf("load stored sandbox metadata %s: %w", id, err)
 	}
-	m.sandboxes.Set(data.ID, stored)
-	logrus.Debugf("store sandbox %s metadata success, cost %v", data.ID, time.Since(start).String())
+	if stored.Metadata == nil ||
+		stored.Metadata.PhysicalPhase == runtime.SandboxPhysicalPhase_SANDBOX_PHYSICAL_PHASE_INTENT {
+		return fmt.Errorf("sandbox %s physical intent is not committed: %w",
+			id, errord.ErrFailedPrecondition)
+	}
+	if m.physicalIntents != nil {
+		m.physicalIntents.Remove(id)
+	}
+	m.sandboxes.Set(id, stored)
 	return nil
+}
+
+// StoreMetadata atomically persists and publishes metadata for an already
+// materialized sandbox. New sandbox creation uses PersistMetadata before the
+// runtime start and ActivateMetadata after physical creation completes.
+func (m *Manager) StoreMetadata(id string, data *runtime.SandboxMetadata) error {
+	if data != nil {
+		data.PhysicalPhase = runtime.SandboxPhysicalPhase_SANDBOX_PHYSICAL_PHASE_COMMITTED
+	}
+	if err := m.PersistMetadata(id, data); err != nil {
+		return err
+	}
+	return m.ActivateMetadata(id)
 }
 
 func (m *Manager) housekeeping() {
@@ -433,6 +479,8 @@ func (m *Manager) loadSandboxes() error {
 	logrus.Debugf("manager loaded sandboxes under %s", m.root)
 
 	m.sandboxes = cmap.New[*Sandbox]()
+	intents := cmap.New[*Sandbox]()
+	m.physicalIntents = &intents
 
 	// load sandbox metadata and spec
 	for _, sandboxDir := range list {
@@ -443,6 +491,11 @@ func (m *Manager) loadSandboxes() error {
 		sb, err := m.loadSandbox(filepath.Join(m.root, sandboxDir.Name()))
 		if err != nil {
 			logrus.Errorf("load sandbox %s failed: %v", sandboxDir.Name(), err)
+			continue
+		}
+		if sb.Metadata != nil &&
+			sb.Metadata.PhysicalPhase == runtime.SandboxPhysicalPhase_SANDBOX_PHYSICAL_PHASE_INTENT {
+			m.physicalIntents.Set(sandboxDir.Name(), sb)
 			continue
 		}
 		m.sandboxes.Set(sandboxDir.Name(), sb)
@@ -607,6 +660,32 @@ func (m *Manager) List(option ...ListOption) []*Sandbox {
 		}
 	}
 	return sandboxes
+}
+
+// HasPhysicalRecord reports whether sandboxd owns either a published sandbox
+// or a hidden creation intent for the deterministic ID.
+func (m *Manager) HasPhysicalRecord(id string) bool {
+	if m.sandboxes.Has(id) {
+		return true
+	}
+	return m.physicalIntents != nil && m.physicalIntents.Has(id)
+}
+
+// ListPhysicalIntents returns immutable snapshots of incomplete physical
+// records for startup reconciliation. INTENT records never appear in Get/List.
+func (m *Manager) ListPhysicalIntents() []*runtime.SandboxMetadata {
+	if m.physicalIntents == nil {
+		return nil
+	}
+	items := m.physicalIntents.Items()
+	result := make([]*runtime.SandboxMetadata, 0, len(items))
+	for _, sb := range items {
+		if sb == nil || sb.Metadata == nil {
+			continue
+		}
+		result = append(result, proto.Clone(sb.Metadata).(*runtime.SandboxMetadata))
+	}
+	return result
 }
 
 // MetricsTarget is an immutable snapshot of the information needed to collect
@@ -817,6 +896,9 @@ func (m *Manager) CleanSandboxRoot(id string) {
 				logrus.Warnf("remove sandbox %s root failed: %v", sandboxRoot, err)
 			}
 		}
+	}
+	if m.physicalIntents != nil {
+		m.physicalIntents.Remove(id)
 	}
 }
 

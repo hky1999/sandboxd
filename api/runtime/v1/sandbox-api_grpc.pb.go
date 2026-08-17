@@ -35,6 +35,8 @@ const _ = grpc.SupportPackageIsVersion9
 const (
 	SandboxService_Start_FullMethodName                 = "/runtime.v1.SandboxService/Start"
 	SandboxService_Checkpoint_FullMethodName            = "/runtime.v1.SandboxService/Checkpoint"
+	SandboxService_Restore_FullMethodName               = "/runtime.v1.SandboxService/Restore"
+	SandboxService_DeleteCheckpoint_FullMethodName      = "/runtime.v1.SandboxService/DeleteCheckpoint"
 	SandboxService_Delete_FullMethodName                = "/runtime.v1.SandboxService/Delete"
 	SandboxService_Wait_FullMethodName                  = "/runtime.v1.SandboxService/Wait"
 	SandboxService_List_FullMethodName                  = "/runtime.v1.SandboxService/List"
@@ -51,8 +53,13 @@ const (
 type SandboxServiceClient interface {
 	// Start creates and starts a sandbox.
 	Start(ctx context.Context, in *StartRequest, opts ...grpc.CallOption) (*StartResponse, error)
-	// Checkpoint saves a running sandbox into a caller-owned directory.
+	// Checkpoint saves a running sandbox and stops its source process.
 	Checkpoint(ctx context.Context, in *CheckpointRequest, opts ...grpc.CallOption) (*CheckpointResponse, error)
+	// Restore restores either a legacy local checkpoint or a verified,
+	// deterministic resume attempt and returns authoritative physical facts.
+	Restore(ctx context.Context, in *RestoreRequest, opts ...grpc.CallOption) (*StartResponse, error)
+	// DeleteCheckpoint deletes one exact sandboxd-owned checkpoint artifact.
+	DeleteCheckpoint(ctx context.Context, in *DeleteCheckpointRequest, opts ...grpc.CallOption) (*DeleteCheckpointResponse, error)
 	// Delete force-deletes a sandbox.
 	Delete(ctx context.Context, in *DeleteRequest, opts ...grpc.CallOption) (*DeleteResponse, error)
 	// Wait waits for a sandbox to exit.
@@ -89,6 +96,26 @@ func (c *sandboxServiceClient) Checkpoint(ctx context.Context, in *CheckpointReq
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(CheckpointResponse)
 	err := c.cc.Invoke(ctx, SandboxService_Checkpoint_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *sandboxServiceClient) Restore(ctx context.Context, in *RestoreRequest, opts ...grpc.CallOption) (*StartResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(StartResponse)
+	err := c.cc.Invoke(ctx, SandboxService_Restore_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *sandboxServiceClient) DeleteCheckpoint(ctx context.Context, in *DeleteCheckpointRequest, opts ...grpc.CallOption) (*DeleteCheckpointResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DeleteCheckpointResponse)
+	err := c.cc.Invoke(ctx, SandboxService_DeleteCheckpoint_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -163,8 +190,13 @@ func (c *sandboxServiceClient) SetNetworkPolicy(ctx context.Context, in *SetNetw
 type SandboxServiceServer interface {
 	// Start creates and starts a sandbox.
 	Start(context.Context, *StartRequest) (*StartResponse, error)
-	// Checkpoint saves a running sandbox into a caller-owned directory.
+	// Checkpoint saves a running sandbox and stops its source process.
 	Checkpoint(context.Context, *CheckpointRequest) (*CheckpointResponse, error)
+	// Restore restores either a legacy local checkpoint or a verified,
+	// deterministic resume attempt and returns authoritative physical facts.
+	Restore(context.Context, *RestoreRequest) (*StartResponse, error)
+	// DeleteCheckpoint deletes one exact sandboxd-owned checkpoint artifact.
+	DeleteCheckpoint(context.Context, *DeleteCheckpointRequest) (*DeleteCheckpointResponse, error)
 	// Delete force-deletes a sandbox.
 	Delete(context.Context, *DeleteRequest) (*DeleteResponse, error)
 	// Wait waits for a sandbox to exit.
@@ -192,6 +224,12 @@ func (UnimplementedSandboxServiceServer) Start(context.Context, *StartRequest) (
 }
 func (UnimplementedSandboxServiceServer) Checkpoint(context.Context, *CheckpointRequest) (*CheckpointResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Checkpoint not implemented")
+}
+func (UnimplementedSandboxServiceServer) Restore(context.Context, *RestoreRequest) (*StartResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method Restore not implemented")
+}
+func (UnimplementedSandboxServiceServer) DeleteCheckpoint(context.Context, *DeleteCheckpointRequest) (*DeleteCheckpointResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method DeleteCheckpoint not implemented")
 }
 func (UnimplementedSandboxServiceServer) Delete(context.Context, *DeleteRequest) (*DeleteResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Delete not implemented")
@@ -264,6 +302,42 @@ func _SandboxService_Checkpoint_Handler(srv interface{}, ctx context.Context, de
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(SandboxServiceServer).Checkpoint(ctx, req.(*CheckpointRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SandboxService_Restore_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RestoreRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SandboxServiceServer).Restore(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SandboxService_Restore_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SandboxServiceServer).Restore(ctx, req.(*RestoreRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SandboxService_DeleteCheckpoint_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DeleteCheckpointRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SandboxServiceServer).DeleteCheckpoint(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SandboxService_DeleteCheckpoint_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SandboxServiceServer).DeleteCheckpoint(ctx, req.(*DeleteCheckpointRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -390,6 +464,14 @@ var SandboxService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Checkpoint",
 			Handler:    _SandboxService_Checkpoint_Handler,
+		},
+		{
+			MethodName: "Restore",
+			Handler:    _SandboxService_Restore_Handler,
+		},
+		{
+			MethodName: "DeleteCheckpoint",
+			Handler:    _SandboxService_DeleteCheckpoint_Handler,
 		},
 		{
 			MethodName: "Delete",
