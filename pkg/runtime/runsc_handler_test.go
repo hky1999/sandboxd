@@ -16,6 +16,7 @@ package runtime
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -143,9 +144,13 @@ func TestRunscHandlerMountsRootfsImageForNVProxy(t *testing.T) {
 type staticOciLoader struct {
 	bundlePath string
 	spec       *Spec
+	onGenerate func(OciLoadOptions)
 }
 
-func (l staticOciLoader) GenerateOci(OciLoadOptions) (string, *Spec, error) {
+func (l staticOciLoader) GenerateOci(options OciLoadOptions) (string, *Spec, error) {
+	if l.onGenerate != nil {
+		l.onGenerate(options)
+	}
 	return l.bundlePath, l.spec, nil
 }
 
@@ -153,9 +158,181 @@ type successfulRunscClient struct{}
 
 func (successfulRunscClient) Create(context.Context, runscapi.StartArgs) error { return nil }
 func (successfulRunscClient) Start(context.Context, runscapi.StartArgs) error  { return nil }
-func (successfulRunscClient) Wait(context.Context, string) (int, error)        { return 0, nil }
-func (successfulRunscClient) Delete(context.Context, string, bool) error       { return nil }
-func (successfulRunscClient) ListJSON(context.Context) ([]byte, error)         { return []byte("[]"), nil }
+func (successfulRunscClient) Checkpoint(context.Context, string, string, bool) error {
+	return nil
+}
+func (successfulRunscClient) Restore(context.Context, runscapi.StartArgs, string) error {
+	return nil
+}
+func (successfulRunscClient) Wait(context.Context, string) (int, error)  { return 0, nil }
+func (successfulRunscClient) Delete(context.Context, string, bool) error { return nil }
+func (successfulRunscClient) ListJSON(context.Context) ([]byte, error)   { return []byte("[]"), nil }
+
+type checkpointWritingRunscClient struct {
+	successfulRunscClient
+	checkpointDir *string
+}
+
+func (c checkpointWritingRunscClient) Restore(
+	context.Context, runscapi.StartArgs, string,
+) error {
+	return os.WriteFile(filepath.Join(*c.checkpointDir, "checkpoint.img"), []byte("transient"), 0600)
+}
+
+type checkpointRemovalFailureRunscClient struct {
+	successfulRunscClient
+	checkpointDir *string
+	deleteErrors  []error
+	deleteCalls   int
+}
+
+func (c *checkpointRemovalFailureRunscClient) Restore(
+	context.Context, runscapi.StartArgs, string,
+) error {
+	imagePath := filepath.Join(*c.checkpointDir, gvisorCheckpointImageName)
+	if err := os.Mkdir(imagePath, 0700); err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(imagePath, "entry"), []byte("busy"), 0600)
+}
+
+func (c *checkpointRemovalFailureRunscClient) Delete(context.Context, string, bool) error {
+	index := c.deleteCalls
+	c.deleteCalls++
+	if index >= len(c.deleteErrors) {
+		return nil
+	}
+	return c.deleteErrors[index]
+}
+
+func newRunscRestoreTestHandler(t *testing.T) (*RunscHandler, *string) {
+	t.Helper()
+	rootDir := filepath.Join(t.TempDir(), "sandboxd", "root")
+	bundleRoot := filepath.Join(rootDir, "containers")
+	bundlePath := filepath.Join(bundleRoot, "sbox-restored")
+	assert.NoError(t, os.MkdirAll(bundlePath, 0755))
+	checkpointRoot := filepath.Join(rootDir, config.GVisorCheckpointDirName)
+	assert.NoError(t, os.MkdirAll(checkpointRoot, 0700))
+
+	var checkpointDir string
+	handler := &RunscHandler{
+		ociLoader: staticOciLoader{
+			bundlePath: bundlePath,
+			spec:       &Spec{Root: &Root{Path: t.TempDir()}},
+			onGenerate: func(options OciLoadOptions) {
+				checkpointDir = options.ManagedAnnotations[config.GVisorCheckpointPathAnnotation]
+				spec := &Spec{
+					Root:        &Root{Path: t.TempDir()},
+					Annotations: options.ManagedAnnotations,
+				}
+				content, err := json.Marshal(spec)
+				assert.NoError(t, err)
+				assert.NoError(t, os.WriteFile(
+					filepath.Join(bundlePath, config.SandboxSpecFile), content, 0600,
+				))
+			},
+		},
+		rootfsOverlayTmpfsSize: "10G",
+		filestoreDir:           t.TempDir(),
+		sandboxRoot:            bundleRoot,
+		checkpointRoot:         checkpointRoot,
+	}
+	return handler, &checkpointDir
+}
+
+func TestRunscHandlerRestoreRemovesTransientCoordinationImage(t *testing.T) {
+	handler, checkpointDir := newRunscRestoreTestHandler(t)
+	handler.runsc = checkpointWritingRunscClient{checkpointDir: checkpointDir}
+
+	err := handler.Restore(context.Background(), StartConfig{
+		ID:      "sbox-restored",
+		Network: &networkmanager.NetResource{},
+	}, filepath.Join(t.TempDir(), "source-checkpoint.img"))
+
+	assert.NoError(t, err)
+	assert.DirExists(t, *checkpointDir, "future checkpoints still need the coordination directory")
+	assert.NoFileExists(t, filepath.Join(*checkpointDir, "checkpoint.img"))
+	assert.NoError(t, os.WriteFile(
+		filepath.Join(*checkpointDir, "checkpoint.img"), []byte("next checkpoint"), 0600,
+	))
+	assert.FileExists(t, filepath.Join(*checkpointDir, "checkpoint.img"))
+}
+
+func TestRunscHandlerCleansPreparedStateWhenRuntimeIsAbsent(t *testing.T) {
+	handler, checkpointDir := newRunscRestoreTestHandler(t)
+	handler.runsc = checkpointWritingRunscClient{checkpointDir: checkpointDir}
+	assert.NoError(t, handler.Restore(context.Background(), StartConfig{
+		ID:      "sbox-restored",
+		Network: &networkmanager.NetResource{},
+	}, filepath.Join(t.TempDir(), "source-checkpoint.img")))
+	assert.NoError(t, os.WriteFile(
+		filepath.Join(*checkpointDir, gvisorCheckpointImageName), []byte("orphan"), 0600,
+	))
+	err := handler.CleanupPreparedState(context.Background(), "sbox-restored")
+
+	assert.NoError(t, err)
+	assert.NoDirExists(t, *checkpointDir)
+}
+
+func TestRunscHandlerRestoreCleanupRemovesPreparedStateAfterDelete(t *testing.T) {
+	handler, checkpointDir := newRunscRestoreTestHandler(t)
+	client := &checkpointRemovalFailureRunscClient{
+		checkpointDir: checkpointDir,
+		deleteErrors:  []error{nil},
+	}
+	handler.runsc = client
+
+	err := handler.Restore(context.Background(), StartConfig{
+		ID:      "sbox-restored",
+		Network: &networkmanager.NetResource{},
+	}, filepath.Join(t.TempDir(), "source-checkpoint.img"))
+
+	assert.ErrorContains(t, err, "remove restored gVisor checkpoint image")
+	assert.NotErrorIs(t, err, ErrRestoreCleanupIncomplete)
+	assert.Equal(t, 1, client.deleteCalls)
+	assert.NoDirExists(t, *checkpointDir)
+}
+
+func TestRunscHandlerRestoreCleanupRetriesBeforeRemovingPreparedState(t *testing.T) {
+	handler, checkpointDir := newRunscRestoreTestHandler(t)
+	client := &checkpointRemovalFailureRunscClient{
+		checkpointDir: checkpointDir,
+		deleteErrors:  []error{errors.New("delete temporarily unavailable"), nil},
+	}
+	handler.runsc = client
+
+	err := handler.Restore(context.Background(), StartConfig{
+		ID:      "sbox-restored",
+		Network: &networkmanager.NetResource{},
+	}, filepath.Join(t.TempDir(), "source-checkpoint.img"))
+
+	assert.ErrorContains(t, err, "remove restored gVisor checkpoint image")
+	assert.NotErrorIs(t, err, ErrRestoreCleanupIncomplete)
+	assert.Equal(t, 2, client.deleteCalls)
+	assert.NoDirExists(t, *checkpointDir)
+}
+
+func TestRunscHandlerRestoreCleanupPreservesPreparedStateWhenDeleteFails(t *testing.T) {
+	handler, checkpointDir := newRunscRestoreTestHandler(t)
+	deleteErr := errors.New("delete permanently unavailable")
+	client := &checkpointRemovalFailureRunscClient{
+		checkpointDir: checkpointDir,
+		deleteErrors:  []error{deleteErr, deleteErr, deleteErr},
+	}
+	handler.runsc = client
+
+	err := handler.Restore(context.Background(), StartConfig{
+		ID:      "sbox-restored",
+		Network: &networkmanager.NetResource{},
+	}, filepath.Join(t.TempDir(), "source-checkpoint.img"))
+
+	assert.ErrorContains(t, err, "remove restored gVisor checkpoint image")
+	assert.ErrorContains(t, err, "delete permanently unavailable")
+	assert.ErrorIs(t, err, ErrRestoreCleanupIncomplete)
+	assert.Equal(t, runscFailureCleanupRetries, client.deleteCalls)
+	assert.DirExists(t, *checkpointDir)
+	assert.DirExists(t, filepath.Join(*checkpointDir, gvisorCheckpointImageName))
+}
 
 func TestRunscHandlerResolvesWritableLayerOverlay(t *testing.T) {
 	rootDir := filepath.Join(t.TempDir(), "sandboxd", "root")

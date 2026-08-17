@@ -35,6 +35,28 @@ type Handler interface {
 	Wait(context.Context, string) (Exit, error)
 }
 
+// ManagedCheckpointHandler is an optional runtime capability. Keeping it out
+// of Handler allows runtimes without native checkpoint support to remain
+// unchanged and lets the server report Unimplemented explicitly.
+type ManagedCheckpointHandler interface {
+	Checkpoint(context.Context, string, string, CheckpointOptions) error
+	Restore(context.Context, StartConfig, string) error
+}
+
+// PreparedStateCleaner is an optional runtime capability for removing local
+// physical preparation after List confirms that no runtime exists. It avoids
+// imposing absent-runtime Delete semantics on every Handler implementation.
+type PreparedStateCleaner interface {
+	CleanupPreparedState(context.Context, string) error
+}
+
+// CheckpointOptions describes physical checkpoint behavior. It is kept at
+// the optional runtime capability boundary so runtimes without checkpoint
+// support do not need to understand it.
+type CheckpointOptions struct {
+	LeaveRunning bool
+}
+
 type StartConfig struct {
 	ID                      string
 	Hostname                string
@@ -128,3 +150,9 @@ func getErrorFromContext(ctx context.Context) error {
 }
 
 var _ Handler = &FakeRuntimeHandler{}
+
+// ErrRestoreCleanupIncomplete marks a failed restore whose runtime deletion
+// could not be confirmed. Callers must retain the physical intent and its
+// prepared resources so reconciliation can still locate and remove the exact
+// runtime after restart or retry.
+var ErrRestoreCleanupIncomplete = errors.New("restore runtime cleanup is incomplete")

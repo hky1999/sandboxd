@@ -70,18 +70,25 @@ func (c *Sandbox) EnvValue(key string) string {
 }
 
 func (c *Sandbox) ApiStatus() *runtime.SandboxStatus {
-	if c.Status == nil || c.Spec == nil || c.Metadata == nil || c.Spec.Process == nil {
+	if c.Status == nil || c.Metadata == nil {
 		return &runtime.SandboxStatus{}
 	}
+	current := c.Status.Get()
 	envKv := make([]*runtime.KeyValue, 0)
-	for _, env := range c.Spec.Process.Env {
-		if len(strings.Split(env, "=")) != 2 {
-			continue
+	var command []string
+	var mounts []*runtime.Mount
+	if c.Spec != nil {
+		mounts = util.MountToApi(c.Spec.Mounts)
+		if c.Spec.Process != nil {
+			command = append([]string(nil), c.Spec.Process.Args...)
+			for _, env := range c.Spec.Process.Env {
+				parts := strings.SplitN(env, "=", 2)
+				if len(parts) != 2 {
+					continue
+				}
+				envKv = append(envKv, &runtime.KeyValue{Key: parts[0], Value: parts[1]})
+			}
 		}
-		envKv = append(envKv, &runtime.KeyValue{
-			Key:   strings.Split(env, "=")[0],
-			Value: strings.Split(env, "=")[1],
-		})
 	}
 
 	copyLabels := make(map[string]string)
@@ -98,7 +105,7 @@ func (c *Sandbox) ApiStatus() *runtime.SandboxStatus {
 	}
 
 	var copyResource *runtime.LinuxSandboxResources
-	resource := c.Status.Get().Resources
+	resource := current.Resources
 	if resource != nil {
 		copyResourcesUnified := make(map[string]string)
 		if resource.Unified != nil {
@@ -131,18 +138,19 @@ func (c *Sandbox) ApiStatus() *runtime.SandboxStatus {
 
 	return &runtime.SandboxStatus{
 		ID:           c.Metadata.ID,
-		Command:      c.Spec.Process.Args,
+		Command:      command,
 		Runtime:      c.Metadata.RuntimeHandler,
-		State:        c.Status.Get().State(),
-		StartedAt:    util.MustInt64(c.Status.Get().StartedAt),
-		FinishedAt:   util.MustInt64(c.Status.Get().FinishedAt),
-		ExitCode:     c.Status.Get().ExitCode,
+		State:        current.State(),
+		StartedAt:    util.MustInt64(current.StartedAt),
+		FinishedAt:   util.MustInt64(current.FinishedAt),
+		ExitCode:     current.ExitCode,
 		Labels:       copyLabels,
 		MetricLabels: copyMetricLabels,
-		Mounts:       util.MountToApi(c.Spec.Mounts),
+		Mounts:       mounts,
 		Envs:         envKv,
 		Stdout:       c.Metadata.Stdout,
 		Stderr:       c.Metadata.Stderr,
 		Resources:    copyResource,
+		Ports:        append([]string(nil), c.Metadata.Ports...),
 	}
 }
