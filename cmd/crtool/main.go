@@ -179,6 +179,23 @@ func main() {
 		}
 		out, _ := protojson.Marshal(resp)
 		fmt.Printf("elapsed_ms=%d %s\n", dt.Milliseconds(), string(out))
+	case "pause", "resume":
+		if len(args) < 2 {
+			fatal("%s needs <sandbox-id>", args[0])
+		}
+		start := time.Now()
+		var resp *runtime.PauseResponse
+		var err error
+		if args[0] == "pause" {
+			resp, err = c.Pause(ctx, &runtime.PauseRequest{ID: args[1]})
+		} else {
+			resp, err = c.Resume(ctx, &runtime.PauseRequest{ID: args[1]})
+		}
+		if err != nil {
+			fatal("%s: %v", args[0], err)
+		}
+		out, _ := protojson.Marshal(resp)
+		fmt.Printf("elapsed_ms=%.3f %s\n", float64(time.Since(start).Microseconds())/1000.0, string(out))
 	case "delete":
 		fs := flag.NewFlagSet("delete", flag.ExitOnError)
 		timeout := fs.Int64("timeout", 30, "timeout seconds")

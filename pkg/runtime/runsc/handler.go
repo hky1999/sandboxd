@@ -352,6 +352,18 @@ func (r *Handler) checkpointCoordinationDir(bundlePath string) (string, error) {
 	return target, nil
 }
 
+// Pause freezes all tasks in the sandbox without terminating it. Identity,
+// network, and broker-side records survive; the sandbox simply stops
+// executing until the matching Resume.
+func (r *Handler) Pause(ctx context.Context, sandboxID string) error {
+	return r.runsc.Pause(ctx, sandboxID)
+}
+
+// Resume unfreezes a previously paused sandbox.
+func (r *Handler) Resume(ctx context.Context, sandboxID string) error {
+	return r.runsc.Resume(ctx, sandboxID)
+}
+
 // CleanupPreparedState removes local runsc preparation (bundle state, the
 // NVProxy private rootfs, coordination directories) after List confirms no
 // runtime exists under the ID.

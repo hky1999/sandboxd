@@ -24,6 +24,14 @@ service SandboxService {
   rpc Start(StartRequest) returns (StartResponse) {}
   // Checkpoint saves a running sandbox and stops its source process.
   rpc Checkpoint(CheckpointRequest) returns (CheckpointResponse) {}
+  // Pause freezes all tasks in a running sandbox without terminating it.
+  // The sandbox keeps its identity, network, and control-plane linkage;
+  // Resume unfreezes it. This is the short-window parking primitive that
+  // preserves broker-level records (unlike Checkpoint, whose source
+  // termination is observed by the broker as sandbox death).
+  rpc Pause(PauseRequest) returns (PauseResponse) {}
+  // Resume unfreezes a previously paused sandbox.
+  rpc Resume(PauseRequest) returns (PauseResponse) {}
   // Restore restores either a legacy local checkpoint or a verified,
   // deterministic resume attempt and returns authoritative physical facts.
   rpc Restore(RestoreRequest) returns (StartResponse) {}
@@ -282,6 +290,16 @@ message CheckpointResponse {
   int64 artifact_size = 4;
   string artifact_sha256 = 5;
 }
+
+// PauseRequest targets one running sandbox. Resume takes the same shape.
+message PauseRequest {
+  // SandboxID is the sandbox to freeze or unfreeze.
+  string id = 1;
+  string trace_id = 2;
+}
+
+// PauseResponse is empty once the freeze (or unfreeze) has taken effect.
+message PauseResponse {}
 
 // DeleteCheckpointRequest binds cleanup to one committed physical artifact.
 message DeleteCheckpointRequest {
