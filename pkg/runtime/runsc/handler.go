@@ -22,8 +22,10 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
+	"github.com/inclusionAI/sandboxd/internal/checkpoint"
 	"github.com/inclusionAI/sandboxd/internal/trace"
 	"github.com/inclusionAI/sandboxd/internal/util"
 
@@ -34,7 +36,7 @@ import (
 )
 
 var _ runtimecore.Handler = &Handler{}
-var _ runtimecore.CheckpointHandler = &Handler{}
+var _ runtimecore.ManagedCheckpointHandler = &Handler{}
 var _ runtimecore.CheckpointRestoreCapabilitiesProvider = &Handler{}
 var _ runtimecore.SandboxDefaultsProvider = &Handler{}
 
@@ -55,6 +57,7 @@ type Handler struct {
 	rootfsOverlayTmpfsSize string
 	filestoreDir           string
 	sandboxRoot            string
+	checkpointRoot         string
 	mountEROFS             runtimecommon.EROFSImageMounter
 }
 
@@ -62,6 +65,9 @@ type runscClient interface {
 	Create(context.Context, StartArgs) error
 	Start(context.Context, StartArgs) error
 	Checkpoint(context.Context, string, string, bool, bool) error
+	FsCheckpoint(context.Context, string, string, bool) error
+	Pause(context.Context, string) error
+	Resume(context.Context, string) error
 	Restore(context.Context, StartArgs, string) error
 	Wait(context.Context, string) (int, error)
 	Delete(context.Context, string, bool) error
@@ -77,6 +83,13 @@ func NewHandler(cfg config.Config, bin string, loader runtimecore.OciLoader) (*H
 		return nil, fmt.Errorf("configure runsc: %w", err)
 	}
 	root := cfg.RootDir
+	checkpointRoot := filepath.Join(root, config.GVisorCheckpointDirName)
+	if err := os.MkdirAll(checkpointRoot, 0700); err != nil {
+		return nil, err
+	}
+	if err := os.Chmod(checkpointRoot, 0700); err != nil {
+		return nil, err
+	}
 	runscRoot := filepath.Join(root, config.RuntimeNameRunsc)
 	if err := os.MkdirAll(runscRoot, 0711); err != nil {
 		return nil, err
@@ -103,7 +116,8 @@ func NewHandler(cfg config.Config, bin string, loader runtimecore.OciLoader) (*H
 		rootfsOverlayTmpfsSize: cfg.RuntimeConfig.OverlayTmpfsSize,
 		filestoreDir:           cfg.RuntimeConfig.FilestoreDir,
 		sandboxRoot:            filepath.Join(root, "containers"),
-		mountEROFS:             mountEROFS,
+		mountEROFS:             mountEROFS,,
+		checkpointRoot:         checkpointRoot
 	}, nil
 }
 
@@ -190,19 +204,41 @@ func (r *Handler) Start(ctx context.Context, config runtimecore.StartConfig) err
 	return nil
 }
 
-func (r *Handler) Checkpoint(ctx context.Context, config runtimecore.CheckpointConfig) error {
-	return r.runsc.Checkpoint(
-		ctx,
-		config.ID,
-		config.Directory,
-		config.Compress,
-		config.LeaveRunning,
-	)
+// Checkpoint implements the scheduler-facing ManagedCheckpointHandler.
+// Without IncludeFilesystem it is a plain state dump; with it, the sandbox
+// is paused first so the memory-state and writable-layer artifacts describe
+// one frozen point, and source liveness is decided solely by LeaveRunning.
+func (r *Handler) Checkpoint(
+	ctx context.Context, sandboxID, imagePath string, options runtimecore.CheckpointOptions,
+) error {
+	if !options.IncludeFilesystem {
+		return r.runsc.Checkpoint(ctx, sandboxID, imagePath, true, options.LeaveRunning)
+	}
+	if err := r.runsc.Pause(ctx, sandboxID); err != nil {
+		return err
+	}
+	resumeSource := func(cause error) error {
+		// Cleanup must survive cancellation of the checkpoint request, but
+		// remains bounded if runsc cannot answer.
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		defer cancel()
+		return errors.Join(cause, r.runsc.Resume(cleanupCtx, sandboxID))
+	}
+	if err := r.runsc.FsCheckpoint(ctx, sandboxID, filepath.Join(imagePath, checkpoint.FsArtifactDirName), true); err != nil {
+		// Never terminate the source after failing to capture its files.
+		return resumeSource(err)
+	}
+	ckptErr := r.runsc.Checkpoint(ctx, sandboxID, imagePath, true, options.LeaveRunning)
+	if options.LeaveRunning || ckptErr != nil {
+		return resumeSource(ckptErr)
+	}
+	return nil
 }
 
 func (r *Handler) Restore(
 	ctx context.Context,
 	config runtimecore.StartConfig,
+	imagePath string,
 ) (retErr error) {
 	traceID, _ := trace.GetContextID(ctx)
 	if config.Network == nil {
@@ -274,7 +310,6 @@ func (r *Handler) Restore(
 	if err := r.runsc.Create(ctx, startArgs); err != nil {
 		return errors.Join(err, cleanupFailure())
 	}
-	imagePath := filepath.Join(config.CheckpointDir, checkpointImageName)
 	if err := r.runsc.Restore(ctx, startArgs, imagePath); err != nil {
 		return errors.Join(err, cleanupFailure())
 	}
@@ -284,6 +319,56 @@ func (r *Handler) Restore(
 		time.Since(start),
 	)
 	return nil
+}
+
+// checkpointCoordinationDir resolves the runsc-internal coordination
+// directory recorded in the sandbox OCI spec annotation, fenced to stay
+// below the daemon-owned checkpoint root.
+func (r *Handler) checkpointCoordinationDir(bundlePath string) (string, error) {
+	spec, err := LoadSpec(filepath.Join(bundlePath, config.SandboxSpecFile))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return "", nil
+		}
+		return "", fmt.Errorf("load runsc OCI spec: %w", err)
+	}
+	path := spec.Annotations[config.GVisorCheckpointPathAnnotation]
+	if path == "" {
+		return "", nil
+	}
+	root, err := filepath.Abs(r.checkpointRoot)
+	if err != nil {
+		return "", err
+	}
+	target, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	rel, err := filepath.Rel(root, target)
+	if err != nil || rel == "." || rel == ".." || filepath.IsAbs(rel) ||
+		strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("gVisor checkpoint coordination path %q is outside %q", target, root)
+	}
+	return target, nil
+}
+
+// CleanupPreparedState removes local runsc preparation (bundle state, the
+// NVProxy private rootfs, coordination directories) after List confirms no
+// runtime exists under the ID.
+func (r *Handler) CleanupPreparedState(_ context.Context, sandboxID string) error {
+	bundlePath, err := util.JoinWithinRoot(r.sandboxRoot, sandboxID)
+	if err != nil {
+		return fmt.Errorf("resolve runsc sandbox bundle: %w", err)
+	}
+	checkpointDir, err := r.checkpointCoordinationDir(bundlePath)
+	if err != nil {
+		return err
+	}
+	cleanupErr := cleanupRunscNVProxyRootfs(bundlePath)
+	if checkpointDir != "" {
+		cleanupErr = errors.Join(cleanupErr, os.RemoveAll(checkpointDir))
+	}
+	return cleanupErr
 }
 
 func (r *Handler) resolveRootOverlay(limitBytes uint64) (string, string, error) {

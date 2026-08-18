@@ -27,16 +27,22 @@ type Manifest struct {
 	LeaveRunning bool   `json:"leaveRunning,omitempty"`
 	ImageSHA256  string `json:"imageSha256"`
 	ImageSize    int64  `json:"imageSize"`
+	// IncludeFilesystem marks a paired writable-layer artifact published in
+	// the FsArtifactDirName subdirectory next to the state image.
+	IncludeFilesystem bool   `json:"includeFilesystem,omitempty"`
+	FsImageSHA256     string `json:"fsImageSha256,omitempty"`
+	FsImageSize       int64  `json:"fsImageSize,omitempty"`
 }
 
 // SourceIdentity describes the logical source whose checkpoint may be
 // replayed. It deliberately excludes transient process and node identities.
 type SourceIdentity struct {
-	CheckpointID string
-	SourceID     string
-	Runtime      string
-	RootfsSHA256 string
-	LeaveRunning bool
+	CheckpointID      string
+	SourceID          string
+	Runtime           string
+	RootfsSHA256      string
+	LeaveRunning      bool
+	IncludeFilesystem bool
 }
 
 // Paths are the sandboxd-owned paths for a checkpoint fact.
@@ -54,10 +60,11 @@ type Fact struct {
 
 func (manifest Manifest) sourceIdentity() SourceIdentity {
 	return SourceIdentity{
-		CheckpointID: manifest.CheckpointID,
-		SourceID:     manifest.SourceID,
-		Runtime:      manifest.Runtime,
-		RootfsSHA256: manifest.RootfsSHA256,
-		LeaveRunning: manifest.LeaveRunning,
+		CheckpointID:      manifest.CheckpointID,
+		SourceID:          manifest.SourceID,
+		Runtime:           manifest.Runtime,
+		RootfsSHA256:      manifest.RootfsSHA256,
+		LeaveRunning:      manifest.LeaveRunning,
+		IncludeFilesystem: manifest.IncludeFilesystem,
 	}
 }
