@@ -368,6 +368,15 @@ func (o *restoreOpts) setFilePayload(files []*os.File) {
 
 // Restore connects a runsc sandbox previously created with Create, installs
 // its target networking, and restores the checkpoint files.
+//
+// The ordering mirrors runsc's own Sandbox.Restore: links and routes are
+// configured through the control RPC while the sandbox is still in the
+// created state (the post-restore sentry tightens its seccomp policy and
+// can no longer create NICs), then the checkpoint files are pushed through
+// the containerManager.Restore control RPC. The checkpoint's pages file
+// already carries the writable-layer contents — the overlay upper tmpfs is
+// part of the saved sentry state, and Create passed a fresh (empty) host
+// filestore whose pages are repopulated from the image.
 // The Restore RPC has no fixed timeout because loading a large image may take
 // arbitrarily long; it remains cancellable through ctx.
 func (c *Client) Restore(ctx context.Context, args StartArgs, imagePath string) error {
