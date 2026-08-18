@@ -74,6 +74,10 @@ type StartArgs struct {
 	UserStderr  string
 	RootOverlay string
 	Network     NetworkConfig
+	// FsRestoreImagePath restores the gVisor writable-layer filestore from a
+	// filesystem checkpoint (runsc fscheckpoint artifact directory). Empty
+	// keeps the historical behavior of a fresh writable layer.
+	FsRestoreImagePath string
 }
 
 func NewClient(binary, rootDir string) *Client {
@@ -140,10 +144,11 @@ func (c *Client) Create(ctx context.Context, args StartArgs) error {
 	}
 	cmdArgs = append(cmdArgs, "--overlay2="+rootOverlay)
 	cmdArgs = append(cmdArgs, "create")
-	cmdArgs = append(cmdArgs,
-		"--bundle", args.BundleDir,
-		args.ID,
-	)
+	cmdArgs = append(cmdArgs, "--bundle", args.BundleDir)
+	if args.FsRestoreImagePath != "" {
+		cmdArgs = append(cmdArgs, "--fs-restore-image-path", args.FsRestoreImagePath)
+	}
+	cmdArgs = append(cmdArgs, args.ID)
 	cmd := exec.CommandContext(ctx, c.Binary, cmdArgs...)
 	cmd.Env = os.Environ()
 	cmd.Stdin = stdin
@@ -276,6 +281,61 @@ func (c *Client) Checkpoint(ctx context.Context, id, imageDir string, leaveRunni
 			return ctxErr
 		}
 		return fmt.Errorf("runsc checkpoint %s failed: %w: %s", id, err, strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
+// FsCheckpoint saves the gVisor writable-layer filestore to imageDir using
+// the upstream runsc fscheckpoint subcommand. The artifact is a raw
+// uncompressed directory tree (fscheckpoint.json + pages.img + ...) that a
+// later Create can consume through FsRestoreImagePath.
+func (c *Client) FsCheckpoint(ctx context.Context, id, imageDir string, leaveRunning bool) error {
+	if id == "" {
+		return fmt.Errorf("container id is empty")
+	}
+	if imageDir == "" {
+		return fmt.Errorf("filesystem checkpoint image directory is empty for %s", id)
+	}
+	args := append(c.globalArgs(), "fscheckpoint")
+	if leaveRunning {
+		args = append(args, "--leave-running")
+	}
+	args = append(args, "--image-path", imageDir, id)
+	cmd := exec.CommandContext(ctx, c.Binary, args...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		return fmt.Errorf("runsc fscheckpoint %s failed: %w: %s", id, err, strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
+// Pause freezes all container tasks in the sandbox. It is the consistency
+// point used when pairing a memory-state checkpoint with a filesystem
+// checkpoint.
+func (c *Client) Pause(ctx context.Context, id string) error {
+	return c.simpleCommand(ctx, "pause", id)
+}
+
+// Resume unfreezes previously paused container tasks.
+func (c *Client) Resume(ctx context.Context, id string) error {
+	return c.simpleCommand(ctx, "resume", id)
+}
+
+func (c *Client) simpleCommand(ctx context.Context, subcommand, id string) error {
+	if id == "" {
+		return fmt.Errorf("container id is empty")
+	}
+	args := append(c.globalArgs(), subcommand, id)
+	cmd := exec.CommandContext(ctx, c.Binary, args...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		return fmt.Errorf("runsc %s %s failed: %w: %s", subcommand, id, err, strings.TrimSpace(string(output)))
 	}
 	return nil
 }

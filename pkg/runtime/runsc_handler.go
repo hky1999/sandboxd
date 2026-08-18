@@ -40,9 +40,12 @@ var (
 )
 
 const (
-	ImageName                  = "rootfs.img"
-	SplitSeparator             = "__.__"
-	gvisorCheckpointImageName  = "checkpoint.img"
+	ImageName                 = "rootfs.img"
+	SplitSeparator            = "__.__"
+	gvisorCheckpointImageName = "checkpoint.img"
+	// FsArtifactDirName is the subdirectory inside a checkpoint directory
+	// that holds the runsc fscheckpoint (writable-layer) artifact.
+	FsArtifactDirName          = "fs"
 	runscFailureCleanupTimeout = 20 * time.Second
 	runscFailureCleanupRetries = 3
 	runscFailureCleanupBackoff = 50 * time.Millisecond
@@ -62,6 +65,9 @@ type runscClient interface {
 	Create(context.Context, runscapi.StartArgs) error
 	Start(context.Context, runscapi.StartArgs) error
 	Checkpoint(context.Context, string, string, bool) error
+	FsCheckpoint(context.Context, string, string, bool) error
+	Pause(context.Context, string) error
+	Resume(context.Context, string) error
 	Restore(context.Context, runscapi.StartArgs, string) error
 	Wait(context.Context, string) (int, error)
 	Delete(context.Context, string, bool) error
@@ -212,7 +218,30 @@ func (r *RunscHandler) newCheckpointCoordinationDir(sandboxID string) (string, e
 func (r *RunscHandler) Checkpoint(
 	ctx context.Context, sandboxID, imagePath string, options CheckpointOptions,
 ) error {
-	return r.runsc.Checkpoint(ctx, sandboxID, imagePath, options.LeaveRunning)
+	if !options.IncludeFilesystem {
+		return r.runsc.Checkpoint(ctx, sandboxID, imagePath, options.LeaveRunning)
+	}
+	// Paired memory-state + filesystem checkpoint. The sandbox is paused
+	// first so both artifacts describe the same frozen point; liveness of
+	// the source sandbox is then decided solely by options.LeaveRunning.
+	if err := r.runsc.Pause(ctx, sandboxID); err != nil {
+		return err
+	}
+	fsErr := r.runsc.FsCheckpoint(ctx, sandboxID, filepath.Join(imagePath, FsArtifactDirName), true)
+	var ckptErr error
+	if options.LeaveRunning {
+		ckptErr = r.runsc.Checkpoint(ctx, sandboxID, imagePath, true)
+	} else {
+		// The state checkpoint itself terminates the frozen sandbox, which
+		// the managed flow observes through WaitForExit.
+		ckptErr = r.runsc.Checkpoint(ctx, sandboxID, imagePath, false)
+	}
+	if options.LeaveRunning {
+		if resumeErr := r.runsc.Resume(ctx, sandboxID); resumeErr != nil {
+			return errors.Join(fsErr, ckptErr, resumeErr)
+		}
+	}
+	return errors.Join(fsErr, ckptErr)
 }
 
 func (r *RunscHandler) Restore(ctx context.Context, startConfig StartConfig, imagePath string) error {
@@ -220,6 +249,13 @@ func (r *RunscHandler) Restore(ctx context.Context, startConfig StartConfig, ima
 	startArgs, cleanupPrepared, err := r.prepareStart(startConfig)
 	if err != nil {
 		return err
+	}
+	if fsPath, err := fsArtifactPath(imagePath); err != nil {
+		return err
+	} else if fsPath != "" {
+		// The checkpoint carries a writable-layer artifact: rebuild the
+		// filestore from it during create instead of starting fresh.
+		startArgs.FsRestoreImagePath = fsPath
 	}
 	start := time.Now()
 	if err := r.runsc.Create(ctx, startArgs); err != nil {
@@ -249,6 +285,24 @@ func (r *RunscHandler) Restore(ctx context.Context, startConfig StartConfig, ima
 		"call runsc create/restore, args: %+v, cost: %v", startArgs, time.Since(start),
 	)
 	return nil
+}
+
+// fsArtifactPath reports the writable-layer artifact directory that belongs
+// next to the checkpoint image at imagePath, or "" when the checkpoint was
+// published without one.
+func fsArtifactPath(imagePath string) (string, error) {
+	fsPath := filepath.Join(filepath.Dir(imagePath), FsArtifactDirName)
+	info, err := os.Lstat(fsPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("inspect filesystem checkpoint artifact %q: %w", fsPath, err)
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("filesystem checkpoint artifact %q is not a directory", fsPath)
+	}
+	return fsPath, nil
 }
 
 func (r *RunscHandler) removeRestoredCoordinationImage(bundlePath string) error {

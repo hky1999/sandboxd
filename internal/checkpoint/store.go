@@ -25,6 +25,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"syscall"
 
@@ -32,9 +33,12 @@ import (
 )
 
 const (
-	ImageName        = "checkpoint.img"
-	ManifestName     = "manifest.json"
-	maxManifestBytes = 64 * 1024
+	ImageName    = "checkpoint.img"
+	ManifestName = "manifest.json"
+	// FsArtifactDirName is the subdirectory inside a checkpoint directory
+	// that holds a paired writable-layer (runsc fscheckpoint) artifact.
+	FsArtifactDirName = "fs"
+	maxManifestBytes  = 64 * 1024
 )
 
 // DeleteIdentity binds cleanup to one committed checkpoint artifact. Callers
@@ -118,8 +122,17 @@ func PublishAt(directory string, source SourceIdentity, build func(string) error
 	}
 	manifest := Manifest{Version: manifestVersion, CheckpointID: source.CheckpointID,
 		SourceID: source.SourceID, Runtime: source.Runtime, RootfsSHA256: source.RootfsSHA256,
-		LeaveRunning: source.LeaveRunning,
-		ImageSHA256:  imageDigest, ImageSize: imageSize}
+		LeaveRunning: source.LeaveRunning, IncludeFilesystem: source.IncludeFilesystem,
+		ImageSHA256: imageDigest, ImageSize: imageSize}
+	if source.IncludeFilesystem {
+		fsDir := filepath.Join(staging, FsArtifactDirName)
+		fsSize, fsDigest, fsErr := inspectFsImage(fsDir)
+		if fsErr != nil {
+			return Fact{}, fsErr
+		}
+		manifest.FsImageSize = fsSize
+		manifest.FsImageSHA256 = fsDigest
+	}
 	data, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {
 		return Fact{}, err
@@ -128,7 +141,11 @@ func PublishAt(directory string, source SourceIdentity, build func(string) error
 	if err := os.WriteFile(stagingManifest, append(data, '\n'), 0600); err != nil {
 		return Fact{}, classifyIOError(err)
 	}
-	for _, path := range []string{stagingImage, stagingManifest, staging} {
+	syncTargets := []string{stagingImage, stagingManifest, staging}
+	if source.IncludeFilesystem {
+		syncTargets = append(syncTargets, filepath.Join(staging, FsArtifactDirName))
+	}
+	for _, path := range syncTargets {
 		if err := syncPath(path); err != nil {
 			return Fact{}, classifyIOError(err)
 		}
@@ -158,6 +175,12 @@ func InspectAt(directory, checkpointID string) (Fact, error) {
 	size, digest, err := inspectImage(paths.Image)
 	if err != nil || size != manifest.ImageSize || digest != manifest.ImageSHA256 {
 		return Fact{}, fmt.Errorf("checkpoint image integrity differs from manifest: %w", errord.ErrFailedPrecondition)
+	}
+	if manifest.IncludeFilesystem {
+		fsSize, fsDigest, fsErr := inspectFsImage(filepath.Join(directory, FsArtifactDirName))
+		if fsErr != nil || fsSize != manifest.FsImageSize || fsDigest != manifest.FsImageSHA256 {
+			return Fact{}, fmt.Errorf("filesystem checkpoint integrity differs from manifest: %w", errord.ErrFailedPrecondition)
+		}
 	}
 	return Fact{Paths: paths, Manifest: manifest}, nil
 }
@@ -263,7 +286,75 @@ func validateManifest(checkpointID string, manifest Manifest) error {
 	if _, err := hex.DecodeString(manifest.ImageSHA256); err != nil {
 		return fmt.Errorf("checkpoint image digest is invalid: %w", errord.ErrFailedPrecondition)
 	}
+	if manifest.IncludeFilesystem {
+		if manifest.FsImageSize <= 0 || len(manifest.FsImageSHA256) != sha256.Size*2 {
+			return fmt.Errorf("filesystem checkpoint manifest digest is invalid: %w",
+				errord.ErrFailedPrecondition)
+		}
+		if _, err := hex.DecodeString(manifest.FsImageSHA256); err != nil {
+			return fmt.Errorf("filesystem checkpoint digest is invalid: %w",
+				errord.ErrFailedPrecondition)
+		}
+	}
 	return nil
+}
+
+// inspectFsImage hashes the writable-layer artifact directory in a
+// deterministic order: sorted regular file names, then their sizes and
+// contents. The returned size is the sum of the regular file sizes.
+func inspectFsImage(dir string) (int64, string, error) {
+	info, err := os.Lstat(dir)
+	if err != nil {
+		return 0, "", fmt.Errorf("inspect filesystem checkpoint: %w", errord.ErrFailedPrecondition)
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return 0, "", fmt.Errorf("filesystem checkpoint must be a real directory: %w",
+			errord.ErrFailedPrecondition)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return 0, "", classifyIOError(fmt.Errorf("scan filesystem checkpoint: %w", err))
+	}
+	names := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		names = append(names, entry.Name())
+	}
+	sort.Strings(names)
+	hash := sha256.New()
+	var size int64
+	for _, name := range names {
+		path := filepath.Join(dir, name)
+		entryInfo, err := os.Lstat(path)
+		if err != nil || !entryInfo.Mode().IsRegular() {
+			return 0, "", fmt.Errorf("filesystem checkpoint entry %q is not a regular file: %w",
+				name, errord.ErrFailedPrecondition)
+		}
+		hash.Write([]byte(name))
+		if _, err := hash.Write([]byte(fmt.Sprintf(":%d:", entryInfo.Size()))); err != nil {
+			return 0, "", err
+		}
+		file, err := os.Open(path)
+		if err != nil {
+			return 0, "", classifyIOError(fmt.Errorf("open filesystem checkpoint entry: %w", err))
+		}
+		written, copyErr := io.Copy(hash, file)
+		closeErr := file.Close()
+		if copyErr != nil {
+			return 0, "", classifyIOError(fmt.Errorf("hash filesystem checkpoint entry: %w", copyErr))
+		}
+		if closeErr != nil {
+			return 0, "", classifyIOError(closeErr)
+		}
+		if written != entryInfo.Size() {
+			return 0, "", fmt.Errorf("filesystem checkpoint entry %q changed while reading: %w",
+				name, errord.ErrFailedPrecondition)
+		}
+		size += written
+	}
+	if size <= 0 {
+		return 0, "", fmt.Errorf("filesystem checkpoint is empty: %w", errord.ErrFailedPrecondition)
+	}
+	return size, hex.EncodeToString(hash.Sum(nil)), nil
 }
 
 func readManifest(path string) (Manifest, error) {
@@ -297,6 +388,26 @@ func ensureJSONEOF(decoder *json.Decoder) error {
 		return fmt.Errorf("checkpoint manifest has trailing data: %w", errord.ErrFailedPrecondition)
 	}
 	return nil
+}
+
+// FsArtifactPath returns the writable-layer artifact directory recorded by
+// the committed manifest in directory, or "" when the checkpoint has none.
+// It verifies presence only; full content verification happens in InspectAt.
+func FsArtifactPath(directory string) (string, error) {
+	manifest, err := readManifest(filepath.Join(directory, ManifestName))
+	if err != nil {
+		return "", err
+	}
+	if !manifest.IncludeFilesystem {
+		return "", nil
+	}
+	path := filepath.Join(directory, FsArtifactDirName)
+	info, statErr := os.Lstat(path)
+	if statErr != nil || !info.IsDir() {
+		return "", fmt.Errorf("filesystem checkpoint artifact is missing: %w",
+			errord.ErrFailedPrecondition)
+	}
+	return path, nil
 }
 
 func inspectImage(path string) (int64, string, error) {

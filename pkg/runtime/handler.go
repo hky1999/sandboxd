@@ -55,6 +55,10 @@ type PreparedStateCleaner interface {
 // support do not need to understand it.
 type CheckpointOptions struct {
 	LeaveRunning bool
+	// IncludeFilesystem additionally captures the runtime writable layer
+	// so a restore reproduces the workload's on-disk state. Both artifacts
+	// are taken at one paused consistency point.
+	IncludeFilesystem bool
 }
 
 type StartConfig struct {

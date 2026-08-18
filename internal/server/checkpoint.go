@@ -57,9 +57,10 @@ func (h *sandboxService) Checkpoint(
 		artifactErr = fmt.Errorf("checkpoint %q: %w", request.CheckpointID, errord.ErrNotFound)
 	}
 	if artifactErr == nil && (existing.Manifest.SourceID != request.ID ||
-		existing.Manifest.LeaveRunning != request.LeaveRunning) {
+		existing.Manifest.LeaveRunning != request.LeaveRunning ||
+		existing.Manifest.IncludeFilesystem != request.IncludeFilesystem) {
 		return nil, checkpointGRPCError(fmt.Errorf(
-			"checkpoint %q source or leave-running mode conflicts with replay: %w",
+			"checkpoint %q source or physical mode conflicts with replay: %w",
 			request.CheckpointID,
 			errord.ErrFailedPrecondition))
 	}
@@ -83,11 +84,12 @@ func (h *sandboxService) Checkpoint(
 		return nil, checkpointGRPCError(err)
 	}
 	source := checkpoint.SourceIdentity{
-		CheckpointID: request.CheckpointID,
-		SourceID:     request.ID,
-		Runtime:      sandbox.Metadata.RuntimeHandler,
-		RootfsSHA256: hex.EncodeToString(identity[:]),
-		LeaveRunning: request.LeaveRunning,
+		CheckpointID:      request.CheckpointID,
+		SourceID:          request.ID,
+		Runtime:           sandbox.Metadata.RuntimeHandler,
+		RootfsSHA256:      hex.EncodeToString(identity[:]),
+		LeaveRunning:      request.LeaveRunning,
+		IncludeFilesystem: request.IncludeFilesystem,
 	}
 	if artifactErr == nil {
 		exact, matchErr := checkpoint.MatchSource(existing, source)
@@ -136,7 +138,10 @@ func (h *sandboxService) Checkpoint(
 		go func() {
 			defer releaseOperation()
 			h.executeCheckpoint(operationCtx, checkpointDir, key, checkpointHandler, source,
-				svc.CheckpointOptions{LeaveRunning: request.LeaveRunning}, attempt)
+				svc.CheckpointOptions{
+					LeaveRunning:      request.LeaveRunning,
+					IncludeFilesystem: request.IncludeFilesystem,
+				}, attempt)
 		}()
 	} else {
 		releaseOperation()
@@ -254,6 +259,11 @@ func (h *sandboxService) restoreCheckpoint(
 	}
 	imagePath, err := verifyExternalCheckpoint(checkpointDir, request.ExpectedSize, request.ExpectedSha256)
 	if err != nil {
+		return nil, checkpointGRPCError(err)
+	}
+	// A checkpoint published with a filesystem artifact must restore it;
+	// silently dropping the writable layer would rewind workload state.
+	if _, err := checkpoint.FsArtifactPath(checkpointDir); err != nil {
 		return nil, checkpointGRPCError(err)
 	}
 	if startConfig.Runtime != config.RuntimeNameRunsc {

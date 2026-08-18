@@ -161,6 +161,11 @@ func (successfulRunscClient) Start(context.Context, runscapi.StartArgs) error  {
 func (successfulRunscClient) Checkpoint(context.Context, string, string, bool) error {
 	return nil
 }
+func (successfulRunscClient) FsCheckpoint(context.Context, string, string, bool) error {
+	return nil
+}
+func (successfulRunscClient) Pause(context.Context, string) error  { return nil }
+func (successfulRunscClient) Resume(context.Context, string) error { return nil }
 func (successfulRunscClient) Restore(context.Context, runscapi.StartArgs, string) error {
 	return nil
 }
