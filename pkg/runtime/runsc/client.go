@@ -74,10 +74,6 @@ type StartArgs struct {
 	UserStderr  string
 	RootOverlay string
 	Network     NetworkConfig
-	// FsRestoreImagePath restores the gVisor writable-layer filestore from a
-	// filesystem checkpoint (runsc fscheckpoint artifact directory). Empty
-	// keeps the historical behavior of a fresh writable layer.
-	FsRestoreImagePath string
 }
 
 func NewClient(binary, rootDir string) *Client {
@@ -145,9 +141,6 @@ func (c *Client) Create(ctx context.Context, args StartArgs) error {
 	cmdArgs = append(cmdArgs, "--overlay2="+rootOverlay)
 	cmdArgs = append(cmdArgs, "create")
 	cmdArgs = append(cmdArgs, "--bundle", args.BundleDir)
-	if args.FsRestoreImagePath != "" {
-		cmdArgs = append(cmdArgs, "--fs-restore-image-path", args.FsRestoreImagePath)
-	}
 	cmdArgs = append(cmdArgs, args.ID)
 	cmd := exec.CommandContext(ctx, c.Binary, cmdArgs...)
 	cmd.Env = os.Environ()
@@ -357,8 +350,17 @@ func (o *restoreOpts) setFilePayload(files []*os.File) {
 	o.payload.Files = files
 }
 
-// Restore connects a runsc sandbox previously created with Create, installs
-// its target networking, and restores the single compressed checkpoint file.
+// Restore brings a sandbox back from a checkpoint and installs its target
+// networking. The sandbox must already exist from a Create call. This mirrors
+// the ordering of runsc's own Sandbox.Restore: links and routes are configured
+// through the control RPC while the sandbox is still in the created state
+// (the post-restore sentry tightens its seccomp policy and can no longer
+// create NICs), then the single compressed checkpoint file is pushed through
+// the containerManager.Restore control RPC. The checkpoint's pages file
+// already carries the writable-layer contents — the overlay upper tmpfs is
+// part of the saved sentry state, and Create passed a fresh (empty) host
+// filestore whose pages are repopulated from the image.
+//
 // The Restore RPC has no fixed timeout because loading a large image may take
 // arbitrarily long; it remains cancellable through ctx.
 func (c *Client) Restore(ctx context.Context, args StartArgs, imagePath string) error {
@@ -376,6 +378,7 @@ func (c *Client) Restore(ctx context.Context, args StartArgs, imagePath string) 
 	if err != nil {
 		return fmt.Errorf("load runsc state for %s: %w", args.ID, err)
 	}
+
 	rawSocket, err := c.openRawSocket(*args.Network.Interface)
 	if err != nil {
 		return err
@@ -386,6 +389,7 @@ func (c *Client) Restore(ctx context.Context, args StartArgs, imagePath string) 
 	if err != nil {
 		return err
 	}
+
 	conn, err := c.connectControl(state.Sandbox.ControlSocketPath)
 	if err != nil {
 		return fmt.Errorf("connect runsc control socket for %s: %w", args.ID, err)
@@ -395,6 +399,7 @@ func (c *Client) Restore(ctx context.Context, args StartArgs, imagePath string) 
 	if err := callContextWithTimeout(ctx, conn, contMgrCreateLinksAndRoutes, networkArgs, nil, 30*time.Second); err != nil {
 		return fmt.Errorf("create links and routes for %s: %w", args.ID, err)
 	}
+
 	image, err := os.Open(imagePath)
 	if err != nil {
 		return fmt.Errorf("open checkpoint image for %s: %w", args.ID, err)

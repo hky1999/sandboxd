@@ -112,6 +112,34 @@ func main() {
 		}
 		out, _ := protojson.Marshal(resp)
 		fmt.Println(string(out))
+	case "start":
+		fs := flag.NewFlagSet("start", flag.ExitOnError)
+		cfgFile := fs.String("config", "", "JSON file with a StartRequest message")
+		text := fs.Bool("text", false, "config file is proto text format (as logged by sandboxd)")
+		fs.Parse(args[1:])
+		if *cfgFile == "" {
+			fatal("start needs -config (StartRequest json)")
+		}
+		raw, err := os.ReadFile(*cfgFile)
+		if err != nil {
+			fatal("read config: %v", err)
+		}
+		cfg := &runtime.StartRequest{}
+		if *text {
+			if err := (prototext.UnmarshalOptions{DiscardUnknown: true}).Unmarshal(raw, cfg); err != nil {
+				fatal("parse config (text): %v", err)
+			}
+		} else if err := (protojson.UnmarshalOptions{DiscardUnknown: true}).Unmarshal(raw, cfg); err != nil {
+			fatal("parse config: %v", err)
+		}
+		t0 := time.Now()
+		resp, err := c.Start(ctx, cfg)
+		dt := time.Since(t0)
+		if err != nil {
+			fatal("start (%v): %v", dt, err)
+		}
+		out, _ := protojson.Marshal(resp)
+		fmt.Printf("elapsed_ms=%d %s\n", dt.Milliseconds(), string(out))
 	case "restore":
 		fs := flag.NewFlagSet("restore", flag.ExitOnError)
 		cfgFile := fs.String("config", "", "JSON file with a StartRequest message")
