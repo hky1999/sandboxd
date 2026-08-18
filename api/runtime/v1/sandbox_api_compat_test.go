@@ -25,6 +25,10 @@ import (
 
 // TestV010WireContract pins the public protobuf descriptor while allowing
 // comments and generated-code details to change.
+//
+// v011 (2026-08-18): added SandboxService.Pause/Resume and the
+// PauseRequest/PauseResponse messages. All v010 field numbers, names,
+// and json_names are unchanged.
 func TestV010WireContract(t *testing.T) {
 	descriptor := protodesc.ToFileDescriptorProto(File_api_runtime_v1_sandbox_api_proto)
 	descriptor.SourceCodeInfo = nil
@@ -33,7 +37,7 @@ func TestV010WireContract(t *testing.T) {
 		t.Fatal(err)
 	}
 	sum := sha256.Sum256(wire)
-	const want = "d0c1974c55f99c59720bf06ef25a2382791a878efcd59a3720def33207a38d9d"
+	const want = "a5923761dfddb093be26dfdccce5830b75e37800d8640f9e4e7113094c50f240"
 	if got := hex.EncodeToString(sum[:]); got != want {
 		t.Fatalf("sandbox API descriptor hash = %s, want %s", got, want)
 	}

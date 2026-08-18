@@ -43,6 +43,15 @@ type ManagedCheckpointHandler interface {
 	Restore(context.Context, StartConfig, string) error
 }
 
+// TaskFreezer is an optional runtime capability for freezing a running
+// sandbox in place: identity, network, and broker linkage survive, only
+// task execution stops. It is the short-window parking primitive; keeping
+// it out of Handler lets runtimes without freeze support stay unchanged.
+type TaskFreezer interface {
+	Pause(context.Context, string) error
+	Resume(context.Context, string) error
+}
+
 // PreparedStateCleaner is an optional runtime capability for removing local
 // physical preparation after List confirms that no runtime exists. It avoids
 // imposing absent-runtime Delete semantics on every Handler implementation.

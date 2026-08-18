@@ -244,6 +244,18 @@ func (r *RunscHandler) Checkpoint(
 	return errors.Join(fsErr, ckptErr)
 }
 
+// Pause freezes all tasks in the sandbox without terminating it. Identity,
+// network, and broker-side records survive; the sandbox simply stops
+// executing until the matching Resume.
+func (r *RunscHandler) Pause(ctx context.Context, sandboxID string) error {
+	return r.runsc.Pause(ctx, sandboxID)
+}
+
+// Resume unfreezes a previously paused sandbox.
+func (r *RunscHandler) Resume(ctx context.Context, sandboxID string) error {
+	return r.runsc.Resume(ctx, sandboxID)
+}
+
 func (r *RunscHandler) Restore(ctx context.Context, startConfig StartConfig, imagePath string) error {
 	traceID, _ := trace.GetContextID(ctx)
 	startArgs, cleanupPrepared, err := r.prepareStart(startConfig)
