@@ -388,6 +388,12 @@ func NewCgroupManager(
 	if cfg.PidsMax < 0 {
 		return nil, fmt.Errorf("pids_max must be non-negative")
 	}
+	if cfg.MemoryHighRatio < 0 || cfg.MemoryHighRatio >= 1 {
+		return nil, fmt.Errorf(
+			"memory_high_ratio must be within [0, 1), got %.2f",
+			cfg.MemoryHighRatio,
+		)
+	}
 
 	configuredRoot := cfg.CgroupRootName
 	if configuredRoot == "" {
@@ -398,7 +404,7 @@ func NewCgroupManager(
 		return nil, err
 	}
 
-	ops, err := newCgroupOps()
+	ops, err := newCgroupOps(cfg.MemoryHighRatio)
 	if err != nil {
 		return nil, err
 	}
