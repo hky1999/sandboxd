@@ -46,6 +46,11 @@ cpu_limit_mode = "quota"
 cgroup_cache_size = 1
 # Maximum processes per sandbox. Omit or set to 0 for unlimited.
 # pids_max = 4096
+# cgroup v2 only: soft memory limit applied together with every per-sandbox
+# memory.max (memory.high = ceil(ratio * memory.max)), throttling allocation
+# before the hard limit kills. Omit or set to 0 to leave memory.high unset.
+# Valid range is [0, 1).
+# memory_high_ratio = 0.9
 interface_cache_size = 1
 cgroup_root_name = "/sandboxd"
 max_instance_num = 32

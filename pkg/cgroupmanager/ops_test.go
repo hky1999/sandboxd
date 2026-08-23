@@ -51,7 +51,7 @@ func TestNewCgroupOpsSelectsDetectedMode(t *testing.T) {
 		{mode: cgroups.Unavailable, wantErr: true},
 	} {
 		detectCgroupMode = func() cgroups.CGMode { return test.mode }
-		ops, err := newCgroupOps()
+		ops, err := newCgroupOps(0)
 		if test.wantErr {
 			assert.Error(t, err)
 			continue
@@ -386,6 +386,7 @@ func TestV2ResetAndStats(t *testing.T) {
 	writeTestFile(t, filepath.Join(groupPath, "cpu.weight"), "39")
 	writeTestFile(t, filepath.Join(groupPath, "cpu.max"), "50000 100000")
 	writeTestFile(t, filepath.Join(groupPath, "memory.max"), "268435456")
+	writeTestFile(t, filepath.Join(groupPath, "memory.high"), "241591910")
 	writeTestFile(t, filepath.Join(groupPath, "memory.swap.max"), "268435456")
 	writeTestFile(t, filepath.Join(groupPath, "pids.max"), "1024")
 	writeTestFile(t, filepath.Join(groupPath, "cpuset.cpus"), "0")
@@ -396,6 +397,7 @@ func TestV2ResetAndStats(t *testing.T) {
 	assertFileContents(t, filepath.Join(groupPath, "cpu.weight"), "100")
 	assertFileContents(t, filepath.Join(groupPath, "cpu.max"), "max 100000")
 	assertFileContents(t, filepath.Join(groupPath, "memory.max"), "max")
+	assertFileContents(t, filepath.Join(groupPath, "memory.high"), "max")
 	assertFileContents(t, filepath.Join(groupPath, "memory.swap.max"), "268435456")
 	assertFileContents(t, filepath.Join(groupPath, "pids.max"), "1024")
 	assertFileContents(t, filepath.Join(groupPath, "cpuset.cpus"), "0")
@@ -534,6 +536,90 @@ func TestV1OOMKilledDrainsPendingEventFD(t *testing.T) {
 func TestNewCgroupManagerRejectsNegativePidsMax(t *testing.T) {
 	_, err := NewCgroupManager(nil, config.ResourceConfig{PidsMax: -1}, 1)
 	assert.EqualError(t, err, "pids_max must be non-negative")
+}
+
+func TestNewCgroupManagerRejectsInvalidMemoryHighRatio(t *testing.T) {
+	for _, ratio := range []float64{-0.1, 1.0, 1.5} {
+		_, err := NewCgroupManager(
+			nil,
+			config.ResourceConfig{MemoryHighRatio: ratio},
+			1,
+		)
+		assert.ErrorContains(
+			t,
+			err,
+			"memory_high_ratio must be within [0, 1)",
+			"ratio %.2f must be rejected",
+			ratio,
+		)
+	}
+}
+
+func TestMemoryHighBytes(t *testing.T) {
+	for _, test := range []struct {
+		limit uint64
+		ratio float64
+		want  uint64
+	}{
+		{limit: 0, ratio: 0.9, want: 0},
+		{limit: 1 << 30, ratio: 0, want: 0},
+		{limit: 1000, ratio: 0.5, want: 500},
+		{limit: 1001, ratio: 0.5, want: 501},
+		{limit: 1 << 30, ratio: 0.9, want: 966367642},
+		{limit: 100, ratio: 0.99, want: 99},
+		{limit: 10, ratio: 0.999999, want: 9},
+		{limit: 1, ratio: 0.9, want: 0},
+	} {
+		assert.Equal(
+			t,
+			test.want,
+			MemoryHighBytes(test.limit, test.ratio),
+			"limit=%d ratio=%.6f",
+			test.limit,
+			test.ratio,
+		)
+	}
+}
+
+func TestV2UpdateWritesMemoryHigh(t *testing.T) {
+	const name = "/sandbox/lease"
+	newFakeGroup := func(t *testing.T) (string, string) {
+		mountpoint := t.TempDir()
+		groupPath := filepath.Join(mountpoint, name)
+		require.NoError(t, os.MkdirAll(groupPath, 0755))
+		for _, filename := range []string{
+			"cpu.weight",
+			"cpu.max",
+			"cpuset.cpus",
+			"cpuset.mems",
+			"memory.max",
+			"memory.swap.max",
+			"memory.high",
+			"pids.max",
+		} {
+			writeTestFile(t, filepath.Join(groupPath, filename), "max")
+		}
+		return mountpoint, groupPath
+	}
+	limit := int64(1 << 30)
+	resources := &specs.LinuxResources{Memory: &specs.LinuxMemory{Limit: &limit}}
+
+	mountpoint, groupPath := newFakeGroup(t)
+	ops := &cgroupV2{mountpoint: mountpoint, memoryHighRatio: 0.9}
+	require.NoError(t, ops.update(name, resources))
+	assertFileContents(t, filepath.Join(groupPath, "memory.max"), "1073741824")
+	assertFileContents(t, filepath.Join(groupPath, "memory.high"), "966367642")
+
+	mountpoint, groupPath = newFakeGroup(t)
+	ops = &cgroupV2{mountpoint: mountpoint}
+	require.NoError(t, ops.update(name, resources))
+	assertFileContents(t, filepath.Join(groupPath, "memory.max"), "1073741824")
+	assertFileContents(t, filepath.Join(groupPath, "memory.high"), "max")
+
+	mountpoint, groupPath = newFakeGroup(t)
+	ops = &cgroupV2{mountpoint: mountpoint, memoryHighRatio: 0.9}
+	require.NoError(t, ops.update(name, &specs.LinuxResources{}))
+	assertFileContents(t, filepath.Join(groupPath, "memory.high"), "max")
 }
 
 func writeTestFile(t *testing.T, name, contents string) {

@@ -30,12 +30,16 @@ import (
 )
 
 const (
-	defaultV2CPUWeight = "100"
-	defaultV2MemoryMax = "max"
+	defaultV2CPUWeight  = "100"
+	defaultV2MemoryMax  = "max"
+	defaultV2MemoryHigh = "max"
 )
 
 type cgroupV2 struct {
 	mountpoint string
+	// memoryHighRatio enables writing memory.high alongside every finite
+	// memory.max (see ResourceConfig.MemoryHighRatio). Zero disables.
+	memoryHighRatio float64
 }
 
 func (*cgroupV2) mode() cgroups.CGMode { return cgroups.Unified }
@@ -121,9 +125,10 @@ func (o *cgroupV2) create(name string, resources *specs.LinuxResources) error {
 func (o *cgroupV2) reset(name string) error {
 	groupPath := filepath.Join(o.mountpoint, name)
 	values := map[string]string{
-		"cpu.weight": defaultV2CPUWeight,
-		"cpu.max":    "max " + strconv.FormatUint(config.DefaultCPUPeriodMicros, 10),
-		"memory.max": defaultV2MemoryMax,
+		"cpu.weight":  defaultV2CPUWeight,
+		"cpu.max":     "max " + strconv.FormatUint(config.DefaultCPUPeriodMicros, 10),
+		"memory.max":  defaultV2MemoryMax,
+		"memory.high": defaultV2MemoryHigh,
 	}
 	for filename, value := range values {
 		if err := os.WriteFile(filepath.Join(groupPath, filename), []byte(value), 0644); err != nil {
@@ -159,7 +164,29 @@ func (o *cgroupV2) update(name string, resources *specs.LinuxResources) error {
 	if err != nil {
 		return err
 	}
-	return group.Update(cgroup2.ToResources(resources))
+	if err := group.Update(cgroup2.ToResources(resources)); err != nil {
+		return err
+	}
+	// containerd's cgroup2 writer has no memory.high support, so the soft
+	// limit is applied directly: every finite memory.max lands together with
+	// high = ceil(ratio * max), giving the node-side upgrade ladder an
+	// interception window before the hard limit kills
+	if o.memoryHighRatio <= 0 || resources.Memory == nil ||
+		resources.Memory.Limit == nil || *resources.Memory.Limit <= 0 {
+		return nil
+	}
+	high := MemoryHighBytes(uint64(*resources.Memory.Limit), o.memoryHighRatio)
+	if high == 0 {
+		return nil
+	}
+	if err := os.WriteFile(
+		filepath.Join(o.mountpoint, name, "memory.high"),
+		[]byte(strconv.FormatUint(high, 10)),
+		0644,
+	); err != nil {
+		return fmt.Errorf("set memory.high for cgroup %s: %w", name, err)
+	}
+	return nil
 }
 
 func (o *cgroupV2) stat(name string) (Stats, error) {

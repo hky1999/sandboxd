@@ -26,6 +26,7 @@ import (
 
 	"github.com/containerd/cgroups/v3"
 	"github.com/opencontainers/runtime-spec/specs-go"
+	"github.com/sirupsen/logrus"
 )
 
 const (
@@ -61,17 +62,34 @@ type cgroupOps interface {
 
 var detectCgroupMode = cgroups.Mode
 
-func newCgroupOps() (cgroupOps, error) {
+func newCgroupOps(memoryHighRatio float64) (cgroupOps, error) {
 	switch mode := detectCgroupMode(); mode {
 	case cgroups.Unified:
-		return &cgroupV2{mountpoint: cgroupMountpoint}, nil
+		return &cgroupV2{mountpoint: cgroupMountpoint, memoryHighRatio: memoryHighRatio}, nil
 	case cgroups.Legacy, cgroups.Hybrid:
+		if memoryHighRatio > 0 {
+			logrus.Warnf("memory_high_ratio %.2f configured but cgroup v1 has no memory.high; ignoring", memoryHighRatio)
+		}
 		return &cgroupV1{detectedMode: mode}, nil
 	case cgroups.Unavailable:
 		return nil, errors.New("cgroup filesystem is unavailable")
 	default:
 		return nil, fmt.Errorf("unsupported cgroup mode %d", mode)
 	}
+}
+
+// MemoryHighBytes computes the cgroup v2 memory.high value for a sandbox
+// memory limit: ceil(ratio * limit), always below the limit for a valid
+// ratio in [0,1). A zero ratio disables the soft limit (0 is returned).
+func MemoryHighBytes(limitBytes uint64, ratio float64) uint64 {
+	if limitBytes == 0 || ratio <= 0 {
+		return 0
+	}
+	high := uint64(math.Ceil(ratio * float64(limitBytes)))
+	if high >= limitBytes {
+		high = limitBytes - 1
+	}
+	return high
 }
 
 func cgroupVersion(mode cgroups.CGMode) int {

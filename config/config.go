@@ -187,6 +187,13 @@ type ResourceConfig struct {
 	// PidsMax is the maximum number of processes allowed in each sandbox cgroup.
 	// Zero leaves the kernel default of unlimited processes unchanged.
 	PidsMax int64 `toml:"pids_max" json:"pidsMax"`
+	// MemoryHighRatio enables the memory.high soft limit on cgroup v2: every
+	// sandbox cgroup whose memory.max is applied also gets
+	// memory.high = ceil(ratio * memory.max). The soft limit throttles
+	// allocation before the hard limit kills, giving the node-side upgrade
+	// ladder (which raises max and high together) an interception window.
+	// Zero (default) leaves memory.high unset. Valid range is [0, 1).
+	MemoryHighRatio float64 `toml:"memory_high_ratio" json:"memoryHighRatio"`
 	// InterfaceCacheSize is the size of interface cache. Default is same as max_instance_num.
 	InterfaceCacheSize int `toml:"interface_cache_size" json:"interfaceCacheSize"`
 }
