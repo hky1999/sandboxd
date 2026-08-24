@@ -56,6 +56,7 @@ func (handler *Handler) Checkpoint(
 	config runtimecore.CheckpointConfig,
 ) (retErr error) {
 	sandboxID := config.ID
+	tStarted := time.Now()
 	instance, err := handler.lookupInstance(sandboxID)
 	if err != nil {
 		return err
@@ -105,11 +106,35 @@ func (handler *Handler) Checkpoint(
 			return fmt.Errorf("lay out Firecracker checkpoint for %s: %w", sandboxID, err)
 		}
 	}
+	tPrepared := time.Now()
+
+	// Best-effort guest flush (U4): sync the writable layer while the guest is
+	// still running, so the overlay cloned below captures quiesced data. A
+	// miss (old guest agent, slow sync, dead vsock) never fails the checkpoint
+	// — the overlay clone is crash-consistent either way.
+	tFlushed := time.Now()
+	flushCtx, flushCancel := context.WithTimeout(ctx, firecrackerFlushTimeout)
+	flushErr := requestFirecrackerAgentWaiting(
+		flushCtx,
+		state.VsockPath,
+		firecrackerproto.MessageFlush,
+		nil,
+		firecrackerFlushTimeout,
+	)
+	flushCancel()
+	tFlushed = time.Now()
+	if flushErr != nil {
+		logrus.Debugf(
+			"firecracker: guest flush before checkpointing %s skipped: %v",
+			sandboxID, flushErr,
+		)
+	}
 
 	if err := api.pause(ctx); err != nil {
 		discardUnsealedFirecrackerCheckpoint(files)
 		return fmt.Errorf("pause Firecracker sandbox %s: %w", sandboxID, err)
 	}
+	tPaused := time.Now()
 	if err := api.createSnapshot(ctx, files.State, files.Memory, snapshotType); err != nil {
 		if base != "" && layoutMemorySize > 0 {
 			// A failed snapshot request disarms the Firecracker ledger, so
@@ -138,6 +163,7 @@ func (handler *Handler) Checkpoint(
 	}
 	// The snapshot succeeded: files.Memory is now the complete guest memory
 	// image and the baseline the Firecracker ledger tracks.
+	tSnapshotted := time.Now()
 	if _, err := cloneFile(state.OverlayPath, files.Overlay); err != nil {
 		// The window already reset, so keep the chain alive through the base
 		// even though this artifact cannot be sealed.
@@ -152,11 +178,13 @@ func (handler *Handler) Checkpoint(
 	}
 
 	resumeErr := error(nil)
+	tOverlay := time.Now()
 	if config.LeaveRunning {
 		if err := api.resume(ctx); err != nil {
 			resumeErr = fmt.Errorf("resume Firecracker sandbox %s: %w", sandboxID, err)
 		}
 	}
+	tResumed := time.Now()
 
 	// Post-resume tail: sealing digests and adopting the base cost seconds per
 	// GiB on hashing and copying and must not extend the pause window.
@@ -184,6 +212,21 @@ func (handler *Handler) Checkpoint(
 		))
 	}
 	adoptCheckpointMemory(instance, files.Memory, false)
+
+	// Pause window = pause..resume (snapshot + overlay clone); layout and
+	// sealing are host-side work outside it by design.
+	phaseMS := func(from, to time.Time) int64 { return to.Sub(from).Milliseconds() }
+	tEnd := time.Now()
+	logrus.Infof(
+		"firecracker: checkpointed sandbox %s type=%s memory=%dMiB dir=%s "+
+			"phases: layout=%dms flush=%dms pause=%dms snapshot=%dms overlay=%dms "+
+			"resume=%dms seal=%dms total=%dms",
+		sandboxID, snapshotType, memoryInfo.Size()>>20, config.Directory,
+		phaseMS(tStarted, tPrepared), phaseMS(tPrepared, tFlushed),
+		phaseMS(tFlushed, tPaused), phaseMS(tPaused, tSnapshotted),
+		phaseMS(tSnapshotted, tOverlay),
+		phaseMS(tOverlay, tResumed), phaseMS(tResumed, tEnd), phaseMS(tStarted, tEnd),
+	)
 
 	if !config.LeaveRunning {
 		return handler.finishCheckpointedSandbox(instance, state, sandboxID)
@@ -458,6 +501,7 @@ func (handler *Handler) Restore(
 	ctx context.Context,
 	startConfig runtimecore.StartConfig,
 ) (retErr error) {
+	tStarted := time.Now()
 	artifact, err := openFirecrackerCheckpoint(startConfig.CheckpointDir)
 	if err != nil {
 		return fmt.Errorf(
@@ -489,6 +533,7 @@ func (handler *Handler) Restore(
 	if alreadyRunning {
 		return fmt.Errorf("Firecracker sandbox %s already exists", startConfig.ID)
 	}
+	tOpened := time.Now()
 
 	bundlePath, spec, err := handler.ociLoader.GenerateOci(runtimecore.OciLoadOptions{
 		SandboxID:  startConfig.ID,
@@ -558,6 +603,7 @@ func (handler *Handler) Restore(
 	// memory file, so the caller must keep the checkpoint directory intact
 	// for the lifetime of the restored sandbox. Only the writable layer is
 	// instantiated into sandbox-owned storage (the restored VM writes to it).
+	tPrepared := time.Now()
 	checkpointFiles, memorySize, err := instantiateFirecrackerCheckpoint(
 		ctx,
 		artifact,
@@ -573,6 +619,7 @@ func (handler *Handler) Restore(
 	)); err != nil {
 		return fmt.Errorf("link restored Firecracker writable layer: %w", err)
 	}
+	tInstantiated := time.Now()
 
 	stdout, err := openFirecrackerOutput(startConfig.Stdout)
 	if err != nil {
@@ -645,6 +692,7 @@ func (handler *Handler) Restore(
 		return err
 	}
 	readyCancel()
+	tReady := time.Now()
 	if err := api.loadSnapshot(
 		ctx,
 		checkpointFiles.State,
@@ -654,6 +702,7 @@ func (handler *Handler) Restore(
 	); err != nil {
 		return fmt.Errorf("load Firecracker checkpoint for %s: %w", startConfig.ID, err)
 	}
+	tLoaded := time.Now()
 	agentCtx, agentCancel := context.WithTimeout(ctx, firecrackerAgentTimeout)
 	defer agentCancel()
 	if err := waitForFirecrackerAgent(agentCtx, vsockPath); err != nil {
@@ -682,10 +731,17 @@ func (handler *Handler) Restore(
 	restoreSucceeded = true
 	keepStorage = true
 	keepRuntimeArtifacts = true
+	phaseMS := func(from, to time.Time) int64 { return to.Sub(from).Milliseconds() }
+	tEnd := time.Now()
 	logrus.Infof(
-		"firecracker: restored sandbox %s pid=%d",
-		startConfig.ID,
-		command.Process.Pid,
+		"firecracker: restored sandbox %s pid=%d "+
+			"phases: open=%dms prepare=%dms instantiate=%dms vmm_ready=%dms "+
+			"load=%dms agent=%dms total=%dms",
+		startConfig.ID, command.Process.Pid,
+		phaseMS(tStarted, tOpened), phaseMS(tOpened, tPrepared),
+		phaseMS(tPrepared, tInstantiated), phaseMS(tInstantiated, tReady),
+		phaseMS(tReady, tLoaded), phaseMS(tLoaded, tEnd),
+		phaseMS(tStarted, tEnd),
 	)
 	return nil
 }

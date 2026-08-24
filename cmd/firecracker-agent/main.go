@@ -140,6 +140,13 @@ func handleConnection(connection *os.File) {
 			return
 		}
 		writeResponse(connection, reconfigureNetwork(request))
+	case firecrackerproto.MessageFlush:
+		// Checkpoint quiesce hook: sync() drains the writable layer (the
+		// guest's only persistent filesystem) before the host snapshots it.
+		// The reply doubles as the ack — the host proceeds on timeout anyway.
+		log.Printf("flushing guest filesystems for checkpoint")
+		syscall.Sync()
+		writeResponse(connection, nil)
 	case firecrackerproto.MessageShutdown:
 		writeResponse(connection, nil)
 		go powerOff()

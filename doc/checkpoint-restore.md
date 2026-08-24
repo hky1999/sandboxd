@@ -93,6 +93,18 @@ own stack and refuses on a mismatch, naming the conflicting field. Manifests
 without a tuple (artifacts from before the tuple existed) restore without
 stack verification.
 
+### Guest flush before pause
+
+Before pausing the source for a checkpoint, sandboxd asks the guest agent (over
+the existing vsock control channel, protocol message type 8) to `sync()` its
+writable layer, so the cloned `overlay.ext4` captures guest-buffered writes
+instead of a crash-consistent mix. The request is best-effort with a bounded
+budget (2 seconds): on timeout, transport error, or a guest agent that
+predates the message, the checkpoint proceeds without the flush and stays
+crash-consistent. The flush happens while the guest is still running, so a
+successful flush adds to the checkpoint's wall time but not to the pause
+window. The message never fails a checkpoint.
+
 ## Source and failure semantics
 
 `leave_running` defines only the successful result:

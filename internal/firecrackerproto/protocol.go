@@ -46,7 +46,11 @@ const (
 	MessageExecTTY    MessageType = 5
 	MessageWait       MessageType = 6
 	MessageSetNetwork MessageType = 7
-	MessageResponse   MessageType = 100
+	// MessageFlush asks the guest to sync its writable layer so a checkpoint
+	// captures the overlay in a quiesced state. Best-effort: the host treats
+	// errors and timeouts as advisory, never as checkpoint failures.
+	MessageFlush    MessageType = 8
+	MessageResponse MessageType = 100
 )
 
 type Response struct {

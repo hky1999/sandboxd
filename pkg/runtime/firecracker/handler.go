@@ -48,8 +48,12 @@ const (
 	firecrackerVsock           = firecrackerproto.HostAgentSocketName
 	firecrackerAgentTimeout    = 15 * time.Second
 	firecrackerShutdownTimeout = 2 * time.Second
-	firecrackerMinMemoryMiB    = uint32(128)
-	firecrackerMaxVCPUs        = uint32(32)
+	// Guest flush budget before pausing for a checkpoint. Syncing a heavily
+	// dirty writable layer can exceed the default 1s agent round-trip, but
+	// the pause window must not grow unbounded on a stuck guest.
+	firecrackerFlushTimeout = 2 * time.Second
+	firecrackerMinMemoryMiB = uint32(128)
+	firecrackerMaxVCPUs     = uint32(32)
 )
 
 var (
@@ -1202,14 +1206,27 @@ func requestFirecrackerAgent(
 	messageType firecrackerproto.MessageType,
 	value any,
 ) error {
-	timeout := time.Second
+	return requestFirecrackerAgentWaiting(ctx, vsockPath, messageType, value, time.Second)
+}
+
+// requestFirecrackerAgentWaiting is requestFirecrackerAgent with a caller-set
+// cap on the dial timeout (used by the checkpoint flush, which may legitimately
+// wait out a slow guest sync).
+func requestFirecrackerAgentWaiting(
+	ctx context.Context,
+	vsockPath string,
+	messageType firecrackerproto.MessageType,
+	value any,
+	maxWait time.Duration,
+) error {
+	timeout := maxWait
 	if deadline, ok := ctx.Deadline(); ok {
 		timeout = time.Until(deadline)
 		if timeout <= 0 {
 			return ctx.Err()
 		}
-		if timeout > time.Second {
-			timeout = time.Second
+		if timeout > maxWait {
+			timeout = maxWait
 		}
 	}
 	connection, err := firecrackerproto.DialAgent(vsockPath, timeout)
