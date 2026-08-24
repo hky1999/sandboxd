@@ -45,6 +45,7 @@ type options struct {
 	compress                 bool
 	leaveRunning             bool
 	snapshotType             string
+	workloadCmd              string
 }
 
 func main() {
@@ -70,6 +71,8 @@ func main() {
 	flag.BoolVar(&value.leaveRunning, "leave-running", true, "leave source running")
 	flag.StringVar(&value.snapshotType, "snapshot-type", "",
 		"checkpoint flavor: empty (auto), Full, Incremental, or SoftDirty")
+	flag.StringVar(&value.workloadCmd, "workload-cmd", "",
+		"override the built-in start workload command (template warmup hooks)")
 	flag.Parse()
 
 	if err := run(value); err != nil {
@@ -134,17 +137,7 @@ func start(
 		Command: []string{
 			"/bin/sh",
 			"-c",
-			"if [ -e /var/checkpoint-started ]; then " +
-				"echo restarted > /var/checkpoint-restarted; fi; " +
-				"echo started > /var/checkpoint-started; " +
-				// The anonymous 100MiB blob gives the dirty-page ledgers a
-				// substantial first window; the fsyncs land the marker files
-				// on the writable layer, where a sealed artifact can read
-				// them back with debugfs (the guest page cache is otherwise
-				// still unflushed at snapshot pause time).
-				"dd if=/dev/zero of=/tmp/blob bs=1M count=100 conv=fsync 2>/dev/null; sync; " +
-				"counter=0; while :; do counter=$((counter + 1)); " +
-				"echo \"$counter\" > /var/checkpoint-counter; sync; sleep 0.1; done",
+			workloadCommand(value.workloadCmd),
 		},
 		Cwd:     "/",
 		Network: "sandbox",
@@ -176,6 +169,26 @@ func start(
 	}
 	fmt.Println(response.ID)
 	return nil
+}
+
+// workloadCommand returns the guest workload for a start: an explicit hook
+// overrides the built-in regression workload. Hook authors keep full control
+// but must keep the sandbox alive — end with an idle loop.
+func workloadCommand(hook string) string {
+	if hook != "" {
+		return hook
+	}
+	return "if [ -e /var/checkpoint-started ]; then " +
+		"echo restarted > /var/checkpoint-restarted; fi; " +
+		"echo started > /var/checkpoint-started; " +
+		// The anonymous 100MiB blob gives the dirty-page ledgers a
+		// substantial first window; the fsyncs land the marker files
+		// on the writable layer, where a sealed artifact can read
+		// them back with debugfs (the guest page cache is otherwise
+		// still unflushed at snapshot pause time).
+		"dd if=/dev/zero of=/tmp/blob bs=1M count=100 conv=fsync 2>/dev/null; sync; " +
+		"counter=0; while :; do counter=$((counter + 1)); " +
+		"echo \"$counter\" > /var/checkpoint-counter; sync; sleep 0.1; done"
 }
 
 func checkpoint(
