@@ -26,20 +26,34 @@ import (
 
 	"github.com/inclusionAI/sandboxd/config"
 	"github.com/inclusionAI/sandboxd/internal/firecrackerproto"
+	"github.com/inclusionAI/sandboxd/internal/util"
 	runtimecore "github.com/inclusionAI/sandboxd/pkg/runtime"
 	runtimecommon "github.com/inclusionAI/sandboxd/pkg/runtime/internal/common"
 	"github.com/sirupsen/logrus"
 )
 
+const firecrackerBaseMemoryName = "base-memory"
+
+// Checkpoint writes a v2 checkpoint directory owned by the caller and keeps
+// the incremental lineage alive across generations:
+//
+//   - tier 1: a base from a previous checkpoint in the same Firecracker
+//     process — reflink-clone it and let a SoftDirty snapshot patch the pages
+//     of the current window into the clone;
+//   - tier 2: a base from the last restore — clone it and use the pagemap
+//     (Incremental) ledger, which is the baseline a restored process tracks;
+//   - tier 3: no usable base — preallocate a zero memory file and take a
+//     first SoftDirty window.
+//
+// The sandbox-owned base only advances to a memory image the running
+// Firecracker actually produced (mirroring the fork's ack semantics), so a
+// failed generation never leaves a stale base that a later window could be
+// patched into incorrectly.
 func (handler *Handler) Checkpoint(
 	ctx context.Context,
 	config runtimecore.CheckpointConfig,
 ) (retErr error) {
 	sandboxID := config.ID
-	imagePath := filepath.Join(
-		config.Directory,
-		checkpointImageName,
-	)
 	instance, err := handler.lookupInstance(sandboxID)
 	if err != nil {
 		return err
@@ -53,39 +67,141 @@ func (handler *Handler) Checkpoint(
 	}
 
 	api := newFirecrackerAPI(state.APIPath)
+	memorySize := int64(state.MemoryMiB) << 20
+	base := state.BaseMemoryPath
+	incremental := state.BaseMemoryIncremental
+	if memorySize > 0 && base != "" && !firecrackerBaseMemoryUsable(base, memorySize) {
+		// The base drifted (crash cleanup, operator interference): fall
+		// through to a first window instead of failing outright.
+		base = ""
+		incremental = false
+	}
+	snapshotType := firecrackerSnapshotTypeFull
+	if memorySize > 0 {
+		snapshotType = firecrackerSnapshotTypeSoftDirty
+		if base != "" && incremental {
+			snapshotType = firecrackerSnapshotTypeIncremental
+		}
+	}
+
+	// Layout happens before the pause: cloning the base is pure host-side
+	// work the guest should not wait for. A tier-1/2 layout failure degrades
+	// to a first window; anything else is unrecoverable.
+	files, err := prepareFirecrackerCheckpointV2(config.Directory, base, memorySize)
+	if err != nil {
+		if base == "" || memorySize <= 0 {
+			return fmt.Errorf("lay out Firecracker checkpoint for %s: %w", sandboxID, err)
+		}
+		logrus.Warnf(
+			"firecracker: incremental layout for %s failed, rebuilding base: %v",
+			sandboxID, err,
+		)
+		handler.disarmBaseMemory(instance, sandboxID)
+		base, incremental = "", false
+		snapshotType = firecrackerSnapshotTypeSoftDirty
+		if files, err = prepareFirecrackerCheckpointV2(config.Directory, "", memorySize); err != nil {
+			return fmt.Errorf("lay out Firecracker checkpoint for %s: %w", sandboxID, err)
+		}
+	}
+
 	if err := api.pause(ctx); err != nil {
+		discardUnsealedFirecrackerCheckpoint(files)
 		return fmt.Errorf("pause Firecracker sandbox %s: %w", sandboxID, err)
 	}
+	if err := api.createSnapshot(ctx, files.State, files.Memory, snapshotType); err != nil {
+		if base != "" && memorySize > 0 {
+			// A failed snapshot request disarms the Firecracker ledger, so
+			// the previous base is dead: rebuild from a first window while
+			// the guest is still paused.
+			handler.disarmBaseMemory(instance, sandboxID)
+			discardUnsealedFirecrackerCheckpoint(files)
+			base, incremental = "", false
+			snapshotType = firecrackerSnapshotTypeSoftDirty
+			if files, err = prepareFirecrackerCheckpointV2(config.Directory, "", memorySize); err == nil {
+				err = api.createSnapshot(ctx, files.State, files.Memory, snapshotType)
+			} else {
+				files = firecrackerCheckpointFiles{}
+			}
+		}
+		if err != nil {
+			discardUnsealedFirecrackerCheckpoint(files)
+			if config.LeaveRunning {
+				err = errors.Join(err, fmt.Errorf(
+					"resume Firecracker sandbox %s: %w", sandboxID, api.resume(ctx),
+				))
+			}
+			return fmt.Errorf("create Firecracker %s snapshot for %s: %w",
+				snapshotType, sandboxID, err)
+		}
+	}
+	// The snapshot succeeded: files.Memory is now the complete guest memory
+	// image and the baseline the Firecracker ledger tracks.
+	if _, err := cloneFile(state.OverlayPath, files.Overlay); err != nil {
+		// The window already reset, so keep the chain alive through the base
+		// even though this artifact cannot be sealed.
+		handler.adoptCheckpointMemory(instance, files.Memory, sandboxID, false)
+		discardUnsealedFirecrackerCheckpoint(files)
+		if config.LeaveRunning {
+			err = errors.Join(err, fmt.Errorf(
+				"resume Firecracker sandbox %s: %w", sandboxID, api.resume(ctx),
+			))
+		}
+		return fmt.Errorf("snapshot Firecracker writable layer for %s: %w", sandboxID, err)
+	}
 
-	workDir, err := os.MkdirTemp(filepath.Dir(imagePath), ".firecracker-snapshot-")
-	if err != nil {
-		return fmt.Errorf("create Firecracker checkpoint staging files: %w", err)
-	}
-	defer os.RemoveAll(workDir)
-	memoryPath := filepath.Join(workDir, firecrackerCheckpointMemoryName)
-	files := firecrackerCheckpointFiles{
-		State:   filepath.Join(workDir, firecrackerCheckpointStateName),
-		Memory:  memoryPath,
-		Overlay: state.OverlayPath,
-	}
-	if err := api.createSnapshot(ctx, files.State, files.Memory); err != nil {
-		return fmt.Errorf("create Firecracker snapshot for %s: %w", sandboxID, err)
-	}
-	if err := createFirecrackerCheckpointArchive(
-		ctx,
-		imagePath,
-		config.Compress,
-		files,
-	); err != nil {
-		return fmt.Errorf("package Firecracker checkpoint for %s: %w", sandboxID, err)
-	}
+	resumeErr := error(nil)
 	if config.LeaveRunning {
 		if err := api.resume(ctx); err != nil {
-			return fmt.Errorf("resume Firecracker sandbox %s: %w", sandboxID, err)
+			resumeErr = fmt.Errorf("resume Firecracker sandbox %s: %w", sandboxID, err)
 		}
-		return nil
 	}
 
+	// Post-resume tail: sealing digests and adopting the base cost seconds per
+	// GiB on hashing and copying and must not extend the pause window.
+	memoryInfo, err := os.Lstat(files.Memory)
+	if err != nil {
+		handler.adoptCheckpointMemory(instance, files.Memory, sandboxID, false)
+		discardUnsealedFirecrackerCheckpoint(files)
+		return errors.Join(resumeErr, fmt.Errorf(
+			"inspect Firecracker checkpoint memory for %s: %w", sandboxID, err,
+		))
+	}
+	manifest := &firecrackerCheckpointManifest{
+		SnapshotType: snapshotType,
+		MemorySize:   memoryInfo.Size(),
+	}
+	if base != "" {
+		manifest.BaseMemory = firecrackerBaseMemoryName
+	}
+	if err := finalizeFirecrackerCheckpointV2(ctx, files, manifest); err != nil {
+		handler.adoptCheckpointMemory(instance, files.Memory, sandboxID, false)
+		discardUnsealedFirecrackerCheckpoint(files)
+		return errors.Join(resumeErr, fmt.Errorf(
+			"seal Firecracker checkpoint for %s: %w", sandboxID, err,
+		))
+	}
+	handler.adoptCheckpointMemory(instance, files.Memory, sandboxID, false)
+
+	if !config.LeaveRunning {
+		return handler.finishCheckpointedSandbox(instance, state, sandboxID)
+	}
+	if resumeErr != nil {
+		// The artifact is sealed and the base adopted; only the guest is
+		// still paused, which the caller must see as a failure.
+		return resumeErr
+	}
+	logrus.Infof(
+		"firecracker: checkpointed sandbox %s type=%s memory=%dMiB dir=%s",
+		sandboxID, snapshotType, memoryInfo.Size()>>20, config.Directory,
+	)
+	return nil
+}
+
+func (handler *Handler) finishCheckpointedSandbox(
+	instance *firecrackerInstance,
+	state firecrackerPersistedState,
+	sandboxID string,
+) error {
 	handler.stopInstance(instance, true)
 	if firecrackerProcessMatches(state.PID, handler.binary, state.APIPath, state.ID) {
 		return fmt.Errorf("stop Firecracker sandbox %s after checkpoint", sandboxID)
@@ -96,6 +212,86 @@ func (handler *Handler) Checkpoint(
 		}
 	}
 	return nil
+}
+
+// firecrackerBaseMemoryUsable reports whether the recorded base can still be
+// patched by an incremental snapshot of a guest with the given memory size.
+func firecrackerBaseMemoryUsable(path string, memorySize int64) bool {
+	info, err := os.Lstat(path)
+	return err == nil && info.Mode().IsRegular() &&
+		info.Mode()&os.ModeSymlink == 0 && info.Size() == memorySize
+}
+
+// discardUnsealedFirecrackerCheckpoint removes the components of a checkpoint
+// directory that never reached a manifest; sealed artifacts are left alone.
+func discardUnsealedFirecrackerCheckpoint(files firecrackerCheckpointFiles) {
+	for _, path := range []string{files.State, files.Memory, files.Overlay} {
+		if path != "" {
+			_ = os.Remove(path)
+		}
+	}
+}
+
+// adoptCheckpointMemory advances the sandbox-owned base to a memory image a
+// Firecracker process produced (a checkpoint the running VMM just wrote, or
+// the file a restore just loaded), keeping the incremental chain consistent
+// with the in-process ledger. When the adoption itself fails the lineage is
+// dropped: the next checkpoint rebuilds a first window.
+func (handler *Handler) adoptCheckpointMemory(
+	instance *firecrackerInstance,
+	memoryPath,
+	sandboxID string,
+	incremental bool,
+) {
+	if memoryPath == "" {
+		return
+	}
+	if err := handler.cloneBaseMemory(memoryPath, sandboxID); err != nil {
+		logrus.Warnf(
+			"firecracker: adopt checkpoint base for %s: %v", sandboxID, err,
+		)
+		instance.clearBaseMemory()
+		return
+	}
+	instance.setBaseMemory(handler.baseMemoryPath(sandboxID), incremental)
+}
+
+func (handler *Handler) cloneBaseMemory(memoryPath, sandboxID string) error {
+	base := handler.baseMemoryPath(sandboxID)
+	if base == "" {
+		return errors.New("sandbox ID is rejected by the storage root")
+	}
+	staging := base + ".staging"
+	if err := os.Remove(staging); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if _, err := cloneFile(memoryPath, staging); err != nil {
+		_ = os.Remove(staging)
+		return err
+	}
+	if err := os.Rename(staging, base); err != nil {
+		_ = os.Remove(staging)
+		return err
+	}
+	return nil
+}
+
+// disarmBaseMemory drops the incremental lineage and removes the orphaned
+// base file so it cannot be mistaken for a live baseline later.
+func (handler *Handler) disarmBaseMemory(instance *firecrackerInstance, sandboxID string) {
+	if instance.clearBaseMemory() {
+		if base := handler.baseMemoryPath(sandboxID); base != "" {
+			_ = os.Remove(base)
+		}
+	}
+}
+
+func (handler *Handler) baseMemoryPath(sandboxID string) string {
+	directory, err := util.JoinWithinRoot(handler.storageRoot, sandboxID)
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(directory, firecrackerBaseMemoryName)
 }
 
 func (handler *Handler) Restore(
@@ -197,6 +393,10 @@ func (handler *Handler) Restore(
 	); err != nil {
 		return err
 	}
+	memoryInfo, err := os.Lstat(checkpointFiles.Memory)
+	if err != nil {
+		return fmt.Errorf("inspect restored Firecracker memory: %w", err)
+	}
 	if err := os.Symlink(checkpointFiles.Overlay, filepath.Join(
 		stateDir, firecrackerCheckpointOverlayName,
 	)); err != nil {
@@ -233,6 +433,7 @@ func (handler *Handler) Restore(
 			APIPath:     apiPath,
 			VsockPath:   vsockPath,
 			OverlayPath: checkpointFiles.Overlay,
+			MemoryMiB:   uint32(memoryInfo.Size() >> 20),
 			CreatedAt:   time.Now().Format(time.RFC3339Nano),
 		},
 		done: make(chan struct{}),
@@ -290,6 +491,15 @@ func (handler *Handler) Restore(
 		return fmt.Errorf("configure restored Firecracker network: %w", err)
 	}
 	instance.markConfigured()
+	// A restored Firecracker diffs against the memory file it loaded, so the
+	// sandbox-owned base adopts that image and the next checkpoint runs as a
+	// pagemap (Incremental) generation.
+	handler.adoptCheckpointMemory(
+		instance,
+		checkpointFiles.Memory,
+		startConfig.ID,
+		true,
+	)
 	if err := handler.persistInstance(instance); err != nil {
 		return err
 	}

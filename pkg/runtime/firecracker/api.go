@@ -123,10 +123,11 @@ func (api *firecrackerAPI) resume(ctx context.Context) error {
 func (api *firecrackerAPI) createSnapshot(
 	ctx context.Context,
 	statePath,
-	memoryPath string,
+	memoryPath,
+	snapshotType string,
 ) error {
 	return api.put(ctx, "/snapshot/create", map[string]any{
-		"snapshot_type": "Full",
+		"snapshot_type": snapshotType,
 		"snapshot_path": statePath,
 		"mem_file_path": memoryPath,
 	})

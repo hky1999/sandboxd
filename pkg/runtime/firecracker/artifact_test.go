@@ -68,6 +68,32 @@ func TestPrepareCheckpointV2PreallocatesZeroMemory(t *testing.T) {
 	}
 }
 
+func TestPrepareCheckpointV2FullDiscoversMemorySize(t *testing.T) {
+	dir := t.TempDir()
+	// Full snapshots pass no size: Firecracker writes the memory file itself
+	// and the manifest learns the size from disk.
+	files, err := prepareFirecrackerCheckpointV2(dir, "", 0)
+	if err != nil {
+		t.Fatalf("prepare v2 full checkpoint: %v", err)
+	}
+	if _, err := os.Lstat(files.Memory); !os.IsNotExist(err) {
+		t.Fatalf("full layout preallocated memory: %v", err)
+	}
+	writeArtifactComponent(t, files.State, 4<<10)
+	writeArtifactComponent(t, files.Memory, 96<<10)
+	writeArtifactComponent(t, files.Overlay, 32<<10)
+	manifest := &firecrackerCheckpointManifest{SnapshotType: firecrackerSnapshotTypeFull}
+	if err := finalizeFirecrackerCheckpointV2(context.Background(), files, manifest); err != nil {
+		t.Fatalf("finalize v2 full checkpoint: %v", err)
+	}
+	if manifest.MemorySize != 96<<10 {
+		t.Fatalf("manifest memory size %d, want %d", manifest.MemorySize, 96<<10)
+	}
+	if _, err := openFirecrackerCheckpoint(dir); err != nil {
+		t.Fatalf("open sealed full checkpoint: %v", err)
+	}
+}
+
 func TestPrepareCheckpointV2ClonesBaseMemory(t *testing.T) {
 	dir := t.TempDir()
 	base := filepath.Join(dir, "base-memory")
@@ -106,6 +132,14 @@ func TestPrepareCheckpointV2RejectsSealedDirectory(t *testing.T) {
 
 	if _, err := prepareFirecrackerCheckpointV2(dir, "", 64<<10); err == nil {
 		t.Fatal("prepare v2 checkpoint into a sealed directory succeeded")
+	}
+}
+
+func TestPrepareCheckpointV2RejectsV1ArchiveDirectory(t *testing.T) {
+	dir := t.TempDir()
+	writeArtifactComponent(t, filepath.Join(dir, checkpointImageName), 4096)
+	if _, err := prepareFirecrackerCheckpointV2(dir, "", 64<<10); err == nil {
+		t.Fatal("prepare v2 checkpoint over a legacy archive succeeded")
 	}
 }
 

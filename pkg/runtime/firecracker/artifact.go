@@ -97,6 +97,11 @@ func prepareFirecrackerCheckpointV2(
 	}
 
 	if baseMemoryPath == "" {
+		if memorySize <= 0 {
+			// Full snapshots have no base to patch and no size to preallocate:
+			// Firecracker writes the whole memory file itself.
+			return files, nil
+		}
 		memory, err := os.OpenFile(
 			files.Memory,
 			os.O_CREATE|os.O_EXCL|os.O_WRONLY,
@@ -124,20 +129,27 @@ func prepareFirecrackerCheckpointV2(
 }
 
 // checkFirecrackerCheckpointDirVacant rejects a directory that already
-// contains the manifest of a complete checkpoint. Individual components are
-// protected by O_EXCL at creation time instead.
+// contains a complete checkpoint in either layout: a v2 manifest or a legacy
+// v1 archive, which would otherwise shadow freshly written v2 components.
+// Individual components are protected by O_EXCL at creation time instead.
 func checkFirecrackerCheckpointDirVacant(dir string) error {
-	_, err := os.Lstat(filepath.Join(dir, firecrackerCheckpointManifestName))
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
+	for _, marker := range []string{
+		firecrackerCheckpointManifestName,
+		checkpointImageName,
+	} {
+		_, err := os.Lstat(filepath.Join(dir, marker))
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("inspect Firecracker checkpoint directory: %w", err)
+		}
+		return fmt.Errorf(
+			"Firecracker checkpoint directory %s already contains a complete checkpoint",
+			dir,
+		)
 	}
-	if err != nil {
-		return fmt.Errorf("inspect Firecracker checkpoint directory: %w", err)
-	}
-	return fmt.Errorf(
-		"Firecracker checkpoint directory %s already contains a complete checkpoint",
-		dir,
-	)
+	return nil
 }
 
 // finalizeFirecrackerCheckpointV2 seals a v2 checkpoint after Firecracker has
@@ -152,6 +164,15 @@ func finalizeFirecrackerCheckpointV2(
 ) (retErr error) {
 	manifest.Version = firecrackerCheckpointVersion2
 	manifest.CreatedAt = time.Now().UTC()
+	if manifest.MemorySize <= 0 {
+		// Full snapshots discover the guest memory size from the file
+		// Firecracker just wrote.
+		info, err := os.Lstat(files.Memory)
+		if err != nil {
+			return fmt.Errorf("inspect Firecracker checkpoint memory: %w", err)
+		}
+		manifest.MemorySize = info.Size()
+	}
 	manifest.Digests = make(map[string]string, 3)
 	for _, component := range firecrackerCheckpointComponents(files) {
 		digest, err := digestFirecrackerCheckpointComponent(ctx, component.name, component.path)

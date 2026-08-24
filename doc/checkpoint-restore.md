@@ -43,6 +43,27 @@ never overwrites a non-empty directory.
 The directory is the artifact boundary. Its contents are opaque and specific
 to the runtime that created them.
 
+## Firecracker artifacts and incremental checkpoints
+
+The Firecracker runtime writes *uncompressed* checkpoint directories (layout
+version 2): `manifest.json` plus the `vmstate`, `memory`, and `overlay.ext4`
+components. The manifest is written last, so a directory that shows a manifest
+is a self-consistent artifact; a directory without one is partial output that
+sandboxd cleans up. The memory file stays a plain file that Firecracker
+patches in place — the layout deliberately avoids archiving or compression so
+reflink sharing and incremental writes survive. `compress` has no effect on
+this layout (it only applies to legacy artifacts). Legacy single-file
+`checkpoint.img` archives can still be restored but are no longer written.
+
+Repeated checkpoints of the same running sandbox are incremental: each
+generation clones the previous generation's memory (a copy-on-write reflink
+where the filesystem supports it) and Firecracker rewrites only the pages that
+changed, both into the artifact and on disk. Each generation is still a
+complete, independently restorable artifact; incremental behavior affects only
+how much host work and disk space a generation costs. Consecutive generations
+must use distinct `checkpoint_dir` values — sandboxd refuses to overwrite a
+directory that already holds a checkpoint.
+
 ## Source and failure semantics
 
 `leave_running` defines only the successful result:
@@ -98,6 +119,6 @@ binary, machine architecture, host or guest kernel, and runtime configuration.
 Compression changes only the runtime-specific artifact encoding; it does not
 make an artifact portable.
 
-Incremental checkpoints, deterministic replay, migration orchestration, and
-automatic recovery of a source after checkpoint failure are outside this
-design.
+Incremental checkpoint scheduling (which generations a caller takes and when),
+deterministic replay, migration orchestration, and automatic recovery of a
+source after checkpoint failure are outside this design.

@@ -68,10 +68,20 @@ type firecrackerPersistedState struct {
 	VsockPath   string `json:"vsock_path"`
 	OverlayPath string `json:"overlay_path"`
 	CreatedAt   string `json:"created_at"`
-	Configured  bool   `json:"configured,omitempty"`
-	Exited      bool   `json:"exited,omitempty"`
-	ExitedAt    string `json:"exited_at,omitempty"`
-	ExitCode    int    `json:"exit_code,omitempty"`
+	// MemoryMiB is the guest memory size in MiB, recorded so incremental
+	// checkpoints can preallocate or clone a full-size base memory file.
+	MemoryMiB uint32 `json:"memory_mib,omitempty"`
+	// BaseMemoryPath points at the sandbox-owned memory image the Firecracker
+	// dirty-page ledger currently tracks; empty means the next checkpoint
+	// rebuilds from a first window.
+	BaseMemoryPath string `json:"base_memory_path,omitempty"`
+	// BaseMemoryIncremental marks a base that came from a restore, which the
+	// Firecracker pagemap ledger (not the soft-dirty window) diffs against.
+	BaseMemoryIncremental bool   `json:"base_memory_incremental,omitempty"`
+	Configured            bool   `json:"configured,omitempty"`
+	Exited                bool   `json:"exited,omitempty"`
+	ExitedAt              string `json:"exited_at,omitempty"`
+	ExitCode              int    `json:"exit_code,omitempty"`
 }
 
 type firecrackerInstance struct {
@@ -100,6 +110,30 @@ func (instance *firecrackerInstance) markConfigured() {
 	instance.mu.Lock()
 	instance.state.Configured = true
 	instance.mu.Unlock()
+}
+
+func (instance *firecrackerInstance) setMemoryMiB(size uint32) {
+	instance.mu.Lock()
+	instance.state.MemoryMiB = size
+	instance.mu.Unlock()
+}
+
+func (instance *firecrackerInstance) setBaseMemory(path string, incremental bool) {
+	instance.mu.Lock()
+	instance.state.BaseMemoryPath = path
+	instance.state.BaseMemoryIncremental = incremental
+	instance.mu.Unlock()
+}
+
+// clearBaseMemory drops the incremental lineage and reports whether there was
+// one to drop.
+func (instance *firecrackerInstance) clearBaseMemory() bool {
+	instance.mu.Lock()
+	changed := instance.state.BaseMemoryPath != ""
+	instance.state.BaseMemoryPath = ""
+	instance.state.BaseMemoryIncremental = false
+	instance.mu.Unlock()
+	return changed
 }
 
 func (instance *firecrackerInstance) finish(exit runtimecore.Exit) bool {
@@ -473,6 +507,7 @@ func (handler *Handler) Start(
 	if err != nil {
 		return err
 	}
+	instance.setMemoryMiB(memoryMiB)
 	drives := []firecrackerDrive{
 		plan.rootDrive,
 		{
@@ -1013,6 +1048,14 @@ func (handler *Handler) recoverState(
 			logrus.Warnf("firecracker: persist incomplete state: %v", err)
 		}
 		return instance
+	}
+	if state.BaseMemoryPath != "" {
+		// A daemon restart loses the bookkeeping that ties the in-process
+		// Firecracker dirty-page ledger to a sandbox-owned base; restart the
+		// incremental chain from a first window rather than risk patching a
+		// stale base.
+		state.BaseMemoryPath = ""
+		state.BaseMemoryIncremental = false
 	}
 	go handler.waitGuest(instance)
 	go handler.monitorRecovered(instance)
