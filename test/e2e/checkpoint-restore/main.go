@@ -134,8 +134,14 @@ func start(
 			"if [ -e /var/checkpoint-started ]; then " +
 				"echo restarted > /var/checkpoint-restarted; fi; " +
 				"echo started > /var/checkpoint-started; " +
+				// The anonymous 100MiB blob gives the dirty-page ledgers a
+				// substantial first window; the fsyncs land the marker files
+				// on the writable layer, where a sealed artifact can read
+				// them back with debugfs (the guest page cache is otherwise
+				// still unflushed at snapshot pause time).
+				"dd if=/dev/zero of=/tmp/blob bs=1M count=100 conv=fsync 2>/dev/null; sync; " +
 				"counter=0; while :; do counter=$((counter + 1)); " +
-				"echo \"$counter\" > /var/checkpoint-counter; sleep 0.1; done",
+				"echo \"$counter\" > /var/checkpoint-counter; sync; sleep 0.1; done",
 		},
 		Cwd:     "/",
 		Network: "sandbox",

@@ -253,11 +253,80 @@ func adoptCheckpointMemory(
 	instance.setBaseMemory(memoryPath, incremental)
 }
 
+// instantiateFirecrackerCheckpoint materializes the runtime-side pieces of an
+// opened checkpoint for a restore and reports the guest memory size it
+// carries. v1 archives are unpacked into the sandbox state directory; v2
+// directories are restored in place — Firecracker mmaps the artifact's memory
+// file, so the caller must keep the checkpoint directory intact for the
+// lifetime of the restored sandbox — and only the writable layer is cloned
+// into sandbox-owned storage, because the restored VM writes to it.
+func instantiateFirecrackerCheckpoint(
+	ctx context.Context,
+	artifact *firecrackerCheckpointArtifact,
+	checkpointDir, stateDir, overlayPath string,
+) (firecrackerCheckpointFiles, int64, error) {
+	files := firecrackerCheckpointFiles{Overlay: overlayPath}
+	switch artifact.Layout {
+	case firecrackerCheckpointLayoutV1Archive:
+		files.State = filepath.Join(stateDir, firecrackerCheckpointStateName)
+		files.Memory = filepath.Join(stateDir, firecrackerCheckpointMemoryName)
+		if err := extractFirecrackerCheckpointArchive(
+			ctx,
+			filepath.Join(checkpointDir, checkpointImageName),
+			files,
+		); err != nil {
+			return files, 0, err
+		}
+		info, err := os.Lstat(files.Memory)
+		if err != nil {
+			return files, 0, fmt.Errorf("inspect restored Firecracker memory: %w", err)
+		}
+		if err := checkRestoredMemorySize(info.Size()); err != nil {
+			return files, 0, err
+		}
+		return files, info.Size(), nil
+	case firecrackerCheckpointLayoutV2Directory:
+		if err := verifyFirecrackerCheckpointDigests(ctx, artifact); err != nil {
+			return files, 0, fmt.Errorf(
+				"verify Firecracker checkpoint %s: %w",
+				checkpointDir, err,
+			)
+		}
+		files.State = artifact.Files.State
+		files.Memory = artifact.Files.Memory
+		if _, err := cloneFile(artifact.Files.Overlay, files.Overlay); err != nil {
+			return files, 0, fmt.Errorf("instantiate Firecracker writable layer: %w", err)
+		}
+		if err := checkRestoredMemorySize(artifact.Manifest.MemorySize); err != nil {
+			return files, 0, err
+		}
+		return files, artifact.Manifest.MemorySize, nil
+	}
+	return files, 0, fmt.Errorf(
+		"unsupported Firecracker checkpoint layout %d", artifact.Layout,
+	)
+}
+
+func checkRestoredMemorySize(memorySize int64) error {
+	if memorySize <= 0 || memorySize%(1<<20) != 0 {
+		return fmt.Errorf(
+			"Firecracker checkpoint memory size %d is not MiB-aligned", memorySize,
+		)
+	}
+	return nil
+}
+
 func (handler *Handler) Restore(
 	ctx context.Context,
 	startConfig runtimecore.StartConfig,
 ) (retErr error) {
-	imagePath := filepath.Join(startConfig.CheckpointDir, checkpointImageName)
+	artifact, err := openFirecrackerCheckpoint(startConfig.CheckpointDir)
+	if err != nil {
+		return fmt.Errorf(
+			"open Firecracker checkpoint %s: %w",
+			startConfig.CheckpointDir, err,
+		)
+	}
 	if startConfig.DisableCgroup || startConfig.CgroupPath == "" {
 		return errors.New("Firecracker requires a managed cgroup")
 	}
@@ -340,21 +409,20 @@ func (handler *Handler) Restore(
 		return err
 	}
 
-	checkpointFiles := firecrackerCheckpointFiles{
-		State:   filepath.Join(stateDir, firecrackerCheckpointStateName),
-		Memory:  filepath.Join(stateDir, firecrackerCheckpointMemoryName),
-		Overlay: filepath.Join(storageDir, "overlay.ext4"),
-	}
-	if err := extractFirecrackerCheckpointArchive(
+	// v1 archives are unpacked into the sandbox state directory; v2
+	// directories are restored in place — Firecracker mmaps the artifact's
+	// memory file, so the caller must keep the checkpoint directory intact
+	// for the lifetime of the restored sandbox. Only the writable layer is
+	// instantiated into sandbox-owned storage (the restored VM writes to it).
+	checkpointFiles, memorySize, err := instantiateFirecrackerCheckpoint(
 		ctx,
-		imagePath,
-		checkpointFiles,
-	); err != nil {
-		return err
-	}
-	memoryInfo, err := os.Lstat(checkpointFiles.Memory)
+		artifact,
+		startConfig.CheckpointDir,
+		stateDir,
+		filepath.Join(storageDir, "overlay.ext4"),
+	)
 	if err != nil {
-		return fmt.Errorf("inspect restored Firecracker memory: %w", err)
+		return err
 	}
 	if err := os.Symlink(checkpointFiles.Overlay, filepath.Join(
 		stateDir, firecrackerCheckpointOverlayName,
@@ -392,7 +460,7 @@ func (handler *Handler) Restore(
 			APIPath:     apiPath,
 			VsockPath:   vsockPath,
 			OverlayPath: checkpointFiles.Overlay,
-			MemoryMiB:   uint32(memoryInfo.Size() >> 20),
+			MemoryMiB:   uint32(memorySize >> 20),
 			CreatedAt:   time.Now().Format(time.RFC3339Nano),
 		},
 		done: make(chan struct{}),

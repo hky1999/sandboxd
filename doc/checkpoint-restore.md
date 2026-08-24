@@ -107,8 +107,14 @@ runtime, root filesystem, resources, mounts, and network settings. The target
 should use a new sandbox ID and receives newly allocated sandboxd resources.
 
 If restore fails, sandboxd rolls back the partially created target. It does not
-modify the source or delete the checkpoint input. After `Start` succeeds, the
-target no longer depends on the checkpoint directory.
+modify the source or delete the checkpoint input.
+
+After `Start` succeeds, the target no longer depends on the checkpoint
+directory — with one exception: restoring a Firecracker v2 directory keeps the
+artifact's `memory` file mapped into the restored VM, so the caller must keep
+the checkpoint directory intact until the restored sandbox exits. The next
+checkpoint of the restored sandbox also diffs against that memory file
+(the tier-2 base below).
 
 ## Runtime support and compatibility
 
