@@ -30,6 +30,7 @@ owns a successful artifact.
 | `timeout_seconds` | Maximum time sandboxd waits for checkpoint completion |
 | `compress` | Ask the runtime to compress the checkpoint image |
 | `leave_running` | Keep the source running after a successful checkpoint |
+| `snapshot_type` | Checkpoint flavor: empty (automatic), `Full`, `Incremental`, or `SoftDirty` |
 
 `timeout_seconds` must be greater than zero and is enforced by sandboxd.
 Caller cancellation may end the operation earlier. Only one checkpoint may be
@@ -67,6 +68,19 @@ incremental chain references the latest artifact's memory file directly, so a
 caller that deletes or mutates the most recent checkpoint directory drops the
 sandbox back to a full first window on the next checkpoint; deleting older
 generations is always safe.
+
+`snapshot_type` is a Firecracker-specific control with a validated enum: an
+empty value keeps the automatic tier selection above (a pagemap `Incremental`
+generation against the memory file a restore loaded, `SoftDirty` windows
+against a previous checkpoint afterwards, a `SoftDirty` first window with no
+lineage). An explicit `Full` drops the lineage for one generation and has
+Firecracker write the whole memory file. An explicit `Incremental` requires
+the restore-established pagemap base and fails otherwise. An explicit
+`SoftDirty` accepts whatever lineage is still usable. Independently of the
+request, a generation whose Firecracker snapshot fails degrades to a `SoftDirty`
+first window to keep the chain consistent — the sealed manifest records what
+was actually taken. Runtimes without incremental checkpoints (runsc) ignore
+the field.
 
 The manifest digests the small components (`vmstate`, `overlay.ext4`); hashing
 the memory file is skipped because it costs seconds of CPU per GiB and would

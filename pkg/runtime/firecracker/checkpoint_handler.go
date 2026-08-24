@@ -64,29 +64,22 @@ func (handler *Handler) Checkpoint(
 	}
 
 	api := newFirecrackerAPI(state.APIPath)
-	memorySize := int64(state.MemoryMiB) << 20
-	base := state.BaseMemoryPath
-	incremental := state.BaseMemoryIncremental
-	if memorySize > 0 && base != "" && !firecrackerBaseMemoryUsable(base, memorySize) {
-		// The base drifted (crash cleanup, operator interference): fall
-		// through to a first window instead of failing outright.
-		base = ""
-		incremental = false
-	}
-	snapshotType := firecrackerSnapshotTypeFull
-	if memorySize > 0 {
-		snapshotType = firecrackerSnapshotTypeSoftDirty
-		if base != "" && incremental {
-			snapshotType = firecrackerSnapshotTypeIncremental
-		}
+	snapshotType, base, _, layoutMemorySize, err := selectFirecrackerSnapshotTier(
+		int64(state.MemoryMiB)<<20,
+		state.BaseMemoryPath,
+		state.BaseMemoryIncremental,
+		config.SnapshotType,
+	)
+	if err != nil {
+		return err
 	}
 
 	// Layout happens before the pause: cloning the base is pure host-side
 	// work the guest should not wait for. A tier-1/2 layout failure degrades
 	// to a first window; anything else is unrecoverable.
-	files, err := prepareFirecrackerCheckpointV2(config.Directory, base, memorySize)
+	files, err := prepareFirecrackerCheckpointV2(config.Directory, base, layoutMemorySize)
 	if err != nil {
-		if base == "" || memorySize <= 0 {
+		if base == "" || layoutMemorySize <= 0 {
 			return fmt.Errorf("lay out Firecracker checkpoint for %s: %w", sandboxID, err)
 		}
 		logrus.Warnf(
@@ -94,9 +87,9 @@ func (handler *Handler) Checkpoint(
 			sandboxID, err,
 		)
 		instance.clearBaseMemory()
-		base, incremental = "", false
+		base = ""
 		snapshotType = firecrackerSnapshotTypeSoftDirty
-		if files, err = prepareFirecrackerCheckpointV2(config.Directory, "", memorySize); err != nil {
+		if files, err = prepareFirecrackerCheckpointV2(config.Directory, "", layoutMemorySize); err != nil {
 			return fmt.Errorf("lay out Firecracker checkpoint for %s: %w", sandboxID, err)
 		}
 	}
@@ -106,15 +99,15 @@ func (handler *Handler) Checkpoint(
 		return fmt.Errorf("pause Firecracker sandbox %s: %w", sandboxID, err)
 	}
 	if err := api.createSnapshot(ctx, files.State, files.Memory, snapshotType); err != nil {
-		if base != "" && memorySize > 0 {
+		if base != "" && layoutMemorySize > 0 {
 			// A failed snapshot request disarms the Firecracker ledger, so
 			// the previous base is dead: rebuild from a first window while
 			// the guest is still paused.
 			instance.clearBaseMemory()
 			discardUnsealedFirecrackerCheckpoint(files)
-			base, incremental = "", false
+			base = ""
 			snapshotType = firecrackerSnapshotTypeSoftDirty
-			if files, err = prepareFirecrackerCheckpointV2(config.Directory, "", memorySize); err == nil {
+			if files, err = prepareFirecrackerCheckpointV2(config.Directory, "", layoutMemorySize); err == nil {
 				err = api.createSnapshot(ctx, files.State, files.Memory, snapshotType)
 			} else {
 				files = firecrackerCheckpointFiles{}
@@ -209,6 +202,61 @@ func (handler *Handler) finishCheckpointedSandbox(
 		}
 	}
 	return nil
+}
+
+// firecrackerBaseMemoryUsable reports whether the recorded base can still be
+// patched by an incremental snapshot of a guest with the given memory size.
+// selectFirecrackerSnapshotTier resolves how the next generation is taken.
+// An empty request leaves the automatic three-tier choice to the recorded
+// lineage: Incremental after a restore, SoftDirty windows afterwards, Full
+// only when the guest memory size is unknown. An explicit request pins the
+// snapshot type: Full drops the lineage for one generation (Firecracker
+// writes the whole memory file itself, so the layout preallocates nothing),
+// Incremental demands the pagemap base only a restore establishes, and
+// SoftDirty accepts whatever lineage is still usable. A drifted base falls
+// back to a first window instead of failing, whatever was requested.
+func selectFirecrackerSnapshotTier(
+	memorySize int64,
+	basePath string,
+	baseIncremental bool,
+	requested string,
+) (snapshotType, base string, incremental bool, layoutMemorySize int64, err error) {
+	base, incremental = basePath, baseIncremental
+	if memorySize > 0 && base != "" && !firecrackerBaseMemoryUsable(base, memorySize) {
+		// The base drifted (crash cleanup, operator interference): fall
+		// through to a first window instead of failing outright.
+		base = ""
+	}
+	switch requested {
+	case "":
+		// Automatic tier selection: Full is only reachable when the guest
+		// memory size is unknown, which in practice never happens for a
+		// running sandbox.
+		snapshotType = firecrackerSnapshotTypeSoftDirty
+		layoutMemorySize = memorySize
+		if memorySize <= 0 {
+			snapshotType = firecrackerSnapshotTypeFull
+		} else if base != "" && incremental {
+			snapshotType = firecrackerSnapshotTypeIncremental
+		}
+		return snapshotType, base, incremental, layoutMemorySize, nil
+	case firecrackerSnapshotTypeFull:
+		// Firecracker writes the whole memory file itself: no clone, no
+		// preallocation, and the lineage restarts at this artifact.
+		return requested, "", false, 0, nil
+	case firecrackerSnapshotTypeIncremental:
+		if base == "" || !incremental {
+			return "", "", false, 0, fmt.Errorf(
+				"Firecracker Incremental checkpoint needs the pagemap base a restore establishes",
+			)
+		}
+		return requested, base, incremental, memorySize, nil
+	case firecrackerSnapshotTypeSoftDirty:
+		return requested, base, incremental, memorySize, nil
+	}
+	return "", "", false, 0, fmt.Errorf(
+		"unsupported Firecracker snapshot type %q", requested,
+	)
 }
 
 // firecrackerBaseMemoryUsable reports whether the recorded base can still be

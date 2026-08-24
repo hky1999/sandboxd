@@ -20,6 +20,129 @@ import (
 	"testing"
 )
 
+func TestSelectFirecrackerSnapshotTier(t *testing.T) {
+	dir := t.TempDir()
+	usableBase := filepath.Join(dir, "gen0", firecrackerCheckpointMemoryName)
+	if err := os.Mkdir(filepath.Dir(usableBase), 0700); err != nil {
+		t.Fatalf("create base dir: %v", err)
+	}
+	writeArtifactComponent(t, usableBase, 1<<20)
+	driftedBase := filepath.Join(dir, "drifted", firecrackerCheckpointMemoryName)
+
+	for _, tc := range []struct {
+		name            string
+		memorySize      int64
+		base            string
+		baseIncremental bool
+		requested       string
+		wantType        string
+		wantBase        string
+		wantLayoutSize  int64
+		wantErr         bool
+	}{
+		{
+			name:           "auto without base takes a first window",
+			memorySize:     1 << 20,
+			wantType:       firecrackerSnapshotTypeSoftDirty,
+			wantLayoutSize: 1 << 20,
+		},
+		{
+			name:            "auto with checkpoint base keeps soft-dirty windows",
+			memorySize:      1 << 20,
+			base:            usableBase,
+			baseIncremental: false,
+			wantType:        firecrackerSnapshotTypeSoftDirty,
+			wantBase:        usableBase,
+			wantLayoutSize:  1 << 20,
+		},
+		{
+			name:            "auto after restore runs incremental",
+			memorySize:      1 << 20,
+			base:            usableBase,
+			baseIncremental: true,
+			wantType:        firecrackerSnapshotTypeIncremental,
+			wantBase:        usableBase,
+			wantLayoutSize:  1 << 20,
+		},
+		{
+			name:           "auto with drifted base rebuilds a first window",
+			memorySize:     1 << 20,
+			base:           driftedBase,
+			wantType:       firecrackerSnapshotTypeSoftDirty,
+			wantLayoutSize: 1 << 20,
+		},
+		{
+			name:            "explicit Full drops the lineage and the size",
+			memorySize:      1 << 20,
+			base:            usableBase,
+			baseIncremental: true,
+			requested:       firecrackerSnapshotTypeFull,
+			wantType:        firecrackerSnapshotTypeFull,
+			wantLayoutSize:  0,
+		},
+		{
+			name:       "explicit Incremental without a base is an error",
+			memorySize: 1 << 20,
+			requested:  firecrackerSnapshotTypeIncremental,
+			wantErr:    true,
+		},
+		{
+			name:            "explicit Incremental with a checkpoint base is an error",
+			memorySize:      1 << 20,
+			base:            usableBase,
+			baseIncremental: false,
+			requested:       firecrackerSnapshotTypeIncremental,
+			wantErr:         true,
+		},
+		{
+			name:            "explicit Incremental after restore is honored",
+			memorySize:      1 << 20,
+			base:            usableBase,
+			baseIncremental: true,
+			requested:       firecrackerSnapshotTypeIncremental,
+			wantType:        firecrackerSnapshotTypeIncremental,
+			wantBase:        usableBase,
+			wantLayoutSize:  1 << 20,
+		},
+		{
+			name:           "explicit SoftDirty without a base is a first window",
+			memorySize:     1 << 20,
+			requested:      firecrackerSnapshotTypeSoftDirty,
+			wantType:       firecrackerSnapshotTypeSoftDirty,
+			wantLayoutSize: 1 << 20,
+		},
+		{
+			name:      "unknown snapshot type is rejected",
+			requested: "Lazy",
+			wantErr:   true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			snapshotType, base, _, layoutSize, err := selectFirecrackerSnapshotTier(
+				tc.memorySize, tc.base, tc.baseIncremental, tc.requested,
+			)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("tier selection succeeded: %+v", tc)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("tier selection failed: %v", err)
+			}
+			if snapshotType != tc.wantType {
+				t.Fatalf("snapshot type %q, want %q", snapshotType, tc.wantType)
+			}
+			if base != tc.wantBase {
+				t.Fatalf("base %q, want %q", base, tc.wantBase)
+			}
+			if layoutSize != tc.wantLayoutSize {
+				t.Fatalf("layout size %d, want %d", layoutSize, tc.wantLayoutSize)
+			}
+		})
+	}
+}
+
 func TestFirecrackerBaseMemoryUsable(t *testing.T) {
 	dir := t.TempDir()
 	base := filepath.Join(dir, "base-memory")

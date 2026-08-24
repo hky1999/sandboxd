@@ -44,6 +44,7 @@ type options struct {
 	storageMB                uint64
 	compress                 bool
 	leaveRunning             bool
+	snapshotType             string
 }
 
 func main() {
@@ -67,6 +68,8 @@ func main() {
 	flag.Uint64Var(&value.storageMB, "storage-mb", 64, "writable layer in MiB")
 	flag.BoolVar(&value.compress, "compress", true, "compress checkpoint artifacts")
 	flag.BoolVar(&value.leaveRunning, "leave-running", true, "leave source running")
+	flag.StringVar(&value.snapshotType, "snapshot-type", "",
+		"checkpoint flavor: empty (auto), Full, Incremental, or SoftDirty")
 	flag.Parse()
 
 	if err := run(value); err != nil {
@@ -192,6 +195,7 @@ func checkpoint(
 		TimeoutSeconds: uint32(value.checkpointTimeoutSeconds),
 		Compress:       value.compress,
 		LeaveRunning:   value.leaveRunning,
+		SnapshotType:   value.snapshotType,
 	})
 	if err != nil {
 		return fmt.Errorf("checkpoint: %w", err)
