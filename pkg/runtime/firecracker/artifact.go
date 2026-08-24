@@ -173,8 +173,15 @@ func finalizeFirecrackerCheckpointV2(
 		}
 		manifest.MemorySize = info.Size()
 	}
-	manifest.Digests = make(map[string]string, 3)
+	// Only the small components are digested: hashing guest memory costs
+	// seconds per GiB of pure CPU, which dwarfs every other step of an
+	// incremental checkpoint. The memory file's integrity rests on the
+	// reflink copy-on-write and Firecracker's own writes.
+	manifest.Digests = make(map[string]string, 2)
 	for _, component := range firecrackerCheckpointComponents(files) {
+		if component.name == firecrackerCheckpointMemoryName {
+			continue
+		}
 		digest, err := digestFirecrackerCheckpointComponent(ctx, component.name, component.path)
 		if err != nil {
 			return err
@@ -302,16 +309,16 @@ func readFirecrackerCheckpointManifest(dir string) (*firecrackerCheckpointManife
 	return &manifest, nil
 }
 
-// verifyFirecrackerCheckpointDigests recomputes component digests and compares
-// them against the manifest. verifyMemory can be skipped for large memory
-// files where a full pass costs seconds per GiB.
+// verifyFirecrackerCheckpointDigests recomputes the digests the manifest
+// recorded and compares them against the components on disk. Components
+// without a recorded digest (memory, by design) are skipped.
 func verifyFirecrackerCheckpointDigests(
 	ctx context.Context,
 	artifact *firecrackerCheckpointArtifact,
-	verifyMemory bool,
 ) error {
 	for _, component := range firecrackerCheckpointComponents(artifact.Files) {
-		if component.name == firecrackerCheckpointMemoryName && !verifyMemory {
+		expected, recorded := artifact.Manifest.Digests[component.name]
+		if !recorded || expected == "" {
 			continue
 		}
 		digest, err := digestFirecrackerCheckpointComponent(
@@ -322,10 +329,10 @@ func verifyFirecrackerCheckpointDigests(
 		if err != nil {
 			return err
 		}
-		if digest != artifact.Manifest.Digests[component.name] {
+		if digest != expected {
 			return fmt.Errorf(
 				"Firecracker checkpoint component %s digest mismatch: manifest %s, on disk %s",
-				component.name, artifact.Manifest.Digests[component.name], digest,
+				component.name, expected, digest,
 			)
 		}
 	}

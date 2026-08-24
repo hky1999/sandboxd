@@ -57,12 +57,20 @@ this layout (it only applies to legacy artifacts). Legacy single-file
 
 Repeated checkpoints of the same running sandbox are incremental: each
 generation clones the previous generation's memory (a copy-on-write reflink
-where the filesystem supports it) and Firecracker rewrites only the pages that
-changed, both into the artifact and on disk. Each generation is still a
-complete, independently restorable artifact; incremental behavior affects only
-how much host work and disk space a generation costs. Consecutive generations
-must use distinct `checkpoint_dir` values — sandboxd refuses to overwrite a
-directory that already holds a checkpoint.
+when both directories share a reflink-capable filesystem) and Firecracker
+rewrites only the pages that changed, both into the artifact and on disk. Each
+generation is still a complete, independently restorable artifact; incremental
+behavior affects only how much host work and disk space a generation costs.
+Consecutive generations must use distinct `checkpoint_dir` values — sandboxd
+refuses to overwrite a directory that already holds a checkpoint. The
+incremental chain references the latest artifact's memory file directly, so a
+caller that deletes or mutates the most recent checkpoint directory drops the
+sandbox back to a full first window on the next checkpoint; deleting older
+generations is always safe.
+
+The manifest digests the small components (`vmstate`, `overlay.ext4`); hashing
+the memory file is skipped because it costs seconds of CPU per GiB and would
+dominate an otherwise sub-second incremental checkpoint.
 
 ## Source and failure semantics
 

@@ -42,97 +42,58 @@ func TestFirecrackerBaseMemoryUsable(t *testing.T) {
 	}
 }
 
-func newIncrementalTestHandler(t *testing.T) (*Handler, *firecrackerInstance, string) {
-	t.Helper()
-	storageRoot := t.TempDir()
-	handler := &Handler{storageRoot: storageRoot}
-	sandboxID := "sbox-incremental-test"
-	if err := os.Mkdir(filepath.Join(storageRoot, sandboxID), 0700); err != nil {
-		t.Fatalf("create storage dir: %v", err)
+func TestAdoptCheckpointMemoryRecordsArtifactMemory(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, "gen1"), 0700); err != nil {
+		t.Fatalf("create artifact dir: %v", err)
 	}
 	instance := &firecrackerInstance{}
-	return handler, instance, sandboxID
-}
+	memory := filepath.Join(dir, "gen1", firecrackerCheckpointMemoryName)
+	writeArtifactComponent(t, memory, 64<<10)
 
-func TestAdoptCheckpointMemoryAdvancesBase(t *testing.T) {
-	handler, instance, sandboxID := newIncrementalTestHandler(t)
-	dir := t.TempDir()
-	first := filepath.Join(dir, "gen1-memory")
-	writeArtifactComponent(t, first, 64<<10)
-
-	handler.adoptCheckpointMemory(instance, first, sandboxID, true)
+	adoptCheckpointMemory(instance, memory, true)
 	state := instance.snapshot()
-	if state.BaseMemoryPath == "" || !state.BaseMemoryIncremental {
+	if state.BaseMemoryPath != memory || !state.BaseMemoryIncremental {
 		t.Fatalf("base lineage not adopted: %+v", state)
 	}
-	baseContent, err := os.ReadFile(state.BaseMemoryPath)
-	if err != nil {
-		t.Fatalf("read adopted base: %v", err)
-	}
-	firstContent, _ := os.ReadFile(first)
-	if string(baseContent) != string(firstContent) {
-		t.Fatal("adopted base diverged from the checkpoint memory")
-	}
 
-	// A second adoption replaces the base without leaving staging behind.
-	second := filepath.Join(dir, "gen2-memory")
-	writeArtifactComponent(t, second, 32<<10)
-	handler.adoptCheckpointMemory(instance, second, sandboxID, false)
+	// A later checkpoint adoption flips the ledger marker: the next
+	// generation diffs through the soft-dirty window, not the pagemap.
+	writeArtifactComponent(t, memory, 64<<10)
+	adoptCheckpointMemory(instance, memory, false)
 	state = instance.snapshot()
-	if state.BaseMemoryIncremental {
-		t.Fatal("checkpoint adoption kept the restore marker")
-	}
-	entries, err := os.ReadDir(filepath.Dir(state.BaseMemoryPath))
-	if err != nil {
-		t.Fatalf("scan storage dir: %v", err)
-	}
-	if len(entries) != 1 {
-		t.Fatalf("adoption left %d files behind, want 1", len(entries))
-	}
-	secondContent, _ := os.ReadFile(second)
-	baseContent, _ = os.ReadFile(state.BaseMemoryPath)
-	if string(baseContent) != string(secondContent) {
-		t.Fatal("adopted base was not replaced")
+	if state.BaseMemoryPath != memory || state.BaseMemoryIncremental {
+		t.Fatalf("checkpoint adoption kept the restore marker: %+v", state)
 	}
 }
 
-func TestAdoptCheckpointMemoryDropsLineageOnFailure(t *testing.T) {
-	handler, instance, sandboxID := newIncrementalTestHandler(t)
-	memory := filepath.Join(t.TempDir(), "memory")
+func TestAdoptCheckpointMemoryDropsUnusableLineage(t *testing.T) {
+	dir := t.TempDir()
+	instance := &firecrackerInstance{}
+	link := filepath.Join(dir, "memory-link")
+	if err := os.Symlink(filepath.Join(dir, "memory"), link); err != nil {
+		t.Fatalf("symlink memory: %v", err)
+	}
+
+	adoptCheckpointMemory(instance, link, false)
+	if instance.snapshot().BaseMemoryPath != "" {
+		t.Fatal("a symlinked memory was adopted as a base")
+	}
+
+	memory := filepath.Join(dir, "memory")
 	writeArtifactComponent(t, memory, 64<<10)
-
-	// A sandbox ID that escapes the storage root must not adopt anything.
-	handler.adoptCheckpointMemory(instance, memory, "../"+sandboxID, true)
-	if instance.snapshot().BaseMemoryPath != "" {
-		t.Fatal("base adopted outside the storage root")
+	adoptCheckpointMemory(instance, memory, false)
+	if instance.snapshot().BaseMemoryPath == "" {
+		t.Fatal("adoption failed for a regular memory file")
 	}
-
-	// An empty memory path is a no-op, not a failure.
-	handler.adoptCheckpointMemory(instance, "", sandboxID, true)
-	if instance.snapshot().BaseMemoryPath != "" {
-		t.Fatal("empty adoption changed the lineage")
+	instance.clearBaseMemory()
+	if instance.snapshot().BaseMemoryPath != "" || instance.snapshot().BaseMemoryIncremental {
+		t.Fatal("clearBaseMemory left the lineage behind")
 	}
-}
-
-func TestDisarmBaseMemoryRemovesBase(t *testing.T) {
-	handler, instance, sandboxID := newIncrementalTestHandler(t)
-	memory := filepath.Join(t.TempDir(), "memory")
-	writeArtifactComponent(t, memory, 64<<10)
-	handler.adoptCheckpointMemory(instance, memory, sandboxID, false)
-	base := instance.snapshot().BaseMemoryPath
-	if base == "" {
-		t.Fatal("adoption failed")
+	// Clearing again is a no-op.
+	if instance.clearBaseMemory() {
+		t.Fatal("second clear reported a change")
 	}
-
-	handler.disarmBaseMemory(instance, sandboxID)
-	if instance.snapshot().BaseMemoryPath != "" {
-		t.Fatal("disarm kept the lineage")
-	}
-	if _, err := os.Lstat(base); !os.IsNotExist(err) {
-		t.Fatalf("disarmed base file still present: %v", err)
-	}
-	// Disarming without a lineage is a no-op.
-	handler.disarmBaseMemory(instance, sandboxID)
 }
 
 func TestDiscardUnsealedFirecrackerCheckpoint(t *testing.T) {

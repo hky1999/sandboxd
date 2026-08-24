@@ -71,9 +71,10 @@ type firecrackerPersistedState struct {
 	// MemoryMiB is the guest memory size in MiB, recorded so incremental
 	// checkpoints can preallocate or clone a full-size base memory file.
 	MemoryMiB uint32 `json:"memory_mib,omitempty"`
-	// BaseMemoryPath points at the sandbox-owned memory image the Firecracker
-	// dirty-page ledger currently tracks; empty means the next checkpoint
-	// rebuilds from a first window.
+	// BaseMemoryPath points at the memory image the Firecracker dirty-page
+	// ledger currently tracks — the previous artifact's own memory file, or
+	// the file a restore loaded. Empty means the next checkpoint rebuilds
+	// from a first window.
 	BaseMemoryPath string `json:"base_memory_path,omitempty"`
 	// BaseMemoryIncremental marks a base that came from a restore, which the
 	// Firecracker pagemap ledger (not the soft-dirty window) diffs against.

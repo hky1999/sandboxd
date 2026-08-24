@@ -218,14 +218,22 @@ func TestOpenCheckpointV2AndVerifyDigests(t *testing.T) {
 	if artifact.Manifest.BaseMemory != "gen0/memory" {
 		t.Fatalf("base memory lineage %q lost", artifact.Manifest.BaseMemory)
 	}
-	if err := verifyFirecrackerCheckpointDigests(context.Background(), artifact, true); err != nil {
+	if err := verifyFirecrackerCheckpointDigests(context.Background(), artifact); err != nil {
 		t.Fatalf("verify untouched artifact digests: %v", err)
 	}
+	if _, recorded := artifact.Manifest.Digests[firecrackerCheckpointMemoryName]; recorded {
+		t.Fatal("memory digest was computed despite the synchronous-cost policy")
+	}
 
-	// Tampering with a component must surface as a digest mismatch.
+	// The memory file carries no digest by design: changing it must not
+	// fail verification, while tampering with a digested component must.
+	writeArtifactComponent(t, artifact.Files.Memory, 16<<10)
+	if err := verifyFirecrackerCheckpointDigests(context.Background(), artifact); err != nil {
+		t.Fatalf("undigested memory component failed verification: %v", err)
+	}
 	writeArtifactComponent(t, artifact.Files.Overlay, 16<<10)
 	if err := verifyFirecrackerCheckpointDigests(
-		context.Background(), artifact, true,
+		context.Background(), artifact,
 	); err == nil || !strings.Contains(err.Error(), "digest mismatch") {
 		t.Fatalf("tampered component not detected: %v", err)
 	}
