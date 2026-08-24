@@ -16,11 +16,16 @@ package firecracker
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"syscall"
 	"time"
 
@@ -70,6 +75,13 @@ func (handler *Handler) Checkpoint(
 		state.BaseMemoryIncremental,
 		config.SnapshotType,
 	)
+	if err != nil {
+		return err
+	}
+	// Hashing the VMM binary and the guest kernel happens before the pause:
+	// the first checkpoint after a daemon start pays it once, later ones
+	// read the cache.
+	compat, err := handler.buildCheckpointCompat(state.Vcpus)
 	if err != nil {
 		return err
 	}
@@ -159,6 +171,7 @@ func (handler *Handler) Checkpoint(
 	manifest := &firecrackerCheckpointManifest{
 		SnapshotType: snapshotType,
 		MemorySize:   memoryInfo.Size(),
+		Compat:       compat,
 	}
 	if base != "" {
 		manifest.BaseMemory = filepath.Base(filepath.Dir(base))
@@ -257,6 +270,83 @@ func selectFirecrackerSnapshotTier(
 	return "", "", false, 0, fmt.Errorf(
 		"unsupported Firecracker snapshot type %q", requested,
 	)
+}
+
+// buildCheckpointCompat assembles the compatibility tuple for a guest with
+// the given vCPU count, digesting the VMM binary, guest kernel, and initrd
+// once per handler and caching the results.
+func (handler *Handler) buildCheckpointCompat(vcpus uint32) (*firecrackerCheckpointCompat, error) {
+	handler.compatMu.Lock()
+	defer handler.compatMu.Unlock()
+	if handler.compatDigests == nil {
+		compat := &firecrackerCheckpointCompat{Arch: runtime.GOARCH}
+		var err error
+		if compat.Firecracker, err = digestFirecrackerStackFile(handler.binary); err != nil {
+			return nil, fmt.Errorf("digest Firecracker binary: %w", err)
+		}
+		if compat.Kernel, err = digestFirecrackerStackFile(handler.kernelPath); err != nil {
+			return nil, fmt.Errorf("digest Firecracker guest kernel: %w", err)
+		}
+		if handler.initrdPath != "" {
+			if compat.Initrd, err = digestFirecrackerStackFile(handler.initrdPath); err != nil {
+				return nil, fmt.Errorf("digest Firecracker initrd: %w", err)
+			}
+		}
+		handler.compatDigests = compat
+	}
+	compat := *handler.compatDigests
+	compat.Vcpus = vcpus
+	compat.KernelArgs = handler.kernelArgs
+	return &compat, nil
+}
+
+// verifyCheckpointCompat refuses to restore an artifact whose recorded
+// software stack differs from this handler's. Fields the manifest did not
+// record are skipped, and a manifest without a tuple at all (pre-M3
+// artifacts) restores without stack verification.
+func (handler *Handler) verifyCheckpointCompat(
+	artifact *firecrackerCheckpointArtifact,
+) error {
+	recorded := artifact.Manifest.Compat
+	if recorded == nil {
+		return nil
+	}
+	local, err := handler.buildCheckpointCompat(recorded.Vcpus)
+	if err != nil {
+		return err
+	}
+	var mismatches []string
+	for _, field := range []struct{ name, recorded, local string }{
+		{"arch", recorded.Arch, local.Arch},
+		{"firecracker", recorded.Firecracker, local.Firecracker},
+		{"kernel", recorded.Kernel, local.Kernel},
+		{"initrd", recorded.Initrd, local.Initrd},
+		{"kernel_args", recorded.KernelArgs, local.KernelArgs},
+	} {
+		if field.recorded != "" && field.recorded != field.local {
+			mismatches = append(mismatches, field.name)
+		}
+	}
+	if len(mismatches) > 0 {
+		return fmt.Errorf(
+			"Firecracker checkpoint %s was built on an incompatible stack (mismatched: %s)",
+			artifact.Files.State, strings.Join(mismatches, ", "),
+		)
+	}
+	return nil
+}
+
+func digestFirecrackerStackFile(path string) (string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	hash := sha256.New()
+	if _, err := io.Copy(hash, file); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(hash.Sum(nil)), nil
 }
 
 // firecrackerBaseMemoryUsable reports whether the recorded base can still be
@@ -372,6 +462,12 @@ func (handler *Handler) Restore(
 	if err != nil {
 		return fmt.Errorf(
 			"open Firecracker checkpoint %s: %w",
+			startConfig.CheckpointDir, err,
+		)
+	}
+	if err := handler.verifyCheckpointCompat(artifact); err != nil {
+		return fmt.Errorf(
+			"refuse Firecracker restore from %s: %w",
 			startConfig.CheckpointDir, err,
 		)
 	}
@@ -500,6 +596,11 @@ func (handler *Handler) Restore(
 	if err := command.Start(); err != nil {
 		return fmt.Errorf("start Firecracker restore VMM: %w", err)
 	}
+	restoredVcpus := uint32(0)
+	if compat := artifact.Manifest.Compat; compat != nil {
+		// Informational only: the vmstate pins the real count.
+		restoredVcpus = compat.Vcpus
+	}
 	instance := &firecrackerInstance{
 		state: firecrackerPersistedState{
 			ID:          startConfig.ID,
@@ -509,6 +610,7 @@ func (handler *Handler) Restore(
 			VsockPath:   vsockPath,
 			OverlayPath: checkpointFiles.Overlay,
 			MemoryMiB:   uint32(memorySize >> 20),
+			Vcpus:       restoredVcpus,
 			CreatedAt:   time.Now().Format(time.RFC3339Nano),
 		},
 		done: make(chan struct{}),

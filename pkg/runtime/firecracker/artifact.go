@@ -39,16 +39,31 @@ const (
 	firecrackerSnapshotTypeSoftDirty   = "SoftDirty"
 )
 
+// firecrackerCheckpointCompat pins the software stack a checkpoint was
+// produced on. A restore compares it against its own stack and refuses on a
+// mismatch; manifests without a tuple (pre-M3 artifacts) restore without
+// stack verification. Vcpus is informational — the vmstate already pins the
+// count a restored VM comes up with.
+type firecrackerCheckpointCompat struct {
+	Arch        string `json:"arch,omitempty"`
+	Firecracker string `json:"firecracker,omitempty"`
+	Kernel      string `json:"kernel,omitempty"`
+	Initrd      string `json:"initrd,omitempty"`
+	Vcpus       uint32 `json:"vcpus,omitempty"`
+	KernelArgs  string `json:"kernel_args,omitempty"`
+}
+
 // firecrackerCheckpointManifest describes the contents of a v2 checkpoint
 // directory. It is written last so that its presence marks a self-consistent
 // artifact: a restore never sees a half-written checkpoint.
 type firecrackerCheckpointManifest struct {
-	Version      int               `json:"version"`
-	SnapshotType string            `json:"snapshot_type"`
-	MemorySize   int64             `json:"memory_size"`
-	BaseMemory   string            `json:"base_memory,omitempty"`
-	CreatedAt    time.Time         `json:"created_at"`
-	Digests      map[string]string `json:"digests"`
+	Version      int                          `json:"version"`
+	SnapshotType string                       `json:"snapshot_type"`
+	MemorySize   int64                        `json:"memory_size"`
+	BaseMemory   string                       `json:"base_memory,omitempty"`
+	Compat       *firecrackerCheckpointCompat `json:"compat,omitempty"`
+	CreatedAt    time.Time                    `json:"created_at"`
+	Digests      map[string]string            `json:"digests"`
 }
 
 type firecrackerCheckpointLayout int
@@ -306,7 +321,33 @@ func readFirecrackerCheckpointManifest(dir string) (*firecrackerCheckpointManife
 			manifest.MemorySize,
 		)
 	}
+	if manifest.Compat != nil {
+		for name, digest := range map[string]string{
+			"firecracker": manifest.Compat.Firecracker,
+			"kernel":      manifest.Compat.Kernel,
+			"initrd":      manifest.Compat.Initrd,
+		} {
+			if digest != "" && !isFirecrackerCompatDigest(digest) {
+				return nil, fmt.Errorf(
+					"Firecracker checkpoint compat %s digest %q is not a sha256 hex string",
+					name, digest,
+				)
+			}
+		}
+	}
 	return &manifest, nil
+}
+
+func isFirecrackerCompatDigest(digest string) bool {
+	if len(digest) != sha256.Size*2 {
+		return false
+	}
+	for _, c := range digest {
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 // verifyFirecrackerCheckpointDigests recomputes the digests the manifest

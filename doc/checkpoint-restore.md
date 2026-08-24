@@ -86,6 +86,13 @@ The manifest digests the small components (`vmstate`, `overlay.ext4`); hashing
 the memory file is skipped because it costs seconds of CPU per GiB and would
 dominate an otherwise sub-second incremental checkpoint.
 
+The manifest also records a `compat` tuple — sha256 digests of the Firecracker
+binary, guest kernel, and initrd, plus architecture and kernel arguments —
+computed once per sandboxd process. A restore compares the tuple against its
+own stack and refuses on a mismatch, naming the conflicting field. Manifests
+without a tuple (artifacts from before the tuple existed) restore without
+stack verification.
+
 ## Source and failure semantics
 
 `leave_running` defines only the successful result:

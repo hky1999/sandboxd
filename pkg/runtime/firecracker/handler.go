@@ -71,6 +71,10 @@ type firecrackerPersistedState struct {
 	// MemoryMiB is the guest memory size in MiB, recorded so incremental
 	// checkpoints can preallocate or clone a full-size base memory file.
 	MemoryMiB uint32 `json:"memory_mib,omitempty"`
+	// Vcpus is the guest vCPU count at Start time, recorded so checkpoints
+	// can stamp the compatibility tuple (the vmstate itself pins the count
+	// for a restore).
+	Vcpus uint32 `json:"vcpus,omitempty"`
 	// BaseMemoryPath points at the memory image the Firecracker dirty-page
 	// ledger currently tracks — the previous artifact's own memory file, or
 	// the file a restore loaded. Empty means the next checkpoint rebuilds
@@ -116,6 +120,12 @@ func (instance *firecrackerInstance) markConfigured() {
 func (instance *firecrackerInstance) setMemoryMiB(size uint32) {
 	instance.mu.Lock()
 	instance.state.MemoryMiB = size
+	instance.mu.Unlock()
+}
+
+func (instance *firecrackerInstance) setVcpus(count uint32) {
+	instance.mu.Lock()
+	instance.state.Vcpus = count
 	instance.mu.Unlock()
 }
 
@@ -181,6 +191,11 @@ type Handler struct {
 
 	mu        sync.RWMutex
 	instances map[string]*firecrackerInstance
+
+	// compatMu guards the cached binary/kernel digests behind the
+	// compatibility tuple; hashing a vmlinux is a one-off per daemon.
+	compatMu      sync.Mutex
+	compatDigests *firecrackerCheckpointCompat
 }
 
 func (handler *Handler) ValidateStartRequest(
@@ -509,6 +524,7 @@ func (handler *Handler) Start(
 		return err
 	}
 	instance.setMemoryMiB(memoryMiB)
+	instance.setVcpus(vcpus)
 	drives := []firecrackerDrive{
 		plan.rootDrive,
 		{
