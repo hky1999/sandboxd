@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -60,9 +61,14 @@ func TestExistingRestorePhysicalFact_ParkLeftoverDropped(t *testing.T) {
 		PhysicalPhase:  runtime.SandboxPhysicalPhase_SANDBOX_PHYSICAL_PHASE_COMMITTED,
 	}))
 	assert.NoError(t, s.sandboxManager.SetExit(id, 0, time.Now().Format(time.RFC3339Nano), false))
+	// the synchronous cleanup reads the sandbox's OCI spec; stage a minimal one
+	specDir := filepath.Join(s.config.RootDir, "containers", id)
+	assert.NoError(t, os.MkdirAll(specDir, 0o755))
+	assert.NoError(t, os.WriteFile(filepath.Join(specDir, "config.json"),
+		[]byte(`{"ociVersion":"1.0.2","process":{"args":["/init"]},"root":{"path":"rootfs"},"linux":{}}`), 0o644))
 
 	identity := &runtime.RestoreIdentity{CheckpointID: "ckpt-1", RequestSha256: "abc"}
-	_, found, err := s.existingRestorePhysicalFact(&runtime.StartRequest{SandboxID: id}, identity)
+	_, found, err := s.existingRestorePhysicalFact(context.Background(), &runtime.StartRequest{SandboxID: id}, identity)
 	assert.NoError(t, err)
 	assert.False(t, found, "park leftover must not be treated as a replay")
 	_, gerr := s.sandboxManager.Get(id)
@@ -82,7 +88,7 @@ func TestExistingRestorePhysicalFact_IdempotentReplay(t *testing.T) {
 		RestoreIdentity: identity,
 	}))
 	resp, found, err := s.existingRestorePhysicalFact(
-		&runtime.StartRequest{SandboxID: id, Runtime: "runsc"},
+		context.Background(), &runtime.StartRequest{SandboxID: id, Runtime: "runsc"},
 		proto.Clone(identity).(*runtime.RestoreIdentity))
 	assert.NoError(t, err)
 	assert.True(t, found)
@@ -100,7 +106,7 @@ func TestExistingRestorePhysicalFact_LiveSandboxRefused(t *testing.T) {
 		PhysicalPhase:  runtime.SandboxPhysicalPhase_SANDBOX_PHYSICAL_PHASE_COMMITTED,
 	}))
 	identity := &runtime.RestoreIdentity{CheckpointID: "ckpt-1", RequestSha256: "abc"}
-	_, found, err := s.existingRestorePhysicalFact(&runtime.StartRequest{SandboxID: id}, identity)
+	_, found, err := s.existingRestorePhysicalFact(context.Background(), &runtime.StartRequest{SandboxID: id}, identity)
 	assert.Error(t, err)
 	assert.True(t, found)
 }
