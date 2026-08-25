@@ -130,25 +130,28 @@ func (handler *Handler) Checkpoint(
 		)
 	}
 
-	// Best-effort guest shrink (E2B absorption): drop the guest page caches
-	// so block DMA does not keep re-materializing (and re-dirtying) cached
-	// pages into every snapshot window. Runs while the guest is up, after the
-	// flush; a miss (old guest agent, dead vsock, slow drop) never fails the
-	// checkpoint.
-	shrinkCtx, shrinkCancel := context.WithTimeout(ctx, firecrackerFlushTimeout)
-	shrinkErr := requestFirecrackerAgentWaiting(
-		shrinkCtx,
-		state.VsockPath,
-		firecrackerproto.MessageShrink,
-		nil,
-		firecrackerFlushTimeout,
-	)
-	shrinkCancel()
-	if shrinkErr != nil {
-		logrus.Debugf(
-			"firecracker: guest shrink before checkpointing %s skipped: %v",
-			sandboxID, shrinkErr,
+	// Best-effort guest shrink (E2B absorption), config-gated because it is
+	// net-negative for read-hot workloads: dropping the caches makes the next
+	// re-read re-materialize pages through block DMA, which re-dirties the
+	// next window (measured: snapshot phase 23-72ms without vs 130-143ms with
+	// on a continuous 512MiB re-read loop). It helps long parks of
+	// cold-cache sandboxes, which is why it stays available.
+	if handler.shrinkBeforeCheckpoint {
+		shrinkCtx, shrinkCancel := context.WithTimeout(ctx, firecrackerFlushTimeout)
+		shrinkErr := requestFirecrackerAgentWaiting(
+			shrinkCtx,
+			state.VsockPath,
+			firecrackerproto.MessageShrink,
+			nil,
+			firecrackerFlushTimeout,
 		)
+		shrinkCancel()
+		if shrinkErr != nil {
+			logrus.Debugf(
+				"firecracker: guest shrink before checkpointing %s skipped: %v",
+				sandboxID, shrinkErr,
+			)
+		}
 	}
 
 	if err := api.pause(ctx); err != nil {

@@ -204,6 +204,11 @@ type Handler struct {
 	// digestCache memoizes verified checkpoint component digests so warm
 	// restores from a stable directory skip the re-hash.
 	digestCache checkpointDigestCache
+
+	// shrinkBeforeCheckpoint gates the pre-pause guest page-cache drop;
+	// see FirecrackerConfig.ShrinkBeforeCheckpoint for why it is off by
+	// default.
+	shrinkBeforeCheckpoint bool
 }
 
 func (handler *Handler) ValidateStartRequest(
@@ -273,19 +278,20 @@ func NewHandler(
 		}
 	}
 	handler := &Handler{
-		binary:       binary,
-		sandboxRoot:  sandboxRoot,
-		storageRoot:  storageRoot,
-		runtimeRoot:  firecrackerproto.HostRuntimeRoot,
-		kernelPath:   firecrackerConfig.KernelImagePath,
-		initrdPath:   firecrackerConfig.InitrdPath,
-		kernelArgs:   firecrackerConfig.KernelArgs,
-		kvmDevice:    firecrackerConfig.KVMDevice,
-		defaultVCPUs: firecrackerConfig.DefaultVCPUCount,
-		defaultMem:   firecrackerConfig.DefaultMemoryMiB,
-		defaultDisk:  firecrackerConfig.DefaultOverlaySizeBytes,
-		ociLoader:    loader,
-		instances:    make(map[string]*firecrackerInstance),
+		binary:                 binary,
+		sandboxRoot:            sandboxRoot,
+		storageRoot:            storageRoot,
+		runtimeRoot:            firecrackerproto.HostRuntimeRoot,
+		kernelPath:             firecrackerConfig.KernelImagePath,
+		initrdPath:             firecrackerConfig.InitrdPath,
+		kernelArgs:             firecrackerConfig.KernelArgs,
+		kvmDevice:              firecrackerConfig.KVMDevice,
+		defaultVCPUs:           firecrackerConfig.DefaultVCPUCount,
+		defaultMem:             firecrackerConfig.DefaultMemoryMiB,
+		shrinkBeforeCheckpoint: firecrackerConfig.ShrinkBeforeCheckpoint,
+		defaultDisk:            firecrackerConfig.DefaultOverlaySizeBytes,
+		ociLoader:              loader,
+		instances:              make(map[string]*firecrackerInstance),
 	}
 	handler.recoverInstances()
 	return handler, nil
