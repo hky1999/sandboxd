@@ -71,9 +71,12 @@ generations is always safe.
 
 Durability is deliberately kept out of the pause window. Firecracker is asked
 to create the snapshot with `deferred_sync`, so its writes only reach the page
-cache while the guest is paused; after the guest resumes, sandboxd fsyncs the
-components and only then lands the manifest. The pause window is therefore
-pause → snapshot writes → overlay clone → resume, and the manifest remains the
+cache while the guest is paused; the overlay reflink clone is likewise created
+without an in-clone fsync (a sync there would wait behind the snapshot's
+deferred dirty writeback on the same filesystem); and after the guest resumes,
+sandboxd fsyncs the components and only then lands the manifest. The pause
+window is therefore pause → snapshot writes → overlay clone → resume with no
+fsync on the path, and the manifest remains the
 commit point: a generation without a manifest is partial output. A crash
 between resume and manifest commit discards the newest generation and restores
 from the previous one — sound because each generation writes into a fresh

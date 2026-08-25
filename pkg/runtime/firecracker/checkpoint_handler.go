@@ -164,7 +164,10 @@ func (handler *Handler) Checkpoint(
 	// The snapshot succeeded: files.Memory is now the complete guest memory
 	// image and the baseline the Firecracker ledger tracks.
 	tSnapshotted := time.Now()
-	if _, err := cloneFile(state.OverlayPath, files.Overlay); err != nil {
+	// No in-clone fsync: syncing the clone here would wait behind the
+	// snapshot's deferred dirty writeback on the same filesystem, pulling it
+	// back into the pause window. The seal-phase fsync covers durability.
+	if _, err := cloneFileNoSync(state.OverlayPath, files.Overlay); err != nil {
 		// The window already reset, so keep the chain alive through the base
 		// even though this artifact cannot be sealed.
 		adoptCheckpointMemory(instance, files.Memory, false)
