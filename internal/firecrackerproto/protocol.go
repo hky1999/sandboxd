@@ -49,7 +49,14 @@ const (
 	// MessageFlush asks the guest to sync its writable layer so a checkpoint
 	// captures the overlay in a quiesced state. Best-effort: the host treats
 	// errors and timeouts as advisory, never as checkpoint failures.
-	MessageFlush    MessageType = 8
+	MessageFlush MessageType = 8
+	// MessageShrink asks the guest to drop its page caches before a
+	// checkpoint: cached file pages are re-materialized by block DMA on every
+	// re-read, which re-dirties them in the host ledger and lands them in
+	// every snapshot window. Dropping the caches right before the pause
+	// shrinks the working set the checkpoint has to carry. Same best-effort
+	// contract as MessageFlush.
+	MessageShrink   MessageType = 9
 	MessageResponse MessageType = 100
 )
 

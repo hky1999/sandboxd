@@ -132,6 +132,14 @@ crash-consistent. The flush happens while the guest is still running, so a
 successful flush adds to the checkpoint's wall time but not to the pause
 window. The message never fails a checkpoint.
 
+After the flush, sandboxd also asks the guest agent to drop its page caches
+(protocol message type 9) with the same best-effort contract: cached file
+pages are re-materialized by block DMA on every re-read, which re-dirties
+them in the host ledger and drags them into each snapshot window, so dropping
+the caches right before the pause shrinks the set a checkpoint carries. A
+guest agent that predates the message declines it and the checkpoint
+proceeds.
+
 ## Source and failure semantics
 
 `leave_running` defines only the successful result:

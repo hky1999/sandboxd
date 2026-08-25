@@ -147,6 +147,18 @@ func handleConnection(connection *os.File) {
 		log.Printf("flushing guest filesystems for checkpoint")
 		syscall.Sync()
 		writeResponse(connection, nil)
+	case firecrackerproto.MessageShrink:
+		// Checkpoint shrink hook: sync, then drop the page caches. Cached
+		// file pages keep getting re-materialized by block DMA on re-reads,
+		// which re-dirties them in the host's soft-dirty ledger and pulls
+		// them into every snapshot window; dropping the caches right before
+		// the pause shrinks that set. Best-effort, same as flush.
+		log.Printf("shrinking guest caches for checkpoint")
+		syscall.Sync()
+		if err := os.WriteFile("/proc/sys/vm/drop_caches", []byte("3"), 0o200); err != nil {
+			log.Printf("drop_caches: %v", err)
+		}
+		writeResponse(connection, nil)
 	case firecrackerproto.MessageShutdown:
 		writeResponse(connection, nil)
 		go powerOff()
