@@ -41,6 +41,7 @@ type options struct {
 	timeout                  time.Duration
 	checkpointTimeoutSeconds uint
 	memoryMB                 float64
+	cpu                      int
 	storageMB                uint64
 	compress                 bool
 	leaveRunning             bool
@@ -66,6 +67,7 @@ func main() {
 		"sandboxd checkpoint timeout in seconds",
 	)
 	flag.Float64Var(&value.memoryMB, "memory-mb", 128, "sandbox memory in MiB")
+	flag.IntVar(&value.cpu, "cpu", 500, "CPU quota (milli-CPU)")
 	flag.Uint64Var(&value.storageMB, "storage-mb", 64, "writable layer in MiB")
 	flag.BoolVar(&value.compress, "compress", true, "compress checkpoint artifacts")
 	flag.BoolVar(&value.leaveRunning, "leave-running", true, "leave source running")
@@ -149,7 +151,7 @@ func start(
 		Stdout:  "/var/log/sandboxd/checkpoint-workload.stdout",
 		Stderr:  "/var/log/sandboxd/checkpoint-runtime.stderr",
 		Resources: map[string]float64{
-			"CPU":    500,
+			"CPU":    float64(value.cpu),
 			"Memory": value.memoryMB,
 		},
 		WritableLayerLimitBytes: value.storageMB * 1024 * 1024,
