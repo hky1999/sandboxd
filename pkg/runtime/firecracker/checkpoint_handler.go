@@ -457,6 +457,7 @@ func adoptCheckpointMemory(
 func instantiateFirecrackerCheckpoint(
 	ctx context.Context,
 	artifact *firecrackerCheckpointArtifact,
+	digests *checkpointDigestCache,
 	checkpointDir, stateDir, overlayPath string,
 ) (firecrackerCheckpointFiles, int64, error) {
 	files := firecrackerCheckpointFiles{Overlay: overlayPath}
@@ -480,7 +481,7 @@ func instantiateFirecrackerCheckpoint(
 		}
 		return files, info.Size(), nil
 	case firecrackerCheckpointLayoutV2Directory:
-		if err := verifyFirecrackerCheckpointDigests(ctx, artifact); err != nil {
+		if err := digests.verifyFirecrackerCheckpointDigests(ctx, artifact); err != nil {
 			return files, 0, fmt.Errorf(
 				"verify Firecracker checkpoint %s: %w",
 				checkpointDir, err,
@@ -620,6 +621,7 @@ func (handler *Handler) Restore(
 	checkpointFiles, memorySize, err := instantiateFirecrackerCheckpoint(
 		ctx,
 		artifact,
+		&handler.digestCache,
 		startConfig.CheckpointDir,
 		stateDir,
 		filepath.Join(storageDir, "overlay.ext4"),

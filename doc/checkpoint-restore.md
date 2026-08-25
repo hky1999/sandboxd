@@ -102,7 +102,13 @@ the field.
 The manifest digests the small components (`vmstate`, `overlay.ext4`); hashing
 the memory file is skipped because it costs seconds of CPU per GiB and would
 dominate an otherwise sub-second incremental checkpoint. Digests are computed
-after the post-resume fsync, so the manifest attests durable bytes.
+after the post-resume fsync, so the manifest attests durable bytes. On restore
+the verification is memoized per sandboxd process: a component whose size and
+mtime are unchanged since a previous successful verification is not re-hashed,
+so warm starts from a stable template directory skip the cost. The tradeoff is
+that a content swap which preserves both size and mtime within the filesystem's
+timestamp granularity goes undetected — the same granularity the nydus
+bootstrap cache accepts.
 
 The manifest also records a `compat` tuple — sha256 digests of the Firecracker
 binary, guest kernel, and initrd, plus architecture and kernel arguments —

@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 )
 
@@ -350,25 +351,66 @@ func isFirecrackerCompatDigest(digest string) bool {
 	return true
 }
 
-// verifyFirecrackerCheckpointDigests recomputes the digests the manifest
-// recorded and compares them against the components on disk. Components
-// without a recorded digest (memory, by design) are skipped.
-func verifyFirecrackerCheckpointDigests(
+// cachedCheckpointDigest remembers a verified component digest together with
+// the file identity it was computed from.
+type cachedCheckpointDigest struct {
+	size      int64
+	modTimeNs int64
+	digest    string
+}
+
+// checkpointDigestCache memoizes component digests across restores so a warm
+// start from a stable checkpoint directory (typically a manufactured
+// template) does not re-hash its vmstate and overlay every time. Entries are
+// keyed by component path and invalidated by a size or mtime change; the
+// granularity matches the nydus bootstrap cache. This trades detection of a
+// same-stat content swap for memoization — the checkpoint directories are
+// daemon-adjacent 0600 artifacts, not adversarial inputs. The cache is
+// advisory and resets once it exceeds a generous entry bound (incremental
+// chains mint a fresh directory per generation).
+type checkpointDigestCache struct {
+	mu      sync.Mutex
+	entries map[string]cachedCheckpointDigest
+	// hashes counts component hashes performed; it exists so tests can
+	// observe cache hits without timing.
+	hashes int
+}
+
+const checkpointDigestCacheMaxEntries = 1024
+
+// verifyFirecrackerCheckpointDigests compares the components on disk against
+// the digests the manifest recorded, hashing only components whose file
+// identity is not already cached. Components without a recorded digest
+// (memory, by design) are skipped.
+func (cache *checkpointDigestCache) verifyFirecrackerCheckpointDigests(
 	ctx context.Context,
 	artifact *firecrackerCheckpointArtifact,
 ) error {
+	cache.mu.Lock()
+	defer cache.mu.Unlock()
 	for _, component := range firecrackerCheckpointComponents(artifact.Files) {
 		expected, recorded := artifact.Manifest.Digests[component.name]
 		if !recorded || expected == "" {
 			continue
 		}
-		digest, err := digestFirecrackerCheckpointComponent(
-			ctx,
-			component.name,
-			component.path,
-		)
+		info, err := os.Lstat(component.path)
 		if err != nil {
-			return err
+			return fmt.Errorf(
+				"inspect Firecracker checkpoint component %s: %w",
+				component.name, err,
+			)
+		}
+		digest, cached := cache.lookup(component.path, info)
+		if !cached {
+			digest, err = digestFirecrackerCheckpointComponent(
+				ctx,
+				component.name,
+				component.path,
+			)
+			if err != nil {
+				return err
+			}
+			cache.remember(component.path, info, digest)
 		}
 		if digest != expected {
 			return fmt.Errorf(
@@ -378,6 +420,33 @@ func verifyFirecrackerCheckpointDigests(
 		}
 	}
 	return nil
+}
+
+func (cache *checkpointDigestCache) lookup(
+	path string, info os.FileInfo,
+) (string, bool) {
+	entry, ok := cache.entries[path]
+	if !ok || entry.size != info.Size() ||
+		entry.modTimeNs != info.ModTime().UnixNano() {
+		return "", false
+	}
+	return entry.digest, true
+}
+
+func (cache *checkpointDigestCache) remember(
+	path string, info os.FileInfo, digest string,
+) {
+	if cache.entries == nil {
+		cache.entries = make(map[string]cachedCheckpointDigest)
+	} else if len(cache.entries) >= checkpointDigestCacheMaxEntries {
+		cache.entries = make(map[string]cachedCheckpointDigest)
+	}
+	cache.entries[path] = cachedCheckpointDigest{
+		size:      info.Size(),
+		modTimeNs: info.ModTime().UnixNano(),
+		digest:    digest,
+	}
+	cache.hashes++
 }
 
 func firecrackerCheckpointComponents(

@@ -200,6 +200,10 @@ type Handler struct {
 	// compatibility tuple; hashing a vmlinux is a one-off per daemon.
 	compatMu      sync.Mutex
 	compatDigests *firecrackerCheckpointCompat
+
+	// digestCache memoizes verified checkpoint component digests so warm
+	// restores from a stable directory skip the re-hash.
+	digestCache checkpointDigestCache
 }
 
 func (handler *Handler) ValidateStartRequest(
