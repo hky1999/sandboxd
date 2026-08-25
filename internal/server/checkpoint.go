@@ -258,7 +258,7 @@ func (h *sandboxService) restoreCheckpoint(
 	restoreIdentity := &runtime.RestoreIdentity{
 		CheckpointID: request.CheckpointID, RequestSha256: fingerprint,
 	}
-	if existing, found, existingErr := h.existingRestorePhysicalFact(startConfig, restoreIdentity); found || existingErr != nil {
+	if existing, found, existingErr := h.existingRestorePhysicalFact(ctx, startConfig, restoreIdentity); found || existingErr != nil {
 		if existingErr != nil {
 			return nil, checkpointGRPCError(existingErr)
 		}
@@ -309,6 +309,7 @@ func (h *sandboxService) restoreCheckpoint(
 }
 
 func (h *sandboxService) existingRestorePhysicalFact(
+	ctx context.Context,
 	request *runtime.StartRequest,
 	expectedIdentity *runtime.RestoreIdentity,
 ) (*runtime.StartResponse, bool, error) {
@@ -343,7 +344,16 @@ func (h *sandboxService) existingRestorePhysicalFact(
 	if expectedIdentity != nil && metadata.RestoreIdentity == nil {
 		state := physical.Status.Get().State()
 		if state == runtime.SandboxState_SANDBOX_STATE_EXITED {
-			h.sandboxManager.Delete(request.SandboxID)
+			// Complete the deferred destroy SYNCHRONOUSLY (runsc delete, fs,
+			// ACL, resources, record): a bare record drop let the subsequent
+			// create race the leftover container root ("filesystem state
+			// already exists", observed at +3s) and a concurrent YR retry then
+			// hit the half-written INTENT record as a replay conflict (observed
+			// at +5s). deleteSandbox coalesces with an in-flight destroy.
+			if err := h.deleteSandbox(ctx, request.SandboxID); err != nil {
+				return nil, true, fmt.Errorf("clean up parked sandbox %s before restore: %w",
+					request.SandboxID, err)
+			}
 			return nil, false, nil
 		}
 		return nil, true, fmt.Errorf("sandbox %s is %s; cannot restore onto a live sandbox: %w",
