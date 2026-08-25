@@ -218,6 +218,8 @@ func (h *sandboxService) Restore(
 		return nil, checkpointGRPCError(fmt.Errorf(
 			"legacy checkpoint image is missing or not a regular file: %w", errord.ErrFailedPrecondition))
 	}
+	// W7-P1.1: same resource-limit override as the managed path.
+	applyCheckpointResourceLimits(startConfig, checkpointDir)
 	response, err := h.createSandbox(ctx, startConfig, createOptions{checkpointImage: imagePath})
 	if err != nil {
 		return nil, checkpointGRPCError(err)
@@ -244,6 +246,11 @@ func (h *sandboxService) restoreCheckpoint(
 	if err != nil {
 		return nil, checkpointGRPCError(err)
 	}
+	// W7-P1.1: prefer the limits snapshotted at checkpoint time (ladder/
+	// task-variant changes) over the caller's original booking. Missing
+	// sidecar keeps legacy behavior. Applied BEFORE the fingerprint so the
+	// restore identity covers the config actually applied.
+	applyCheckpointResourceLimits(startConfig, checkpointDir)
 	fingerprint, err := restoreFingerprint(startConfig, request.CheckpointID)
 	if err != nil {
 		return nil, checkpointGRPCError(err)
@@ -323,6 +330,24 @@ func (h *sandboxService) existingRestorePhysicalFact(
 	if metadata.PhysicalPhase != runtime.SandboxPhysicalPhase_SANDBOX_PHYSICAL_PHASE_COMMITTED {
 		return nil, true, fmt.Errorf("sandbox %s physical record is not committed: %w",
 			request.SandboxID, errord.ErrFailedPrecondition)
+	}
+	// A park (checkpoint with leaveRunning=false) exits the sandbox but leaves
+	// its pre-park physical record in place until the deferred destroy cleanup
+	// removes it; a restore landing inside that window used to fail here with
+	// a replay conflict (variable 26-45s+ window, orchestrators had to retry).
+	// A record whose RestoreIdentity is nil originates from a plain create and
+	// was never restored: if the sandbox has exited it is a park leftover, not
+	// a replay — drop the stale record and let the restore proceed. A sandbox
+	// that is still running keeps conflicting (restoring onto a live ID is a
+	// genuine error).
+	if expectedIdentity != nil && metadata.RestoreIdentity == nil {
+		state := physical.Status.Get().State()
+		if state == runtime.SandboxState_SANDBOX_STATE_EXITED {
+			h.sandboxManager.Delete(request.SandboxID)
+			return nil, false, nil
+		}
+		return nil, true, fmt.Errorf("sandbox %s is %s; cannot restore onto a live sandbox: %w",
+			request.SandboxID, state, errord.ErrFailedPrecondition)
 	}
 	if expectedIdentity == nil || !proto.Equal(metadata.RestoreIdentity, expectedIdentity) {
 		return nil, true, fmt.Errorf("sandbox %s restore identity conflicts with replay: %w",
@@ -457,6 +482,12 @@ func (h *sandboxService) executeCheckpoint(
 	attempt *checkpointstate.Attempt,
 ) {
 	_, err := checkpoint.PublishAt(checkpointDir, source, func(imagePath string) error {
+		// W7-P1.1: snapshot the effective cgroup limits BEFORE the runtime
+		// checkpoint (sandbox still alive) so the restore can re-apply them
+		// instead of the caller's original booking.
+		if cerr := h.captureResourceLimits(key.SandboxID, filepath.Dir(imagePath)); cerr != nil {
+			return fmt.Errorf("capture resource limits: %w", cerr)
+		}
 		if err := checkpointHandler.Checkpoint(ctx, key.SandboxID, filepath.Dir(imagePath), options); err != nil {
 			return fmt.Errorf("runtime checkpoint failed: %w", err)
 		}
