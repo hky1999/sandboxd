@@ -135,6 +135,23 @@ func (handler *Handler) Checkpoint(
 		return fmt.Errorf("pause Firecracker sandbox %s: %w", sandboxID, err)
 	}
 	tPaused := time.Now()
+	// Clone the writable layer BEFORE the memory snapshot: the snapshot writes
+	// the whole guest memory into the page cache inside the window, and an
+	// overlay FICLONE after it can stall for seconds on the same filesystem's
+	// writeback of that fresh dirty data (measured 12.8s at a 2GiB layer after
+	// a 4GiB snapshot). Cloning first runs with a cache that does not yet hold
+	// the snapshot, removing the interaction. No in-clone fsync either — the
+	// seal-phase fsync covers durability.
+	if _, err := cloneFileNoSync(state.OverlayPath, files.Overlay); err != nil {
+		discardUnsealedFirecrackerCheckpoint(files)
+		if config.LeaveRunning {
+			err = errors.Join(err, fmt.Errorf(
+				"resume Firecracker sandbox %s: %w", sandboxID, api.resume(ctx),
+			))
+		}
+		return fmt.Errorf("snapshot Firecracker writable layer for %s: %w", sandboxID, err)
+	}
+	tOverlay := time.Now()
 	if err := api.createSnapshot(ctx, files.State, files.Memory, snapshotType); err != nil {
 		if base != "" && layoutMemorySize > 0 {
 			// A failed snapshot request disarms the Firecracker ledger, so
@@ -164,24 +181,8 @@ func (handler *Handler) Checkpoint(
 	// The snapshot succeeded: files.Memory is now the complete guest memory
 	// image and the baseline the Firecracker ledger tracks.
 	tSnapshotted := time.Now()
-	// No in-clone fsync: syncing the clone here would wait behind the
-	// snapshot's deferred dirty writeback on the same filesystem, pulling it
-	// back into the pause window. The seal-phase fsync covers durability.
-	if _, err := cloneFileNoSync(state.OverlayPath, files.Overlay); err != nil {
-		// The window already reset, so keep the chain alive through the base
-		// even though this artifact cannot be sealed.
-		adoptCheckpointMemory(instance, files.Memory, false)
-		discardUnsealedFirecrackerCheckpoint(files)
-		if config.LeaveRunning {
-			err = errors.Join(err, fmt.Errorf(
-				"resume Firecracker sandbox %s: %w", sandboxID, api.resume(ctx),
-			))
-		}
-		return fmt.Errorf("snapshot Firecracker writable layer for %s: %w", sandboxID, err)
-	}
 
 	resumeErr := error(nil)
-	tOverlay := time.Now()
 	if config.LeaveRunning {
 		if err := api.resume(ctx); err != nil {
 			resumeErr = fmt.Errorf("resume Firecracker sandbox %s: %w", sandboxID, err)
@@ -238,9 +239,9 @@ func (handler *Handler) Checkpoint(
 			"resume=%dms fsync=%dms seal=%dms total=%dms",
 		sandboxID, snapshotType, memoryInfo.Size()>>20, config.Directory,
 		phaseMS(tStarted, tPrepared), phaseMS(tPrepared, tFlushed),
-		phaseMS(tFlushed, tPaused), phaseMS(tPaused, tSnapshotted),
-		phaseMS(tSnapshotted, tOverlay),
-		phaseMS(tOverlay, tResumed), phaseMS(tResumed, tFsynced),
+		phaseMS(tFlushed, tPaused), phaseMS(tOverlay, tSnapshotted),
+		phaseMS(tPaused, tOverlay),
+		phaseMS(tSnapshotted, tResumed), phaseMS(tResumed, tFsynced),
 		phaseMS(tFsynced, tEnd), phaseMS(tStarted, tEnd),
 	)
 
