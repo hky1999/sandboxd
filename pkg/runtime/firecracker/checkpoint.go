@@ -23,6 +23,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
+	"strings"
+
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -31,7 +35,16 @@ const (
 	firecrackerCheckpointMemoryName   = "memory"
 	firecrackerCheckpointOverlayName  = "overlay.ext4"
 	firecrackerCheckpointMaxComponent = int64(16 << 40)
+	firecrackerCheckpointMaxExtents   = 1 << 20
+
+	firecrackerSparseSizePAX = "AKERNEL.sandboxd.sparse.size"
+	firecrackerSparseMapPAX  = "AKERNEL.sandboxd.sparse.map"
 )
+
+type firecrackerSparseExtent struct {
+	Offset int64
+	Length int64
+}
 
 type firecrackerCheckpointFiles struct {
 	State   string
@@ -119,21 +132,106 @@ func writeFirecrackerCheckpointFile(
 		return fmt.Errorf("open Firecracker checkpoint component %s: %w", name, err)
 	}
 	defer file.Close()
+	extents, err := firecrackerDataExtents(file, info.Size())
+	if err != nil {
+		return fmt.Errorf("inspect sparse Firecracker component %s: %w", name, err)
+	}
+	storedSize := info.Size()
+	var paxRecords map[string]string
+	if !firecrackerExtentMapIsFull(extents, info.Size()) {
+		storedSize = firecrackerExtentStoredSize(extents)
+		paxRecords = map[string]string{
+			firecrackerSparseSizePAX: strconv.FormatInt(info.Size(), 10),
+			firecrackerSparseMapPAX:  formatFirecrackerSparseExtents(extents),
+		}
+	}
 	if err := archive.WriteHeader(&tar.Header{
-		Name: name,
-		Mode: 0600,
-		Size: info.Size(),
+		Name:       name,
+		Mode:       0600,
+		Size:       storedSize,
+		PAXRecords: paxRecords,
 	}); err != nil {
 		return err
 	}
-	written, err := copyFirecrackerCheckpoint(ctx, archive, file)
-	if err != nil {
-		return fmt.Errorf("write Firecracker checkpoint component %s: %w", name, err)
+	var written int64
+	for _, extent := range extents {
+		count, copyErr := copyFirecrackerCheckpoint(
+			ctx,
+			archive,
+			io.NewSectionReader(file, extent.Offset, extent.Length),
+		)
+		written += count
+		if copyErr != nil {
+			return fmt.Errorf("write Firecracker checkpoint component %s: %w", name, copyErr)
+		}
 	}
-	if written != info.Size() {
+	if written != storedSize {
 		return fmt.Errorf("Firecracker checkpoint component %s changed while reading", name)
 	}
 	return nil
+}
+
+func firecrackerDataExtents(file *os.File, size int64) ([]firecrackerSparseExtent, error) {
+	extents := make([]firecrackerSparseExtent, 0, 8)
+	for offset := int64(0); offset < size; {
+		data, err := unix.Seek(int(file.Fd()), offset, unix.SEEK_DATA)
+		if errors.Is(err, unix.ENXIO) {
+			break
+		}
+		if errors.Is(err, unix.EINVAL) || errors.Is(err, unix.ENOTSUP) {
+			return []firecrackerSparseExtent{{Offset: 0, Length: size}}, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		hole, err := unix.Seek(int(file.Fd()), data, unix.SEEK_HOLE)
+		if errors.Is(err, unix.EINVAL) || errors.Is(err, unix.ENOTSUP) {
+			return []firecrackerSparseExtent{{Offset: 0, Length: size}}, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		if data < offset || data >= size || hole <= data {
+			return nil, errors.New("filesystem returned an invalid sparse extent")
+		}
+		if hole > size {
+			hole = size
+		}
+		extents = append(extents, firecrackerSparseExtent{
+			Offset: data,
+			Length: hole - data,
+		})
+		if len(extents) > firecrackerCheckpointMaxExtents {
+			return nil, errors.New("Firecracker checkpoint component has too many sparse extents")
+		}
+		offset = hole
+	}
+	return extents, nil
+}
+
+func firecrackerExtentMapIsFull(extents []firecrackerSparseExtent, size int64) bool {
+	return len(extents) == 1 && extents[0].Offset == 0 && extents[0].Length == size
+}
+
+func firecrackerExtentStoredSize(extents []firecrackerSparseExtent) int64 {
+	var size int64
+	for _, extent := range extents {
+		size += extent.Length
+	}
+	return size
+}
+
+func formatFirecrackerSparseExtents(extents []firecrackerSparseExtent) string {
+	var result strings.Builder
+	for index, extent := range extents {
+		if index != 0 {
+			result.WriteByte(',')
+		}
+		result.WriteString(strconv.FormatInt(extent.Offset, 10))
+		result.WriteByte(':')
+		result.WriteString(strconv.FormatInt(extent.Length, 10))
+	}
+	return result.String()
 }
 
 func extractFirecrackerCheckpointArchive(
@@ -190,8 +288,9 @@ func extractFirecrackerCheckpointArchive(
 			return fmt.Errorf("read Firecracker checkpoint archive: %w", nextErr)
 		}
 		path, ok := outputs[header.Name]
-		if !ok || seen[header.Name] || header.Typeflag != tar.TypeReg ||
-			header.Size <= 0 || header.Size > firecrackerCheckpointMaxComponent {
+		logicalSize, extents, sparse, sparseErr := parseFirecrackerSparseHeader(header)
+		if !ok || seen[header.Name] || header.Typeflag != tar.TypeReg || sparseErr != nil ||
+			logicalSize <= 0 || logicalSize > firecrackerCheckpointMaxComponent {
 			return fmt.Errorf("invalid Firecracker checkpoint entry %q", header.Name)
 		}
 		seen[header.Name] = true
@@ -200,7 +299,31 @@ func extractFirecrackerCheckpointArchive(
 			return fmt.Errorf("create Firecracker checkpoint component %s: %w", header.Name, err)
 		}
 		created = append(created, path)
-		written, copyErr := copyFirecrackerCheckpoint(ctx, output, archive)
+		var written int64
+		var copyErr error
+		if sparse {
+			copyErr = output.Truncate(logicalSize)
+			for _, extent := range extents {
+				if copyErr != nil {
+					break
+				}
+				if _, copyErr = output.Seek(extent.Offset, io.SeekStart); copyErr != nil {
+					break
+				}
+				var count int64
+				count, copyErr = copyFirecrackerCheckpoint(
+					ctx,
+					output,
+					io.LimitReader(archive, extent.Length),
+				)
+				written += count
+				if copyErr == nil && count != extent.Length {
+					copyErr = io.ErrUnexpectedEOF
+				}
+			}
+		} else {
+			written, copyErr = copyFirecrackerCheckpoint(ctx, output, archive)
+		}
 		closeErr := errors.Join(output.Sync(), output.Close())
 		if err := errors.Join(copyErr, closeErr); err != nil {
 			return fmt.Errorf("extract Firecracker checkpoint component %s: %w", header.Name, err)
@@ -215,6 +338,53 @@ func extractFirecrackerCheckpointArchive(
 		}
 	}
 	return nil
+}
+
+func parseFirecrackerSparseHeader(
+	header *tar.Header,
+) (int64, []firecrackerSparseExtent, bool, error) {
+	sizeValue, hasSize := header.PAXRecords[firecrackerSparseSizePAX]
+	mapValue, hasMap := header.PAXRecords[firecrackerSparseMapPAX]
+	if !hasSize && !hasMap {
+		if header.Size <= 0 || header.Size > firecrackerCheckpointMaxComponent {
+			return 0, nil, false, errors.New("invalid component size")
+		}
+		return header.Size, nil, false, nil
+	}
+	if !hasSize || !hasMap || header.Size < 0 ||
+		header.Size > firecrackerCheckpointMaxComponent {
+		return 0, nil, false, errors.New("incomplete sparse component metadata")
+	}
+	logicalSize, err := strconv.ParseInt(sizeValue, 10, 64)
+	if err != nil || logicalSize <= 0 || logicalSize > firecrackerCheckpointMaxComponent {
+		return 0, nil, false, errors.New("invalid sparse component size")
+	}
+	extents := make([]firecrackerSparseExtent, 0, strings.Count(mapValue, ",")+1)
+	if mapValue != "" {
+		for _, value := range strings.Split(mapValue, ",") {
+			offsetValue, lengthValue, found := strings.Cut(value, ":")
+			offset, offsetErr := strconv.ParseInt(offsetValue, 10, 64)
+			length, lengthErr := strconv.ParseInt(lengthValue, 10, 64)
+			if !found || offsetErr != nil || lengthErr != nil || offset < 0 || length <= 0 ||
+				offset > logicalSize-length {
+				return 0, nil, false, errors.New("invalid sparse component extent")
+			}
+			if len(extents) != 0 {
+				previous := extents[len(extents)-1]
+				if offset < previous.Offset+previous.Length {
+					return 0, nil, false, errors.New("overlapping sparse component extents")
+				}
+			}
+			extents = append(extents, firecrackerSparseExtent{Offset: offset, Length: length})
+			if len(extents) > firecrackerCheckpointMaxExtents {
+				return 0, nil, false, errors.New("too many sparse component extents")
+			}
+		}
+	}
+	if firecrackerExtentStoredSize(extents) != header.Size {
+		return 0, nil, false, errors.New("sparse component size mismatch")
+	}
+	return logicalSize, extents, true, nil
 }
 
 func copyFirecrackerCheckpoint(

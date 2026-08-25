@@ -112,3 +112,87 @@ func TestFirecrackerCheckpointArchiveCancellationRemovesOutput(t *testing.T) {
 		t.Fatalf("partial checkpoint retained: %v", err)
 	}
 }
+
+func TestFirecrackerCheckpointArchivePreservesSparseFiles(t *testing.T) {
+	root := t.TempDir()
+	files := firecrackerCheckpointFiles{
+		State:   filepath.Join(root, "state"),
+		Memory:  filepath.Join(root, "memory"),
+		Overlay: filepath.Join(root, "overlay"),
+	}
+	for _, path := range []string{files.State, files.Memory} {
+		if err := os.WriteFile(path, []byte("content"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	overlay, err := os.OpenFile(files.Overlay, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const logicalSize = int64(1 << 30)
+	if err := overlay.Truncate(logicalSize); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := overlay.WriteAt([]byte("first"), 4096); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := overlay.WriteAt([]byte("last"), logicalSize-4096); err != nil {
+		t.Fatal(err)
+	}
+	if err := overlay.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	image := filepath.Join(root, "checkpoint.img")
+	if err := createFirecrackerCheckpointArchive(
+		context.Background(), image, false, files,
+	); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(image)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() > 1<<20 {
+		t.Fatalf("sparse checkpoint archive size = %d", info.Size())
+	}
+
+	destinationRoot := filepath.Join(root, "destination")
+	if err := os.Mkdir(destinationRoot, 0700); err != nil {
+		t.Fatal(err)
+	}
+	destination := firecrackerCheckpointFiles{
+		State:   filepath.Join(destinationRoot, "state"),
+		Memory:  filepath.Join(destinationRoot, "memory"),
+		Overlay: filepath.Join(destinationRoot, "overlay"),
+	}
+	if err := extractFirecrackerCheckpointArchive(
+		context.Background(), image, destination,
+	); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := os.Open(destination.Overlay)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restored.Close()
+	restoredInfo, err := restored.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restoredInfo.Size() != logicalSize {
+		t.Fatalf("restored sparse size = %d", restoredInfo.Size())
+	}
+	for offset, expected := range map[int64]string{
+		4096:               "first",
+		logicalSize - 4096: "last",
+	} {
+		data := make([]byte, len(expected))
+		if _, err := restored.ReadAt(data, offset); err != nil {
+			t.Fatal(err)
+		}
+		if string(data) != expected {
+			t.Fatalf("restored data at %d = %q", offset, data)
+		}
+	}
+}

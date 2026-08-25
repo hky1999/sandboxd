@@ -19,6 +19,13 @@ not manage checkpoint names, catalogs, storage, transfer, retention, or
 compatibility negotiation. The caller chooses the checkpoint directory and
 owns a successful artifact.
 
+`ListAvailableRuntimes` reports checkpoint/restore support for each initialized
+runtime handler. A supporting runtime may also advertise guest-visible
+checkpoint handoff and restore-environment paths. Callers can use this metadata
+to configure cooperative workloads and reject unsupported requests early, but
+the `Checkpoint` and restore `Start` RPCs remain authoritative and validate the
+runtime again when they execute.
+
 ## Checkpoint API
 
 `CheckpointRequest` contains:
@@ -90,6 +97,13 @@ target no longer depends on the checkpoint directory.
 | Firecracker | Supported |
 | Kata Containers | Not supported |
 | runc | Not supported |
+
+runsc advertises `/proc/gvisor/checkpoint` as its checkpoint handoff and
+`/proc/gvisor/spec_environ` as its restore environment. Firecracker provides
+the equivalent guest-agent endpoints at `/run/sandboxd/checkpoint` and
+`/run/sandboxd/restore-environ`. These paths are runtime-neutral transport
+metadata: sandboxd does not inject or interpret application-specific
+environment variables.
 
 Unsupported runtimes return `Unimplemented`.
 

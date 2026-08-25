@@ -20,6 +20,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -149,6 +150,69 @@ func TestFirecrackerTmpfsParameters(t *testing.T) {
 	}
 	if _, _, err := firecrackerTmpfsParameters([]string{"bind"}); err == nil {
 		t.Fatal("accepted unsafe tmpfs option")
+	}
+}
+
+func TestCheckpointHandoff(t *testing.T) {
+	root := t.TempDir()
+	environment := []string{
+		"RUNTIME_ID=source",
+		"YR_SEED_FILE=/untrusted",
+		"YR_ENV_FILE=/untrusted",
+	}
+	handoff, err := prepareCheckpointHandoff(root, environment)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer handoff.close()
+	initialEnvironment, err := os.ReadFile(handoff.environmentPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range environment {
+		if !bytes.Contains(initialEnvironment, []byte(entry+"\x00")) {
+			t.Fatalf("initial environment = %q, missing %q", initialEnvironment, entry)
+		}
+	}
+
+	for _, outcome := range []string{"resume", "restore"} {
+		if err := handoff.signal(outcome); err != nil {
+			t.Fatal(err)
+		}
+		result := make(chan struct {
+			value string
+			err   error
+		}, 1)
+		go func() {
+			data, err := os.ReadFile(handoff.fifoPath)
+			result <- struct {
+				value string
+				err   error
+			}{string(data), err}
+		}()
+		select {
+		case read := <-result:
+			if read.err != nil || read.value != outcome {
+				t.Fatalf("handoff = %q, %v, want %q", read.value, read.err, outcome)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("checkpoint handoff timed out")
+		}
+	}
+
+	if err := writeCheckpointEnvironment(
+		handoff.environmentPath,
+		[]string{"RUNTIME_ID=restore"},
+	); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(handoff.environmentPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(data, []byte("RUNTIME_ID=restore\x00")) ||
+		bytes.Contains(data, []byte("RUNTIME_ID=source")) {
+		t.Fatalf("restored environment = %q", data)
 	}
 }
 

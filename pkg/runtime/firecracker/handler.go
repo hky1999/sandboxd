@@ -148,6 +148,17 @@ type Handler struct {
 	instances map[string]*firecrackerInstance
 }
 
+var _ runtimecore.Handler = &Handler{}
+var _ runtimecore.CheckpointHandler = &Handler{}
+var _ runtimecore.CheckpointRestoreCapabilitiesProvider = &Handler{}
+
+func (handler *Handler) CheckpointRestoreCapabilities() runtimecore.CheckpointRestoreCapabilities {
+	return runtimecore.CheckpointRestoreCapabilities{
+		CheckpointHandoffPath: firecrackerproto.CheckpointHandoffPath,
+		RestoreEnvPath:        firecrackerproto.RestoreEnvPath,
+	}
+}
+
 func (handler *Handler) ValidateStartRequest(
 	request *runtimeapi.StartRequest,
 ) error {

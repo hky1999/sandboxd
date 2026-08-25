@@ -56,6 +56,38 @@ func (handler *Handler) Checkpoint(
 	if err := api.pause(ctx); err != nil {
 		return fmt.Errorf("pause Firecracker sandbox %s: %w", sandboxID, err)
 	}
+	handoffReleased := false
+	defer func() {
+		if retErr == nil || handoffReleased ||
+			!firecrackerProcessMatches(state.PID, handler.binary, state.APIPath, state.ID) {
+			return
+		}
+		cleanupCtx, cancel := context.WithTimeout(
+			context.WithoutCancel(ctx),
+			firecrackerAgentTimeout,
+		)
+		defer cancel()
+		if err := api.resume(cleanupCtx); err != nil {
+			retErr = errors.Join(
+				retErr,
+				fmt.Errorf("resume Firecracker sandbox %s after checkpoint failure: %w", sandboxID, err),
+			)
+			return
+		}
+		if err := requestFirecrackerAgent(
+			cleanupCtx,
+			state.VsockPath,
+			firecrackerproto.MessageCheckpoint,
+			firecrackerproto.CheckpointRequest{Outcome: "error"},
+		); err != nil {
+			retErr = errors.Join(
+				retErr,
+				fmt.Errorf("release Firecracker sandbox %s after checkpoint failure: %w", sandboxID, err),
+			)
+			return
+		}
+		handoffReleased = true
+	}()
 
 	workDir, err := os.MkdirTemp(filepath.Dir(imagePath), ".firecracker-snapshot-")
 	if err != nil {
@@ -83,6 +115,15 @@ func (handler *Handler) Checkpoint(
 		if err := api.resume(ctx); err != nil {
 			return fmt.Errorf("resume Firecracker sandbox %s: %w", sandboxID, err)
 		}
+		if err := requestFirecrackerAgent(
+			ctx,
+			state.VsockPath,
+			firecrackerproto.MessageCheckpoint,
+			firecrackerproto.CheckpointRequest{Outcome: "resume"},
+		); err != nil {
+			return fmt.Errorf("release checkpointed Firecracker sandbox %s: %w", sandboxID, err)
+		}
+		handoffReleased = true
 		return nil
 	}
 
@@ -288,6 +329,17 @@ func (handler *Handler) Restore(
 		plan.configure.Network,
 	); err != nil {
 		return fmt.Errorf("configure restored Firecracker network: %w", err)
+	}
+	if err := requestFirecrackerAgent(
+		agentCtx,
+		vsockPath,
+		firecrackerproto.MessageCheckpoint,
+		firecrackerproto.CheckpointRequest{
+			Outcome:     "restore",
+			Environment: plan.configure.Process.Env,
+		},
+	); err != nil {
+		return fmt.Errorf("release restored Firecracker sandbox: %w", err)
 	}
 	instance.markConfigured()
 	if err := handler.persistInstance(instance); err != nil {

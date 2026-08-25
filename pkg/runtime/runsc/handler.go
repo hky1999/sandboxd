@@ -35,6 +35,7 @@ import (
 
 var _ runtimecore.Handler = &Handler{}
 var _ runtimecore.CheckpointHandler = &Handler{}
+var _ runtimecore.CheckpointRestoreCapabilitiesProvider = &Handler{}
 var _ runtimecore.SandboxDefaultsProvider = &Handler{}
 
 const (
@@ -42,6 +43,8 @@ const (
 	SplitSeparator             = "__.__"
 	checkpointImageName        = "checkpoint.img"
 	runscRestoreCleanupTimeout = 20 * time.Second
+	checkpointHandoffPath      = "/proc/gvisor/checkpoint"
+	restoreEnvPath             = "/proc/gvisor/spec_environ"
 )
 
 // Handler manages the runsc sandbox lifecycle.
@@ -106,6 +109,13 @@ func NewHandler(cfg config.Config, bin string, loader runtimecore.OciLoader) (*H
 
 func (r *Handler) SandboxDefaults() runtimecore.SandboxDefaults {
 	return runtimecore.LoaderSandboxDefaults(r.ociLoader)
+}
+
+func (r *Handler) CheckpointRestoreCapabilities() runtimecore.CheckpointRestoreCapabilities {
+	return runtimecore.CheckpointRestoreCapabilities{
+		CheckpointHandoffPath: checkpointHandoffPath,
+		RestoreEnvPath:        restoreEnvPath,
+	}
 }
 
 func (r *Handler) Start(ctx context.Context, config runtimecore.StartConfig) error {

@@ -30,6 +30,9 @@ const (
 	Version   = uint16(1)
 	AgentPort = uint32(52)
 
+	CheckpointHandoffPath = "/run/sandboxd/checkpoint"
+	RestoreEnvPath        = "/run/sandboxd/restore-environ"
+
 	maxMessageSize = 16 << 20
 	maxFrameSize   = 16 << 20
 )
@@ -46,6 +49,7 @@ const (
 	MessageExecTTY    MessageType = 5
 	MessageWait       MessageType = 6
 	MessageSetNetwork MessageType = 7
+	MessageCheckpoint MessageType = 8
 	MessageResponse   MessageType = 100
 )
 
@@ -95,6 +99,14 @@ type ConfigureRequest struct {
 	Network       NetworkSpec `json:"network"`
 	Mounts        []MountSpec `json:"mounts,omitempty"`
 	Files         []FileSpec  `json:"files,omitempty"`
+}
+
+// CheckpointRequest releases a guest process after a VM checkpoint. Restore
+// supplies the target process environment so a snapshotted runtime can adopt
+// its new physical identity before reconnecting to the control plane.
+type CheckpointRequest struct {
+	Outcome     string   `json:"outcome"`
+	Environment []string `json:"environment,omitempty"`
 }
 
 type ExecRequest struct {

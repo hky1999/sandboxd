@@ -414,9 +414,24 @@ func (h *sandboxService) ListAvailableRuntimes(
 	}
 	runtimeClasses := h.serviceHandler.Keys()
 	sort.Strings(runtimeClasses)
+	runtimes := make([]*runtime.RuntimeInfo, 0, len(runtimeClasses))
+	for _, runtimeClass := range runtimeClasses {
+		info := &runtime.RuntimeInfo{RuntimeClass: runtimeClass}
+		handler, _ := h.serviceHandler.Get(runtimeClass)
+		if _, ok := handler.(svc.CheckpointHandler); ok {
+			info.SupportsCheckpointRestore = true
+		}
+		if provider, ok := handler.(svc.CheckpointRestoreCapabilitiesProvider); ok {
+			capabilities := provider.CheckpointRestoreCapabilities()
+			info.CheckpointHandoffPath = capabilities.CheckpointHandoffPath
+			info.RestoreEnvPath = capabilities.RestoreEnvPath
+		}
+		runtimes = append(runtimes, info)
+	}
 
 	return &runtime.ListAvailableRuntimesResponse{
 		RuntimeClasses: runtimeClasses,
+		Runtimes:       runtimes,
 	}, nil
 }
 

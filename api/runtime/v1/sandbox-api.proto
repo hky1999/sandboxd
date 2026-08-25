@@ -442,9 +442,24 @@ message StatsResponse {
 // for new sandbox creation.
 message ListAvailableRuntimesRequest {}
 
+// RuntimeInfo describes one initialized runtime handler and its optional
+// checkpoint/restore application handoff interface.
+message RuntimeInfo {
+  // RuntimeClass is the handler name accepted by sandbox start requests.
+  string runtime_class = 1;
+  // SupportsCheckpointRestore reports whether the handler implements both operations.
+  bool supports_checkpoint_restore = 2;
+  // CheckpointHandoffPath is the guest-visible resume/restore/error endpoint.
+  string checkpoint_handoff_path = 3;
+  // RestoreEnvPath exposes the target OCI process environment after restore.
+  string restore_env_path = 4;
+}
+
 // ListAvailableRuntimesResponse contains the available runtime class snapshot.
 message ListAvailableRuntimesResponse {
   // RuntimeClasses contains the sorted handler names accepted by sandbox start requests.
   // Configured runtime classes whose handlers failed to initialize are excluded.
   repeated string runtime_classes = 1;
+  // Runtimes contains detailed capabilities in runtime_classes order.
+  repeated RuntimeInfo runtimes = 2;
 }

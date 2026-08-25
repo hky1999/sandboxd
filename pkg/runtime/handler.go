@@ -38,6 +38,20 @@ type CheckpointHandler interface {
 	Restore(context.Context, StartConfig) error
 }
 
+// CheckpointRestoreCapabilities describes the optional application-facing
+// handoff interface exposed inside a restored sandbox. Empty paths mean the
+// runtime supports transparent checkpoint/restore without application help.
+type CheckpointRestoreCapabilities struct {
+	CheckpointHandoffPath string
+	RestoreEnvPath        string
+}
+
+// CheckpointRestoreCapabilitiesProvider optionally describes the guest-facing
+// application handoff exposed by a CheckpointHandler.
+type CheckpointRestoreCapabilitiesProvider interface {
+	CheckpointRestoreCapabilities() CheckpointRestoreCapabilities
+}
+
 type CheckpointConfig struct {
 	ID           string
 	Directory    string
