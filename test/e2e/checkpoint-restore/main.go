@@ -50,7 +50,7 @@ type options struct {
 
 func main() {
 	var value options
-	flag.StringVar(&value.action, "action", "", "start, checkpoint, or restore")
+	flag.StringVar(&value.action, "action", "", "start, checkpoint, restore, or delete")
 	flag.StringVar(&value.socket, "socket", "", "sandboxd Unix socket")
 	flag.StringVar(&value.runtime, "runtime", "runsc", "runtime handler")
 	flag.StringVar(&value.rootfs, "rootfs", "", "local rootfs path")
@@ -82,8 +82,8 @@ func main() {
 }
 
 func run(value options) error {
-	if value.socket == "" || value.requestFile == "" {
-		return errors.New("--socket and --request-file are required")
+	if value.socket == "" {
+		return errors.New("--socket is required")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), value.timeout)
 	defer cancel()
@@ -109,8 +109,10 @@ func run(value options) error {
 		return checkpoint(ctx, client, value)
 	case "restore":
 		return restore(ctx, client, value)
+	case "delete":
+		return deleteSandbox(ctx, client, value)
 	default:
-		return errors.New("--action must be start, checkpoint, or restore")
+		return errors.New("--action must be start, checkpoint, restore, or delete")
 	}
 }
 
@@ -121,6 +123,9 @@ func start(
 ) error {
 	if value.rootfs == "" || value.sandboxID == "" {
 		return errors.New("--rootfs and --sandbox-id are required for start")
+	}
+	if value.requestFile == "" {
+		return errors.New("--request-file is required for start")
 	}
 	if value.storageMB > ^uint64(0)/(1024*1024) {
 		return errors.New("--storage-mb overflows bytes")
@@ -224,6 +229,9 @@ func restore(
 	if value.targetID == "" || value.checkpointDir == "" {
 		return errors.New("--target-id and --checkpoint-dir are required for restore")
 	}
+	if value.requestFile == "" {
+		return errors.New("--request-file is required for restore")
+	}
 	data, err := os.ReadFile(value.requestFile)
 	if err != nil {
 		return err
@@ -244,5 +252,24 @@ func restore(
 		return fmt.Errorf("restore response = %+v", response)
 	}
 	fmt.Println(response.ID)
+	return nil
+}
+
+// deleteSandbox releases a sandbox through the normal Delete RPC, cleaning
+// its runtime state and writable layer — the acceptance counterpart to
+// checkpoint/restore (previously only reachable through the sbox CLI).
+func deleteSandbox(
+	ctx context.Context,
+	client runtime.SandboxServiceClient,
+	value options,
+) error {
+	if value.sandboxID == "" {
+		return errors.New("--sandbox-id is required for delete")
+	}
+	if _, err := client.Delete(ctx, &runtime.DeleteRequest{
+		ID: value.sandboxID,
+	}); err != nil {
+		return fmt.Errorf("delete: %w", err)
+	}
 	return nil
 }
