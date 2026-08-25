@@ -169,6 +169,25 @@ func TestFinalizeCheckpointV2ManifestIsSealedOnce(t *testing.T) {
 	}
 }
 
+func TestFsyncCheckpointDataRequiresAllComponents(t *testing.T) {
+	dir := t.TempDir()
+	files := sealArtifactFixture(t, dir)
+	if err := fsyncFirecrackerCheckpointData(files); err != nil {
+		t.Fatalf("fsync v2 checkpoint data: %v", err)
+	}
+
+	if err := os.Remove(files.Memory); err != nil {
+		t.Fatalf("remove memory component: %v", err)
+	}
+	err := fsyncFirecrackerCheckpointData(files)
+	if err == nil {
+		t.Fatal("fsync v2 checkpoint data without memory succeeded")
+	}
+	if !strings.Contains(err.Error(), firecrackerCheckpointMemoryName) {
+		t.Fatalf("fsync error does not name the missing component: %v", err)
+	}
+}
+
 func TestOpenCheckpointSniffsLayouts(t *testing.T) {
 	dir := t.TempDir()
 

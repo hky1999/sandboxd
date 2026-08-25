@@ -435,3 +435,34 @@ func syncFirecrackerCheckpointDir(dir string) error {
 	}
 	return nil
 }
+
+// fsyncFirecrackerCheckpointData flushes the checkpoint components to stable
+// storage. Firecracker is asked to create snapshots with deferred_sync, so
+// the memory and state files only reach the page cache inside the pause
+// window; this pass, run after the guest resumes and before the manifest
+// lands, is what makes the sealed directory actually durable. The overlay is
+// already synced by its reflink clone but is fsynced again here to keep the
+// invariant uniform: everything in the directory is durable before the
+// manifest exists.
+func fsyncFirecrackerCheckpointData(files firecrackerCheckpointFiles) error {
+	for _, component := range firecrackerCheckpointComponents(files) {
+		file, err := os.OpenFile(component.path, os.O_RDWR, 0)
+		if err != nil {
+			return fmt.Errorf(
+				"open Firecracker checkpoint component %s for fsync: %w",
+				component.name, err,
+			)
+		}
+		err = file.Sync()
+		if closeErr := file.Close(); err == nil {
+			err = closeErr
+		}
+		if err != nil {
+			return fmt.Errorf(
+				"fsync Firecracker checkpoint component %s: %w",
+				component.name, err,
+			)
+		}
+	}
+	return nil
+}

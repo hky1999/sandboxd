@@ -130,6 +130,10 @@ func (api *firecrackerAPI) createSnapshot(
 		"snapshot_type": snapshotType,
 		"snapshot_path": statePath,
 		"mem_file_path": memoryPath,
+		// Durability is delegated: the checkpoint is fsynced after the guest
+		// resumes, right before the manifest commits the generation. This
+		// keeps the multi-second memory-file fsync out of the pause window.
+		"deferred_sync": true,
 	})
 }
 

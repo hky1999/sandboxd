@@ -186,8 +186,9 @@ func (handler *Handler) Checkpoint(
 	}
 	tResumed := time.Now()
 
-	// Post-resume tail: sealing digests and adopting the base cost seconds per
-	// GiB on hashing and copying and must not extend the pause window.
+	// Post-resume tail: fsyncing the artifacts, sealing digests and adopting
+	// the base cost seconds per GiB on I/O and hashing and must not extend
+	// the pause window.
 	memoryInfo, err := os.Lstat(files.Memory)
 	if err != nil {
 		adoptCheckpointMemory(instance, files.Memory, false)
@@ -196,6 +197,17 @@ func (handler *Handler) Checkpoint(
 			"inspect Firecracker checkpoint memory for %s: %w", sandboxID, err,
 		))
 	}
+	// The snapshot was created with deferred_sync, so its writes only reached
+	// the page cache: durability happens here, before the manifest commits
+	// the generation.
+	if err := fsyncFirecrackerCheckpointData(files); err != nil {
+		adoptCheckpointMemory(instance, files.Memory, false)
+		discardUnsealedFirecrackerCheckpoint(files)
+		return errors.Join(resumeErr, fmt.Errorf(
+			"fsync Firecracker checkpoint data for %s: %w", sandboxID, err,
+		))
+	}
+	tFsynced := time.Now()
 	manifest := &firecrackerCheckpointManifest{
 		SnapshotType: snapshotType,
 		MemorySize:   memoryInfo.Size(),
@@ -220,12 +232,13 @@ func (handler *Handler) Checkpoint(
 	logrus.Infof(
 		"firecracker: checkpointed sandbox %s type=%s memory=%dMiB dir=%s "+
 			"phases: layout=%dms flush=%dms pause=%dms snapshot=%dms overlay=%dms "+
-			"resume=%dms seal=%dms total=%dms",
+			"resume=%dms fsync=%dms seal=%dms total=%dms",
 		sandboxID, snapshotType, memoryInfo.Size()>>20, config.Directory,
 		phaseMS(tStarted, tPrepared), phaseMS(tPrepared, tFlushed),
 		phaseMS(tFlushed, tPaused), phaseMS(tPaused, tSnapshotted),
 		phaseMS(tSnapshotted, tOverlay),
-		phaseMS(tOverlay, tResumed), phaseMS(tResumed, tEnd), phaseMS(tStarted, tEnd),
+		phaseMS(tOverlay, tResumed), phaseMS(tResumed, tFsynced),
+		phaseMS(tFsynced, tEnd), phaseMS(tStarted, tEnd),
 	)
 
 	if !config.LeaveRunning {

@@ -69,6 +69,23 @@ caller that deletes or mutates the most recent checkpoint directory drops the
 sandbox back to a full first window on the next checkpoint; deleting older
 generations is always safe.
 
+Durability is deliberately kept out of the pause window. Firecracker is asked
+to create the snapshot with `deferred_sync`, so its writes only reach the page
+cache while the guest is paused; after the guest resumes, sandboxd fsyncs the
+components and only then lands the manifest. The pause window is therefore
+pause → snapshot writes → overlay clone → resume, and the manifest remains the
+commit point: a generation without a manifest is partial output. A crash
+between resume and manifest commit discards the newest generation and restores
+from the previous one — sound because each generation writes into a fresh
+clone and never mutates its base. Firecracker re-arms its soft-dirty window
+before the artifact is durable (an ordering that predates the deferral), so
+writes the guest performed during that gap belong to a generation that is
+discarded with the artifact; checkpoint success is only reported after the
+manifest commits. Write errors such as `ENOSPC` or `EIO` can therefore surface
+at the post-resume fsync instead of the snapshot request; sandboxd treats this
+like any seal failure (the partial generation is discarded and the next
+checkpoint rebuilds from a first window).
+
 `snapshot_type` is a Firecracker-specific control with a validated enum: an
 empty value keeps the automatic tier selection above (a pagemap `Incremental`
 generation against the memory file a restore loaded, `SoftDirty` windows
@@ -84,7 +101,8 @@ the field.
 
 The manifest digests the small components (`vmstate`, `overlay.ext4`); hashing
 the memory file is skipped because it costs seconds of CPU per GiB and would
-dominate an otherwise sub-second incremental checkpoint.
+dominate an otherwise sub-second incremental checkpoint. Digests are computed
+after the post-resume fsync, so the manifest attests durable bytes.
 
 The manifest also records a `compat` tuple — sha256 digests of the Firecracker
 binary, guest kernel, and initrd, plus architecture and kernel arguments —
