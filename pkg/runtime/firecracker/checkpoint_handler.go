@@ -130,11 +130,52 @@ func (handler *Handler) Checkpoint(
 		)
 	}
 
+	// Best-effort guest shrink (E2B absorption), config-gated because it is
+	// net-negative for read-hot workloads: dropping the caches makes the next
+	// re-read re-materialize pages through block DMA, which re-dirties the
+	// next window (measured: snapshot phase 23-72ms without vs 130-143ms with
+	// on a continuous 512MiB re-read loop). It helps long parks of
+	// cold-cache sandboxes, which is why it stays available.
+	if handler.shrinkBeforeCheckpoint {
+		shrinkCtx, shrinkCancel := context.WithTimeout(ctx, firecrackerFlushTimeout)
+		shrinkErr := requestFirecrackerAgentWaiting(
+			shrinkCtx,
+			state.VsockPath,
+			firecrackerproto.MessageShrink,
+			nil,
+			firecrackerFlushTimeout,
+		)
+		shrinkCancel()
+		if shrinkErr != nil {
+			logrus.Debugf(
+				"firecracker: guest shrink before checkpointing %s skipped: %v",
+				sandboxID, shrinkErr,
+			)
+		}
+	}
+
 	if err := api.pause(ctx); err != nil {
 		discardUnsealedFirecrackerCheckpoint(files)
 		return fmt.Errorf("pause Firecracker sandbox %s: %w", sandboxID, err)
 	}
 	tPaused := time.Now()
+	// Clone the writable layer BEFORE the memory snapshot: the snapshot writes
+	// the whole guest memory into the page cache inside the window, and an
+	// overlay FICLONE after it can stall for seconds on the same filesystem's
+	// writeback of that fresh dirty data (measured 12.8s at a 2GiB layer after
+	// a 4GiB snapshot). Cloning first runs with a cache that does not yet hold
+	// the snapshot, removing the interaction. No in-clone fsync either — the
+	// seal-phase fsync covers durability.
+	if _, err := cloneFileNoSync(state.OverlayPath, files.Overlay); err != nil {
+		discardUnsealedFirecrackerCheckpoint(files)
+		if config.LeaveRunning {
+			err = errors.Join(err, fmt.Errorf(
+				"resume Firecracker sandbox %s: %w", sandboxID, api.resume(ctx),
+			))
+		}
+		return fmt.Errorf("snapshot Firecracker writable layer for %s: %w", sandboxID, err)
+	}
+	tOverlay := time.Now()
 	if err := api.createSnapshot(ctx, files.State, files.Memory, snapshotType); err != nil {
 		if base != "" && layoutMemorySize > 0 {
 			// A failed snapshot request disarms the Firecracker ledger, so
@@ -164,21 +205,8 @@ func (handler *Handler) Checkpoint(
 	// The snapshot succeeded: files.Memory is now the complete guest memory
 	// image and the baseline the Firecracker ledger tracks.
 	tSnapshotted := time.Now()
-	if _, err := cloneFile(state.OverlayPath, files.Overlay); err != nil {
-		// The window already reset, so keep the chain alive through the base
-		// even though this artifact cannot be sealed.
-		adoptCheckpointMemory(instance, files.Memory, false)
-		discardUnsealedFirecrackerCheckpoint(files)
-		if config.LeaveRunning {
-			err = errors.Join(err, fmt.Errorf(
-				"resume Firecracker sandbox %s: %w", sandboxID, api.resume(ctx),
-			))
-		}
-		return fmt.Errorf("snapshot Firecracker writable layer for %s: %w", sandboxID, err)
-	}
 
 	resumeErr := error(nil)
-	tOverlay := time.Now()
 	if config.LeaveRunning {
 		if err := api.resume(ctx); err != nil {
 			resumeErr = fmt.Errorf("resume Firecracker sandbox %s: %w", sandboxID, err)
@@ -186,8 +214,9 @@ func (handler *Handler) Checkpoint(
 	}
 	tResumed := time.Now()
 
-	// Post-resume tail: sealing digests and adopting the base cost seconds per
-	// GiB on hashing and copying and must not extend the pause window.
+	// Post-resume tail: fsyncing the artifacts, sealing digests and adopting
+	// the base cost seconds per GiB on I/O and hashing and must not extend
+	// the pause window.
 	memoryInfo, err := os.Lstat(files.Memory)
 	if err != nil {
 		adoptCheckpointMemory(instance, files.Memory, false)
@@ -196,6 +225,17 @@ func (handler *Handler) Checkpoint(
 			"inspect Firecracker checkpoint memory for %s: %w", sandboxID, err,
 		))
 	}
+	// The snapshot was created with deferred_sync, so its writes only reached
+	// the page cache: durability happens here, before the manifest commits
+	// the generation.
+	if err := fsyncFirecrackerCheckpointData(files); err != nil {
+		adoptCheckpointMemory(instance, files.Memory, false)
+		discardUnsealedFirecrackerCheckpoint(files)
+		return errors.Join(resumeErr, fmt.Errorf(
+			"fsync Firecracker checkpoint data for %s: %w", sandboxID, err,
+		))
+	}
+	tFsynced := time.Now()
 	manifest := &firecrackerCheckpointManifest{
 		SnapshotType: snapshotType,
 		MemorySize:   memoryInfo.Size(),
@@ -204,7 +244,15 @@ func (handler *Handler) Checkpoint(
 	if base != "" {
 		manifest.BaseMemory = filepath.Base(filepath.Dir(base))
 	}
-	if err := finalizeFirecrackerCheckpointV2(ctx, files, manifest); err != nil {
+	// Digest the overlay only for Full snapshots (template manufacture):
+	// incremental generations are short-lived rolling artifacts whose
+	// overlay is a reflink of the live one, and hashing it costs ~5ms/MiB
+	// of CPU plus the same page cache re-read per generation. Their
+	// integrity rests on the reflink copy-on-write and Firecracker's own
+	// writes, the same rationale that excludes the memory file from the
+	// digests; restore skips components without a recorded digest.
+	digestOverlay := snapshotType == firecrackerSnapshotTypeFull
+	if err := finalizeFirecrackerCheckpointV2(ctx, files, manifest, digestOverlay); err != nil {
 		adoptCheckpointMemory(instance, files.Memory, false)
 		discardUnsealedFirecrackerCheckpoint(files)
 		return errors.Join(resumeErr, fmt.Errorf(
@@ -220,12 +268,13 @@ func (handler *Handler) Checkpoint(
 	logrus.Infof(
 		"firecracker: checkpointed sandbox %s type=%s memory=%dMiB dir=%s "+
 			"phases: layout=%dms flush=%dms pause=%dms snapshot=%dms overlay=%dms "+
-			"resume=%dms seal=%dms total=%dms",
+			"resume=%dms fsync=%dms seal=%dms total=%dms",
 		sandboxID, snapshotType, memoryInfo.Size()>>20, config.Directory,
 		phaseMS(tStarted, tPrepared), phaseMS(tPrepared, tFlushed),
-		phaseMS(tFlushed, tPaused), phaseMS(tPaused, tSnapshotted),
-		phaseMS(tSnapshotted, tOverlay),
-		phaseMS(tOverlay, tResumed), phaseMS(tResumed, tEnd), phaseMS(tStarted, tEnd),
+		phaseMS(tFlushed, tPaused), phaseMS(tOverlay, tSnapshotted),
+		phaseMS(tPaused, tOverlay),
+		phaseMS(tSnapshotted, tResumed), phaseMS(tResumed, tFsynced),
+		phaseMS(tFsynced, tEnd), phaseMS(tStarted, tEnd),
 	)
 
 	if !config.LeaveRunning {
@@ -444,6 +493,7 @@ func adoptCheckpointMemory(
 func instantiateFirecrackerCheckpoint(
 	ctx context.Context,
 	artifact *firecrackerCheckpointArtifact,
+	digests *checkpointDigestCache,
 	checkpointDir, stateDir, overlayPath string,
 ) (firecrackerCheckpointFiles, int64, error) {
 	files := firecrackerCheckpointFiles{Overlay: overlayPath}
@@ -467,7 +517,7 @@ func instantiateFirecrackerCheckpoint(
 		}
 		return files, info.Size(), nil
 	case firecrackerCheckpointLayoutV2Directory:
-		if err := verifyFirecrackerCheckpointDigests(ctx, artifact); err != nil {
+		if err := digests.verifyFirecrackerCheckpointDigests(ctx, artifact); err != nil {
 			return files, 0, fmt.Errorf(
 				"verify Firecracker checkpoint %s: %w",
 				checkpointDir, err,
@@ -607,6 +657,7 @@ func (handler *Handler) Restore(
 	checkpointFiles, memorySize, err := instantiateFirecrackerCheckpoint(
 		ctx,
 		artifact,
+		&handler.digestCache,
 		startConfig.CheckpointDir,
 		stateDir,
 		filepath.Join(storageDir, "overlay.ext4"),

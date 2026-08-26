@@ -45,6 +45,7 @@ func TestInstantiateCheckpointV2UsesArtifactInPlace(t *testing.T) {
 	files, memorySize, err := instantiateFirecrackerCheckpoint(
 		context.Background(),
 		artifact,
+		&checkpointDigestCache{},
 		filepath.Join(root, "gen1"),
 		filepath.Join(root, "state"),
 		overlayCopy,
@@ -95,6 +96,7 @@ func TestInstantiateCheckpointV2RejectsTamperedArtifact(t *testing.T) {
 	_, _, err := instantiateFirecrackerCheckpoint(
 		context.Background(),
 		artifact,
+		&checkpointDigestCache{},
 		dir,
 		filepath.Join(root, "state"),
 		filepath.Join(root, "overlay"),
@@ -134,7 +136,7 @@ func TestInstantiateCheckpointV1ArchiveExtracts(t *testing.T) {
 	}
 	overlayPath := filepath.Join(root, "overlay")
 	files, memorySize, err := instantiateFirecrackerCheckpoint(
-		context.Background(), artifact, archiveDir, stateDir, overlayPath,
+		context.Background(), artifact, &checkpointDigestCache{}, archiveDir, stateDir, overlayPath,
 	)
 	if err != nil {
 		t.Fatalf("instantiate v1 checkpoint: %v", err)
@@ -164,6 +166,7 @@ func TestInstantiateCheckpointRejectsUnalignedMemory(t *testing.T) {
 	_, _, err = instantiateFirecrackerCheckpoint(
 		context.Background(),
 		artifact,
+		&checkpointDigestCache{},
 		dir,
 		filepath.Join(root, "state"),
 		filepath.Join(root, "overlay"),
@@ -187,7 +190,7 @@ func sealV2ArtifactFixtureMemSize(t *testing.T, dir string, memorySize int64) fi
 	if err := finalizeFirecrackerCheckpointV2(context.Background(), files, &firecrackerCheckpointManifest{
 		SnapshotType: firecrackerSnapshotTypeSoftDirty,
 		MemorySize:   memorySize,
-	}); err != nil {
+	}, true); err != nil {
 		t.Fatalf("finalize v2 checkpoint: %v", err)
 	}
 	return files
