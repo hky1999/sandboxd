@@ -244,7 +244,15 @@ func (handler *Handler) Checkpoint(
 	if base != "" {
 		manifest.BaseMemory = filepath.Base(filepath.Dir(base))
 	}
-	if err := finalizeFirecrackerCheckpointV2(ctx, files, manifest); err != nil {
+	// Digest the overlay only for Full snapshots (template manufacture):
+	// incremental generations are short-lived rolling artifacts whose
+	// overlay is a reflink of the live one, and hashing it costs ~5ms/MiB
+	// of CPU plus the same page cache re-read per generation. Their
+	// integrity rests on the reflink copy-on-write and Firecracker's own
+	// writes, the same rationale that excludes the memory file from the
+	// digests; restore skips components without a recorded digest.
+	digestOverlay := snapshotType == firecrackerSnapshotTypeFull
+	if err := finalizeFirecrackerCheckpointV2(ctx, files, manifest, digestOverlay); err != nil {
 		adoptCheckpointMemory(instance, files.Memory, false)
 		discardUnsealedFirecrackerCheckpoint(files)
 		return errors.Join(resumeErr, fmt.Errorf(

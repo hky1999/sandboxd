@@ -177,6 +177,7 @@ func finalizeFirecrackerCheckpointV2(
 	ctx context.Context,
 	files firecrackerCheckpointFiles,
 	manifest *firecrackerCheckpointManifest,
+	digestOverlay bool,
 ) (retErr error) {
 	manifest.Version = firecrackerCheckpointVersion2
 	manifest.CreatedAt = time.Now().UTC()
@@ -196,6 +197,13 @@ func finalizeFirecrackerCheckpointV2(
 	manifest.Digests = make(map[string]string, 2)
 	for _, component := range firecrackerCheckpointComponents(files) {
 		if component.name == firecrackerCheckpointMemoryName {
+			continue
+		}
+		if component.name == firecrackerCheckpointOverlayName && !digestOverlay {
+			// Rolling generations skip the overlay digest too: hashing it
+			// costs ~5ms/MiB of CPU and re-reads it into the page cache on
+			// every generation. Full snapshots (template manufacture) keep
+			// digesting it.
 			continue
 		}
 		digest, err := digestFirecrackerCheckpointComponent(ctx, component.name, component.path)

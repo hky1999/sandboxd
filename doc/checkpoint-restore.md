@@ -102,9 +102,14 @@ first window to keep the chain consistent — the sealed manifest records what
 was actually taken. Runtimes without incremental checkpoints (runsc) ignore
 the field.
 
-The manifest digests the small components (`vmstate`, `overlay.ext4`); hashing
-the memory file is skipped because it costs seconds of CPU per GiB and would
-dominate an otherwise sub-second incremental checkpoint. Digests are computed
+The manifest digests the small components; hashing the memory file is skipped
+because it costs seconds of CPU per GiB and would dominate an otherwise
+sub-second incremental checkpoint. Full snapshots (template manufacture) also
+digest `overlay.ext4`; rolling incremental generations skip the overlay digest
+for the same reason — hashing it costs ~5ms/MiB of CPU and re-reads it into
+the page cache on every generation, and a rolling generation's integrity rests
+on the reflink copy-on-write and Firecracker's own writes. Restores skip
+components without a recorded digest either way. Digests are computed
 after the post-resume fsync, so the manifest attests durable bytes. On restore
 the verification is memoized per sandboxd process: a component whose size and
 mtime are unchanged since a previous successful verification is not re-hashed,
