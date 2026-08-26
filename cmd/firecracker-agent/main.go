@@ -344,6 +344,17 @@ func configure(request firecrackerproto.ConfigureRequest) error {
 	state.configured = true
 	state.mainDone = make(chan struct{})
 	go waitMainProcess(command, state.mainDone)
+
+	// Set up the cooperative checkpoint handoff (PR #30): a FIFO inside the
+	// guest that applications can read to learn about checkpoint lifecycle
+	// events, and an environment file that carries the restore target env.
+	handoff, handoffErr := prepareCheckpointHandoff(containerRoot, request.Process.Env)
+	if handoffErr != nil {
+		log.Printf("prepare checkpoint handoff: %v (cooperative notifications disabled)", handoffErr)
+	} else {
+		state.handoff = handoff
+	}
+
 	log.Printf("started sandbox process pid=%d command=%q", command.Process.Pid, request.Process.Args)
 	return nil
 }
