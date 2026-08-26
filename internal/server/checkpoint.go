@@ -345,7 +345,12 @@ func (h *sandboxService) existingRestorePhysicalFact(
 	state := physical.Status.Get().State()
 	identityMatches := expectedIdentity != nil && metadata.RestoreIdentity != nil &&
 		proto.Equal(metadata.RestoreIdentity, expectedIdentity)
-	if expectedIdentity != nil && state == runtime.SandboxState_SANDBOX_STATE_EXITED && !identityMatches {
+	// W8 (G3b arm-B finding): the endogenous monitor unparks SECONDS after the
+	// park (park frees memory -> ratio drops -> FIFO wake), landing inside the
+	// in-flight delete window where the record may not have reached EXITED yet
+	// (UNKNOWN). Any non-RUNNING sandbox with a non-matching identity is a park
+	// leftover — only a live RUNNING sandbox is a genuine conflict.
+	if expectedIdentity != nil && state != runtime.SandboxState_SANDBOX_STATE_RUNNING && !identityMatches {
 		// Complete the deferred destroy SYNCHRONOUSLY (runsc delete, fs,
 		// ACL, resources, record): a bare record drop let the subsequent
 		// create race the leftover container root ("filesystem state
@@ -358,7 +363,7 @@ func (h *sandboxService) existingRestorePhysicalFact(
 		}
 		return nil, false, nil
 	}
-	if expectedIdentity != nil && metadata.RestoreIdentity == nil && state != runtime.SandboxState_SANDBOX_STATE_EXITED {
+	if expectedIdentity != nil && metadata.RestoreIdentity == nil && state == runtime.SandboxState_SANDBOX_STATE_RUNNING {
 		return nil, true, fmt.Errorf("sandbox %s is %s; cannot restore onto a live sandbox: %w",
 			request.SandboxID, state, errord.ErrFailedPrecondition)
 	}
