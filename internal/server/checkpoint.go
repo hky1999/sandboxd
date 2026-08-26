@@ -333,33 +333,36 @@ func (h *sandboxService) existingRestorePhysicalFact(
 			request.SandboxID, errord.ErrFailedPrecondition)
 	}
 	// A park (checkpoint with leaveRunning=false) exits the sandbox but leaves
-	// its pre-park physical record in place until the deferred destroy cleanup
-	// removes it; a restore landing inside that window used to fail here with
-	// a replay conflict (variable 26-45s+ window, orchestrators had to retry).
-	// A record whose RestoreIdentity is nil originates from a plain create and
-	// was never restored: if the sandbox has exited it is a park leftover, not
-	// a replay — drop the stale record and let the restore proceed. A sandbox
-	// that is still running keeps conflicting (restoring onto a live ID is a
-	// genuine error).
-	if expectedIdentity != nil && metadata.RestoreIdentity == nil {
-		state := physical.Status.Get().State()
-		if state == runtime.SandboxState_SANDBOX_STATE_EXITED {
-			// Complete the deferred destroy SYNCHRONOUSLY (runsc delete, fs,
-			// ACL, resources, record): a bare record drop let the subsequent
-			// create race the leftover container root ("filesystem state
-			// already exists", observed at +3s) and a concurrent YR retry then
-			// hit the half-written INTENT record as a replay conflict (observed
-			// at +5s). deleteSandbox coalesces with an in-flight destroy.
-			if err := h.deleteSandbox(ctx, request.SandboxID); err != nil {
-				return nil, true, fmt.Errorf("clean up parked sandbox %s before restore: %w",
-					request.SandboxID, err)
-			}
-			return nil, false, nil
+	// its physical record in place until the deferred destroy cleanup removes
+	// it; a restore landing inside that window used to fail here with a replay
+	// conflict (variable 26-45s+ window, orchestrators had to retry).
+	//
+	// Any EXITED sandbox whose record identity differs from this request is a
+	// park leftover — from the FIRST cycle (RestoreIdentity nil, plain create)
+	// or any LATER cycle (identity from the previous restore; the new park
+	// produces a fresh checkpoint id). Only an identity EQUAL to the request
+	// is a genuine idempotent replay. A still-running sandbox keeps conflicting.
+	state := physical.Status.Get().State()
+	identityMatches := expectedIdentity != nil && metadata.RestoreIdentity != nil &&
+		proto.Equal(metadata.RestoreIdentity, expectedIdentity)
+	if expectedIdentity != nil && state == runtime.SandboxState_SANDBOX_STATE_EXITED && !identityMatches {
+		// Complete the deferred destroy SYNCHRONOUSLY (runsc delete, fs,
+		// ACL, resources, record): a bare record drop let the subsequent
+		// create race the leftover container root ("filesystem state
+		// already exists", observed at +3s) and a concurrent YR retry then
+		// hit the half-written INTENT record as a replay conflict (observed
+		// at +5s). deleteSandbox coalesces with an in-flight destroy.
+		if err := h.deleteSandbox(ctx, request.SandboxID); err != nil {
+			return nil, true, fmt.Errorf("clean up parked sandbox %s before restore: %w",
+				request.SandboxID, err)
 		}
+		return nil, false, nil
+	}
+	if expectedIdentity != nil && metadata.RestoreIdentity == nil && state != runtime.SandboxState_SANDBOX_STATE_EXITED {
 		return nil, true, fmt.Errorf("sandbox %s is %s; cannot restore onto a live sandbox: %w",
 			request.SandboxID, state, errord.ErrFailedPrecondition)
 	}
-	if expectedIdentity == nil || !proto.Equal(metadata.RestoreIdentity, expectedIdentity) {
+	if expectedIdentity == nil || !identityMatches {
 		return nil, true, fmt.Errorf("sandbox %s restore identity conflicts with replay: %w",
 			request.SandboxID, errord.ErrFailedPrecondition)
 	}
