@@ -170,6 +170,15 @@ func (m *InterfaceManager) load(ips sets.Set[string]) error {
 			if stateErr := m.setTapState(stored, true); stateErr != nil {
 				return fmt.Errorf("recover active pooled TAP %s: %w", dev.Name, stateErr)
 			}
+			// setTapState may repair lease bookkeeping in memory (e.g. an
+			// ifindex refresh after the device was recreated). Swap the
+			// durable key so the repaired lease is what gets stored and
+			// handed back on recycle, instead of re-warning every restart.
+			if refreshed := stored.ToString(); refreshed != activeID {
+				m.usingInterfaces.Pop(activeID)
+				m.usingInterfaces.Set(refreshed, struct{}{})
+				m.storeMark.Store(true)
+			}
 		} else {
 			if stateErr := m.setTapState(current, false); stateErr != nil {
 				return fmt.Errorf("recover idle pooled TAP %s: %w", dev.Name, stateErr)
