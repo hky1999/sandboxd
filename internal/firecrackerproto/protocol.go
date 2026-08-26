@@ -49,8 +49,18 @@ const (
 	MessageExecTTY    MessageType = 5
 	MessageWait       MessageType = 6
 	MessageSetNetwork MessageType = 7
-	MessageCheckpoint MessageType = 8
-	MessageResponse   MessageType = 100
+	// MessageFlush asks the guest to sync its writable layer so a checkpoint
+	// captures the overlay in a quiesced state. Best-effort: the host treats
+	// errors and timeouts as advisory, never as checkpoint failures.
+	MessageFlush MessageType = 8
+	// MessageCheckpoint tells the guest agent a checkpoint lifecycle event
+	// occurred (completed, failed, or restored) so it can signal the
+	// cooperative handoff FIFO inside the guest.
+	MessageCheckpoint MessageType = 9
+	// MessageShrink asks the guest to drop its page caches before a
+	// checkpoint. Best-effort with the same contract as MessageFlush.
+	MessageShrink   MessageType = 10
+	MessageResponse MessageType = 100
 )
 
 type Response struct {

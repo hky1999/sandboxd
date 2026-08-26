@@ -33,7 +33,10 @@ func TestV010WireContract(t *testing.T) {
 		t.Fatal(err)
 	}
 	sum := sha256.Sum256(wire)
-	const want = "81fc21070e849e5d2ef140f50391bc678941ba47ee4ad7642d5e534bcb6c2043"
+	// Rolled for PR #30's RuntimeInfo message + checkpoint snapshot_type
+	// (field 6 of CheckpointRequest); both are wire-compatible additions.
+	// Recompute after any proto change: run this test, copy the got hash.
+	const want = "898bfeb6681af5aadbc949209199cea98746b25887bcd6b089ae0588447cee95"
 	if got := hex.EncodeToString(sum[:]); got != want {
 		t.Fatalf("sandbox API descriptor hash = %s, want %s", got, want)
 	}

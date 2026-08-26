@@ -154,6 +154,21 @@ func handleConnection(connection *os.File) {
 			return
 		}
 		writeResponse(connection, reconfigureNetwork(request))
+	case firecrackerproto.MessageFlush:
+		// Checkpoint quiesce hook: sync() drains the writable layer (the
+		// guest's only persistent filesystem) before the host snapshots it.
+		// The reply doubles as the ack — the host proceeds on timeout anyway.
+		log.Printf("flushing guest filesystems for checkpoint")
+		syscall.Sync()
+		writeResponse(connection, nil)
+	case firecrackerproto.MessageShrink:
+		// Checkpoint shrink hook: sync, then drop the page caches.
+		log.Printf("shrinking guest caches for checkpoint")
+		syscall.Sync()
+		if err := os.WriteFile("/proc/sys/vm/drop_caches", []byte("3"), 0o200); err != nil {
+			log.Printf("drop_caches: %v", err)
+		}
+		writeResponse(connection, nil)
 	case firecrackerproto.MessageCheckpoint:
 		var request firecrackerproto.CheckpointRequest
 		if err := firecrackerproto.Decode(payload, &request); err != nil {

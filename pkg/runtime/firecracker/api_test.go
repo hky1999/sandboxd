@@ -167,7 +167,12 @@ func TestFirecrackerSnapshotAPI(t *testing.T) {
 	if err := api.pause(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if err := api.createSnapshot(ctx, "/tmp/vmstate", "/tmp/memory"); err != nil {
+	if err := api.createSnapshot(
+		ctx,
+		"/tmp/vmstate",
+		"/tmp/memory",
+		firecrackerSnapshotTypeFull,
+	); err != nil {
 		t.Fatal(err)
 	}
 	if err := api.resume(ctx); err != nil {
