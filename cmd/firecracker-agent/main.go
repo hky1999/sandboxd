@@ -32,7 +32,6 @@ import (
 	"strings"
 	"sync"
 	"syscall"
-	"time"
 
 	"github.com/inclusionAI/sandboxd/internal/firecrackerproto"
 	"github.com/vishvananda/netlink"
@@ -48,12 +47,8 @@ const (
 type checkpointHandoff struct {
 	fifoPath        string
 	environmentPath string
-	mu              sync.Mutex
-	reader          chan string
-	pendingRestore  bool
-	closed          bool
+	outcomes        chan string
 	stop            chan struct{}
-	done            chan struct{}
 	stopOnce        sync.Once
 }
 
@@ -162,7 +157,11 @@ func handleConnection(connection *os.File) {
 		syscall.Sync()
 		writeResponse(connection, nil)
 	case firecrackerproto.MessageShrink:
-		// Checkpoint shrink hook: sync, then drop the page caches.
+		// Checkpoint shrink hook: sync, then drop the page caches. Cached
+		// file pages keep getting re-materialized by block DMA on re-reads,
+		// which re-dirties them in the host's soft-dirty ledger and pulls
+		// them into every snapshot window; dropping the caches right before
+		// the pause shrinks that set. Best-effort, same as flush.
 		log.Printf("shrinking guest caches for checkpoint")
 		syscall.Sync()
 		if err := os.WriteFile("/proc/sys/vm/drop_caches", []byte("3"), 0o200); err != nil {
@@ -331,243 +330,22 @@ func configure(request firecrackerproto.ConfigureRequest) error {
 	if err := configureNetwork(request.Network); err != nil {
 		return err
 	}
-	handoff, err := prepareCheckpointHandoff(
-		containerRoot,
-		request.Process.Env,
-	)
-	if err != nil {
-		return fmt.Errorf("prepare checkpoint handoff: %w", err)
-	}
 	command, err := sandboxCommand(request.Process, nil)
 	if err != nil {
-		handoff.close()
 		return err
 	}
 	command.Stdin = nil
 	command.Stdout = os.Stdout
 	command.Stderr = os.Stderr
 	if err := command.Start(); err != nil {
-		handoff.close()
 		return fmt.Errorf("start sandbox process: %w", err)
 	}
 	state.process = request.Process
-	state.handoff = handoff
 	state.configured = true
 	state.mainDone = make(chan struct{})
 	go waitMainProcess(command, state.mainDone)
 	log.Printf("started sandbox process pid=%d command=%q", command.Process.Pid, request.Process.Args)
 	return nil
-}
-
-func prepareCheckpointHandoff(
-	root string,
-	environment []string,
-) (*checkpointHandoff, error) {
-	fifoPath := filepath.Join(
-		root,
-		strings.TrimPrefix(firecrackerproto.CheckpointHandoffPath, "/"),
-	)
-	environmentPath := filepath.Join(
-		root,
-		strings.TrimPrefix(firecrackerproto.RestoreEnvPath, "/"),
-	)
-	if err := os.MkdirAll(filepath.Dir(fifoPath), 0755); err != nil {
-		return nil, err
-	}
-	if err := replaceCheckpointFIFO(fifoPath); err != nil {
-		return nil, err
-	}
-	if err := writeCheckpointEnvironment(environmentPath, environment); err != nil {
-		_ = os.Remove(fifoPath)
-		return nil, err
-	}
-	handoff := &checkpointHandoff{
-		fifoPath:        fifoPath,
-		environmentPath: environmentPath,
-		stop:            make(chan struct{}),
-		done:            make(chan struct{}),
-	}
-	go handoff.serve()
-	return handoff, nil
-}
-
-func replaceCheckpointFIFO(path string) error {
-	replacement := path + ".next"
-	if err := os.Remove(replacement); err != nil && !os.IsNotExist(err) {
-		return err
-	}
-	if err := unix.Mkfifo(replacement, 0600); err != nil {
-		return err
-	}
-	if err := os.Rename(replacement, path); err != nil {
-		_ = os.Remove(replacement)
-		return err
-	}
-	return nil
-}
-
-func writeCheckpointEnvironment(path string, environment []string) error {
-	for _, entry := range environment {
-		if strings.IndexByte(entry, 0) >= 0 {
-			return errors.New("checkpoint environment contains a NUL byte")
-		}
-	}
-	content := []byte(strings.Join(environment, "\x00"))
-	if len(content) != 0 {
-		content = append(content, 0)
-	}
-	temporary := path + ".tmp"
-	if err := os.WriteFile(temporary, content, 0600); err != nil {
-		return err
-	}
-	if err := os.Rename(temporary, path); err != nil {
-		_ = os.Remove(temporary)
-		return err
-	}
-	return nil
-}
-
-func (handoff *checkpointHandoff) serve() {
-	defer close(handoff.done)
-	retry := time.NewTicker(10 * time.Millisecond)
-	defer retry.Stop()
-	lastOpenError := ""
-	for {
-		file, generation, err := handoff.openWriter()
-		if err != nil {
-			if message := err.Error(); message != lastOpenError {
-				log.Printf("open checkpoint handoff: %v", err)
-				lastOpenError = message
-			}
-			select {
-			case <-handoff.stop:
-				return
-			case <-retry.C:
-				continue
-			}
-		}
-		lastOpenError = ""
-		if file == nil {
-			select {
-			case <-handoff.stop:
-				return
-			case <-retry.C:
-				continue
-			}
-		}
-		select {
-		case outcome := <-generation:
-			// Publish the next FIFO inode before completing this generation.
-			// New readers cannot attach to the old inode while its current
-			// reader is consuming the outcome and waiting for EOF.
-			if err := replaceCheckpointFIFO(handoff.fifoPath); err != nil {
-				log.Printf("replace checkpoint handoff: %v", err)
-				_ = file.Close()
-				return
-			}
-			if _, err := io.WriteString(file, outcome+"\n"); err != nil {
-				log.Printf("write checkpoint handoff: %v", err)
-			}
-			if err := file.Close(); err != nil {
-				log.Printf("close checkpoint handoff: %v", err)
-			}
-		case <-handoff.stop:
-			handoff.clearReader(generation)
-			_ = file.Close()
-			return
-		}
-	}
-}
-
-func (handoff *checkpointHandoff) openWriter() (*os.File, chan string, error) {
-	handoff.mu.Lock()
-	defer handoff.mu.Unlock()
-	if handoff.closed {
-		return nil, nil, nil
-	}
-	fd, err := unix.Open(
-		handoff.fifoPath,
-		unix.O_WRONLY|unix.O_NONBLOCK|unix.O_CLOEXEC,
-		0,
-	)
-	if errors.Is(err, unix.ENXIO) || errors.Is(err, unix.EINTR) {
-		return nil, nil, nil
-	}
-	if errors.Is(err, unix.ENOENT) {
-		if err := replaceCheckpointFIFO(handoff.fifoPath); err != nil {
-			return nil, nil, fmt.Errorf("recreate checkpoint handoff: %w", err)
-		}
-		return nil, nil, nil
-	}
-	if err != nil {
-		return nil, nil, err
-	}
-	generation := make(chan string, 1)
-	if handoff.pendingRestore {
-		handoff.pendingRestore = false
-		generation <- "restore"
-	} else {
-		handoff.reader = generation
-	}
-	return os.NewFile(uintptr(fd), handoff.fifoPath), generation, nil
-}
-
-func (handoff *checkpointHandoff) clearReader(generation chan string) {
-	handoff.mu.Lock()
-	defer handoff.mu.Unlock()
-	if handoff.reader == generation {
-		handoff.reader = nil
-	}
-}
-
-func (handoff *checkpointHandoff) signal(outcome string) error {
-	handoff.mu.Lock()
-	defer handoff.mu.Unlock()
-	if handoff.closed {
-		log.Printf("drop checkpoint handoff outcome %q: handoff is closed", outcome)
-		return nil
-	}
-	if handoff.reader == nil {
-		if outcome == "restore" {
-			handoff.pendingRestore = true
-			log.Printf("defer checkpoint handoff outcome %q until a reader registers", outcome)
-			return nil
-		}
-		log.Printf("drop checkpoint handoff outcome %q: no reader registered", outcome)
-		return nil
-	}
-	generation := handoff.reader
-	handoff.reader = nil
-	generation <- outcome
-	return nil
-}
-
-func (handoff *checkpointHandoff) close() {
-	handoff.stopOnce.Do(func() {
-		handoff.mu.Lock()
-		handoff.closed = true
-		close(handoff.stop)
-		handoff.mu.Unlock()
-	})
-	<-handoff.done
-}
-
-func releaseCheckpoint(request firecrackerproto.CheckpointRequest) error {
-	if request.Outcome != "resume" && request.Outcome != "restore" && request.Outcome != "error" {
-		return fmt.Errorf("invalid checkpoint outcome %q", request.Outcome)
-	}
-	state.mu.RLock()
-	handoff := state.handoff
-	state.mu.RUnlock()
-	if handoff == nil {
-		return errors.New("checkpoint handoff is not configured")
-	}
-	if request.Outcome == "restore" {
-		if err := writeCheckpointEnvironment(handoff.environmentPath, request.Environment); err != nil {
-			return fmt.Errorf("write restored checkpoint environment: %w", err)
-		}
-	}
-	return handoff.signal(request.Outcome)
 }
 
 func mountRuntimeFilesystems() error {
@@ -1405,4 +1183,132 @@ func processExitCode(err error) int {
 		}
 	}
 	return 255
+}
+func prepareCheckpointHandoff(
+	root string,
+	environment []string,
+) (*checkpointHandoff, error) {
+	fifoPath := filepath.Join(
+		root,
+		strings.TrimPrefix(firecrackerproto.CheckpointHandoffPath, "/"),
+	)
+	environmentPath := filepath.Join(
+		root,
+		strings.TrimPrefix(firecrackerproto.RestoreEnvPath, "/"),
+	)
+	if err := os.MkdirAll(filepath.Dir(fifoPath), 0755); err != nil {
+		return nil, err
+	}
+	if err := replaceCheckpointFIFO(fifoPath); err != nil {
+		return nil, err
+	}
+	if err := writeCheckpointEnvironment(environmentPath, environment); err != nil {
+		_ = os.Remove(fifoPath)
+		return nil, err
+	}
+	handoff := &checkpointHandoff{
+		fifoPath:        fifoPath,
+		environmentPath: environmentPath,
+		outcomes:        make(chan string, 2),
+		stop:            make(chan struct{}),
+	}
+	go handoff.serve()
+	return handoff, nil
+}
+
+func replaceCheckpointFIFO(path string) error {
+	replacement := path + ".next"
+	if err := os.Remove(replacement); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if err := unix.Mkfifo(replacement, 0600); err != nil {
+		return err
+	}
+	if err := os.Rename(replacement, path); err != nil {
+		_ = os.Remove(replacement)
+		return err
+	}
+	return nil
+}
+
+func writeCheckpointEnvironment(path string, environment []string) error {
+	for _, entry := range environment {
+		if strings.IndexByte(entry, 0) >= 0 {
+			return errors.New("checkpoint environment contains a NUL byte")
+		}
+	}
+	content := []byte(strings.Join(environment, "\x00"))
+	if len(content) != 0 {
+		content = append(content, 0)
+	}
+	temporary := path + ".tmp"
+	if err := os.WriteFile(temporary, content, 0600); err != nil {
+		return err
+	}
+	if err := os.Rename(temporary, path); err != nil {
+		_ = os.Remove(temporary)
+		return err
+	}
+	return nil
+}
+
+func (handoff *checkpointHandoff) serve() {
+	for {
+		file, err := os.OpenFile(handoff.fifoPath, os.O_WRONLY, 0)
+		if err != nil {
+			log.Printf("open checkpoint handoff: %v", err)
+			return
+		}
+		select {
+		case outcome := <-handoff.outcomes:
+			// Publish the next FIFO inode before completing this generation.
+			// New readers cannot attach to the old inode while its current
+			// reader is consuming the outcome and waiting for EOF.
+			if err := replaceCheckpointFIFO(handoff.fifoPath); err != nil {
+				log.Printf("replace checkpoint handoff: %v", err)
+				_ = file.Close()
+				return
+			}
+			if _, err := io.WriteString(file, outcome); err != nil {
+				log.Printf("write checkpoint handoff: %v", err)
+			}
+			if err := file.Close(); err != nil {
+				log.Printf("close checkpoint handoff: %v", err)
+			}
+		case <-handoff.stop:
+			_ = file.Close()
+			return
+		}
+	}
+}
+
+func (handoff *checkpointHandoff) signal(outcome string) error {
+	select {
+	case handoff.outcomes <- outcome:
+		return nil
+	default:
+		return errors.New("checkpoint handoff queue is full")
+	}
+}
+
+func (handoff *checkpointHandoff) close() {
+	handoff.stopOnce.Do(func() { close(handoff.stop) })
+}
+
+func releaseCheckpoint(request firecrackerproto.CheckpointRequest) error {
+	if request.Outcome != "resume" && request.Outcome != "restore" && request.Outcome != "error" {
+		return fmt.Errorf("invalid checkpoint outcome %q", request.Outcome)
+	}
+	state.mu.RLock()
+	handoff := state.handoff
+	state.mu.RUnlock()
+	if handoff == nil {
+		return errors.New("checkpoint handoff is not configured")
+	}
+	if request.Outcome == "restore" {
+		if err := writeCheckpointEnvironment(handoff.environmentPath, request.Environment); err != nil {
+			return fmt.Errorf("write restored checkpoint environment: %w", err)
+		}
+	}
+	return handoff.signal(request.Outcome)
 }

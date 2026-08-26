@@ -76,6 +76,26 @@ caller that deletes or mutates the most recent checkpoint directory drops the
 sandbox back to a full first window on the next checkpoint; deleting older
 generations is always safe.
 
+Durability is deliberately kept out of the pause window. Firecracker is asked
+to create the snapshot with `deferred_sync`, so its writes only reach the page
+cache while the guest is paused; the overlay reflink clone is likewise created
+without an in-clone fsync (a sync there would wait behind the snapshot's
+deferred dirty writeback on the same filesystem); and after the guest resumes,
+sandboxd fsyncs the components and only then lands the manifest. The pause
+window is therefore pause → snapshot writes → overlay clone → resume with no
+fsync on the path, and the manifest remains the
+commit point: a generation without a manifest is partial output. A crash
+between resume and manifest commit discards the newest generation and restores
+from the previous one — sound because each generation writes into a fresh
+clone and never mutates its base. Firecracker re-arms its soft-dirty window
+before the artifact is durable (an ordering that predates the deferral), so
+writes the guest performed during that gap belong to a generation that is
+discarded with the artifact; checkpoint success is only reported after the
+manifest commits. Write errors such as `ENOSPC` or `EIO` can therefore surface
+at the post-resume fsync instead of the snapshot request; sandboxd treats this
+like any seal failure (the partial generation is discarded and the next
+checkpoint rebuilds from a first window).
+
 `snapshot_type` is a Firecracker-specific control with a validated enum: an
 empty value keeps the automatic tier selection above (a pagemap `Incremental`
 generation against the memory file a restore loaded, `SoftDirty` windows
@@ -89,9 +109,21 @@ first window to keep the chain consistent — the sealed manifest records what
 was actually taken. Runtimes without incremental checkpoints (runsc) ignore
 the field.
 
-The manifest digests the small components (`vmstate`, `overlay.ext4`); hashing
-the memory file is skipped because it costs seconds of CPU per GiB and would
-dominate an otherwise sub-second incremental checkpoint.
+The manifest digests the small components; hashing the memory file is skipped
+because it costs seconds of CPU per GiB and would dominate an otherwise
+sub-second incremental checkpoint. Full snapshots (template manufacture) also
+digest `overlay.ext4`; rolling incremental generations skip the overlay digest
+for the same reason — hashing it costs ~5ms/MiB of CPU and re-reads it into
+the page cache on every generation, and a rolling generation's integrity rests
+on the reflink copy-on-write and Firecracker's own writes. Restores skip
+components without a recorded digest either way. Digests are computed
+after the post-resume fsync, so the manifest attests durable bytes. On restore
+the verification is memoized per sandboxd process: a component whose size and
+mtime are unchanged since a previous successful verification is not re-hashed,
+so warm starts from a stable template directory skip the cost. The tradeoff is
+that a content swap which preserves both size and mtime within the filesystem's
+timestamp granularity goes undetected — the same granularity the nydus
+bootstrap cache accepts.
 
 The manifest also records a `compat` tuple — sha256 digests of the Firecracker
 binary, guest kernel, and initrd, plus architecture and kernel arguments —
@@ -111,6 +143,14 @@ predates the message, the checkpoint proceeds without the flush and stays
 crash-consistent. The flush happens while the guest is still running, so a
 successful flush adds to the checkpoint's wall time but not to the pause
 window. The message never fails a checkpoint.
+
+After the flush, sandboxd also asks the guest agent to drop its page caches
+(protocol message type 9) with the same best-effort contract: cached file
+pages are re-materialized by block DMA on every re-read, which re-dirties
+them in the host ledger and drags them into each snapshot window, so dropping
+the caches right before the pause shrinks the set a checkpoint carries. A
+guest agent that predates the message declines it and the checkpoint
+proceeds.
 
 ## Source and failure semantics
 

@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 )
 
@@ -176,6 +177,7 @@ func finalizeFirecrackerCheckpointV2(
 	ctx context.Context,
 	files firecrackerCheckpointFiles,
 	manifest *firecrackerCheckpointManifest,
+	digestOverlay bool,
 ) (retErr error) {
 	manifest.Version = firecrackerCheckpointVersion2
 	manifest.CreatedAt = time.Now().UTC()
@@ -195,6 +197,13 @@ func finalizeFirecrackerCheckpointV2(
 	manifest.Digests = make(map[string]string, 2)
 	for _, component := range firecrackerCheckpointComponents(files) {
 		if component.name == firecrackerCheckpointMemoryName {
+			continue
+		}
+		if component.name == firecrackerCheckpointOverlayName && !digestOverlay {
+			// Rolling generations skip the overlay digest too: hashing it
+			// costs ~5ms/MiB of CPU and re-reads it into the page cache on
+			// every generation. Full snapshots (template manufacture) keep
+			// digesting it.
 			continue
 		}
 		digest, err := digestFirecrackerCheckpointComponent(ctx, component.name, component.path)
@@ -350,25 +359,66 @@ func isFirecrackerCompatDigest(digest string) bool {
 	return true
 }
 
-// verifyFirecrackerCheckpointDigests recomputes the digests the manifest
-// recorded and compares them against the components on disk. Components
-// without a recorded digest (memory, by design) are skipped.
-func verifyFirecrackerCheckpointDigests(
+// cachedCheckpointDigest remembers a verified component digest together with
+// the file identity it was computed from.
+type cachedCheckpointDigest struct {
+	size      int64
+	modTimeNs int64
+	digest    string
+}
+
+// checkpointDigestCache memoizes component digests across restores so a warm
+// start from a stable checkpoint directory (typically a manufactured
+// template) does not re-hash its vmstate and overlay every time. Entries are
+// keyed by component path and invalidated by a size or mtime change; the
+// granularity matches the nydus bootstrap cache. This trades detection of a
+// same-stat content swap for memoization — the checkpoint directories are
+// daemon-adjacent 0600 artifacts, not adversarial inputs. The cache is
+// advisory and resets once it exceeds a generous entry bound (incremental
+// chains mint a fresh directory per generation).
+type checkpointDigestCache struct {
+	mu      sync.Mutex
+	entries map[string]cachedCheckpointDigest
+	// hashes counts component hashes performed; it exists so tests can
+	// observe cache hits without timing.
+	hashes int
+}
+
+const checkpointDigestCacheMaxEntries = 1024
+
+// verifyFirecrackerCheckpointDigests compares the components on disk against
+// the digests the manifest recorded, hashing only components whose file
+// identity is not already cached. Components without a recorded digest
+// (memory, by design) are skipped.
+func (cache *checkpointDigestCache) verifyFirecrackerCheckpointDigests(
 	ctx context.Context,
 	artifact *firecrackerCheckpointArtifact,
 ) error {
+	cache.mu.Lock()
+	defer cache.mu.Unlock()
 	for _, component := range firecrackerCheckpointComponents(artifact.Files) {
 		expected, recorded := artifact.Manifest.Digests[component.name]
 		if !recorded || expected == "" {
 			continue
 		}
-		digest, err := digestFirecrackerCheckpointComponent(
-			ctx,
-			component.name,
-			component.path,
-		)
+		info, err := os.Lstat(component.path)
 		if err != nil {
-			return err
+			return fmt.Errorf(
+				"inspect Firecracker checkpoint component %s: %w",
+				component.name, err,
+			)
+		}
+		digest, cached := cache.lookup(component.path, info)
+		if !cached {
+			digest, err = digestFirecrackerCheckpointComponent(
+				ctx,
+				component.name,
+				component.path,
+			)
+			if err != nil {
+				return err
+			}
+			cache.remember(component.path, info, digest)
 		}
 		if digest != expected {
 			return fmt.Errorf(
@@ -378,6 +428,33 @@ func verifyFirecrackerCheckpointDigests(
 		}
 	}
 	return nil
+}
+
+func (cache *checkpointDigestCache) lookup(
+	path string, info os.FileInfo,
+) (string, bool) {
+	entry, ok := cache.entries[path]
+	if !ok || entry.size != info.Size() ||
+		entry.modTimeNs != info.ModTime().UnixNano() {
+		return "", false
+	}
+	return entry.digest, true
+}
+
+func (cache *checkpointDigestCache) remember(
+	path string, info os.FileInfo, digest string,
+) {
+	if cache.entries == nil {
+		cache.entries = make(map[string]cachedCheckpointDigest)
+	} else if len(cache.entries) >= checkpointDigestCacheMaxEntries {
+		cache.entries = make(map[string]cachedCheckpointDigest)
+	}
+	cache.entries[path] = cachedCheckpointDigest{
+		size:      info.Size(),
+		modTimeNs: info.ModTime().UnixNano(),
+		digest:    digest,
+	}
+	cache.hashes++
 }
 
 func firecrackerCheckpointComponents(
@@ -432,6 +509,37 @@ func syncFirecrackerCheckpointDir(dir string) error {
 	defer handle.Close()
 	if err := handle.Sync(); err != nil {
 		return fmt.Errorf("fsync Firecracker checkpoint directory: %w", err)
+	}
+	return nil
+}
+
+// fsyncFirecrackerCheckpointData flushes the checkpoint components to stable
+// storage. Firecracker is asked to create snapshots with deferred_sync, so
+// the memory and state files only reach the page cache inside the pause
+// window; this pass, run after the guest resumes and before the manifest
+// lands, is what makes the sealed directory actually durable. The overlay is
+// already synced by its reflink clone but is fsynced again here to keep the
+// invariant uniform: everything in the directory is durable before the
+// manifest exists.
+func fsyncFirecrackerCheckpointData(files firecrackerCheckpointFiles) error {
+	for _, component := range firecrackerCheckpointComponents(files) {
+		file, err := os.OpenFile(component.path, os.O_RDWR, 0)
+		if err != nil {
+			return fmt.Errorf(
+				"open Firecracker checkpoint component %s for fsync: %w",
+				component.name, err,
+			)
+		}
+		err = file.Sync()
+		if closeErr := file.Close(); err == nil {
+			err = closeErr
+		}
+		if err != nil {
+			return fmt.Errorf(
+				"fsync Firecracker checkpoint component %s: %w",
+				component.name, err,
+			)
+		}
 	}
 	return nil
 }
