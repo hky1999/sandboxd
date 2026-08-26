@@ -1536,7 +1536,12 @@ type CheckpointRequest struct {
 	// Compress enables runtime-supported checkpoint compression.
 	Compress bool `protobuf:"varint,4,opt,name=compress,proto3" json:"compress,omitempty"`
 	// LeaveRunning keeps the source sandbox running after a successful checkpoint.
-	LeaveRunning  bool `protobuf:"varint,5,opt,name=leave_running,json=leaveRunning,proto3" json:"leave_running,omitempty"`
+	LeaveRunning bool `protobuf:"varint,5,opt,name=leave_running,json=leaveRunning,proto3" json:"leave_running,omitempty"`
+	// SnapshotType requests a specific checkpoint flavor: Full, Incremental,
+	// or SoftDirty. Empty (the default) leaves the automatic tier selection to
+	// the runtime. Firecracker maps the values onto its snapshot types;
+	// runtimes without incremental checkpoints ignore the field.
+	SnapshotType  string `protobuf:"bytes,6,opt,name=snapshot_type,json=snapshotType,proto3" json:"snapshot_type,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1604,6 +1609,13 @@ func (x *CheckpointRequest) GetLeaveRunning() bool {
 		return x.LeaveRunning
 	}
 	return false
+}
+
+func (x *CheckpointRequest) GetSnapshotType() string {
+	if x != nil {
+		return x.SnapshotType
+	}
+	return ""
 }
 
 // CheckpointResponse is empty after the checkpoint artifact is complete.
@@ -2900,13 +2912,14 @@ const file_api_runtime_v1_sandbox_api_proto_rawDesc = "" +
 	"\rStartResponse\x12\x12\n" +
 	"\x04code\x18\x01 \x01(\x05R\x04code\x12\x18\n" +
 	"\amessage\x18\x02 \x01(\tR\amessage\x12\x0e\n" +
-	"\x02id\x18\x03 \x01(\tR\x02id\"\xb4\x01\n" +
+	"\x02id\x18\x03 \x01(\tR\x02id\"\xd9\x01\n" +
 	"\x11CheckpointRequest\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12%\n" +
 	"\x0echeckpoint_dir\x18\x02 \x01(\tR\rcheckpointDir\x12'\n" +
 	"\x0ftimeout_seconds\x18\x03 \x01(\rR\x0etimeoutSeconds\x12\x1a\n" +
 	"\bcompress\x18\x04 \x01(\bR\bcompress\x12#\n" +
-	"\rleave_running\x18\x05 \x01(\bR\fleaveRunning\"\x14\n" +
+	"\rleave_running\x18\x05 \x01(\bR\fleaveRunning\x12#\n" +
+	"\rsnapshot_type\x18\x06 \x01(\tR\fsnapshotType\"\x14\n" +
 	"\x12CheckpointResponse\"9\n" +
 	"\rDeleteRequest\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x18\n" +

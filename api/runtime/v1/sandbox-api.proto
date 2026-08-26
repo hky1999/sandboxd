@@ -266,6 +266,11 @@ message CheckpointRequest {
   bool compress = 4;
   // LeaveRunning keeps the source sandbox running after a successful checkpoint.
   bool leave_running = 5;
+  // SnapshotType requests a specific checkpoint flavor: Full, Incremental,
+  // or SoftDirty. Empty (the default) leaves the automatic tier selection to
+  // the runtime. Firecracker maps the values onto its snapshot types;
+  // runtimes without incremental checkpoints ignore the field.
+  string snapshot_type = 6;
 }
 
 // CheckpointResponse is empty after the checkpoint artifact is complete.

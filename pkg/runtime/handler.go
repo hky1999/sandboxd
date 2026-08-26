@@ -57,6 +57,11 @@ type CheckpointConfig struct {
 	Directory    string
 	Compress     bool
 	LeaveRunning bool
+	// SnapshotType requests a specific checkpoint flavor ("Full",
+	// "Incremental", or "SoftDirty" for Firecracker); empty leaves the
+	// runtime's automatic tier selection in charge. Runtimes without
+	// incremental checkpoints ignore it.
+	SnapshotType string
 }
 
 // HostResourcesProvider maps guest-visible resources to the host cgroup that
