@@ -30,11 +30,12 @@ const (
 	Version   = uint16(1)
 	AgentPort = uint32(52)
 
-	CheckpointHandoffPath = "/run/sandboxd/checkpoint"
-	RestoreEnvPath        = "/run/sandboxd/restore-environ"
-
 	maxMessageSize = 16 << 20
 	maxFrameSize   = 16 << 20
+
+	// Cooperative checkpoint handoff paths inside the guest (PR #30).
+	CheckpointHandoffPath = "/run/sandboxd/checkpoint"
+	RestoreEnvPath        = "/run/sandboxd/restore-environ"
 )
 
 var messageMagic = [4]byte{'A', 'K', 'F', 'C'}
@@ -53,15 +54,25 @@ const (
 	// captures the overlay in a quiesced state. Best-effort: the host treats
 	// errors and timeouts as advisory, never as checkpoint failures.
 	MessageFlush MessageType = 8
+	// MessageShrink asks the guest to drop its page caches before a
+	// checkpoint: cached file pages are re-materialized by block DMA on every
+	// re-read, which re-dirties them in the host ledger and lands them in
+	// every snapshot window. Dropping the caches right before the pause
+	// shrinks the working set the checkpoint has to carry. Same best-effort
+	// contract as MessageFlush.
+	MessageShrink MessageType = 9
 	// MessageCheckpoint tells the guest agent a checkpoint lifecycle event
 	// occurred (completed, failed, or restored) so it can signal the
-	// cooperative handoff FIFO inside the guest.
-	MessageCheckpoint MessageType = 9
-	// MessageShrink asks the guest to drop its page caches before a
-	// checkpoint. Best-effort with the same contract as MessageFlush.
-	MessageShrink   MessageType = 10
-	MessageResponse MessageType = 100
+	// cooperative handoff FIFO inside the guest (PR #30).
+	MessageCheckpoint MessageType = 10
+	MessageResponse   MessageType = 100
 )
+
+// CheckpointRequest carries the checkpoint lifecycle event to the guest agent.
+type CheckpointRequest struct {
+	Outcome     string   `json:"outcome"`               // "resume", "error", or "restore"
+	Environment []string `json:"environment,omitempty"` // target env after restore
+}
 
 type Response struct {
 	OK       bool   `json:"ok"`
@@ -109,14 +120,6 @@ type ConfigureRequest struct {
 	Network       NetworkSpec `json:"network"`
 	Mounts        []MountSpec `json:"mounts,omitempty"`
 	Files         []FileSpec  `json:"files,omitempty"`
-}
-
-// CheckpointRequest releases a guest process after a VM checkpoint. Restore
-// supplies the target process environment so a snapshotted runtime can adopt
-// its new physical identity before reconnecting to the control plane.
-type CheckpointRequest struct {
-	Outcome     string   `json:"outcome"`
-	Environment []string `json:"environment,omitempty"`
 }
 
 type ExecRequest struct {

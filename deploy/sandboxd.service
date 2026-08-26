@@ -1,0 +1,33 @@
+# sandboxd systemd unit template for production Firecracker CR nodes.
+# Install: cp deploy/sandboxd.service /etc/systemd/system/sandboxd@.service
+#          systemctl enable --now sandboxd@<instance>
+# The unit is a template: %i selects the instance root (e.g. "m2"), which
+# must contain config.toml and a writable state/ directory.
+#
+# Why a unit at all: sandboxd registers its own SIGHUP handler, so a daemon
+# started from an ssh session is gracefully terminated when systemd-logind
+# tears the session cgroup down (nohup/setsid are not enough).
+
+[Unit]
+Description=AKernel sandboxd (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/sandboxd \
+    --root /srv/akernel/%i \
+    --config /srv/akernel/%i/config.toml \
+    --socket /srv/akernel/%i/state/sandboxd.sock \
+    --log-level info \
+    --log-file /srv/akernel/%i/state/sandboxd.log \
+    --http-address 127.0.0.1:23099
+Restart=on-failure
+RestartSec=2
+# sandboxd manages cgroups, TAPs and KVM: it must run as root.
+# Hardening below is deliberately minimal until P2-1 crash testing says more.
+LimitNOFILE=1048576
+TasksMax=infinity
+
+[Install]
+WantedBy=multi-user.target

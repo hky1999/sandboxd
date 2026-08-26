@@ -199,7 +199,8 @@ func TestFirecrackerSnapshotAPI(t *testing.T) {
 	}
 	if calls[1].method != http.MethodPut ||
 		calls[1].path != "/snapshot/create" ||
-		calls[1].payload["snapshot_type"] != "Full" {
+		calls[1].payload["snapshot_type"] != "Full" ||
+		calls[1].payload["deferred_sync"] != true {
 		t.Fatalf("create snapshot call = %+v", calls[1])
 	}
 	if calls[2].method != http.MethodPatch ||

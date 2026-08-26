@@ -46,8 +46,24 @@ var cloneFileIoctl = func(destination, source *os.File) error {
 // (FICLONE) so that unchanged extents are shared and the copy costs O(changed)
 // disk space instead of O(file). Reflink support is an optimization, never a
 // correctness requirement: on any filesystem or kernel that rejects the ioctl
-// the function falls back to a full copy and reports reflinked=false.
+// the function falls back to a full copy and reports reflinked=false. The
+// destination is fsynced before the call returns.
 func cloneFile(sourcePath, destinationPath string) (reflinked bool, retErr error) {
+	return cloneFileOpts(sourcePath, destinationPath, true)
+}
+
+// cloneFileNoSync is cloneFile without the destination fsync, for callers
+// that fsync the clone later as part of their own durability point. Syncing
+// inside the clone is not free: an fsync on the destination can wait behind
+// unrelated dirty writeback on the same filesystem, which is exactly the
+// pause-window cost this variant exists to avoid.
+func cloneFileNoSync(sourcePath, destinationPath string) (reflinked bool, retErr error) {
+	return cloneFileOpts(sourcePath, destinationPath, false)
+}
+
+func cloneFileOpts(
+	sourcePath, destinationPath string, sync bool,
+) (reflinked bool, retErr error) {
 	source, err := os.Open(sourcePath)
 	if err != nil {
 		return false, fmt.Errorf("open reflink source %s: %w", sourcePath, err)
@@ -63,7 +79,10 @@ func cloneFile(sourcePath, destinationPath string) (reflinked bool, retErr error
 		return false, fmt.Errorf("create reflink destination %s: %w", destinationPath, err)
 	}
 	defer func() {
-		retErr = errors.Join(retErr, destination.Sync(), destination.Close())
+		if sync {
+			retErr = errors.Join(retErr, destination.Sync())
+		}
+		retErr = errors.Join(retErr, destination.Close())
 	}()
 
 	if err := cloneFileIoctl(destination, source); err == nil {
