@@ -48,8 +48,12 @@ const (
 	firecrackerVsock           = firecrackerproto.HostAgentSocketName
 	firecrackerAgentTimeout    = 15 * time.Second
 	firecrackerShutdownTimeout = 2 * time.Second
-	firecrackerMinMemoryMiB    = uint32(128)
-	firecrackerMaxVCPUs        = uint32(32)
+	// Guest flush budget before pausing for a checkpoint. Syncing a heavily
+	// dirty writable layer can exceed the default 1s agent round-trip, but
+	// the pause window must not grow unbounded on a stuck guest.
+	firecrackerFlushTimeout = 2 * time.Second
+	firecrackerMinMemoryMiB = uint32(128)
+	firecrackerMaxVCPUs     = uint32(32)
 )
 
 var (
@@ -68,10 +72,25 @@ type firecrackerPersistedState struct {
 	VsockPath   string `json:"vsock_path"`
 	OverlayPath string `json:"overlay_path"`
 	CreatedAt   string `json:"created_at"`
-	Configured  bool   `json:"configured,omitempty"`
-	Exited      bool   `json:"exited,omitempty"`
-	ExitedAt    string `json:"exited_at,omitempty"`
-	ExitCode    int    `json:"exit_code,omitempty"`
+	// MemoryMiB is the guest memory size in MiB, recorded so incremental
+	// checkpoints can preallocate or clone a full-size base memory file.
+	MemoryMiB uint32 `json:"memory_mib,omitempty"`
+	// Vcpus is the guest vCPU count at Start time, recorded so checkpoints
+	// can stamp the compatibility tuple (the vmstate itself pins the count
+	// for a restore).
+	Vcpus uint32 `json:"vcpus,omitempty"`
+	// BaseMemoryPath points at the memory image the Firecracker dirty-page
+	// ledger currently tracks — the previous artifact's own memory file, or
+	// the file a restore loaded. Empty means the next checkpoint rebuilds
+	// from a first window.
+	BaseMemoryPath string `json:"base_memory_path,omitempty"`
+	// BaseMemoryIncremental marks a base that came from a restore, which the
+	// Firecracker pagemap ledger (not the soft-dirty window) diffs against.
+	BaseMemoryIncremental bool   `json:"base_memory_incremental,omitempty"`
+	Configured            bool   `json:"configured,omitempty"`
+	Exited                bool   `json:"exited,omitempty"`
+	ExitedAt              string `json:"exited_at,omitempty"`
+	ExitCode              int    `json:"exit_code,omitempty"`
 }
 
 type firecrackerInstance struct {
@@ -100,6 +119,36 @@ func (instance *firecrackerInstance) markConfigured() {
 	instance.mu.Lock()
 	instance.state.Configured = true
 	instance.mu.Unlock()
+}
+
+func (instance *firecrackerInstance) setMemoryMiB(size uint32) {
+	instance.mu.Lock()
+	instance.state.MemoryMiB = size
+	instance.mu.Unlock()
+}
+
+func (instance *firecrackerInstance) setVcpus(count uint32) {
+	instance.mu.Lock()
+	instance.state.Vcpus = count
+	instance.mu.Unlock()
+}
+
+func (instance *firecrackerInstance) setBaseMemory(path string, incremental bool) {
+	instance.mu.Lock()
+	instance.state.BaseMemoryPath = path
+	instance.state.BaseMemoryIncremental = incremental
+	instance.mu.Unlock()
+}
+
+// clearBaseMemory drops the incremental lineage and reports whether there was
+// one to drop.
+func (instance *firecrackerInstance) clearBaseMemory() bool {
+	instance.mu.Lock()
+	changed := instance.state.BaseMemoryPath != ""
+	instance.state.BaseMemoryPath = ""
+	instance.state.BaseMemoryIncremental = false
+	instance.mu.Unlock()
+	return changed
 }
 
 func (instance *firecrackerInstance) finish(exit runtimecore.Exit) bool {
@@ -146,6 +195,11 @@ type Handler struct {
 
 	mu        sync.RWMutex
 	instances map[string]*firecrackerInstance
+
+	// compatMu guards the cached binary/kernel digests behind the
+	// compatibility tuple; hashing a vmlinux is a one-off per daemon.
+	compatMu      sync.Mutex
+	compatDigests *firecrackerCheckpointCompat
 }
 
 func (handler *Handler) ValidateStartRequest(
@@ -473,6 +527,8 @@ func (handler *Handler) Start(
 	if err != nil {
 		return err
 	}
+	instance.setMemoryMiB(memoryMiB)
+	instance.setVcpus(vcpus)
 	drives := []firecrackerDrive{
 		plan.rootDrive,
 		{
@@ -1014,6 +1070,14 @@ func (handler *Handler) recoverState(
 		}
 		return instance
 	}
+	if state.BaseMemoryPath != "" {
+		// A daemon restart loses the bookkeeping that ties the in-process
+		// Firecracker dirty-page ledger to a sandbox-owned base; restart the
+		// incremental chain from a first window rather than risk patching a
+		// stale base.
+		state.BaseMemoryPath = ""
+		state.BaseMemoryIncremental = false
+	}
 	go handler.waitGuest(instance)
 	go handler.monitorRecovered(instance)
 	logrus.Infof("firecracker: recovered sandbox %s pid=%d", state.ID, state.PID)
@@ -1142,14 +1206,27 @@ func requestFirecrackerAgent(
 	messageType firecrackerproto.MessageType,
 	value any,
 ) error {
-	timeout := time.Second
+	return requestFirecrackerAgentWaiting(ctx, vsockPath, messageType, value, time.Second)
+}
+
+// requestFirecrackerAgentWaiting is requestFirecrackerAgent with a caller-set
+// cap on the dial timeout (used by the checkpoint flush, which may legitimately
+// wait out a slow guest sync).
+func requestFirecrackerAgentWaiting(
+	ctx context.Context,
+	vsockPath string,
+	messageType firecrackerproto.MessageType,
+	value any,
+	maxWait time.Duration,
+) error {
+	timeout := maxWait
 	if deadline, ok := ctx.Deadline(); ok {
 		timeout = time.Until(deadline)
 		if timeout <= 0 {
 			return ctx.Err()
 		}
-		if timeout > time.Second {
-			timeout = time.Second
+		if timeout > maxWait {
+			timeout = maxWait
 		}
 	}
 	connection, err := firecrackerproto.DialAgent(vsockPath, timeout)

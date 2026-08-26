@@ -33,7 +33,9 @@ func TestV010WireContract(t *testing.T) {
 		t.Fatal(err)
 	}
 	sum := sha256.Sum256(wire)
-	const want = "f4ab97439feb72a68410e6243296a0c00c7856e7cbeae9870b9cebdffa060f0d"
+	// Rolled for checkpoint snapshot_type (field 6 of CheckpointRequest);
+	// adding a field is wire-compatible for existing callers.
+	const want = "5e5afa3a71032103c29be891d85e2d8e6bb1a17dc477a531f7ce8396622be86c"
 	if got := hex.EncodeToString(sum[:]); got != want {
 		t.Fatalf("sandbox API descriptor hash = %s, want %s", got, want)
 	}
