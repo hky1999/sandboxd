@@ -103,6 +103,10 @@ const defaultInterfaceSysctlRoot = "/proc/sys/net/ipv4/conf"
 type linkOperations interface {
 	LinkByName(string) (netlink.Link, error)
 	LinkDel(netlink.Link) error
+	LinkSetMaster(link, master netlink.Link) error
+	LinkSetHardwareAddr(link netlink.Link, addr net.HardwareAddr) error
+	LinkSetUp(netlink.Link) error
+	LinkSetDown(netlink.Link) error
 }
 
 type systemLinkOperations struct{}
@@ -113,6 +117,22 @@ func (systemLinkOperations) LinkByName(name string) (netlink.Link, error) {
 
 func (systemLinkOperations) LinkDel(link netlink.Link) error {
 	return netlink.LinkDel(link)
+}
+
+func (systemLinkOperations) LinkSetMaster(link, master netlink.Link) error {
+	return netlink.LinkSetMaster(link, master)
+}
+
+func (systemLinkOperations) LinkSetHardwareAddr(link netlink.Link, addr net.HardwareAddr) error {
+	return netlink.LinkSetHardwareAddr(link, addr)
+}
+
+func (systemLinkOperations) LinkSetUp(link netlink.Link) error {
+	return netlink.LinkSetUp(link)
+}
+
+func (systemLinkOperations) LinkSetDown(link netlink.Link) error {
+	return netlink.LinkSetDown(link)
 }
 
 func (m *InterfaceManager) links() linkOperations {
@@ -541,6 +561,43 @@ func (m *InterfaceManager) rollbackEphemeralCreation(resource, netNSPath string)
 	return errors.Join(destroyErr, m.deleteEphemeral(netNSPath))
 }
 
+// resolveLeaseKey maps an externally held resource string onto the stored
+// lease key. Recovery renames the durable key when setTapState repairs lease
+// bookkeeping (ifindex drift after a device recreate), while the serialized
+// NetResource persisted in the sandbox OCI annotations at allocation time
+// still names the pre-repair string. Ownership identity is immutable
+// (endpoint type, interface name — which encodes the IP — and the IP
+// itself), so a miss is resolved by that identity instead of silently
+// treating the lease as gone, which would leak the endpoint, its IP, and
+// its pool slot forever.
+//
+// The caller must hold leaseMu (or otherwise exclude concurrent removal).
+func (m *InterfaceManager) resolveLeaseKey(id string) (string, bool) {
+	if m.usingInterfaces.Has(id) {
+		return id, true
+	}
+	want, err := NewNetResource(id)
+	if err != nil || want.Interface == nil || want.Ip == nil {
+		return "", false
+	}
+	for _, key := range m.usingInterfaces.Keys() {
+		got, err := NewNetResource(key)
+		if err != nil || got.Interface == nil || got.Ip == nil {
+			continue
+		}
+		if got.EndpointType == want.EndpointType &&
+			got.Interface.Name == want.Interface.Name &&
+			got.Ip.Equal(want.Ip) {
+			logrus.Warnf(
+				"networkmanager: lease %s resolved onto refreshed key %s by immutable identity",
+				id, key,
+			)
+			return key, true
+		}
+	}
+	return "", false
+}
+
 // markUsing moves a freshly popped/created interface string into the using set.
 func (m *InterfaceManager) markUsing(netResourceStr string) (string, error) {
 	netResource, err := NewNetResource(netResourceStr)
@@ -571,20 +628,23 @@ func (m *InterfaceManager) Recycle(id string) error {
 	m.leaseMu.Lock()
 	defer m.leaseMu.Unlock()
 
-	if !m.usingInterfaces.Has(id) {
+	key, active := m.resolveLeaseKey(id)
+	if !active {
 		return nil
 	}
-	netResource, err := NewNetResource(id)
+	netResource, err := NewNetResource(key)
 	if err != nil {
 		return fmt.Errorf("parse net resource for recycle: %w", err)
 	}
 	if err := m.setTapState(netResource, false); err != nil {
 		return err
 	}
-	m.usingInterfaces.Pop(id)
+	m.usingInterfaces.Pop(key)
 	logrus.Infof("parse interface when recycle: %s ", netResource.ToString())
-	// using -> idle, total unchanged.
-	m.interfaces.Push(id)
+	// using -> idle, total unchanged. Queue the serialization refreshed by
+	// setTapState rather than the caller's copy, so the idle lease carries
+	// current bookkeeping (ifindex).
+	m.interfaces.Push(netResource.ToString())
 	m.storeMark.Store(true)
 
 	return nil
@@ -602,10 +662,11 @@ func (m *InterfaceManager) Deactivate(id string) error {
 	m.leaseMu.Lock()
 	defer m.leaseMu.Unlock()
 
-	if !m.usingInterfaces.Has(id) {
+	key, active := m.resolveLeaseKey(id)
+	if !active {
 		return nil
 	}
-	resource, err := NewNetResource(id)
+	resource, err := NewNetResource(key)
 	if err != nil {
 		return fmt.Errorf("parse net resource for deactivation: %w", err)
 	}
@@ -637,14 +698,16 @@ func (m *InterfaceManager) releaseEphemeral(id string, resource *NetResource) er
 	m.leaseMu.Lock()
 	defer m.leaseMu.Unlock()
 
-	if _, active := m.usingInterfaces.Pop(id); !active {
+	key, active := m.resolveLeaseKey(id)
+	if !active {
 		// A previous attempt may have deleted the pair but failed to remove the
 		// namespace mount. Never touch the deterministic host-veth name here: its
 		// IP may already have been leased to another sandbox.
 		return m.deleteEphemeral(resource.NetNSPath)
 	}
-	if err := m.doDestroy(id); err != nil {
-		m.usingInterfaces.Set(id, struct{}{})
+	m.usingInterfaces.Pop(key)
+	if err := m.doDestroy(key); err != nil {
+		m.usingInterfaces.Set(key, struct{}{})
 		return err
 	}
 	m.releaseReservedSlot()
@@ -673,11 +736,13 @@ func (m *InterfaceManager) Discard(id string) error {
 	m.leaseMu.Lock()
 	defer m.leaseMu.Unlock()
 
-	if _, active := m.usingInterfaces.Pop(id); !active {
+	key, active := m.resolveLeaseKey(id)
+	if !active {
 		return nil
 	}
-	if err := m.doDestroy(id); err != nil {
-		m.usingInterfaces.Set(id, struct{}{})
+	m.usingInterfaces.Pop(key)
+	if err := m.doDestroy(key); err != nil {
+		m.usingInterfaces.Set(key, struct{}{})
 		return err
 	}
 	m.mu.Lock()

@@ -184,7 +184,7 @@ func (m *InterfaceManager) setTapState(resource *NetResource, up bool) error {
 			expectedName,
 		)
 	}
-	link, err := netlink.LinkByName(expectedName)
+	link, err := m.links().LinkByName(expectedName)
 	if err != nil {
 		return fmt.Errorf("find pooled TAP %s: %w", expectedName, err)
 	}
@@ -201,7 +201,7 @@ func (m *InterfaceManager) setTapState(resource *NetResource, up bool) error {
 		return fmt.Errorf("pooled TAP %s has no %s to attach to", expectedName, BridgeName)
 	}
 	if link.Attrs().MasterIndex != m.bridgeLink.Attrs().Index {
-		if err := netlink.LinkSetMaster(link, m.bridgeLink); err != nil {
+		if err := m.links().LinkSetMaster(link, m.bridgeLink); err != nil {
 			return fmt.Errorf(
 				"reattach pooled TAP %s to %s: %w", expectedName, BridgeName, err,
 			)
@@ -213,7 +213,7 @@ func (m *InterfaceManager) setTapState(resource *NetResource, up bool) error {
 	}
 	expectedHostMAC, _ := tapHostMAC(ip4)
 	if !bytes.Equal(link.Attrs().HardwareAddr, expectedHostMAC) {
-		if err := netlink.LinkSetHardwareAddr(link, expectedHostMAC); err != nil {
+		if err := m.links().LinkSetHardwareAddr(link, expectedHostMAC); err != nil {
 			return fmt.Errorf(
 				"restore pooled TAP %s host MAC to %s: %w", expectedName, expectedHostMAC, err,
 			)
@@ -243,12 +243,12 @@ func (m *InterfaceManager) setTapState(resource *NetResource, up bool) error {
 		resource.Interface.Index = link.Attrs().Index
 	}
 	if up {
-		if err := netlink.LinkSetUp(link); err != nil {
+		if err := m.links().LinkSetUp(link); err != nil {
 			return fmt.Errorf("activate pooled TAP %s: %w", expectedName, err)
 		}
 		return nil
 	}
-	if err := netlink.LinkSetDown(link); err != nil {
+	if err := m.links().LinkSetDown(link); err != nil {
 		return fmt.Errorf("deactivate pooled TAP %s: %w", expectedName, err)
 	}
 	return nil

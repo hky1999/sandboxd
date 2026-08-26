@@ -174,6 +174,10 @@ func (m *InterfaceManager) load(ips sets.Set[string]) error {
 			// ifindex refresh after the device was recreated). Swap the
 			// durable key so the repaired lease is what gets stored and
 			// handed back on recycle, instead of re-warning every restart.
+			// External holders (the sandbox OCI annotations) still name the
+			// pre-repair string; release paths resolve leases by immutable
+			// identity (see resolveLeaseKey), so this rename cannot orphan
+			// their references.
 			if refreshed := stored.ToString(); refreshed != activeID {
 				m.usingInterfaces.Pop(activeID)
 				m.usingInterfaces.Set(refreshed, struct{}{})
