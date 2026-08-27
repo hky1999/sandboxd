@@ -1,7 +1,6 @@
 package networkmanager
 
 import (
-	"errors"
 	"net"
 	"os"
 	"testing"
@@ -15,152 +14,162 @@ import (
 	"github.com/inclusionAI/sandboxd/internal/util"
 )
 
-// recoveryFixture models the P1 scenario from the PR review: a durable pooled
-// TAP lease recorded with a stale ifindex, a host device recreated at a fresh
-// ifindex, and everything else (bridge attach, host MAC) already converged.
-type recoveryFixture struct {
-	manager    *InterfaceManager
-	linkOps    *fakeLinkOperations
-	tapName    string
-	staleLease string
+// tapRecoveryFixture builds a manager around one host TAP whose exact state
+// the test controls, with every host mutation recorded by the fake link ops.
+type tapRecoveryFixture struct {
+	manager *InterfaceManager
+	linkOps *fakeLinkOperations
+	tapName string
 }
 
-func newRecoveryFixture(t *testing.T) *recoveryFixture {
+func newTapRecoveryFixture(t *testing.T, tap *netlink.Tuntap) *tapRecoveryFixture {
 	t.Helper()
 
-	ip := net.ParseIP("10.88.0.5").To4()
-	require.NotNil(t, ip)
-	mask := net.CIDRMask(16, 32)
-	bridgeIP := net.ParseIP("10.88.0.1")
-	tapName := util.IpToTap(ip.String())
-	hostMAC, err := tapHostMAC(ip)
-	require.NoError(t, err)
-	guestMAC, err := tapGuestMAC(ip)
-	require.NoError(t, err)
-
 	bridge := &netlink.Bridge{LinkAttrs: netlink.LinkAttrs{Name: BridgeName, Index: 42}}
-	tap := &netlink.Tuntap{
-		LinkAttrs: netlink.LinkAttrs{
-			Name:         tapName,
-			Index:        13, // recreated: the lease still records 7
-			MasterIndex:  42,
-			HardwareAddr: hostMAC,
-		},
-		Mode: netlink.TUNTAP_MODE_TAP,
-	}
-
-	stale := &NetResource{
-		SchemaVersion: NetResourceSchemaVersion,
-		EndpointType:  EndpointTypeTap,
-		GuestMAC:      guestMAC,
-		Interface:     &net.Interface{Name: tapName, Index: 7},
-		Ip:            ip,
-		Mask:          mask,
-		Gateway:       bridgeIP,
-		Type:          "bridge",
-	}
-	staleLease := stale.ToString()
-
-	// The fixture is converged apart from the ifindex: reaching a repair call
-	// means the identity checks matched the wrong device, so fail loudly.
-	linkOps := &fakeLinkOperations{
-		link:         tap,
-		setMasterErr: errors.New("unexpected bridge re-attach on converged fixture"),
-		setMACErr:    errors.New("unexpected host MAC re-stamp on converged fixture"),
-	}
-
-	f := &recoveryFixture{
-		tapName:    tapName,
-		staleLease: staleLease,
-		linkOps:    linkOps,
-	}
-	f.manager = &InterfaceManager{
+	linkOps := &fakeLinkOperations{link: tap}
+	m := &InterfaceManager{
 		IpRange:    "10.88.0.1/16",
-		BridgeIp:   bridgeIP,
-		mask:       mask,
+		BridgeIp:   net.ParseIP("10.88.0.1"),
+		mask:       net.CIDRMask(16, 32),
 		bridgeLink: bridge,
 		linkOps:    linkOps,
 		listLinks: func() ([]net.Interface, error) {
-			return []net.Interface{{Name: tapName, Index: 13}}, nil
+			return []net.Interface{{Name: tap.Attrs().Name, Index: tap.Attrs().Index}}, nil
 		},
 		listNetNS:       func() ([]os.DirEntry, error) { return nil, nil },
 		interfaces:      util.New(""),
 		usingInterfaces: cmap.New[struct{}](),
 		idleIp:          util.New(""),
 	}
-	f.manager.usingInterfaces.Set(staleLease, struct{}{})
-	return f
+	return &tapRecoveryFixture{manager: m, linkOps: linkOps, tapName: tap.Attrs().Name}
 }
 
-// refreshedLease returns the post-recovery durable key and verifies it only
-// differs from the externally held string in bookkeeping fields.
-func (f *recoveryFixture) refreshedLease(t *testing.T) string {
+func convergedTap(t *testing.T, ifindex int) *netlink.Tuntap {
 	t.Helper()
-	keys := f.manager.usingInterfaces.Keys()
-	require.Len(t, keys, 1, "exactly one active lease expected after recovery")
-	assert.False(t, f.manager.usingInterfaces.Has(f.staleLease),
-		"durable key must have been swapped away from the stale lease")
-	refreshed, err := NewNetResource(keys[0])
+	ip := net.ParseIP("10.88.0.5").To4()
+	require.NotNil(t, ip)
+	hostMAC, err := tapHostMAC(ip)
 	require.NoError(t, err)
-	require.NotNil(t, refreshed.Interface)
-	assert.Equal(t, f.tapName, refreshed.Interface.Name)
-	assert.EqualValues(t, 13, refreshed.Interface.Index,
-		"refreshed lease must carry the current ifindex")
-	return keys[0]
+	return &netlink.Tuntap{
+		LinkAttrs: netlink.LinkAttrs{
+			Name:         util.IpToTap(ip.String()),
+			Index:        ifindex,
+			MasterIndex:  42,
+			HardwareAddr: hostMAC,
+		},
+		Mode: netlink.TUNTAP_MODE_TAP,
+	}
 }
 
-// TestRecoveryIfindexDriftKeepsExternalLeaseReferenceWorking is the
-// regression test requested in review: active ifindex drift, daemon restart
-// (which renames the durable lease key), then sandbox deletion driving
-// Deactivate and Release with the pre-restart annotation string. Before the
-// immutable-identity resolution both operations silently succeeded without
-// touching the TAP, leaking the lease, its IP, and its pool slot forever.
-func TestRecoveryIfindexDriftKeepsExternalLeaseReferenceWorking(t *testing.T) {
-	f := newRecoveryFixture(t)
-	m := f.manager
+func activeLeaseWithIfindex(t *testing.T, ifindex int) string {
+	t.Helper()
+	ip := net.ParseIP("10.88.0.5").To4()
+	guestMAC, err := tapGuestMAC(ip)
+	require.NoError(t, err)
+	stale := &NetResource{
+		SchemaVersion: NetResourceSchemaVersion,
+		EndpointType:  EndpointTypeTap,
+		GuestMAC:      guestMAC,
+		Interface:     &net.Interface{Name: util.IpToTap(ip.String()), Index: ifindex},
+		Ip:            ip,
+		Mask:          net.CIDRMask(16, 32),
+		Gateway:       net.ParseIP("10.88.0.1"),
+		Type:          "bridge",
+	}
+	return stale.ToString()
+}
 
-	// Daemon restart: recovery repairs the stale ifindex and renames the
-	// durable key.
-	require.NoError(t, m.load(sets.New[string]()))
-	f.refreshedLease(t)
-	assert.Equal(t, 1, f.linkOps.setUpCount,
-		"active-lease recovery must bring the TAP up")
+// TestRecoveryRejectsExternallyReplacedActiveTap pins the reviewer-requested
+// boundary: sandboxd never recreates a leased TAP, so an ifindex mismatch on
+// an ACTIVE lease means the device was replaced externally and the owning
+// sandbox's networking is already broken (the guest holds the old device).
+// Recovery must refuse to adopt the replacement instead of refreshing the
+// lease record over a dead endpoint.
+func TestRecoveryRejectsExternallyReplacedActiveTap(t *testing.T) {
+	f := newTapRecoveryFixture(t, convergedTap(t, 13))
+	lease := activeLeaseWithIfindex(t, 7)
+	f.manager.usingInterfaces.Set(lease, struct{}{})
 
-	// Sandbox deletion step 1: Deactivate is called with the annotation
-	// string persisted before the restart. It must actually disconnect the
-	// TAP instead of no-op'ing on the renamed key.
-	assert.NoError(t, m.Deactivate(f.staleLease))
-	assert.Equal(t, 1, f.linkOps.setDownCount,
-		"Deactivate must disconnect the TAP resolved by immutable identity")
-	// The lease is retained (deactivated, not recycled).
-	f.refreshedLease(t)
+	err := f.manager.load(sets.New[string]())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "was replaced externally")
+	assert.Contains(t, err.Error(), "ifindex 13, durable lease records 7")
 
-	// Sandbox deletion step 2: Release/Recycle must return the endpoint to
-	// the idle pool under the same external reference.
-	assert.NoError(t, m.Release(f.staleLease))
-	assert.Equal(t, 2, f.linkOps.setDownCount,
-		"Recycle must deactivate the TAP resolved by immutable identity")
-	assert.Zero(t, m.usingInterfaces.Count(),
-		"lease must leave the using set after Release")
-	using, idle := m.Status()
+	// The durable lease is left untouched for the operator to resolve.
+	assert.True(t, f.manager.usingInterfaces.Has(lease))
+	assert.Zero(t, f.linkOps.setUpCount,
+		"a replaced endpoint must not be adopted (no LinkSetUp)")
+}
+
+// TestRecoveryRepairsIdleOrphanMacAndBridgeDrift is the other half of the
+// reviewer-requested pair: an orphan tap with no lease — e.g. left by a
+// predecessor that died inside the createTapDevice window (random MAC, no
+// bridge) — is adopted with its deterministic attributes repaired in place.
+func TestRecoveryRepairsIdleOrphanMacAndBridgeDrift(t *testing.T) {
+	tap := convergedTap(t, 13)
+	tap.LinkAttrs.MasterIndex = 0 // detached
+	tap.LinkAttrs.HardwareAddr = net.HardwareAddr{0x2a, 0x21, 0xc6, 0xf4, 0x97, 0xe0}
+	f := newTapRecoveryFixture(t, tap)
+
+	require.NoError(t, f.manager.load(sets.New[string]()))
+
+	assert.Equal(t, 1, f.linkOps.setMasterCount, "bridge attach must be repaired")
+	assert.Equal(t, 1, f.linkOps.setMACCount, "host MAC must be re-stamped")
+	assert.Equal(t, 1, f.linkOps.setDownCount, "adopted idle tap must be set down")
+	assert.Zero(t, f.linkOps.setUpCount)
+
+	using, idle := f.manager.Status()
 	assert.Empty(t, using)
 	require.Len(t, idle, 1)
-	recycled, err := NewNetResource(idle[0])
+	adopted, err := NewNetResource(idle[0])
 	require.NoError(t, err)
-	require.NotNil(t, recycled.Interface)
-	assert.Equal(t, f.tapName, recycled.Interface.Name)
-	assert.EqualValues(t, 13, recycled.Interface.Index,
-		"idle queue must carry the refreshed lease, not the stale annotation string")
+	require.NotNil(t, adopted.Interface)
+	assert.Equal(t, f.tapName, adopted.Interface.Name)
+}
+
+// TestAllocationRefreshKeepsLeaseAndExternalStringConsistent covers the
+// remaining ifindex-refresh path: a lease re-handed out by markUsing (no
+// external consumer yet). The refreshed serialization is what gets stored
+// AND what the caller persists as the sandbox annotation, so records and
+// external holders can never diverge.
+func TestAllocationRefreshKeepsLeaseAndExternalStringConsistent(t *testing.T) {
+	f := newTapRecoveryFixture(t, convergedTap(t, 13))
+	// An idle lease whose device was externally recreated while idle (no
+	// consumer); markUsing is the post-pop validation Allocate runs.
+	stale := activeLeaseWithIfindex(t, 7)
+
+	handedOut, err := f.manager.markUsing(stale)
+	require.NoError(t, err)
+
+	// The stored key IS the handed-out string (with current bookkeeping).
+	assert.True(t, f.manager.usingInterfaces.Has(handedOut))
+	refreshed, err := NewNetResource(handedOut)
+	require.NoError(t, err)
+	assert.EqualValues(t, 13, refreshed.Interface.Index)
+	assert.NotEqual(t, stale, handedOut,
+		"the refreshed serialization must replace the stale one everywhere")
+	assert.Equal(t, 1, f.linkOps.setUpCount)
+
+	// Sandbox deletion with that exact string recycles cleanly.
+	assert.NoError(t, f.manager.Release(handedOut))
+	using, idle := f.manager.Status()
+	assert.Empty(t, using)
+	assert.Len(t, idle, 1)
 }
 
 // TestResolveLeaseKeyRejectsForeignIdentity pins the resolution boundary: a
 // miss that does not match any active lease by immutable identity stays a
 // miss, so unrelated or malformed strings still take the no-op paths.
 func TestResolveLeaseKeyRejectsForeignIdentity(t *testing.T) {
-	f := newRecoveryFixture(t)
-	m := f.manager
+	f := newTapRecoveryFixture(t, convergedTap(t, 13))
+	stored := activeLeaseWithIfindex(t, 13)
+	f.manager.usingInterfaces.Set(stored, struct{}{})
 
-	require.NoError(t, m.load(sets.New[string]()))
+	// Same immutable identity under an older serialization resolves.
+	staleView := activeLeaseWithIfindex(t, 7)
+	key, ok := f.manager.resolveLeaseKey(staleView)
+	assert.True(t, ok)
+	assert.Equal(t, stored, key)
 
 	foreign := (&NetResource{
 		SchemaVersion: NetResourceSchemaVersion,
@@ -170,16 +179,15 @@ func TestResolveLeaseKeyRejectsForeignIdentity(t *testing.T) {
 		Type:          "bridge",
 	}).ToString()
 
-	key, ok := m.resolveLeaseKey(foreign)
+	_, ok = f.manager.resolveLeaseKey(foreign)
 	assert.False(t, ok)
-	assert.Empty(t, key)
 
-	_, ok = m.resolveLeaseKey("not-json")
+	_, ok = f.manager.resolveLeaseKey("not-json")
 	assert.False(t, ok)
 
 	// Unrelated strings keep the silent no-op semantics.
-	assert.NoError(t, m.Deactivate(foreign))
+	assert.NoError(t, f.manager.Deactivate(foreign))
 	assert.Zero(t, f.linkOps.setDownCount)
-	assert.Equal(t, 1, m.usingInterfaces.Count(),
+	assert.Equal(t, 1, f.manager.usingInterfaces.Count(),
 		"the real lease must be untouched by a foreign Deactivate")
 }

@@ -244,17 +244,19 @@ func TestDisablePeerForwardingRejectsNonPeerInterface(t *testing.T) {
 }
 
 type fakeLinkOperations struct {
-	link         netlink.Link
-	lookupErr    error
-	deleteErr    error
-	lookupName   string
-	deleted      netlink.Link
-	setMasterErr error
-	setMACErr    error
-	setUpErr     error
-	setDownErr   error
-	setUpCount   int
-	setDownCount int
+	link           netlink.Link
+	lookupErr      error
+	deleteErr      error
+	lookupName     string
+	deleted        netlink.Link
+	setMasterErr   error
+	setMACErr      error
+	setUpErr       error
+	setDownErr     error
+	setUpCount     int
+	setDownCount   int
+	setMasterCount int
+	setMACCount    int
 }
 
 type cleanupNetworkManager struct {
@@ -437,10 +439,12 @@ func (f *fakeLinkOperations) LinkDel(link netlink.Link) error {
 }
 
 func (f *fakeLinkOperations) LinkSetMaster(_, _ netlink.Link) error {
+	f.setMasterCount++
 	return f.setMasterErr
 }
 
 func (f *fakeLinkOperations) LinkSetHardwareAddr(_ netlink.Link, _ net.HardwareAddr) error {
+	f.setMACCount++
 	return f.setMACErr
 }
 

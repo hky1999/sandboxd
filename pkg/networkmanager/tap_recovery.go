@@ -167,21 +167,21 @@ func (m *InterfaceManager) load(ips sets.Set[string]) error {
 			if parseErr != nil {
 				return parseErr
 			}
+			// An ifindex mismatch on an active lease means the kernel device
+			// was replaced externally: sandboxd never recreates a leased TAP
+			// (createTapDevice refuses to replace one, and MAC/bridge repairs
+			// do not change the ifindex), and the guest still holds the OLD
+			// device — that sandbox's networking is already broken. Refuse to
+			// adopt the replacement instead of relabeling a broken state as
+			// healthy by refreshing the lease record.
+			if stored.Interface.Index != 0 && stored.Interface.Index != link.Attrs().Index {
+				return fmt.Errorf(
+					"active pooled TAP %s was replaced externally (ifindex %d, durable lease records %d); remove the owning sandbox or restore the device",
+					dev.Name, link.Attrs().Index, stored.Interface.Index,
+				)
+			}
 			if stateErr := m.setTapState(stored, true); stateErr != nil {
 				return fmt.Errorf("recover active pooled TAP %s: %w", dev.Name, stateErr)
-			}
-			// setTapState may repair lease bookkeeping in memory (e.g. an
-			// ifindex refresh after the device was recreated). Swap the
-			// durable key so the repaired lease is what gets stored and
-			// handed back on recycle, instead of re-warning every restart.
-			// External holders (the sandbox OCI annotations) still name the
-			// pre-repair string; release paths resolve leases by immutable
-			// identity (see resolveLeaseKey), so this rename cannot orphan
-			// their references.
-			if refreshed := stored.ToString(); refreshed != activeID {
-				m.usingInterfaces.Pop(activeID)
-				m.usingInterfaces.Set(refreshed, struct{}{})
-				m.storeMark.Store(true)
 			}
 		} else {
 			if stateErr := m.setTapState(current, false); stateErr != nil {

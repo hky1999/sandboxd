@@ -562,14 +562,15 @@ func (m *InterfaceManager) rollbackEphemeralCreation(resource, netNSPath string)
 }
 
 // resolveLeaseKey maps an externally held resource string onto the stored
-// lease key. Recovery renames the durable key when setTapState repairs lease
-// bookkeeping (ifindex drift after a device recreate), while the serialized
-// NetResource persisted in the sandbox OCI annotations at allocation time
-// still names the pre-repair string. Ownership identity is immutable
-// (endpoint type, interface name — which encodes the IP — and the IP
-// itself), so a miss is resolved by that identity instead of silently
-// treating the lease as gone, which would leak the endpoint, its IP, and
-// its pool slot forever.
+// lease key. Lease strings are full serializations that can carry mutable
+// bookkeeping (e.g. an ifindex refreshed when a lease is re-handed out), and
+// an externally held copy — the serialized NetResource persisted in the
+// sandbox OCI annotations — may name an older serialization than the stored
+// key. Ownership identity is immutable (endpoint type, interface name —
+// which encodes the IP — and the IP itself), so a miss is resolved by that
+// identity instead of silently treating the lease as gone, which would leak
+// the endpoint, its IP, and its pool slot forever. This is defense in depth:
+// normal flows keep the stored key and the handed-out string identical.
 //
 // The caller must hold leaseMu (or otherwise exclude concurrent removal).
 func (m *InterfaceManager) resolveLeaseKey(id string) (string, bool) {

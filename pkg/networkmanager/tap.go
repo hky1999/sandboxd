@@ -234,8 +234,12 @@ func (m *InterfaceManager) setTapState(resource *NetResource, up bool) error {
 	}
 	if resource.Interface.Index != 0 && resource.Interface.Index != link.Attrs().Index {
 		// The kernel ifindex is bookkeeping, not identity (it changes whenever
-		// the device is recreated); refresh the lease record instead of
-		// failing over a value nobody consumes.
+		// the device is recreated). This refresh only runs on consumer-less
+		// paths — a lease being (re)handed out by markUsing or returned by
+		// Recycle — where the refreshed serialization becomes the string the
+		// caller persists and later releases, so records and external holders
+		// stay consistent. Recovery of an ACTIVE lease whose device was
+		// replaced externally is rejected by load() before this point.
 		logrus.Warnf(
 			"networkmanager: pooled TAP %s index drifted (%d, lease records %d); refreshing lease",
 			expectedName, link.Attrs().Index, resource.Interface.Index,
