@@ -753,8 +753,12 @@ run_checkpoint_restore_check() {
             --checkpoint-timeout-seconds 180 \
             --compress=true \
             --leave-running=true
-        [ -s "${checkpoint_dir}/checkpoint.img" ] ||
+        # Accept both the legacy v1 single-file archive and the v2 directory
+        # layout (manifest.json + vmstate + memory + overlay.ext4).
+        if [ ! -s "${checkpoint_dir}/checkpoint.img" ] &&
+            [ ! -s "${checkpoint_dir}/manifest.json" ]; then
             fail "${suffix} checkpoint ${checkpoint_index} artifact is missing or empty"
+        fi
 
         source_after=""
         for attempt in $(seq 1 100); do

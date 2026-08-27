@@ -300,6 +300,15 @@ func (handler *Handler) Checkpoint(
 		))
 	}
 	adoptCheckpointMemory(instance, files.Memory, false)
+	// Persist the adopted base: a daemon restart must recover the same
+	// lineage the VMM's armed ledger tracks, or the next window delta would
+	// be patched into a stale image.
+	if err := handler.persistInstance(instance); err != nil {
+		logrus.Warnf(
+			"firecracker: persist adopted base for %s failed (next checkpoint after daemon restart rebuilds from a first window): %v",
+			sandboxID, err,
+		)
+	}
 
 	// Pause window = pause..resume (snapshot + overlay clone); layout and
 	// sealing are host-side work outside it by design.
