@@ -200,11 +200,8 @@ func (handler *Handler) Checkpoint(
 	// seal-phase fsync covers durability.
 	if _, err := cloneFileNoSync(state.OverlayPath, files.Overlay); err != nil {
 		discardUnsealedFirecrackerCheckpoint(files)
-		if config.LeaveRunning {
-			err = errors.Join(err, fmt.Errorf(
-				"resume Firecracker sandbox %s: %w", sandboxID, api.resume(ctx),
-			))
-		}
+		// The deferred handoff cleanup above resumes the guest and sends
+		// the error outcome; an explicit resume here would race with it.
 		return fmt.Errorf("snapshot Firecracker writable layer for %s: %w", sandboxID, err)
 	}
 	tOverlay := time.Now()
@@ -225,11 +222,8 @@ func (handler *Handler) Checkpoint(
 		}
 		if err != nil {
 			discardUnsealedFirecrackerCheckpoint(files)
-			if config.LeaveRunning {
-				err = errors.Join(err, fmt.Errorf(
-					"resume Firecracker sandbox %s: %w", sandboxID, api.resume(ctx),
-				))
-			}
+			// The deferred handoff cleanup above resumes the guest and sends
+			// the error outcome; an explicit resume here would race with it.
 			return fmt.Errorf("create Firecracker %s snapshot for %s: %w",
 				snapshotType, sandboxID, err)
 		}
@@ -445,6 +439,10 @@ func (handler *Handler) buildCheckpointCompat(vcpus uint32) (*firecrackerCheckpo
 func (handler *Handler) verifyCheckpointCompat(
 	artifact *firecrackerCheckpointArtifact,
 ) error {
+	// Legacy v1 archives have no manifest at all; verify only v2 artifacts.
+	if artifact.Manifest == nil {
+		return nil
+	}
 	recorded := artifact.Manifest.Compat
 	if recorded == nil {
 		return nil
@@ -741,7 +739,8 @@ func (handler *Handler) Restore(
 		return fmt.Errorf("start Firecracker restore VMM: %w", err)
 	}
 	restoredVcpus := uint32(0)
-	if compat := artifact.Manifest.Compat; compat != nil {
+	if artifact.Manifest != nil && artifact.Manifest.Compat != nil {
+		compat := artifact.Manifest.Compat
 		// Informational only: the vmstate pins the real count.
 		restoredVcpus = compat.Vcpus
 	}

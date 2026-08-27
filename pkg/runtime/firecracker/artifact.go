@@ -229,11 +229,16 @@ func finalizeFirecrackerCheckpointV2(
 	if err != nil {
 		return fmt.Errorf("create Firecracker checkpoint manifest: %w", err)
 	}
-	defer func() {
-		retErr = errors.Join(retErr, onDisk.Sync(), onDisk.Close())
-	}()
+	// Sync the manifest file before the directory: the manifest is the
+	// commit marker, and a crash between a durable directory entry and an
+	// undurable file would make an incomplete generation look committed.
+	writeErr := error(nil)
 	if _, err := onDisk.Write(append(encoded, '\n')); err != nil {
-		return fmt.Errorf("write Firecracker checkpoint manifest: %w", err)
+		writeErr = fmt.Errorf("write Firecracker checkpoint manifest: %w", err)
+	}
+	retErr = errors.Join(writeErr, onDisk.Sync(), onDisk.Close())
+	if retErr != nil {
+		return retErr
 	}
 	return syncFirecrackerCheckpointDir(filepath.Dir(manifestPath))
 }
