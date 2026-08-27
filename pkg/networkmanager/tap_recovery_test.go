@@ -156,38 +156,3 @@ func TestAllocationRefreshKeepsLeaseAndExternalStringConsistent(t *testing.T) {
 	assert.Empty(t, using)
 	assert.Len(t, idle, 1)
 }
-
-// TestResolveLeaseKeyRejectsForeignIdentity pins the resolution boundary: a
-// miss that does not match any active lease by immutable identity stays a
-// miss, so unrelated or malformed strings still take the no-op paths.
-func TestResolveLeaseKeyRejectsForeignIdentity(t *testing.T) {
-	f := newTapRecoveryFixture(t, convergedTap(t, 13))
-	stored := activeLeaseWithIfindex(t, 13)
-	f.manager.usingInterfaces.Set(stored, struct{}{})
-
-	// Same immutable identity under an older serialization resolves.
-	staleView := activeLeaseWithIfindex(t, 7)
-	key, ok := f.manager.resolveLeaseKey(staleView)
-	assert.True(t, ok)
-	assert.Equal(t, stored, key)
-
-	foreign := (&NetResource{
-		SchemaVersion: NetResourceSchemaVersion,
-		EndpointType:  EndpointTypeTap,
-		Interface:     &net.Interface{Name: util.IpToTap("10.88.0.9"), Index: 99},
-		Ip:            net.ParseIP("10.88.0.9"),
-		Type:          "bridge",
-	}).ToString()
-
-	_, ok = f.manager.resolveLeaseKey(foreign)
-	assert.False(t, ok)
-
-	_, ok = f.manager.resolveLeaseKey("not-json")
-	assert.False(t, ok)
-
-	// Unrelated strings keep the silent no-op semantics.
-	assert.NoError(t, f.manager.Deactivate(foreign))
-	assert.Zero(t, f.linkOps.setDownCount)
-	assert.Equal(t, 1, f.manager.usingInterfaces.Count(),
-		"the real lease must be untouched by a foreign Deactivate")
-}

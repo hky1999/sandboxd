@@ -561,44 +561,6 @@ func (m *InterfaceManager) rollbackEphemeralCreation(resource, netNSPath string)
 	return errors.Join(destroyErr, m.deleteEphemeral(netNSPath))
 }
 
-// resolveLeaseKey maps an externally held resource string onto the stored
-// lease key. Lease strings are full serializations that can carry mutable
-// bookkeeping (e.g. an ifindex refreshed when a lease is re-handed out), and
-// an externally held copy — the serialized NetResource persisted in the
-// sandbox OCI annotations — may name an older serialization than the stored
-// key. Ownership identity is immutable (endpoint type, interface name —
-// which encodes the IP — and the IP itself), so a miss is resolved by that
-// identity instead of silently treating the lease as gone, which would leak
-// the endpoint, its IP, and its pool slot forever. This is defense in depth:
-// normal flows keep the stored key and the handed-out string identical.
-//
-// The caller must hold leaseMu (or otherwise exclude concurrent removal).
-func (m *InterfaceManager) resolveLeaseKey(id string) (string, bool) {
-	if m.usingInterfaces.Has(id) {
-		return id, true
-	}
-	want, err := NewNetResource(id)
-	if err != nil || want.Interface == nil || want.Ip == nil {
-		return "", false
-	}
-	for _, key := range m.usingInterfaces.Keys() {
-		got, err := NewNetResource(key)
-		if err != nil || got.Interface == nil || got.Ip == nil {
-			continue
-		}
-		if got.EndpointType == want.EndpointType &&
-			got.Interface.Name == want.Interface.Name &&
-			got.Ip.Equal(want.Ip) {
-			logrus.Warnf(
-				"networkmanager: lease %s resolved onto refreshed key %s by immutable identity",
-				id, key,
-			)
-			return key, true
-		}
-	}
-	return "", false
-}
-
 // markUsing moves a freshly popped/created interface string into the using set.
 func (m *InterfaceManager) markUsing(netResourceStr string) (string, error) {
 	netResource, err := NewNetResource(netResourceStr)
@@ -629,18 +591,17 @@ func (m *InterfaceManager) Recycle(id string) error {
 	m.leaseMu.Lock()
 	defer m.leaseMu.Unlock()
 
-	key, active := m.resolveLeaseKey(id)
-	if !active {
+	if !m.usingInterfaces.Has(id) {
 		return nil
 	}
-	netResource, err := NewNetResource(key)
+	netResource, err := NewNetResource(id)
 	if err != nil {
 		return fmt.Errorf("parse net resource for recycle: %w", err)
 	}
 	if err := m.setTapState(netResource, false); err != nil {
 		return err
 	}
-	m.usingInterfaces.Pop(key)
+	m.usingInterfaces.Pop(id)
 	logrus.Infof("parse interface when recycle: %s ", netResource.ToString())
 	// using -> idle, total unchanged. Queue the serialization refreshed by
 	// setTapState rather than the caller's copy, so the idle lease carries
@@ -663,11 +624,10 @@ func (m *InterfaceManager) Deactivate(id string) error {
 	m.leaseMu.Lock()
 	defer m.leaseMu.Unlock()
 
-	key, active := m.resolveLeaseKey(id)
-	if !active {
+	if !m.usingInterfaces.Has(id) {
 		return nil
 	}
-	resource, err := NewNetResource(key)
+	resource, err := NewNetResource(id)
 	if err != nil {
 		return fmt.Errorf("parse net resource for deactivation: %w", err)
 	}
@@ -699,16 +659,14 @@ func (m *InterfaceManager) releaseEphemeral(id string, resource *NetResource) er
 	m.leaseMu.Lock()
 	defer m.leaseMu.Unlock()
 
-	key, active := m.resolveLeaseKey(id)
-	if !active {
+	if _, active := m.usingInterfaces.Pop(id); !active {
 		// A previous attempt may have deleted the pair but failed to remove the
 		// namespace mount. Never touch the deterministic host-veth name here: its
 		// IP may already have been leased to another sandbox.
 		return m.deleteEphemeral(resource.NetNSPath)
 	}
-	m.usingInterfaces.Pop(key)
-	if err := m.doDestroy(key); err != nil {
-		m.usingInterfaces.Set(key, struct{}{})
+	if err := m.doDestroy(id); err != nil {
+		m.usingInterfaces.Set(id, struct{}{})
 		return err
 	}
 	m.releaseReservedSlot()
@@ -737,13 +695,11 @@ func (m *InterfaceManager) Discard(id string) error {
 	m.leaseMu.Lock()
 	defer m.leaseMu.Unlock()
 
-	key, active := m.resolveLeaseKey(id)
-	if !active {
+	if _, active := m.usingInterfaces.Pop(id); !active {
 		return nil
 	}
-	m.usingInterfaces.Pop(key)
-	if err := m.doDestroy(key); err != nil {
-		m.usingInterfaces.Set(key, struct{}{})
+	if err := m.doDestroy(id); err != nil {
+		m.usingInterfaces.Set(id, struct{}{})
 		return err
 	}
 	m.mu.Lock()
