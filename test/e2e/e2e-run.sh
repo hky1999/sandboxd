@@ -723,7 +723,10 @@ run_checkpoint_restore_check() {
 
     local before=""
     local attempt
-    for attempt in $(seq 1 100); do
+    # The workload writes a 100MiB blob before starting the counter; on
+    # slow CI runners (runsc-kvm) that can outlast a short budget, so
+    # allow up to ~60s for the first counter value.
+    for attempt in $(seq 1 600); do
         before="$(sbox_cmd exec "${SANDBOX_ID}" \
             /bin/cat /var/checkpoint-counter 2>/dev/null || true)"
         if [[ "${before}" =~ ^[0-9]+$ ]] && [ "${before}" -gt 2 ]; then
@@ -761,7 +764,7 @@ run_checkpoint_restore_check() {
         fi
 
         source_after=""
-        for attempt in $(seq 1 100); do
+        for attempt in $(seq 1 600); do
             source_after="$(sbox_cmd exec "${SANDBOX_ID}" \
                 /bin/cat /var/checkpoint-counter 2>/dev/null || true)"
             if [[ "${source_after}" =~ ^[0-9]+$ ]] &&
@@ -810,7 +813,7 @@ run_checkpoint_restore_check() {
         fail "${suffix} restore re-executed the sandbox entrypoint"
     fi
     local restored=""
-    for attempt in $(seq 1 100); do
+    for attempt in $(seq 1 600); do
         restored="$(sbox_cmd exec "${SANDBOX_ID}" \
             /bin/cat /var/checkpoint-counter 2>/dev/null || true)"
         if [[ "${restored}" =~ ^[0-9]+$ ]] &&
