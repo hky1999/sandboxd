@@ -81,12 +81,20 @@ type firecrackerPersistedState struct {
 	Vcpus uint32 `json:"vcpus,omitempty"`
 	// BaseMemoryPath points at the memory image the Firecracker dirty-page
 	// ledger currently tracks — the previous artifact's own memory file, or
-	// the file a restore loaded. Empty means the next checkpoint rebuilds
-	// from a first window.
+	// the file a restore loaded.
 	BaseMemoryPath string `json:"base_memory_path,omitempty"`
 	// BaseMemoryIncremental marks a base that came from a restore, which the
 	// Firecracker pagemap ledger (not the soft-dirty window) diffs against.
-	BaseMemoryIncremental bool   `json:"base_memory_incremental,omitempty"`
+	BaseMemoryIncremental bool `json:"base_memory_incremental,omitempty"`
+	// BaseMemoryLineageLost marks that the VMM dirty-page ledger may be
+	// armed against a base sandboxd no longer holds: a checkpoint failed
+	// after the VMM wrote and re-armed its window, or the daemon restarted
+	// and cannot tell which generation the surviving VMM tracks. While set,
+	// the next checkpoint must take a Full snapshot — Full ignores the
+	// ledger and writes the complete memory image, and the window re-opens
+	// only after that write, so patching later deltas onto the Full
+	// artifact is a safe superset.
+	BaseMemoryLineageLost bool   `json:"base_memory_lineage_lost,omitempty"`
 	Configured            bool   `json:"configured,omitempty"`
 	Exited                bool   `json:"exited,omitempty"`
 	ExitedAt              string `json:"exited_at,omitempty"`
@@ -137,11 +145,27 @@ func (instance *firecrackerInstance) setBaseMemory(path string, incremental bool
 	instance.mu.Lock()
 	instance.state.BaseMemoryPath = path
 	instance.state.BaseMemoryIncremental = incremental
+	instance.state.BaseMemoryLineageLost = false
 	instance.mu.Unlock()
 }
 
-// clearBaseMemory drops the incremental lineage and reports whether there was
-// one to drop.
+// markBaseMemoryLineageLost drops the incremental lineage and records that
+// the VMM soft-dirty ledger may still be armed against the discarded base.
+// The next checkpoint must take a Full snapshot: with the ledger armed a
+// SoftDirty request writes only the window delta, which would silently lose
+// every page written before the discarded generation.
+func (instance *firecrackerInstance) markBaseMemoryLineageLost() {
+	instance.mu.Lock()
+	instance.state.BaseMemoryPath = ""
+	instance.state.BaseMemoryIncremental = false
+	instance.state.BaseMemoryLineageLost = true
+	instance.mu.Unlock()
+}
+
+// clearBaseMemory drops the incremental lineage without asserting anything
+// about the VMM ledger state; only callers that know the ledger is not armed
+// (a fresh sandbox that never checkpointed) may use it. Lineage-unsafe
+// callers must use markBaseMemoryLineageLost instead.
 func (instance *firecrackerInstance) clearBaseMemory() bool {
 	instance.mu.Lock()
 	changed := instance.state.BaseMemoryPath != ""
@@ -1091,13 +1115,22 @@ func (handler *Handler) recoverState(
 		}
 		return instance
 	}
-	if state.BaseMemoryPath != "" {
-		// A daemon restart loses the bookkeeping that ties the in-process
-		// Firecracker dirty-page ledger to a sandbox-owned base; restart the
-		// incremental chain from a first window rather than risk patching a
-		// stale base.
-		state.BaseMemoryPath = ""
-		state.BaseMemoryIncremental = false
+	// A daemon restart cannot know which generation the surviving VMM's
+	// dirty-page ledger is armed against: a checkpoint may have completed in
+	// the VMM (re-arming the window) without sandboxd persisting the new
+	// base. Never trust a pre-restart incremental lineage — drop the base on
+	// the recovered instance itself and force the next checkpoint to Full,
+	// which ignores the ledger and safely restarts the chain. Persist the
+	// reset so a second restart cannot resurrect the stale base. A sandbox
+	// that never checkpointed also pays one Full snapshot here; its ledger
+	// is disarmed, so that is only a completeness cost, never a correctness
+	// one.
+	instance.markBaseMemoryLineageLost()
+	if err := handler.persistInstance(instance); err != nil {
+		logrus.Warnf(
+			"firecracker: persist lineage reset for recovered sandbox %s: %v",
+			state.ID, err,
+		)
 	}
 	go handler.waitGuest(instance)
 	go handler.monitorRecovered(instance)

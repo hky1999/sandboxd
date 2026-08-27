@@ -72,9 +72,9 @@ behavior affects only how much host work and disk space a generation costs.
 Consecutive generations must use distinct `checkpoint_dir` values — sandboxd
 refuses to overwrite a directory that already holds a checkpoint. The
 incremental chain references the latest artifact's memory file directly, so a
-caller that deletes or mutates the most recent checkpoint directory drops the
-sandbox back to a full first window on the next checkpoint; deleting older
-generations is always safe.
+caller that deletes or mutates the most recent checkpoint directory invalidates
+the lineage: the next checkpoint takes a `Full` snapshot (see the lineage-loss
+rules below); deleting older generations is always safe.
 
 Durability is deliberately kept out of the pause window. Firecracker is asked
 to create the snapshot with `deferred_sync`, so its writes only reach the page
@@ -93,21 +93,33 @@ writes the guest performed during that gap belong to a generation that is
 discarded with the artifact; checkpoint success is only reported after the
 manifest commits. Write errors such as `ENOSPC` or `EIO` can therefore surface
 at the post-resume fsync instead of the snapshot request; sandboxd treats this
-like any seal failure (the partial generation is discarded and the next
-checkpoint rebuilds from a first window).
+like any seal failure: the partial generation is discarded, the lineage is
+marked lost, and the next checkpoint takes a `Full` snapshot.
 
 `snapshot_type` is a Firecracker-specific control with a validated enum: an
 empty value keeps the automatic tier selection above (a pagemap `Incremental`
 generation against the memory file a restore loaded, `SoftDirty` windows
-against a previous checkpoint afterwards, a `SoftDirty` first window with no
-lineage). An explicit `Full` drops the lineage for one generation and has
-Firecracker write the whole memory file. An explicit `Incremental` requires
-the restore-established pagemap base and fails otherwise. An explicit
-`SoftDirty` accepts whatever lineage is still usable. Independently of the
-request, a generation whose Firecracker snapshot fails degrades to a `SoftDirty`
-first window to keep the chain consistent — the sealed manifest records what
-was actually taken. Runtimes without incremental checkpoints (runsc) ignore
-the field.
+against a previous checkpoint afterwards, a `SoftDirty` first window on a
+sandbox that never checkpointed). An explicit `Full` drops the lineage for one
+generation and has Firecracker write the whole memory file. An explicit
+`Incremental` requires the restore-established pagemap base and fails
+otherwise. An explicit `SoftDirty` requires a usable base. Runtimes without
+incremental checkpoints (runsc) ignore the field.
+
+Lineage-loss rules: the VMM keeps its soft-dirty ledger in process memory, and
+an armed ledger writes only the window delta regardless of which base sandboxd
+holds. Whenever sandboxd can no longer prove that its base is the one the
+ledger tracks — a checkpoint failed after the VMM wrote and re-armed (snapshot
+error, post-resume fsync error, seal error), the recorded base drifted or was
+deleted, or the sandboxd daemon restarted — the lineage is marked lost and the
+next checkpoint takes a `Full` snapshot. `Full` ignores the ledger and writes
+the complete memory image; the window re-opens only after that write, so
+subsequent deltas patch onto the `Full` artifact as a safe superset. Explicit
+`SoftDirty`/`Incremental` requests fail while the lineage is lost (take a
+`Full` checkpoint first); automatic selection picks `Full` on its own. A daemon
+restart always marks the lineage lost for surviving sandboxes: the restart
+cannot tell which generation the surviving VMM is armed against, so the
+cheapest provably-safe recovery is one `Full` checkpoint per sandbox.
 
 The manifest digests the small components; hashing the memory file is skipped
 because it costs seconds of CPU per GiB and would dominate an otherwise

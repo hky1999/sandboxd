@@ -15,6 +15,7 @@
 package firecracker
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -34,6 +35,7 @@ func TestSelectFirecrackerSnapshotTier(t *testing.T) {
 		memorySize      int64
 		base            string
 		baseIncremental bool
+		lineageLost     bool
 		requested       string
 		wantType        string
 		wantBase        string
@@ -65,11 +67,51 @@ func TestSelectFirecrackerSnapshotTier(t *testing.T) {
 			wantLayoutSize:  1 << 20,
 		},
 		{
-			name:           "auto with drifted base rebuilds a first window",
+			name:           "auto with drifted base forces Full",
 			memorySize:     1 << 20,
 			base:           driftedBase,
-			wantType:       firecrackerSnapshotTypeSoftDirty,
-			wantLayoutSize: 1 << 20,
+			wantType:       firecrackerSnapshotTypeFull,
+			wantLayoutSize: 0,
+		},
+		{
+			name:           "auto with lost lineage forces Full",
+			memorySize:     1 << 20,
+			lineageLost:    true,
+			wantType:       firecrackerSnapshotTypeFull,
+			wantLayoutSize: 0,
+		},
+		{
+			name:            "lost lineage ignores a recorded base",
+			memorySize:      1 << 20,
+			base:            usableBase,
+			baseIncremental: false,
+			lineageLost:     true,
+			wantType:        firecrackerSnapshotTypeFull,
+			wantLayoutSize:  0,
+		},
+		{
+			name:        "explicit SoftDirty with lost lineage is an error",
+			memorySize:  1 << 20,
+			lineageLost: true,
+			requested:   firecrackerSnapshotTypeSoftDirty,
+			wantErr:     true,
+		},
+		{
+			name:        "explicit Incremental with lost lineage is an error",
+			memorySize:  1 << 20,
+			lineageLost: true,
+			requested:   firecrackerSnapshotTypeIncremental,
+			wantErr:     true,
+		},
+		{
+			name:            "explicit Full with lost lineage restarts the chain",
+			memorySize:      1 << 20,
+			base:            usableBase,
+			baseIncremental: true,
+			lineageLost:     true,
+			requested:       firecrackerSnapshotTypeFull,
+			wantType:        firecrackerSnapshotTypeFull,
+			wantLayoutSize:  0,
 		},
 		{
 			name:            "explicit Full drops the lineage and the size",
@@ -119,7 +161,7 @@ func TestSelectFirecrackerSnapshotTier(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			snapshotType, base, _, layoutSize, err := selectFirecrackerSnapshotTier(
-				tc.memorySize, tc.base, tc.baseIncremental, tc.requested,
+				tc.memorySize, tc.base, tc.baseIncremental, tc.lineageLost, tc.requested,
 			)
 			if tc.wantErr {
 				if err == nil {
@@ -202,12 +244,21 @@ func TestAdoptCheckpointMemoryDropsUnusableLineage(t *testing.T) {
 	if instance.snapshot().BaseMemoryPath != "" {
 		t.Fatal("a symlinked memory was adopted as a base")
 	}
+	// An unusable adoption must force the Full recovery path: the VMM
+	// ledger may still be armed against the recorded base.
+	if !instance.snapshot().BaseMemoryLineageLost {
+		t.Fatal("an unusable adoption kept the lineage trusted")
+	}
 
 	memory := filepath.Join(dir, "memory")
 	writeArtifactComponent(t, memory, 64<<10)
 	adoptCheckpointMemory(instance, memory, false)
-	if instance.snapshot().BaseMemoryPath == "" {
+	state := instance.snapshot()
+	if state.BaseMemoryPath == "" {
 		t.Fatal("adoption failed for a regular memory file")
+	}
+	if state.BaseMemoryLineageLost {
+		t.Fatal("a successful adoption kept the lineage marked lost")
 	}
 	instance.clearBaseMemory()
 	if instance.snapshot().BaseMemoryPath != "" || instance.snapshot().BaseMemoryIncremental {
@@ -216,6 +267,57 @@ func TestAdoptCheckpointMemoryDropsUnusableLineage(t *testing.T) {
 	// Clearing again is a no-op.
 	if instance.clearBaseMemory() {
 		t.Fatal("second clear reported a change")
+	}
+}
+
+// TestBaseMemoryLineageLostSurvivesRestart pins the recovery contract: once
+// the lineage is marked lost, persisting and re-reading the instance state
+// must keep the marker and the cleared base, so a later daemon restart can
+// never resurrect a stale base the VMM ledger may no longer match.
+func TestBaseMemoryLineageLostSurvivesRestart(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, "gen1"), 0700); err != nil {
+		t.Fatalf("create artifact dir: %v", err)
+	}
+	instance := &firecrackerInstance{}
+	memory := filepath.Join(dir, "gen1", firecrackerCheckpointMemoryName)
+	writeArtifactComponent(t, memory, 64<<10)
+
+	// A checkpointed sandbox with a healthy lineage.
+	adoptCheckpointMemory(instance, memory, false)
+	if instance.snapshot().BaseMemoryLineageLost {
+		t.Fatal("a healthy lineage is marked lost")
+	}
+
+	// The discard-recovery path: the VMM wrote and re-armed, the caller
+	// dropped the generation.
+	instance.markBaseMemoryLineageLost()
+
+	// Persist and reload, as a daemon restart does.
+	data, err := json.Marshal(instance.snapshot())
+	if err != nil {
+		t.Fatalf("marshal state: %v", err)
+	}
+	var reloaded firecrackerPersistedState
+	if err := json.Unmarshal(data, &reloaded); err != nil {
+		t.Fatalf("unmarshal state: %v", err)
+	}
+	if reloaded.BaseMemoryPath != "" {
+		t.Fatalf("reloaded state kept the base %q", reloaded.BaseMemoryPath)
+	}
+	if !reloaded.BaseMemoryLineageLost {
+		t.Fatal("reloaded state lost the lineage-lost marker")
+	}
+
+	// The marker forces the Full recovery tier until a new base is adopted.
+	snapshotType, base, _, layoutSize, err := selectFirecrackerSnapshotTier(
+		64<<10, reloaded.BaseMemoryPath, reloaded.BaseMemoryIncremental,
+		reloaded.BaseMemoryLineageLost, "",
+	)
+	if err != nil || snapshotType != firecrackerSnapshotTypeFull ||
+		base != "" || layoutSize != 0 {
+		t.Fatalf("lost lineage did not force Full: type=%q base=%q layout=%d err=%v",
+			snapshotType, base, layoutSize, err)
 	}
 }
 

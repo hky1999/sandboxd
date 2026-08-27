@@ -74,6 +74,7 @@ func (handler *Handler) Checkpoint(
 		int64(state.MemoryMiB)<<20,
 		state.BaseMemoryPath,
 		state.BaseMemoryIncremental,
+		state.BaseMemoryLineageLost,
 		config.SnapshotType,
 	)
 	if err != nil {
@@ -89,20 +90,25 @@ func (handler *Handler) Checkpoint(
 
 	// Layout happens before the pause: cloning the base is pure host-side
 	// work the guest should not wait for. A tier-1/2 layout failure degrades
-	// to a first window; anything else is unrecoverable.
+	// to a Full snapshot; anything else is unrecoverable.
 	files, err := prepareFirecrackerCheckpointV2(config.Directory, base, layoutMemorySize)
 	if err != nil {
 		if base == "" || layoutMemorySize <= 0 {
 			return fmt.Errorf("lay out Firecracker checkpoint for %s: %w", sandboxID, err)
 		}
 		logrus.Warnf(
-			"firecracker: incremental layout for %s failed, rebuilding base: %v",
+			"firecracker: incremental layout for %s failed, rebuilding from Full: %v",
 			sandboxID, err,
 		)
-		instance.clearBaseMemory()
+		// The base cannot be laid out, but the VMM soft-dirty ledger may
+		// still be armed against it: mark the lineage lost and fall back to
+		// a Full snapshot, which writes the complete memory image without
+		// consulting the ledger. A SoftDirty first window is NOT a safe
+		// fallback here — armed, it writes only the window delta.
+		instance.markBaseMemoryLineageLost()
 		base = ""
-		snapshotType = firecrackerSnapshotTypeSoftDirty
-		if files, err = prepareFirecrackerCheckpointV2(config.Directory, "", layoutMemorySize); err != nil {
+		snapshotType = firecrackerSnapshotTypeFull
+		if files, err = prepareFirecrackerCheckpointV2(config.Directory, "", 0); err != nil {
 			return fmt.Errorf("lay out Firecracker checkpoint for %s: %w", sandboxID, err)
 		}
 	}
@@ -206,27 +212,18 @@ func (handler *Handler) Checkpoint(
 	}
 	tOverlay := time.Now()
 	if err := api.createSnapshot(ctx, files.State, files.Memory, snapshotType); err != nil {
-		if base != "" && layoutMemorySize > 0 {
-			// A failed snapshot request disarms the Firecracker ledger, so
-			// the previous base is dead: rebuild from a first window while
-			// the guest is still paused.
-			instance.clearBaseMemory()
-			discardUnsealedFirecrackerCheckpoint(files)
-			base = ""
-			snapshotType = firecrackerSnapshotTypeSoftDirty
-			if files, err = prepareFirecrackerCheckpointV2(config.Directory, "", layoutMemorySize); err == nil {
-				err = api.createSnapshot(ctx, files.State, files.Memory, snapshotType)
-			} else {
-				files = firecrackerCheckpointFiles{}
-			}
-		}
-		if err != nil {
-			discardUnsealedFirecrackerCheckpoint(files)
-			// The deferred handoff cleanup above resumes the guest and sends
-			// the error outcome; an explicit resume here would race with it.
-			return fmt.Errorf("create Firecracker %s snapshot for %s: %w",
-				snapshotType, sandboxID, err)
-		}
+		// The VMM disarms its ledger on write failures, but not on every
+		// failure shape (a request can fail after the memory write already
+		// acked and re-armed, e.g. in the state write). The lineage must be
+		// treated as lost either way: the previous base is no longer
+		// provably the one the ledger tracks. No in-pause retry — the next
+		// checkpoint takes a Full snapshot through the normal path.
+		instance.markBaseMemoryLineageLost()
+		discardUnsealedFirecrackerCheckpoint(files)
+		// The deferred handoff cleanup above resumes the guest and sends
+		// the error outcome; an explicit resume here would race with it.
+		return fmt.Errorf("create Firecracker %s snapshot for %s: %w",
+			snapshotType, sandboxID, err)
 	}
 	// The snapshot succeeded: files.Memory is now the complete guest memory
 	// image and the baseline the Firecracker ledger tracks.
@@ -257,9 +254,15 @@ func (handler *Handler) Checkpoint(
 	// Post-resume tail: fsyncing the artifacts, sealing digests and adopting
 	// the base cost seconds per GiB on I/O and hashing and must not extend
 	// the pause window.
+	//
+	// Failure handling past this point: the VMM already wrote the delta and
+	// re-armed its window, so discarding the artifact invalidates the
+	// lineage — record it as lost (the next checkpoint takes a Full
+	// snapshot). Adopting the doomed memory file would leave a dangling
+	// base that degrades to the same armed-delta corruption.
 	memoryInfo, err := os.Lstat(files.Memory)
 	if err != nil {
-		adoptCheckpointMemory(instance, files.Memory, false)
+		instance.markBaseMemoryLineageLost()
 		discardUnsealedFirecrackerCheckpoint(files)
 		return errors.Join(resumeErr, fmt.Errorf(
 			"inspect Firecracker checkpoint memory for %s: %w", sandboxID, err,
@@ -269,7 +272,7 @@ func (handler *Handler) Checkpoint(
 	// the page cache: durability happens here, before the manifest commits
 	// the generation.
 	if err := fsyncFirecrackerCheckpointData(files); err != nil {
-		adoptCheckpointMemory(instance, files.Memory, false)
+		instance.markBaseMemoryLineageLost()
 		discardUnsealedFirecrackerCheckpoint(files)
 		return errors.Join(resumeErr, fmt.Errorf(
 			"fsync Firecracker checkpoint data for %s: %w", sandboxID, err,
@@ -293,19 +296,21 @@ func (handler *Handler) Checkpoint(
 	// digests; restore skips components without a recorded digest.
 	digestOverlay := snapshotType == firecrackerSnapshotTypeFull
 	if err := finalizeFirecrackerCheckpointV2(ctx, files, manifest, digestOverlay); err != nil {
-		adoptCheckpointMemory(instance, files.Memory, false)
+		instance.markBaseMemoryLineageLost()
 		discardUnsealedFirecrackerCheckpoint(files)
 		return errors.Join(resumeErr, fmt.Errorf(
 			"seal Firecracker checkpoint for %s: %w", sandboxID, err,
 		))
 	}
 	adoptCheckpointMemory(instance, files.Memory, false)
-	// Persist the adopted base: a daemon restart must recover the same
-	// lineage the VMM's armed ledger tracks, or the next window delta would
-	// be patched into a stale image.
+	// Persist the adopted base. A persist failure does not fail the sealed
+	// artifact, and it cannot corrupt a later generation: recovery never
+	// trusts a pre-restart lineage (recoverState marks it lost and forces
+	// the next checkpoint to Full), so a stale durable state only costs one
+	// Full snapshot after the eventual restart.
 	if err := handler.persistInstance(instance); err != nil {
 		logrus.Warnf(
-			"firecracker: persist adopted base for %s failed (next checkpoint after daemon restart rebuilds from a first window): %v",
+			"firecracker: persist adopted base for %s failed (recovery forces a Full snapshot after the next daemon restart): %v",
 			sandboxID, err,
 		)
 	}
@@ -363,33 +368,45 @@ func (handler *Handler) finishCheckpointedSandbox(
 // selectFirecrackerSnapshotTier resolves how the next generation is taken.
 // An empty request leaves the automatic three-tier choice to the recorded
 // lineage: Incremental after a restore, SoftDirty windows afterwards, Full
-// only when the guest memory size is unknown. An explicit request pins the
-// snapshot type: Full drops the lineage for one generation (Firecracker
-// writes the whole memory file itself, so the layout preallocates nothing),
-// Incremental demands the pagemap base only a restore establishes, and
-// SoftDirty accepts whatever lineage is still usable. A drifted base falls
-// back to a first window instead of failing, whatever was requested.
+// when the lineage is lost or the guest memory size is unknown. An explicit
+// request pins the snapshot type: Full drops the lineage for one generation
+// (Firecracker writes the whole memory file itself, so the layout
+// preallocates nothing), Incremental demands the pagemap base only a
+// restore establishes, and SoftDirty demands a usable base. A drifted base
+// or a lost lineage cannot fall back to SoftDirty: with the VMM soft-dirty
+// ledger armed a SoftDirty request writes only the window delta, so the
+// artifact would silently miss every page written before the window opened.
+// Those cases force (or, for explicit incremental requests, demand) Full,
+// which ignores the ledger and writes the complete memory image.
 func selectFirecrackerSnapshotTier(
 	memorySize int64,
 	basePath string,
 	baseIncremental bool,
+	lineageLost bool,
 	requested string,
 ) (snapshotType, base string, incremental bool, layoutMemorySize int64, err error) {
 	base, incremental = basePath, baseIncremental
 	if memorySize > 0 && base != "" && !firecrackerBaseMemoryUsable(base, memorySize) {
-		// The base drifted (crash cleanup, operator interference): fall
-		// through to a first window instead of failing outright.
+		// The base drifted (crash cleanup, operator interference): the VMM
+		// ledger may still be armed against it, so this is a lost lineage,
+		// not a first-window opportunity.
 		base = ""
+		lineageLost = true
+	}
+	if lineageLost && base != "" {
+		base = ""
+		incremental = false
 	}
 	switch requested {
 	case "":
-		// Automatic tier selection: Full is only reachable when the guest
-		// memory size is unknown, which in practice never happens for a
-		// running sandbox.
+		// Automatic tier selection.
 		snapshotType = firecrackerSnapshotTypeSoftDirty
 		layoutMemorySize = memorySize
-		if memorySize <= 0 {
+		if memorySize <= 0 || lineageLost {
 			snapshotType = firecrackerSnapshotTypeFull
+			if memorySize > 0 {
+				layoutMemorySize = 0
+			}
 		} else if base != "" && incremental {
 			snapshotType = firecrackerSnapshotTypeIncremental
 		}
@@ -406,6 +423,11 @@ func selectFirecrackerSnapshotTier(
 		}
 		return requested, base, incremental, memorySize, nil
 	case firecrackerSnapshotTypeSoftDirty:
+		if lineageLost {
+			return "", "", false, 0, fmt.Errorf(
+				"Firecracker SoftDirty checkpoint has no usable base (lineage lost by a failed checkpoint or a daemon restart); take a Full checkpoint first",
+			)
+		}
 		return requested, base, incremental, memorySize, nil
 	}
 	return "", "", false, 0, fmt.Errorf(
@@ -530,7 +552,9 @@ func adoptCheckpointMemory(
 			"firecracker: checkpoint base %s is not a usable regular file: %v",
 			memoryPath, err,
 		)
-		instance.clearBaseMemory()
+		// The base sandboxd recorded cannot be patched anymore; whether the
+		// VMM ledger is armed is unknown, so force the safe Full path.
+		instance.markBaseMemoryLineageLost()
 		return
 	}
 	instance.setBaseMemory(memoryPath, incremental)
