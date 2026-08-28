@@ -185,3 +185,20 @@ func TestSandbox_ApiStatus(t *testing.T) {
 		})
 	}
 }
+
+// W19-4: bridge IP resolution falls back to MetricLabels["bridge_ip"] when
+// neither the in-memory spec nor the on-disk bundle carries the interface
+// annotation (both race or get cleaned at runtime).
+func TestSandbox_ApiStatusBridgeIPLabelFallback(t *testing.T) {
+	sb := &Sandbox{
+		Metadata: &runtime.SandboxMetadata{
+			ID:            "sbox-test-ip",
+			MetricLabels: map[string]string{"bridge_ip": "10.88.9.9"},
+		},
+		Status: &statusStorage{status: Status{Pid: 1, StartedAt: "20260828"}},
+	}
+	status := sb.ApiStatus()
+	if status.Ip != "10.88.9.9" {
+		t.Fatalf("Ip = %q, want 10.88.9.9 (label fallback)", status.Ip)
+	}
+}
