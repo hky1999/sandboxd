@@ -2345,6 +2345,7 @@ type SandboxStatus struct {
 	MetricLabels map[string]string `protobuf:"bytes,15,rep,name=metric_labels,json=metricLabels,proto3" json:"metric_labels,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	// Ports contains the concrete host/container mappings owned by this sandbox.
 	Ports         []string `protobuf:"bytes,16,rep,name=ports,proto3" json:"ports,omitempty"`
+	Ip            string   `protobuf:"bytes,17,opt,name=ip,proto3" json:"ip,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2489,6 +2490,15 @@ func (x *SandboxStatus) GetPorts() []string {
 		return x.Ports
 	}
 	return nil
+}
+
+// W18: sandbox bridge IP (from the interface resource annotation); empty
+// when network resources are absent.
+func (x *SandboxStatus) GetIp() string {
+	if x != nil {
+		return x.Ip
+	}
+	return ""
 }
 
 // KeyValue represents a string key-value pair.

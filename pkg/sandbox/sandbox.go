@@ -19,7 +19,9 @@ import (
 	"time"
 
 	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
+	"github.com/inclusionAI/sandboxd/config"
 	"github.com/inclusionAI/sandboxd/internal/util"
+	"github.com/inclusionAI/sandboxd/pkg/networkmanager"
 	spec "github.com/opencontainers/runtime-spec/specs-go"
 )
 
@@ -136,6 +138,18 @@ func (c *Sandbox) ApiStatus() *runtime.SandboxStatus {
 		}
 	}
 
+	// W18: expose the sandbox bridge IP (from the interface resource
+	// annotation) so List/Stats consumers can join connection source IPs
+	// back to sandboxes without reading OCI specs off disk.
+	var sandboxIP string
+	if c.Spec != nil {
+		if ifaceStr, ok := c.Spec.Annotations[config.ResourceAnnotationKeyPrefix+config.ResourceNameInterface]; ok {
+			if netRes, err := networkmanager.NewNetResource(ifaceStr); err == nil && netRes.Ip != nil {
+				sandboxIP = netRes.Ip.String()
+			}
+		}
+	}
+
 	return &runtime.SandboxStatus{
 		ID:           c.Metadata.ID,
 		Command:      command,
@@ -152,5 +166,6 @@ func (c *Sandbox) ApiStatus() *runtime.SandboxStatus {
 		Stderr:       c.Metadata.Stderr,
 		Resources:    copyResource,
 		Ports:        append([]string(nil), c.Metadata.Ports...),
+		Ip:           sandboxIP,
 	}
 }

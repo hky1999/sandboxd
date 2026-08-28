@@ -415,6 +415,11 @@ message SandboxStatus {
   map<string, string> metric_labels = 15;
   // Ports contains the concrete host/container mappings owned by this sandbox.
   repeated string ports = 16;
+  // Ip is the sandbox's IP inside the sandboxd bridge (W18: the LLM proxy
+  // sees this as the connection source after the host routes 10.88/16;
+  // resolvers join it back to this sandbox). Empty when network resources
+  // are absent (e.g. DisableCgroup/debug sandboxes).
+  string ip = 17;
 }
 
 // KeyValue represents a string key-value pair.
