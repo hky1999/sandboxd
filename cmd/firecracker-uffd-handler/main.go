@@ -206,15 +206,21 @@ func (s *faultServer) resolve(addr uint64) error {
 			continue
 		}
 		fileOff := addr - r.BaseHostVirtAddr + r.Offset
-		// Serve a chunk-aligned window covering the faulting page: the copy
-		// resolves every page inside it, suppressing their future faults.
-		off := fileOff &^ (s.chunk - 1)
+		// UFFDIO_COPY must use page granularity (4KiB): larger copies stall
+		// the KVM vCPU (256KiB copies freeze the guest after ~6 pages).
+		// The fetch/cache chunk size (s.chunk) is independent and larger
+		// for bulk transfer efficiency.
+		const copyLen = 4096
+		off := fileOff &^ (copyLen - 1)
 		buf, err := s.resolveChunk(off)
 		if err != nil {
 			return err
 		}
 		if len(buf) == 0 {
-			buf = make([]byte, s.chunk) // past EOF: zero fill
+			buf = make([]byte, copyLen) // past EOF: zero fill
+		}
+		if uint64(len(buf)) > copyLen {
+			buf = buf[:copyLen] // trim fetched chunk to page size
 		}
 		dst := r.BaseHostVirtAddr + (off - r.Offset)
 		arg := uffdioCopyArg{
