@@ -91,7 +91,7 @@ func TestVerifyCheckpointCompat(t *testing.T) {
 			SnapshotType: firecrackerSnapshotTypeSoftDirty,
 			MemorySize:   1 << 20,
 			Compat:       compat,
-		}); err != nil {
+		}, true); err != nil {
 			t.Fatalf("finalize v2 checkpoint: %v", err)
 		}
 		artifact, err := openFirecrackerCheckpoint(dir)
@@ -143,7 +143,7 @@ func TestManifestRejectsMalformedCompatDigest(t *testing.T) {
 		SnapshotType: firecrackerSnapshotTypeSoftDirty,
 		MemorySize:   1 << 20,
 		Compat:       &firecrackerCheckpointCompat{Kernel: "not-a-digest"},
-	}); err != nil {
+	}, true); err != nil {
 		t.Fatalf("finalize v2 checkpoint: %v", err)
 	}
 	if _, err := openFirecrackerCheckpoint(dir); err == nil ||

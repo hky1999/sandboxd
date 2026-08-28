@@ -297,7 +297,7 @@ func (handler *Handler) Checkpoint(
 	if base != "" {
 		manifest.BaseMemory = filepath.Base(filepath.Dir(base))
 	}
-	if err := finalizeFirecrackerCheckpointV2(ctx, files, manifest); err != nil {
+	if err := finalizeFirecrackerCheckpointV2(ctx, files, manifest, handler.digestMemory); err != nil {
 		instance.markBaseMemoryLineageLost()
 		discardUnsealedFirecrackerCheckpoint(files)
 		return errors.Join(resumeErr, fmt.Errorf(

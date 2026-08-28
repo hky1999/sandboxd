@@ -181,6 +181,23 @@ type FirecrackerConfig struct {
 	OCIRootfsEnabled bool `toml:"oci_rootfs_enabled" json:"ociRootfsEnabled"`
 	// MkfsEROFSPath selects the mkfs.erofs executable used for materialization.
 	MkfsEROFSPath string `toml:"mkfs_erofs_path" json:"mkfsEROFSPath"`
+
+	// DigestMemory seals a sha256 of the memory artifact into the
+	// checkpoint manifest so restores reject corrupted artifacts up front
+	// instead of failing inside the restored guest. The hash runs in the
+	// post-resume tail (outside the pause window) and costs roughly a
+	// second per GiB of checkpointed memory. Nil (key absent) means true;
+	// set digest_memory=false to opt out for latency-sensitive setups.
+	DigestMemory *bool `toml:"digest_memory" json:"digestMemory,omitempty"`
+}
+
+// DigestMemoryOrDefault resolves the tri-state digest_memory knob with the
+// enabled default.
+func (c FirecrackerConfig) DigestMemoryOrDefault() bool {
+	if c.DigestMemory == nil {
+		return true
+	}
+	return *c.DigestMemory
 }
 
 type ResourceConfig struct {

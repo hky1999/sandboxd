@@ -84,7 +84,7 @@ func TestPrepareCheckpointV2FullDiscoversMemorySize(t *testing.T) {
 	writeArtifactComponent(t, files.Memory, 96<<10)
 	writeArtifactComponent(t, files.Overlay, 32<<10)
 	manifest := &firecrackerCheckpointManifest{SnapshotType: firecrackerSnapshotTypeFull}
-	if err := finalizeFirecrackerCheckpointV2(context.Background(), files, manifest); err != nil {
+	if err := finalizeFirecrackerCheckpointV2(context.Background(), files, manifest, true); err != nil {
 		t.Fatalf("finalize v2 full checkpoint: %v", err)
 	}
 	if manifest.MemorySize != 96<<10 {
@@ -127,6 +127,7 @@ func TestPrepareCheckpointV2RejectsSealedDirectory(t *testing.T) {
 			SnapshotType: firecrackerSnapshotTypeSoftDirty,
 			MemorySize:   64 << 10,
 		},
+		true,
 	); err != nil {
 		t.Fatalf("finalize v2 checkpoint: %v", err)
 	}
@@ -151,7 +152,7 @@ func TestFinalizeCheckpointV2ManifestIsSealedOnce(t *testing.T) {
 		SnapshotType: firecrackerSnapshotTypeSoftDirty,
 		MemorySize:   64 << 10,
 	}
-	if err := finalizeFirecrackerCheckpointV2(context.Background(), files, manifest); err != nil {
+	if err := finalizeFirecrackerCheckpointV2(context.Background(), files, manifest, true); err != nil {
 		t.Fatalf("finalize v2 checkpoint: %v", err)
 	}
 	if manifest.Version != firecrackerCheckpointVersion2 {
@@ -165,6 +166,7 @@ func TestFinalizeCheckpointV2ManifestIsSealedOnce(t *testing.T) {
 			SnapshotType: firecrackerSnapshotTypeSoftDirty,
 			MemorySize:   64 << 10,
 		},
+		true,
 	); err == nil {
 		t.Fatal("finalize v2 checkpoint over an existing manifest succeeded")
 	}
@@ -205,6 +207,7 @@ func TestOpenCheckpointV2AndVerifyDigests(t *testing.T) {
 			MemorySize:   64 << 10,
 			BaseMemory:   "gen0/memory",
 		},
+		true,
 	); err != nil {
 		t.Fatalf("finalize v2 checkpoint: %v", err)
 	}
@@ -222,22 +225,26 @@ func TestOpenCheckpointV2AndVerifyDigests(t *testing.T) {
 	if err := verifyArtifactDigests(context.Background(), artifact); err != nil {
 		t.Fatalf("verify untouched artifact digests: %v", err)
 	}
-	if _, recorded := artifact.Manifest.Digests[firecrackerCheckpointMemoryName]; recorded {
-		t.Fatal("memory digest was computed despite the synchronous-cost policy")
+	if digest, recorded := artifact.Manifest.Digests[firecrackerCheckpointMemoryName]; !recorded || digest == "" {
+		t.Fatal("memory digest missing despite digest_memory default policy")
 	}
 	if _, recorded := artifact.Manifest.Digests[firecrackerCheckpointOverlayName]; recorded {
 		t.Fatal("overlay digest was computed despite the synchronous-cost policy")
 	}
 
-	// The memory and overlay files carry no digest by design: changing them
-	// must not fail verification, while tampering with VM state must.
-	writeArtifactComponent(t, artifact.Files.Memory, 16<<10)
-	if err := verifyArtifactDigests(context.Background(), artifact); err != nil {
-		t.Fatalf("undigested memory component failed verification: %v", err)
-	}
+	// The overlay carries no digest by design: changing it must not fail
+	// verification. Memory is digested: tampering with it must fail
+	// verification just like VM state (the corrupted-transfer guard), so
+	// that check runs last to keep the undigested-overlay leg meaningful.
 	writeArtifactComponent(t, artifact.Files.Overlay, 16<<10)
 	if err := verifyArtifactDigests(context.Background(), artifact); err != nil {
 		t.Fatalf("undigested overlay component failed verification: %v", err)
+	}
+	writeArtifactComponent(t, artifact.Files.Memory, 16<<10)
+	if err := verifyArtifactDigests(
+		context.Background(), artifact,
+	); err == nil || !strings.Contains(err.Error(), "digest mismatch") {
+		t.Fatalf("tampered memory not detected: %v", err)
 	}
 	writeArtifactComponent(t, artifact.Files.State, 16<<10)
 	if err := verifyArtifactDigests(
@@ -266,6 +273,7 @@ func TestVerifyCheckpointDigestsMemoized(t *testing.T) {
 			SnapshotType: firecrackerSnapshotTypeIncremental,
 			MemorySize:   64 << 10,
 		},
+		true,
 	); err != nil {
 		t.Fatalf("finalize v2 checkpoint: %v", err)
 	}
@@ -282,9 +290,10 @@ func TestVerifyCheckpointDigestsMemoized(t *testing.T) {
 			t.Fatalf("verify artifact digests (round %d): %v", i, err)
 		}
 	}
-	// Only vmstate is hashed, exactly once; later rounds hit the cache.
-	if cache.hashes != 1 {
-		t.Fatalf("component hashes = %d, want 1", cache.hashes)
+	// vmstate and memory are hashed exactly once; the undigested overlay
+	// is never hashed. Later rounds hit the cache.
+	if cache.hashes != 2 {
+		t.Fatalf("component hashes = %d, want 2", cache.hashes)
 	}
 
 	// A same-stat rewrite is invisible by design (documented tradeoff), but
@@ -299,8 +308,8 @@ func TestVerifyCheckpointDigestsMemoized(t *testing.T) {
 	); err == nil || !strings.Contains(err.Error(), "digest mismatch") {
 		t.Fatalf("stale cache entry survived an mtime change: %v", err)
 	}
-	if cache.hashes != 2 {
-		t.Fatalf("component hashes after invalidation = %d, want 2", cache.hashes)
+	if cache.hashes != 3 {
+		t.Fatalf("component hashes after invalidation = %d, want 3", cache.hashes)
 	}
 }
 
@@ -351,6 +360,7 @@ func TestOpenCheckpointV2RejectsMissingComponent(t *testing.T) {
 			SnapshotType: firecrackerSnapshotTypeSoftDirty,
 			MemorySize:   64 << 10,
 		},
+		true,
 	); err != nil {
 		t.Fatalf("finalize v2 checkpoint: %v", err)
 	}
@@ -362,21 +372,21 @@ func TestOpenCheckpointV2RejectsMissingComponent(t *testing.T) {
 	}
 }
 
-func TestFinalizeCheckpointV2SkipsLargeComponentDigests(t *testing.T) {
+func TestFinalizeCheckpointV2DigestPolicy(t *testing.T) {
 	dir := t.TempDir()
 	files := sealArtifactFixture(t, dir)
 	manifest := &firecrackerCheckpointManifest{
 		SnapshotType: firecrackerSnapshotTypeFull,
 		MemorySize:   64 << 10,
 	}
-	if err := finalizeFirecrackerCheckpointV2(context.Background(), files, manifest); err != nil {
+	if err := finalizeFirecrackerCheckpointV2(context.Background(), files, manifest, true); err != nil {
 		t.Fatalf("finalize v2 checkpoint: %v", err)
 	}
 	if _, recorded := manifest.Digests[firecrackerCheckpointOverlayName]; recorded {
 		t.Fatal("Full generation digested the overlay")
 	}
-	if _, recorded := manifest.Digests[firecrackerCheckpointMemoryName]; recorded {
-		t.Fatal("Full generation digested guest memory")
+	if _, recorded := manifest.Digests[firecrackerCheckpointMemoryName]; !recorded {
+		t.Fatal("Full generation skipped guest memory despite digest_memory")
 	}
 	if _, recorded := manifest.Digests[firecrackerCheckpointStateName]; !recorded {
 		t.Fatal("Full generation lost the vmstate digest")
@@ -389,5 +399,29 @@ func TestFinalizeCheckpointV2SkipsLargeComponentDigests(t *testing.T) {
 	var cache checkpointDigestCache
 	if err := cache.verifyFirecrackerCheckpointDigests(context.Background(), artifact); err != nil {
 		t.Fatalf("verify Full artifact digests: %v", err)
+	}
+
+	// With the knob off the memory digest is simply absent and the
+	// artifact still opens and verifies (pre-knob manifests behave the
+	// same way).
+	dir = t.TempDir()
+	files = sealArtifactFixture(t, dir)
+	manifest = &firecrackerCheckpointManifest{
+		SnapshotType: firecrackerSnapshotTypeFull,
+		MemorySize:   64 << 10,
+	}
+	if err := finalizeFirecrackerCheckpointV2(context.Background(), files, manifest, false); err != nil {
+		t.Fatalf("finalize v2 checkpoint (digest off): %v", err)
+	}
+	if _, recorded := manifest.Digests[firecrackerCheckpointMemoryName]; recorded {
+		t.Fatal("Full generation digested guest memory despite digest_memory=false")
+	}
+	artifact, err = openFirecrackerCheckpoint(dir)
+	if err != nil {
+		t.Fatalf("open Full v2 checkpoint (digest off): %v", err)
+	}
+	cache = checkpointDigestCache{}
+	if err := cache.verifyFirecrackerCheckpointDigests(context.Background(), artifact); err != nil {
+		t.Fatalf("verify Full artifact digests (digest off): %v", err)
 	}
 }

@@ -176,6 +176,7 @@ func finalizeFirecrackerCheckpointV2(
 	ctx context.Context,
 	files firecrackerCheckpointFiles,
 	manifest *firecrackerCheckpointManifest,
+	digestMemory bool,
 ) (retErr error) {
 	manifest.Version = firecrackerCheckpointVersion2
 	manifest.CreatedAt = time.Now().UTC()
@@ -188,14 +189,20 @@ func finalizeFirecrackerCheckpointV2(
 		}
 		manifest.MemorySize = info.Size()
 	}
-	// Only the small state component is digested. Hashing guest memory or the
-	// writable overlay costs seconds per GiB of CPU and cache reads, which can
-	// dominate checkpoint latency. Their integrity rests on the local reflink
-	// copy-on-write and Firecracker's own writes.
-	manifest.Digests = make(map[string]string, 1)
+	// The small components are always digested. Guest memory is digested
+	// only when the runtime opts in (digest_memory, default on): hashing it
+	// costs roughly a second per GiB of pure CPU in this post-resume tail,
+	// which is acceptable for the durability contract (a corrupted transfer
+	// must fail at restore, not inside the restored guest) but can be
+	// turned off for latency-sensitive experiments. The writable overlay
+	// stays undigested either way: hashing it costs seconds per GiB of CPU
+	// and cache reads, and its integrity rests on the local reflink
+	// copy-on-write and Firecracker's own writes. Manifests from before
+	// this knob carry no memory digest and restore keeps skipping it.
+	manifest.Digests = make(map[string]string, 2)
 	for _, component := range firecrackerCheckpointComponents(files) {
-		if component.name == firecrackerCheckpointMemoryName ||
-			component.name == firecrackerCheckpointOverlayName {
+		if component.name == firecrackerCheckpointOverlayName ||
+			(component.name == firecrackerCheckpointMemoryName && !digestMemory) {
 			continue
 		}
 		digest, err := digestFirecrackerCheckpointComponent(ctx, component.name, component.path)

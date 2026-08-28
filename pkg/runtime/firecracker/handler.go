@@ -246,6 +246,11 @@ type Handler struct {
 	// default.
 	shrinkBeforeCheckpoint bool
 
+	// digestMemory records a sha256 of the memory artifact in the sealed
+	// manifest so restores can reject corrupted transfers. Default on; the
+	// cost lands in the post-resume tail (see FirecrackerConfig.DigestMemory).
+	digestMemory bool
+
 	// checkpointWriteback starts background writeback for completed memory
 	// artifacts so a later XFS reflink does not inherit the previous
 	// generation's buffered-I/O debt.
@@ -378,6 +383,7 @@ func NewHandler(
 		shrinkBeforeCheckpoint: firecrackerConfig.ShrinkBeforeCheckpoint,
 		checkpointMode:         firecrackerConfig.CheckpointMode,
 		checkpointWriteback:    newCheckpointWritebackScheduler(),
+		digestMemory:           firecrackerConfig.DigestMemoryOrDefault(),
 		defaultDisk:            firecrackerConfig.DefaultOverlaySizeBytes,
 		ociLoader:              loader,
 		ociRootfsEnabled:       firecrackerConfig.OCIRootfsEnabled,

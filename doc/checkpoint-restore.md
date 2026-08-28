@@ -183,15 +183,22 @@ restart always marks the lineage lost for surviving sandboxes: the restart
 cannot tell which generation the surviving VMM is armed against, so the
 cheapest provably-safe recovery is one `Full` checkpoint per sandbox.
 
-The manifest digests only the small VM state component. Hashing the memory file
-or `overlay.ext4` is skipped because it costs seconds of CPU and page-cache
-reads per GiB and would dominate checkpoint latency. Their local integrity
-rests on reflink copy-on-write and Firecracker's own writes. Restores skip
-components without a recorded digest. Digests are computed from the
-page-cache-visible contents before manifest publication, so the manifest
-attests the logical generation rather than stable-storage durability. On
-restore the verification is memoized per sandboxd process: a component whose
-size and mtime are unchanged since a previous successful verification is not re-hashed,
+The manifest digests the small VM state component and — unless opted out —
+the memory artifact. Hashing guest memory costs roughly a second of CPU per
+GiB and runs in the post-resume tail (outside the pause window), so it can be
+disabled per deployment with `digest_memory = false` under
+`[plugin.runtime.firecracker]` (an absent key means enabled); checkpoints
+sealed while the knob is off — including all manifests from before the knob
+existed — simply carry no memory digest and restores keep skipping that
+component. Hashing `overlay.ext4` stays skipped in every mode because it costs
+seconds of CPU and page-cache reads per GiB and would dominate checkpoint
+latency; its local integrity rests on reflink copy-on-write and Firecracker's
+own writes. Restores skip components without a recorded digest. Digests are
+computed from the page-cache-visible contents before manifest publication, so
+the manifest attests the logical generation rather than stable-storage
+durability. On restore the verification is memoized per sandboxd process: a
+component whose size and mtime are unchanged since a previous successful
+verification is not re-hashed,
 so warm starts from a stable template directory skip the cost. The tradeoff is
 that a content swap which preserves both size and mtime within the filesystem's
 timestamp granularity goes undetected — the same granularity the nydus
