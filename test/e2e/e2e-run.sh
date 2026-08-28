@@ -357,7 +357,8 @@ EOF
     # firecracker job must keep exercising the unset (default full) path.
     local e2e_fc_checkpoint_mode_cfg=""
     if [ -n "${FIRECRACKER_CHECKPOINT_MODE}" ]; then
-        e2e_fc_checkpoint_mode_cfg="checkpoint_mode = "${FIRECRACKER_CHECKPOINT_MODE}""
+        e2e_fc_checkpoint_mode_cfg="$(printf 'checkpoint_mode = "%s"' \
+            "${FIRECRACKER_CHECKPOINT_MODE}")"
     fi
     local e2e_fc_deferred_sync_cfg=""
     if [ -n "${FIRECRACKER_DEFERRED_SYNC}" ]; then
