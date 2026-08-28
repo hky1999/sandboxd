@@ -322,7 +322,7 @@ func main() {
 	chunk := uint64(*chunkKB) << 10
 	source := &pageSource{chunk: chunk, inflight: make(map[uint64]*sync.WaitGroup)}
 	if *remoteURL != "" {
-		cacheFile, err := os.OpenFile(*cachePath, os.O_CREATE|os.O_RDWR, 0o600)
+		cacheFile, err := os.OpenFile(*cachePath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o600)
 		if err != nil {
 			log.Fatalf("open cache file %s: %v", *cachePath, err)
 		}
