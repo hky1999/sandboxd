@@ -21,8 +21,9 @@ import (
 )
 
 const (
-	// A full snapshot faults every guest page into the VMM. Keep host-only
-	// headroom for Firecracker itself without changing guest-visible memory.
+	// Keep a small amount of host-only headroom for the Firecracker process
+	// without changing guest-visible memory. Checkpoint and restore reserve
+	// their larger, short-lived host requirement separately.
 	firecrackerHostMemoryOverheadBytes = int64(64 * 1024 * 1024)
 )
 

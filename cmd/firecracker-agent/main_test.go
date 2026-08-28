@@ -16,14 +16,189 @@ package main
 
 import (
 	"bytes"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/inclusionAI/sandboxd/internal/firecrackerproto"
 	"golang.org/x/sys/unix"
 )
+
+func TestSandboxInitCommandCreatesContainerNamespaces(t *testing.T) {
+	configReader, configWriter, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer configReader.Close()
+	defer configWriter.Close()
+	statusReader, statusWriter, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer statusReader.Close()
+	defer statusWriter.Close()
+
+	command := sandboxInitCommand(configReader, statusWriter)
+	wantFlags := uintptr(
+		unix.CLONE_NEWNS |
+			unix.CLONE_NEWPID |
+			unix.CLONE_NEWUTS |
+			unix.CLONE_NEWIPC,
+	)
+	if command.Path != "/init" ||
+		strings.Join(command.Args, " ") != "/init "+sandboxInitMode {
+		t.Fatalf("sandbox init command = %q %q", command.Path, command.Args)
+	}
+	if command.SysProcAttr.Cloneflags != wantFlags {
+		t.Fatalf(
+			"sandbox clone flags = %#x, want %#x",
+			command.SysProcAttr.Cloneflags,
+			wantFlags,
+		)
+	}
+	if command.SysProcAttr.Chroot != "" {
+		t.Fatalf("agent started sandbox init in chroot %q", command.SysProcAttr.Chroot)
+	}
+	if command.SysProcAttr.Pdeathsig != 0 {
+		t.Fatalf("sandbox init parent death signal = %v", command.SysProcAttr.Pdeathsig)
+	}
+}
+
+func TestJoinSandboxNamespaces(t *testing.T) {
+	var calls []string
+	nextFD := 10
+	ops := namespaceOperations{
+		unshare: func(flags int) error {
+			calls = append(calls, fmt.Sprintf("unshare:%#x", flags))
+			return nil
+		},
+		open: func(path string, flags int, mode uint32) (int, error) {
+			fd := nextFD
+			nextFD++
+			calls = append(calls, fmt.Sprintf("open:%s:%d", path, fd))
+			return fd, nil
+		},
+		close: func(fd int) error {
+			calls = append(calls, fmt.Sprintf("close:%d", fd))
+			return nil
+		},
+		setns: func(fd, flag int) error {
+			calls = append(calls, fmt.Sprintf("setns:%d:%#x", fd, flag))
+			return nil
+		},
+	}
+	if err := joinSandboxNamespaces(42, ops); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		fmt.Sprintf("unshare:%#x", unix.CLONE_FS),
+		"open:/proc/42/ns/ipc:10",
+		"open:/proc/42/ns/uts:11",
+		"open:/proc/42/ns/mnt:12",
+		"open:/proc/42/ns/pid:13",
+		fmt.Sprintf("setns:10:%#x", unix.CLONE_NEWIPC),
+		fmt.Sprintf("setns:11:%#x", unix.CLONE_NEWUTS),
+		fmt.Sprintf("setns:12:%#x", unix.CLONE_NEWNS),
+		fmt.Sprintf("setns:13:%#x", unix.CLONE_NEWPID),
+		"close:10",
+		"close:11",
+		"close:12",
+		"close:13",
+	}
+	if strings.Join(calls, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("namespace calls = %q, want %q", calls, want)
+	}
+}
+
+func TestSandboxExecCommandReliesOnJoinedRoot(t *testing.T) {
+	command, err := sandboxCommand(firecrackerproto.ProcessSpec{
+		Args: []string{"/bin/sh", "-c", "true"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if command.SysProcAttr.Chroot != "" {
+		t.Fatalf("exec command chroot = %q", command.SysProcAttr.Chroot)
+	}
+	if command.SysProcAttr.Pdeathsig != 0 {
+		t.Fatalf("exec command parent death signal = %v", command.SysProcAttr.Pdeathsig)
+	}
+}
+
+func TestSwitchContainerRoot(t *testing.T) {
+	var calls []string
+	ops := rootSwitchOperations{
+		mount: func(source, target, fsType string, flags uintptr, data string) error {
+			calls = append(calls, "mount:"+source+":"+target+":"+strconv.FormatUint(uint64(flags), 10))
+			return nil
+		},
+		open: func(path string, flags int, mode uint32) (int, error) {
+			calls = append(calls, "open:"+path)
+			return 42, nil
+		},
+		close: func(fd int) error {
+			calls = append(calls, "close:"+strconv.Itoa(fd))
+			return nil
+		},
+		fchdir: func(fd int) error {
+			calls = append(calls, "fchdir:"+strconv.Itoa(fd))
+			return nil
+		},
+		chroot: func(path string) error {
+			calls = append(calls, "chroot:"+path)
+			return nil
+		},
+		chdir: func(path string) error {
+			calls = append(calls, "chdir:"+path)
+			return nil
+		},
+	}
+	if err := switchContainerRoot(containerMountRoot, ops); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"mount::/:" + strconv.FormatUint(uint64(unix.MS_REC|unix.MS_PRIVATE), 10),
+		"open:" + containerMountRoot,
+		"mount:" + containerMountRoot + ":/:" + strconv.FormatUint(uint64(unix.MS_MOVE), 10),
+		"fchdir:42",
+		"chroot:.",
+		"chdir:/",
+		"close:42",
+	}
+	if strings.Join(calls, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("root switch calls = %q, want %q", calls, want)
+	}
+}
+
+func TestSwitchContainerRootStopsBeforeMoveWhenOpenFails(t *testing.T) {
+	wantErr := errors.New("open failed")
+	moveCalled := false
+	ops := rootSwitchOperations{
+		mount: func(source, target, fsType string, flags uintptr, data string) error {
+			if flags == unix.MS_MOVE {
+				moveCalled = true
+			}
+			return nil
+		},
+		open:   func(string, int, uint32) (int, error) { return -1, wantErr },
+		close:  func(int) error { return nil },
+		fchdir: func(int) error { return nil },
+		chroot: func(string) error { return nil },
+		chdir:  func(string) error { return nil },
+	}
+	err := switchContainerRoot(containerMountRoot, ops)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("root switch error = %v", err)
+	}
+	if moveCalled {
+		t.Fatal("new root was moved after open failed")
+	}
+}
 
 func TestContainerPathUnder(t *testing.T) {
 	root := t.TempDir()

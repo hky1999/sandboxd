@@ -80,6 +80,36 @@ func TestModuleCapacityZeroBeforeFirstRefresh(t *testing.T) {
 	assert.Equal(t, int64(0), memBytes)
 }
 
+func TestTransientMemoryReservationAffectsAdvertisedCapacity(t *testing.T) {
+	m := &Module{availCpu: 4, availMem: 8 << 30}
+	releaseFirst, ok := m.ReserveTransientMemory("checkpoint-a", 3<<30)
+	assert.True(t, ok)
+	_, ok = m.ReserveTransientMemory("checkpoint-b", 6<<30)
+	assert.False(t, ok)
+	releaseSecond, ok := m.ReserveTransientMemory("checkpoint-b", 5<<30)
+	assert.True(t, ok)
+
+	cpuMilli, memBytes := m.Capacity()
+	assert.Equal(t, int64(4000), cpuMilli)
+	assert.Zero(t, memBytes)
+
+	releaseSecond()
+	_, memBytes = m.Capacity()
+	assert.Equal(t, int64(5<<30), memBytes)
+
+	releaseFirst()
+	releaseFirst()
+	_, memBytes = m.Capacity()
+	assert.Equal(t, int64(8<<30), memBytes)
+
+	releaseThird, ok := m.ReserveTransientMemory("checkpoint-c", 2<<30)
+	assert.True(t, ok)
+	m.ReleaseTransientMemory("checkpoint-c")
+	releaseThird()
+	_, memBytes = m.Capacity()
+	assert.Equal(t, int64(8<<30), memBytes)
+}
+
 func TestModuleServesAvailableResourceOverUnixSocket(t *testing.T) {
 	resourceManager := &stubNodeResourceManager{cpu: 2500, mem: 5 << 30}
 	sockPath := filepath.Join(t.TempDir(), "resource.sock")

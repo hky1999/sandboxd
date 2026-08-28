@@ -16,6 +16,7 @@ package resourcemanager
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -308,6 +309,9 @@ func readCPUQuota(hierarchy cgroupHierarchy, mode cgroups.CGMode) (int64, bool, 
 			milli, limited, err = readV1CPUQuota(group)
 		}
 		if err != nil {
+			if group == hierarchy.mountpoint && errors.Is(err, os.ErrNotExist) {
+				continue
+			}
 			return 0, false, err
 		}
 		if limited && (minimum == 0 || milli < minimum) {
@@ -460,6 +464,9 @@ func readMemoryLimit(hierarchy cgroupHierarchy, mode cgroups.CGMode) (int64, boo
 		path := filepath.Join(group, filename)
 		data, err := os.ReadFile(path)
 		if err != nil {
+			if group == hierarchy.mountpoint && errors.Is(err, os.ErrNotExist) {
+				continue
+			}
 			return 0, false, fmt.Errorf("read %s: %w", path, err)
 		}
 		value := strings.TrimSpace(string(data))

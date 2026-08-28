@@ -24,6 +24,7 @@ import (
 	"time"
 
 	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
+	"github.com/inclusionAI/sandboxd/config"
 	"github.com/inclusionAI/sandboxd/pkg/errord"
 	svc "github.com/inclusionAI/sandboxd/pkg/runtime"
 )
@@ -121,13 +122,34 @@ func (h *sandboxService) Checkpoint(
 		time.Duration(request.TimeoutSeconds)*time.Second,
 	)
 	defer cancel()
-	err = checkpointHandler.Checkpoint(checkpointCtx, svc.CheckpointConfig{
-		ID:           request.ID,
-		Directory:    directory.path,
-		Compress:     request.Compress,
-		LeaveRunning: request.LeaveRunning,
-		SnapshotType: request.SnapshotType,
-	})
+	cgroupPath := ""
+	var resources *runtime.LinuxSandboxResources
+	if sandbox.Metadata.RuntimeHandler == config.RuntimeNameFirecracker {
+		resource, resourceErr := h.sandboxManager.CollectResourceByID(request.ID)
+		if resourceErr != nil {
+			_ = directory.cleanup()
+			return nil, errord.ToGRPC(resourceErr)
+		}
+		cgroupPath = resource.Resources[config.ResourceNameCgroup]
+		resources = sandbox.Status.Get().Resources
+	}
+	err = h.withTransientFirecrackerCheckpointMemory(
+		checkpointCtx,
+		sandbox.Metadata.RuntimeHandler,
+		request.ID,
+		cgroupPath,
+		resources,
+		handler,
+		func() error {
+			return checkpointHandler.Checkpoint(checkpointCtx, svc.CheckpointConfig{
+				ID:           request.ID,
+				Directory:    directory.path,
+				Compress:     request.Compress,
+				LeaveRunning: request.LeaveRunning,
+				SnapshotType: request.SnapshotType,
+			})
+		},
+	)
 	if err != nil {
 		if checkpointCtx.Err() != nil {
 			err = checkpointCtx.Err()

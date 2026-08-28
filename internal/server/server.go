@@ -93,12 +93,14 @@ type sandboxService struct {
 
 	fsMgr *fsManager
 
-	ready         atomic.Bool
-	recoveryReady atomic.Bool
-	deleteGroup   singleflight.Group
-	aclMu         sync.Mutex
-	checkpointMu  sync.Mutex
-	checkpointing map[string]struct{}
+	ready                             atomic.Bool
+	recoveryReady                     atomic.Bool
+	deleteGroup                       singleflight.Group
+	aclMu                             sync.Mutex
+	checkpointMu                      sync.Mutex
+	checkpointing                     map[string]struct{}
+	firecrackerCheckpointMemorySlotMu sync.Mutex
+	firecrackerCheckpointMemorySlot   chan struct{}
 }
 
 // loadRuntimeHandlers loads runtime handlers with exponential backoff.
@@ -221,7 +223,15 @@ func (h *sandboxService) startSandboxRuntime(
 				runtimeName,
 			)
 		}
-		err = checkpointHandler.Restore(ctx, startConfig)
+		err = h.withTransientFirecrackerCheckpointMemory(
+			ctx,
+			runtimeName,
+			startConfig.ID,
+			startConfig.CgroupPath,
+			startConfig.Resources,
+			handler,
+			func() error { return checkpointHandler.Restore(ctx, startConfig) },
+		)
 	} else {
 		err = handler.Start(ctx, startConfig)
 	}
@@ -275,6 +285,11 @@ func (h *sandboxService) deleteSandboxRuntime(ctx context.Context, sandboxID str
 		return errord.ToGRPC(err)
 	}
 	metrics.RecordRuntimeCallResult("delete", "success", c.Metadata.RuntimeHandler)
+	if h.resourceMod != nil {
+		h.resourceMod.ReleaseTransientMemory(
+			firecrackerCheckpointReservationOwner(sandboxID),
+		)
+	}
 	if h.xpuMgr != nil {
 		h.xpuMgr.Release(sandboxID)
 	}

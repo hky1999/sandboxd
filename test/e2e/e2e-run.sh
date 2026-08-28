@@ -153,6 +153,17 @@ cleanup() {
         log "checkpoint runtime stderr tail"
         tail -200 /var/log/sandboxd/checkpoint-runtime.stderr >&2
     fi
+    if [ "${status}" -ne 0 ] && [ "${E2E_RUNTIME}" = "firecracker" ]; then
+        local firecracker_log
+        for firecracker_log in \
+            /tmp/firecracker-main.stdout \
+            /tmp/firecracker-main.stderr; do
+            if [ -f "${firecracker_log}" ]; then
+                log "Firecracker guest log tail: ${firecracker_log}"
+                tail -200 "${firecracker_log}" >&2
+            fi
+        done
+    fi
     if [ "${status}" -ne 0 ] && [ -d /home/akernel/logs/runsc ]; then
         local runsc_log
         while IFS= read -r runsc_log; do
@@ -335,6 +346,7 @@ EOF
     fi
 
     local runtime_binaries
+    local node_resource_config=""
     case "${E2E_RUNTIME}" in
         all)
             runtime_binaries=$'runsc = "/usr/local/bin/runsc"\nrunc = "/usr/local/bin/runc"'
@@ -350,6 +362,7 @@ EOF
             ;;
         firecracker)
             runtime_binaries='firecracker = "/usr/local/bin/firecracker"'
+            node_resource_config=$'[plugin.node_resource]\nprovider = "cgroup"\nsock_path = "/run/sandboxd/resource.sock"'
             ;;
     esac
 
@@ -383,6 +396,8 @@ interface_cache_size = 1
 cgroup_root_name = "/${CGROUP_ROOT}"
 max_instance_num = 8
 pids_max = 64
+
+${node_resource_config}
 
 [plugin.runtime]
 image_lib_dir = "/e2e/images"
@@ -831,6 +846,13 @@ run_checkpoint_restore_check() {
     local persisted
     persisted="$(sbox_cmd exec "${SANDBOX_ID}" /bin/cat /var/checkpoint-persist)"
     assert_eq "${persisted}" "checkpoint-state-ok" "${suffix} restored writable state"
+    if [ "${runtime}" = "firecracker" ]; then
+        local restored_init
+        restored_init="$(sbox_cmd exec "${SANDBOX_ID}" /bin/sh -c \
+            'for namespace in mnt pid uts ipc; do test "$(readlink /proc/self/ns/$namespace)" = "$(readlink /proc/1/ns/$namespace)" || exit 1; done; test "$(hostname)" = akernel; cat /proc/1/comm')"
+        assert_eq "${restored_init}" "sh" \
+            "${suffix} restored exec joined sandbox namespaces"
+    fi
     local restored_generation
     restored_generation="$(sbox_cmd exec "${SANDBOX_ID}" \
         /bin/cat /var/checkpoint-generation)"
@@ -1596,7 +1618,7 @@ run_firecracker_checks() {
         --stderr "${main_stderr}" \
         --cpu-millicores 1500 \
         --memory-mb 256 \
-        /bin/sh -c 'echo "$E2E_MARKER" > /var/start-env; echo firecracker-main-stdout; sleep 300')"
+        /bin/sh -c 'echo "$E2E_MARKER" > /var/start-env; echo firecracker-main-stdout; while :; do sleep 300; done')"
     [ -n "${SANDBOX_ID}" ] || fail "Firecracker start returned empty sandbox id"
     wait_for_state "${SANDBOX_ID}" "SANDBOX_STATE_RUNNING"
 
@@ -1612,6 +1634,9 @@ run_firecracker_checks() {
 
     local got
     wait_for_exec_output "${SANDBOX_ID}" "firecracker-env-ok" /bin/cat /var/start-env
+    got="$(sbox_cmd exec "${SANDBOX_ID}" /bin/sh -c \
+        'for namespace in mnt pid uts ipc; do test "$(readlink /proc/self/ns/$namespace)" = "$(readlink /proc/1/ns/$namespace)" || exit 1; done; test "$(hostname)" = akernel; cat /proc/1/comm')"
+    assert_eq "${got}" "sh" "Firecracker exec joined sandbox namespaces"
     got="$(sbox_cmd exec "${SANDBOX_ID}" /bin/sh -c \
         'echo firecracker-write-ok > /var/firecracker-write && cat /var/firecracker-write')"
     assert_eq "${got}" "firecracker-write-ok" "Firecracker writable overlay"

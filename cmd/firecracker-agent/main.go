@@ -27,6 +27,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	goruntime "runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -40,10 +41,61 @@ import (
 )
 
 const (
-	containerRoot    = "/container/root"
-	containerLower   = "/container/lower"
-	containerOverlay = "/container/overlay"
+	containerMountRoot = "/container/root"
+	containerLower     = "/container/lower"
+	containerOverlay   = "/container/overlay"
+	sandboxInitMode    = "sandbox-init"
+	sandboxConfigFD    = 3
+	sandboxStatusFD    = 4
 )
+
+var containerRoot = containerMountRoot
+
+type rootSwitchOperations struct {
+	mount  func(string, string, string, uintptr, string) error
+	open   func(string, int, uint32) (int, error)
+	close  func(int) error
+	fchdir func(int) error
+	chroot func(string) error
+	chdir  func(string) error
+}
+
+var systemRootSwitchOperations = rootSwitchOperations{
+	mount:  unix.Mount,
+	open:   unix.Open,
+	close:  unix.Close,
+	fchdir: unix.Fchdir,
+	chroot: unix.Chroot,
+	chdir:  unix.Chdir,
+}
+
+type namespaceOperations struct {
+	unshare func(int) error
+	open    func(string, int, uint32) (int, error)
+	close   func(int) error
+	setns   func(int, int) error
+}
+
+var systemNamespaceOperations = namespaceOperations{
+	unshare: unix.Unshare,
+	open:    unix.Open,
+	close:   unix.Close,
+	setns:   unix.Setns,
+}
+
+type sandboxNamespace struct {
+	name string
+	flag int
+}
+
+var sandboxNamespaces = []sandboxNamespace{
+	{name: "ipc", flag: unix.CLONE_NEWIPC},
+	{name: "uts", flag: unix.CLONE_NEWUTS},
+	{name: "mnt", flag: unix.CLONE_NEWNS},
+	// Joining a PID namespace only affects children created afterward, so it
+	// must happen before exec.Cmd.Start forks the requested process.
+	{name: "pid", flag: unix.CLONE_NEWPID},
+}
 
 type checkpointHandoff struct {
 	fifoPath        string
@@ -61,6 +113,7 @@ type agentState struct {
 	mu         sync.RWMutex
 	configured bool
 	process    firecrackerproto.ProcessSpec
+	mainPID    int
 	mainDone   chan struct{}
 	mainExit   int
 	handoff    *checkpointHandoff
@@ -70,6 +123,13 @@ var state agentState
 
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+	if len(os.Args) == 2 && os.Args[1] == sandboxInitMode {
+		if err := runSandboxInit(); err != nil {
+			reportSandboxInitError(err)
+			log.Fatalf("start sandbox init: %v", err)
+		}
+		return
+	}
 	if os.Getpid() != 1 {
 		log.Printf("warning: firecracker-agent is PID %d, not PID 1", os.Getpid())
 	}
@@ -323,11 +383,6 @@ func configure(request firecrackerproto.ConfigureRequest) error {
 			return fmt.Errorf("remount sandbox root read-only: %w", err)
 		}
 	}
-	if request.Hostname != "" {
-		if err := unix.Sethostname([]byte(request.Hostname)); err != nil {
-			return fmt.Errorf("set hostname: %w", err)
-		}
-	}
 	if err := configureNetwork(request.Network); err != nil {
 		return err
 	}
@@ -338,24 +393,231 @@ func configure(request firecrackerproto.ConfigureRequest) error {
 	if err != nil {
 		return fmt.Errorf("prepare checkpoint handoff: %w", err)
 	}
-	command, err := sandboxCommand(request.Process, nil)
+	command, err := startSandboxProcess(request.Hostname, request.Process)
 	if err != nil {
-		handoff.close()
-		return err
-	}
-	command.Stdin = nil
-	command.Stdout = os.Stdout
-	command.Stderr = os.Stderr
-	if err := command.Start(); err != nil {
 		handoff.close()
 		return fmt.Errorf("start sandbox process: %w", err)
 	}
 	state.process = request.Process
+	state.mainPID = command.Process.Pid
 	state.handoff = handoff
 	state.configured = true
 	state.mainDone = make(chan struct{})
 	go waitMainProcess(command, state.mainDone)
 	log.Printf("started sandbox process pid=%d command=%q", command.Process.Pid, request.Process.Args)
+	return nil
+}
+
+type sandboxInitRequest struct {
+	Executable string                       `json:"executable"`
+	Hostname   string                       `json:"hostname,omitempty"`
+	Process    firecrackerproto.ProcessSpec `json:"process"`
+}
+
+func startSandboxProcess(
+	hostname string,
+	process firecrackerproto.ProcessSpec,
+) (*exec.Cmd, error) {
+	if len(process.Args) == 0 {
+		return nil, errors.New("sandbox command is empty")
+	}
+	executable, err := resolveExecutable(process.Args[0], process.Env)
+	if err != nil {
+		return nil, err
+	}
+	configReader, configWriter, err := os.Pipe()
+	if err != nil {
+		return nil, fmt.Errorf("create sandbox init config pipe: %w", err)
+	}
+	defer configWriter.Close()
+	statusReader, statusWriter, err := os.Pipe()
+	if err != nil {
+		configReader.Close()
+		return nil, fmt.Errorf("create sandbox init status pipe: %w", err)
+	}
+	defer statusReader.Close()
+
+	command := sandboxInitCommand(configReader, statusWriter)
+	if err := command.Start(); err != nil {
+		configReader.Close()
+		statusWriter.Close()
+		return nil, err
+	}
+	configReader.Close()
+	statusWriter.Close()
+
+	request := sandboxInitRequest{
+		Executable: executable,
+		Hostname:   hostname,
+		Process:    process,
+	}
+	writeErr := firecrackerproto.WriteMessage(
+		configWriter,
+		firecrackerproto.MessageConfigure,
+		request,
+	)
+	closeErr := configWriter.Close()
+	status, statusErr := io.ReadAll(statusReader)
+	if writeErr != nil || closeErr != nil || statusErr != nil || len(status) != 0 {
+		_ = command.Process.Kill()
+		_ = command.Wait()
+		switch {
+		case writeErr != nil:
+			return nil, fmt.Errorf("send sandbox init config: %w", writeErr)
+		case closeErr != nil:
+			return nil, fmt.Errorf("close sandbox init config: %w", closeErr)
+		case statusErr != nil:
+			return nil, fmt.Errorf("read sandbox init status: %w", statusErr)
+		default:
+			return nil, errors.New(string(status))
+		}
+	}
+	return command, nil
+}
+
+func sandboxInitCommand(configReader, statusWriter *os.File) *exec.Cmd {
+	return &exec.Cmd{
+		Path:       "/init",
+		Args:       []string{"/init", sandboxInitMode},
+		Env:        []string{},
+		Dir:        "/",
+		Stdin:      nil,
+		Stdout:     os.Stdout,
+		Stderr:     os.Stderr,
+		ExtraFiles: []*os.File{configReader, statusWriter},
+		SysProcAttr: &syscall.SysProcAttr{
+			Cloneflags: unix.CLONE_NEWNS |
+				unix.CLONE_NEWPID |
+				unix.CLONE_NEWUTS |
+				unix.CLONE_NEWIPC,
+			Setpgid: true,
+		},
+	}
+}
+
+func runSandboxInit() error {
+	// Credential changes and exec apply to the calling thread. Keep the whole
+	// bootstrap sequence on one OS thread until exec replaces the Go process.
+	goruntime.LockOSThread()
+	if os.Getpid() != 1 {
+		return fmt.Errorf("sandbox init is PID %d, want PID 1", os.Getpid())
+	}
+	unix.CloseOnExec(sandboxStatusFD)
+	config := os.NewFile(sandboxConfigFD, "sandbox-init-config")
+	if config == nil {
+		return errors.New("sandbox init config fd is unavailable")
+	}
+	messageType, payload, err := firecrackerproto.ReadMessage(config)
+	config.Close()
+	if err != nil {
+		return fmt.Errorf("read sandbox init config: %w", err)
+	}
+	if messageType != firecrackerproto.MessageConfigure {
+		return fmt.Errorf("unexpected sandbox init config type %d", messageType)
+	}
+	var request sandboxInitRequest
+	if err := firecrackerproto.Decode(payload, &request); err != nil {
+		return err
+	}
+	if request.Executable == "" || len(request.Process.Args) == 0 {
+		return errors.New("sandbox init command is empty")
+	}
+	if request.Hostname != "" {
+		if err := unix.Sethostname([]byte(request.Hostname)); err != nil {
+			return fmt.Errorf("set sandbox hostname: %w", err)
+		}
+	}
+	if err := switchContainerRoot(containerRoot, systemRootSwitchOperations); err != nil {
+		return fmt.Errorf("switch to sandbox root: %w", err)
+	}
+	if err := remountSandboxProc(); err != nil {
+		return err
+	}
+	workingDirectory := request.Process.Cwd
+	if workingDirectory == "" {
+		workingDirectory = "/"
+	}
+	if err := unix.Chdir(workingDirectory); err != nil {
+		return fmt.Errorf("change sandbox directory to %s: %w", workingDirectory, err)
+	}
+	groups := make([]int, len(request.Process.AdditionalGIDs))
+	for index, group := range request.Process.AdditionalGIDs {
+		groups[index] = int(group)
+	}
+	if err := unix.Setgroups(groups); err != nil {
+		return fmt.Errorf("set sandbox supplementary groups: %w", err)
+	}
+	if err := unix.Setresgid(
+		int(request.Process.GID),
+		int(request.Process.GID),
+		int(request.Process.GID),
+	); err != nil {
+		return fmt.Errorf("set sandbox gid: %w", err)
+	}
+	if err := unix.Setresuid(
+		int(request.Process.UID),
+		int(request.Process.UID),
+		int(request.Process.UID),
+	); err != nil {
+		return fmt.Errorf("set sandbox uid: %w", err)
+	}
+	unix.Umask(0022)
+	return unix.Exec(
+		request.Executable,
+		append([]string(nil), request.Process.Args...),
+		append([]string(nil), request.Process.Env...),
+	)
+}
+
+func reportSandboxInitError(err error) {
+	status := os.NewFile(sandboxStatusFD, "sandbox-init-status")
+	if status == nil {
+		return
+	}
+	defer status.Close()
+	_, _ = io.WriteString(status, err.Error())
+}
+
+func remountSandboxProc() error {
+	if err := unix.Unmount("/proc", unix.MNT_DETACH); err != nil && !errors.Is(err, unix.EINVAL) {
+		return fmt.Errorf("unmount inherited procfs: %w", err)
+	}
+	if err := unix.Mount(
+		"proc",
+		"/proc",
+		"proc",
+		unix.MS_NOSUID|unix.MS_NOEXEC|unix.MS_NODEV,
+		"",
+	); err != nil {
+		return fmt.Errorf("mount sandbox procfs: %w", err)
+	}
+	return nil
+}
+
+func switchContainerRoot(root string, operations rootSwitchOperations) error {
+	if root == "" || root == "/" {
+		return fmt.Errorf("new root %q must identify a mounted child filesystem", root)
+	}
+	if err := operations.mount("", "/", "", unix.MS_REC|unix.MS_PRIVATE, ""); err != nil {
+		return fmt.Errorf("make root mount private: %w", err)
+	}
+	rootFD, err := operations.open(root, unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return fmt.Errorf("open new root %s: %w", root, err)
+	}
+	defer operations.close(rootFD)
+	if err := operations.mount(root, "/", "", unix.MS_MOVE, ""); err != nil {
+		return fmt.Errorf("move new root %s: %w", root, err)
+	}
+	if err := operations.fchdir(rootFD); err != nil {
+		return fmt.Errorf("enter new root %s: %w", root, err)
+	}
+	if err := operations.chroot("."); err != nil {
+		return fmt.Errorf("chroot to new root %s: %w", root, err)
+	}
+	if err := operations.chdir("/"); err != nil {
+		return fmt.Errorf("change directory to new root: %w", err)
+	}
 	return nil
 }
 
@@ -959,6 +1221,61 @@ func powerOff() {
 	}
 }
 
+func startCommandInSandbox(mainPID int, command *exec.Cmd) error {
+	started := make(chan error, 1)
+	go func() {
+		// Namespace membership is per-thread. The goroutine deliberately never
+		// unlocks this thread: after Start returns, the goroutine exits and the Go
+		// runtime terminates the namespace-tainted OS thread.
+		goruntime.LockOSThread()
+		if err := joinSandboxNamespaces(
+			mainPID,
+			systemNamespaceOperations,
+		); err != nil {
+			started <- err
+			return
+		}
+		started <- command.Start()
+	}()
+	return <-started
+}
+
+func joinSandboxNamespaces(mainPID int, operations namespaceOperations) error {
+	if mainPID <= 0 {
+		return fmt.Errorf("invalid sandbox init PID %d", mainPID)
+	}
+	// setns(CLONE_NEWNS) rejects a caller that shares CLONE_FS state. The
+	// locked worker thread gets a private fs_struct before entering the mount
+	// namespace and is terminated instead of being returned to the Go runtime.
+	if err := operations.unshare(unix.CLONE_FS); err != nil {
+		return fmt.Errorf("unshare exec filesystem state: %w", err)
+	}
+	type namespaceFD struct {
+		sandboxNamespace
+		fd int
+	}
+	fds := make([]namespaceFD, 0, len(sandboxNamespaces))
+	defer func() {
+		for _, namespace := range fds {
+			_ = operations.close(namespace.fd)
+		}
+	}()
+	for _, namespace := range sandboxNamespaces {
+		path := fmt.Sprintf("/proc/%d/ns/%s", mainPID, namespace.name)
+		fd, err := operations.open(path, unix.O_RDONLY|unix.O_CLOEXEC, 0)
+		if err != nil {
+			return fmt.Errorf("open sandbox %s namespace: %w", namespace.name, err)
+		}
+		fds = append(fds, namespaceFD{sandboxNamespace: namespace, fd: fd})
+	}
+	for _, namespace := range fds {
+		if err := operations.setns(namespace.fd, namespace.flag); err != nil {
+			return fmt.Errorf("join sandbox %s namespace: %w", namespace.name, err)
+		}
+	}
+	return nil
+}
+
 func handleExec(connection *os.File, request firecrackerproto.ExecRequest, tty bool) {
 	state.mu.RLock()
 	if !state.configured {
@@ -967,6 +1284,7 @@ func handleExec(connection *os.File, request firecrackerproto.ExecRequest, tty b
 		return
 	}
 	base := state.process
+	mainPID := state.mainPID
 	done := state.mainDone
 	state.mu.RUnlock()
 	select {
@@ -981,19 +1299,19 @@ func handleExec(connection *os.File, request firecrackerproto.ExecRequest, tty b
 		writeResponse(connection, err)
 		return
 	}
-	command, err := sandboxCommand(process, &request)
+	command, err := sandboxCommand(process)
 	if err != nil {
 		writeResponse(connection, err)
 		return
 	}
 	if tty {
-		runTTYExec(connection, command, request)
+		runTTYExec(connection, command, request, mainPID)
 		return
 	}
-	runPipeExec(connection, command)
+	runPipeExec(connection, command, mainPID)
 }
 
-func runPipeExec(connection *os.File, command *exec.Cmd) {
+func runPipeExec(connection *os.File, command *exec.Cmd, mainPID int) {
 	stdin, err := command.StdinPipe()
 	if err != nil {
 		writeResponse(connection, err)
@@ -1009,7 +1327,7 @@ func runPipeExec(connection *os.File, command *exec.Cmd) {
 		writeResponse(connection, err)
 		return
 	}
-	if err := command.Start(); err != nil {
+	if err := startCommandInSandbox(mainPID, command); err != nil {
 		writeResponse(connection, err)
 		return
 	}
@@ -1054,7 +1372,12 @@ func runPipeExec(connection *os.File, command *exec.Cmd) {
 	writeMu.Unlock()
 }
 
-func runTTYExec(connection *os.File, command *exec.Cmd, request firecrackerproto.ExecRequest) {
+func runTTYExec(
+	connection *os.File,
+	command *exec.Cmd,
+	request firecrackerproto.ExecRequest,
+	mainPID int,
+) {
 	master, slave, err := openPTY(request.Rows, request.Cols)
 	if err != nil {
 		writeResponse(connection, err)
@@ -1068,7 +1391,7 @@ func runTTYExec(connection *os.File, command *exec.Cmd, request firecrackerproto
 	command.SysProcAttr.Setpgid = false
 	command.SysProcAttr.Setctty = true
 	command.SysProcAttr.Ctty = 0
-	if err := command.Start(); err != nil {
+	if err := startCommandInSandbox(mainPID, command); err != nil {
 		slave.Close()
 		writeResponse(connection, err)
 		return
@@ -1310,10 +1633,7 @@ func resolveGroupIdentity(value string) (uint32, error) {
 	return 0, fmt.Errorf("unknown sandbox group %q", value)
 }
 
-func sandboxCommand(
-	process firecrackerproto.ProcessSpec,
-	request *firecrackerproto.ExecRequest,
-) (*exec.Cmd, error) {
+func sandboxCommand(process firecrackerproto.ProcessSpec) (*exec.Cmd, error) {
 	if len(process.Args) == 0 {
 		return nil, errors.New("sandbox command is empty")
 	}
@@ -1331,16 +1651,13 @@ func sandboxCommand(
 		command.Dir = "/"
 	}
 	command.SysProcAttr = &syscall.SysProcAttr{
-		Chroot:    containerRoot,
-		Setpgid:   true,
-		Pdeathsig: syscall.SIGKILL,
+		Setpgid: true,
 		Credential: &syscall.Credential{
 			Uid:    process.UID,
 			Gid:    process.GID,
 			Groups: append([]uint32(nil), process.AdditionalGIDs...),
 		},
 	}
-	_ = request
 	return command, nil
 }
 
