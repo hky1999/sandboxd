@@ -91,12 +91,23 @@ func (s *faultServer) resolveChunk(fileOff uint64) ([]byte, error) {
 		}
 		return buf[:n], nil
 	}
-	// Remote mode: the chunk granularity is fixed, so the cache offset is
-	// the file offset rounded down and the URL range matches exactly.
+	// Remote mode: fetch/cache at chunk granularity, but return the slice
+	// starting at the REQUESTED file offset, not at the chunk boundary.
+	// The caller (resolve) expects data for [fileOff, fileOff+copyLen).
 	chunkIdx := fileOff / s.source.chunk
 	cacheOff := chunkIdx * s.source.chunk
+	subOff := fileOff - cacheOff // offset within the chunk
+	sliceAt := func(buf []byte) []byte {
+		if subOff >= uint64(len(buf)) {
+			return nil
+		}
+		return buf[subOff:]
+	}
 	if buf, ok := s.readCache(cacheOff); ok {
-		return buf, nil
+		if out := sliceAt(buf); out != nil {
+			return out, nil
+		}
+		return nil, fmt.Errorf("offset %d beyond cached chunk %d", fileOff, chunkIdx)
 	}
 	if err := s.fetchChunk(chunkIdx); err != nil {
 		return nil, err
@@ -105,7 +116,10 @@ func (s *faultServer) resolveChunk(fileOff uint64) ([]byte, error) {
 	if !ok {
 		return nil, fmt.Errorf("chunk %d missing from cache after fetch", chunkIdx)
 	}
-	return buf, nil
+	if out := sliceAt(buf); out != nil {
+		return out, nil
+	}
+	return nil, fmt.Errorf("offset %d beyond fetched chunk %d", fileOff, chunkIdx)
 }
 
 func (s *faultServer) readCache(cacheOff uint64) ([]byte, bool) {
