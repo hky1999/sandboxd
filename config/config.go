@@ -190,6 +190,15 @@ type FirecrackerConfig struct {
 	// restores. Empty looks for firecracker-uffd-handler next to the
 	// sandboxd binary.
 	UffdHandlerBin string `toml:"uffd_handler_bin" json:"uffdHandlerBin,omitempty"`
+	// UffdRemoteURLTemplate builds the source URL for remote uffd restores.
+	// The artifact memory file path is substituted for %s; empty serves the
+	// pages directly from the local artifact file.
+	UffdRemoteURLTemplate string `toml:"uffd_remote_url" json:"uffdRemoteUrl,omitempty"`
+	// UffdCacheDir holds per-sandbox sparse cache files in remote mode.
+	// Empty disables the cache-backed remote chain (falls back to local).
+	UffdCacheDir string `toml:"uffd_cache_dir" json:"uffdCacheDir,omitempty"`
+	// UffdChunkKB is the fetch/copy granularity of the uffd handler.
+	UffdChunkKB uint `toml:"uffd_chunk_kb" json:"uffdChunkKB,omitempty"`
 
 	// DigestMemory seals a sha256 of the memory artifact into the
 	// checkpoint manifest so restores reject corrupted artifacts up front

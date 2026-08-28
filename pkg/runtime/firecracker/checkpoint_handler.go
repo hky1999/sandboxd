@@ -25,6 +25,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -956,7 +957,28 @@ func (handler *Handler) launchUffdHandler(sandboxID, sockPath, backingPath, stat
 		return fmt.Errorf("open uffd handler log: %w", err)
 	}
 	defer logFile.Close()
-	cmd := exec.Command(bin, "-sock", sockPath, "-backing", backingPath)
+	args := []string{"-sock", sockPath}
+	if handler.uffdRemoteURL != "" {
+		remote := strings.ReplaceAll(handler.uffdRemoteURL, "%s", backingPath)
+		cacheDir := handler.uffdCacheDir
+		if cacheDir == "" {
+			cacheDir = stateDir
+		}
+		cachePath := filepath.Join(cacheDir, "uffd-cache")
+		if err := os.MkdirAll(filepath.Dir(cachePath), 0o755); err != nil {
+			return fmt.Errorf("create uffd cache dir: %w", err)
+		}
+		args = append(args, "-remote", remote, "-cache", cachePath)
+		if info, err := os.Stat(backingPath); err == nil {
+			args = append(args, "-cache-size", strconv.FormatInt(info.Size(), 10))
+		}
+	} else {
+		args = append(args, "-backing", backingPath)
+	}
+	if handler.uffdChunkKB > 0 {
+		args = append(args, "-chunk-kb", strconv.FormatUint(uint64(handler.uffdChunkKB), 10))
+	}
+	cmd := exec.Command(bin, args...)
 	cmd.Dir = stateDir
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile

@@ -20,6 +20,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"sync"
 	"time"
@@ -65,11 +66,134 @@ type uffdioRangeArg struct {
 	Len   uint64
 }
 
+// pageSource resolves a chunk of guest memory content: either directly from
+// a local backing file, or through a sparse local cache filled from a remote
+// HTTP range source on miss.
+type pageSource struct {
+	file *os.File // local backing (nil when remote mode is used)
+
+	cachePath string // sparse local cache file (remote mode)
+	cache     *os.File
+	remote    string // base URL of the artifact memory file (remote mode)
+	chunk     uint64
+	client    *http.Client
+
+	inflightMu sync.Mutex
+	inflight   map[uint64]*sync.WaitGroup // chunk index -> waiters' group
+}
+
+func (s *faultServer) resolveChunk(fileOff uint64) ([]byte, error) {
+	if s.source.file != nil {
+		buf := make([]byte, s.source.chunk)
+		n, err := s.source.file.ReadAt(buf, int64(fileOff))
+		if err != nil && !errors.Is(err, io.EOF) {
+			return nil, err
+		}
+		return buf[:n], nil
+	}
+	// Remote mode: the chunk granularity is fixed, so the cache offset is
+	// the file offset rounded down and the URL range matches exactly.
+	chunkIdx := fileOff / s.source.chunk
+	cacheOff := chunkIdx * s.source.chunk
+	if buf, ok := s.readCache(cacheOff); ok {
+		return buf, nil
+	}
+	if err := s.fetchChunk(chunkIdx); err != nil {
+		return nil, err
+	}
+	buf, ok := s.readCache(cacheOff)
+	if !ok {
+		return nil, fmt.Errorf("chunk %d missing from cache after fetch", chunkIdx)
+	}
+	return buf, nil
+}
+
+func (s *faultServer) readCache(cacheOff uint64) ([]byte, bool) {
+	buf := make([]byte, s.source.chunk)
+	n, err := s.source.cache.ReadAt(buf, int64(cacheOff))
+	if err != nil && !errors.Is(err, io.EOF) {
+		return nil, false
+	}
+	if n == 0 {
+		return nil, false
+	}
+	return buf[:n], true
+}
+
+// fetchChunk pulls one chunk from the remote source, collapsing concurrent
+// misses of the same chunk into a single request.
+func (s *faultServer) fetchChunk(chunkIdx uint64) error {
+	src := s.source
+	for {
+		src.inflightMu.Lock()
+		if wg, ok := src.inflight[chunkIdx]; ok {
+			src.inflightMu.Unlock()
+			wg.Wait()
+			return nil // someone fetched it; caller re-reads the cache
+		}
+		wg := &sync.WaitGroup{}
+		wg.Add(1)
+		src.inflight[chunkIdx] = wg
+		src.inflightMu.Unlock()
+		err := func() error {
+			defer wg.Done()
+			defer func() {
+				src.inflightMu.Lock()
+				delete(src.inflight, chunkIdx)
+				src.inflightMu.Unlock()
+			}()
+			start := chunkIdx * src.chunk
+			req, err := http.NewRequest(http.MethodGet, src.remote, nil)
+			if err != nil {
+				return err
+			}
+			req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, start+src.chunk-1))
+			resp, err := src.client.Do(req)
+			if err != nil {
+				return fmt.Errorf("range fetch %s [%d,+%d): %w", src.remote, start, src.chunk, err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusPartialContent && resp.StatusCode != http.StatusOK {
+				return fmt.Errorf("range fetch %s: status %s", src.remote, resp.Status)
+			}
+			// Copy straight into the sparse cache at the chunk offset.
+			written, err := io.Copy(newOffsetWriter(src.cache, int64(start)), resp.Body)
+			if err != nil {
+				return fmt.Errorf("cache chunk %d: %w", chunkIdx, err)
+			}
+			if written == 0 {
+				// Zero-length chunk past the artifact end: touch the cache so
+				// readers see zeros instead of retrying forever.
+				_, _ = src.cache.WriteAt(make([]byte, 1), int64(start))
+			}
+			return nil
+		}()
+		if err == nil {
+			return nil
+		}
+		return err
+	}
+}
+
+// offsetWriter adapts io.Copy onto an *os.File section.
+type offsetWriter struct {
+	f *os.File
+	n int64
+}
+
+func newOffsetWriter(f *os.File, off int64) *offsetWriter { return &offsetWriter{f: f, n: off} }
+
+func (w *offsetWriter) Write(p []byte) (int, error) {
+	n, err := w.f.WriteAt(p, w.n)
+	w.n += int64(n)
+	return n, err
+}
+
 type faultServer struct {
-	file    *os.File
 	regions []regionMapping
 	chunk   uint64
 	uffdFd  int
+	source  *pageSource
 
 	mu     sync.Mutex
 	served uint64
@@ -81,22 +205,21 @@ func (s *faultServer) resolve(addr uint64) error {
 			continue
 		}
 		fileOff := addr - r.BaseHostVirtAddr + r.Offset
-		// Clamp the copy to the region and to the chunk size.
-		n := s.chunk
-		if rem := r.BaseHostVirtAddr + r.Size - addr; rem < n {
-			n = rem
+		// Serve a chunk-aligned window covering the faulting page: the copy
+		// resolves every page inside it, suppressing their future faults.
+		off := fileOff &^ (s.chunk - 1)
+		buf, err := s.resolveChunk(off)
+		if err != nil {
+			return err
 		}
-		buf := make([]byte, n)
-		got, err := s.file.ReadAt(buf, int64(fileOff))
-		if err != nil && !errors.Is(err, io.EOF) {
-			return fmt.Errorf("read backing file at %d: %w", fileOff, err)
+		if len(buf) == 0 {
+			buf = make([]byte, s.chunk) // past EOF: zero fill
 		}
-		// Reads past EOF (or into short reads) yield zero pages, matching the
-		// sparse memory file's hole semantics.
+		dst := r.BaseHostVirtAddr + (off - r.Offset)
 		arg := uffdioCopyArg{
-			Dst:  addr,
+			Dst:  dst,
 			Src:  uint64(uintptr(unsafe.Pointer(&buf[0]))),
-			Len:  uint64(got),
+			Len:  uint64(len(buf)),
 			Mode: 0, // UFFDIO_COPY wakes the faulting thread by default.
 		}
 		for {
@@ -175,12 +298,15 @@ func recvHandshake(l net.Listener) ([]regionMapping, int, error) {
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	sockPath := flag.String("sock", "", "unix socket path Firecracker will connect to")
-	backingPath := flag.String("backing", "", "checkpoint memory file to serve pages from")
+	backingPath := flag.String("backing", "", "local checkpoint memory file (local mode)")
+	remoteURL := flag.String("remote", "", "HTTP(S) URL of the artifact memory file (remote mode)")
+	cachePath := flag.String("cache", "", "sparse local cache file (remote mode)")
+	cacheSize := flag.Int64("cache-size", 0, "pre-size the cache file in bytes (remote mode, 0 = skip)")
 	chunkKB := flag.Uint("chunk-kb", 4, "bytes copied per fault, in KiB")
 	workers := flag.Int("workers", 8, "concurrent UFFDIO_COPY workers")
 	flag.Parse()
-	if *sockPath == "" || *backingPath == "" {
-		log.Fatal("both -sock and -backing are required")
+	if *sockPath == "" || (*backingPath == "" && *remoteURL == "") {
+		log.Fatal("-sock plus -backing or -remote is required")
 	}
 	os.Remove(*sockPath)
 	l, err := net.Listen("unix", *sockPath)
@@ -193,15 +319,34 @@ func main() {
 	if err != nil {
 		log.Fatalf("handshake: %v", err)
 	}
-	file, err := os.Open(*backingPath)
-	if err != nil {
-		log.Fatalf("open backing file: %v", err)
+	chunk := uint64(*chunkKB) << 10
+	source := &pageSource{chunk: chunk, inflight: make(map[uint64]*sync.WaitGroup)}
+	if *remoteURL != "" {
+		cacheFile, err := os.OpenFile(*cachePath, os.O_CREATE|os.O_RDWR, 0o600)
+		if err != nil {
+			log.Fatalf("open cache file %s: %v", *cachePath, err)
+		}
+		source.cache = cacheFile
+		source.cachePath = *cachePath
+		source.remote = *remoteURL
+		source.client = &http.Client{Transport: &http.Transport{
+			MaxIdleConnsPerHost: 16,
+		}}
+		if err := truncateIfNeeded(cacheFile, *cacheSize); err != nil {
+			log.Fatalf("size cache file: %v", err)
+		}
+	} else {
+		file, err := os.Open(*backingPath)
+		if err != nil {
+			log.Fatalf("open backing file: %v", err)
+		}
+		source.file = file
 	}
 	s := &faultServer{
-		file:    file,
 		regions: regions,
-		chunk:   uint64(*chunkKB) << 10,
+		chunk:   chunk,
 		uffdFd:  fd,
+		source:  source,
 	}
 	log.Printf("handler ready: %d regions, chunk=%dKiB, workers=%d",
 		len(regions), *chunkKB, *workers)
@@ -299,4 +444,20 @@ func main() {
 	total := s.served
 	s.mu.Unlock()
 	log.Printf("handler exiting, total faults served=%d", total)
+}
+
+// truncateIfNeeded pre-extends a fresh cache file so writes at arbitrary
+// chunk offsets stay inside the file.
+func truncateIfNeeded(f *os.File, size int64) error {
+	if size <= 0 {
+		return nil
+	}
+	info, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	if info.Size() >= size {
+		return nil
+	}
+	return f.Truncate(size)
 }
