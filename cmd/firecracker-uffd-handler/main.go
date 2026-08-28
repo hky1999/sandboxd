@@ -332,41 +332,7 @@ func main() {
 		source.client = &http.Client{Transport: &http.Transport{
 			MaxIdleConnsPerHost: 16,
 		}}
-		// Bulk download before the handshake: a single sequential stream
-		// eliminates the concurrent-write corruption (interleaved WriteAt
-		// from multiple goroutines produced zeros at scattered offsets).
-		// FC's connect+send buffers in the kernel, so delaying accept()
-		// while downloading is safe.
-		if *prefetch > 0 {
-			info, err := os.Stat(*backingPath)
-			if err != nil {
-				log.Fatalf("prefetch: stat backing %s: %v", *backingPath, err)
-			}
-			total := info.Size()
-			log.Printf("prefetch: bulk downloading %d bytes from %s", total, source.remote)
-			startT := time.Now()
-			req, _ := http.NewRequest(http.MethodGet, source.remote, nil)
-			resp, err := source.client.Do(req)
-			if err != nil {
-				log.Fatalf("prefetch: fetch: %v", err)
-			}
-			if resp.StatusCode != http.StatusOK {
-				resp.Body.Close()
-				log.Fatalf("prefetch: status %s", resp.Status)
-			}
-			written, err := io.Copy(source.cache, resp.Body)
-			resp.Body.Close()
-			if err != nil {
-				log.Fatalf("prefetch: copy: %v", err)
-			}
-			if written != total {
-				log.Fatalf("prefetch: wrote %d bytes, expected %d", written, total)
-			}
-			_ = source.cache.Sync()
-			log.Printf("prefetch: %d bytes in %.2fs (%.0f MiB/s)",
-				written, time.Since(startT).Seconds(),
-				float64(written)/time.Since(startT).Seconds()/(1<<20))
-		}
+		// Cache writes go through fetchChunk which serializes via inflight.
 	} else {
 		file, err := os.Open(*backingPath)
 		if err != nil {
@@ -390,6 +356,35 @@ func main() {
 	faults := make(chan uint64, 4096)
 	var wg sync.WaitGroup
 	stop := make(chan struct{})
+
+	// Background bulk download: sequentially fetchChunk every chunk. This
+	// runs concurrently with fault serving — the inflight dedup in
+	// fetchChunk ensures a chunk is fetched at most once, and the writes
+	// are serialized by the sequential iteration (one fetchChunk at a time
+	// in this goroutine). Fault-serving workers may also call fetchChunk
+	// for the same chunk concurrently, which the inflight WaitGroup handles.
+	if *prefetch > 0 && source.remote != "" {
+		go func() {
+			totalChunks := uint64(0)
+			for _, r := range regions {
+				totalChunks += (r.Size + chunk - 1) / chunk
+			}
+			startT := time.Now()
+			for idx := uint64(0); idx < totalChunks; idx++ {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				if err := s.fetchChunk(idx); err != nil {
+					log.Printf("prefetch chunk %d: %v", idx, err)
+					return
+				}
+			}
+			log.Printf("prefetch: %d chunks in %.2fs",
+				totalChunks, time.Since(startT).Seconds())
+		}()
+	}
 
 	for i := 0; i < *workers; i++ {
 		wg.Add(1)
