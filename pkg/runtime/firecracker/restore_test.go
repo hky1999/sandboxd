@@ -190,7 +190,7 @@ func sealV2ArtifactFixtureMemSize(t *testing.T, dir string, memorySize int64) fi
 	if err := finalizeFirecrackerCheckpointV2(context.Background(), files, &firecrackerCheckpointManifest{
 		SnapshotType: firecrackerSnapshotTypeSoftDirty,
 		MemorySize:   memorySize,
-	}); err != nil {
+	}, true); err != nil {
 		t.Fatalf("finalize v2 checkpoint: %v", err)
 	}
 	return files

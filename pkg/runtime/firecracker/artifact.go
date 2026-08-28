@@ -178,6 +178,7 @@ func finalizeFirecrackerCheckpointV2(
 	ctx context.Context,
 	files firecrackerCheckpointFiles,
 	manifest *firecrackerCheckpointManifest,
+	digestMemory bool,
 ) (retErr error) {
 	manifest.Version = firecrackerCheckpointVersion2
 	manifest.CreatedAt = time.Now().UTC()
@@ -199,8 +200,8 @@ func finalizeFirecrackerCheckpointV2(
 	// rests on local reflink copy-on-write and Firecracker's own writes.
 	manifest.Digests = make(map[string]string, 2)
 	for _, component := range firecrackerCheckpointComponents(files) {
-		if component.name == firecrackerCheckpointMemoryName ||
-			component.name == firecrackerCheckpointOverlayName {
+		if component.name == firecrackerCheckpointOverlayName ||
+			(component.name == firecrackerCheckpointMemoryName && !digestMemory) {
 			continue
 		}
 		digest, err := digestFirecrackerCheckpointComponent(ctx, component.name, component.path)
