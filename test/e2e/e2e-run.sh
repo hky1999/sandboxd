@@ -989,8 +989,9 @@ run_firecracker_post_restore_chain() {
     [[ "${loss_counter}" =~ ^[0-9]+$ ]] &&
         [ "${loss_counter}" -ge "${counter_before_loss}" ] ||
         fail "${suffix} lineage-loss restore lost counter state: before=${counter_before_loss} restored=${loss_counter}"
-    sbox_cmd delete "${SANDBOX_ID}"
-    SANDBOX_ID=""
+    # Deliberately leave the lineage-loss target running in SANDBOX_ID: the
+    # caller's tail reuses it for the checkpoint-directory-independence
+    # check and the final delete.
 }
 
 run_network_soak() {
