@@ -70,12 +70,18 @@ func (handler *Handler) Checkpoint(
 	}
 
 	api := newFirecrackerAPI(state.APIPath)
+	requestedType, err := resolveRequestedSnapshotType(
+		handler.checkpointMode, config.SnapshotType,
+	)
+	if err != nil {
+		return fmt.Errorf("Firecracker sandbox %s: %w", sandboxID, err)
+	}
 	snapshotType, base, _, layoutMemorySize, err := selectFirecrackerSnapshotTier(
 		int64(state.MemoryMiB)<<20,
 		state.BaseMemoryPath,
 		state.BaseMemoryIncremental,
 		state.BaseMemoryLineageLost,
-		config.SnapshotType,
+		requestedType,
 	)
 	if err != nil {
 		return err
@@ -211,7 +217,9 @@ func (handler *Handler) Checkpoint(
 		return fmt.Errorf("snapshot Firecracker writable layer for %s: %w", sandboxID, err)
 	}
 	tOverlay := time.Now()
-	if err := api.createSnapshot(ctx, files.State, files.Memory, snapshotType); err != nil {
+	if err := api.createSnapshot(
+		ctx, files.State, files.Memory, snapshotType, handler.deferredSnapshotSync,
+	); err != nil {
 		// The VMM disarms its ledger on write failures, but not on every
 		// failure shape (a request can fail after the memory write already
 		// acked and re-armed, e.g. in the state write). The lineage must be
@@ -365,6 +373,26 @@ func (handler *Handler) finishCheckpointedSandbox(
 
 // firecrackerBaseMemoryUsable reports whether the recorded base can still be
 // patched by an incremental snapshot of a guest with the given memory size.
+// resolveRequestedSnapshotType applies the checkpoint_mode gate to a
+// checkpoint request. Outside the incremental mode every generation is a
+// Full snapshot; the incremental types stay available only to deployments
+// that opted in, so an explicit request for them is a configuration error
+// rather than something to silently reinterpret.
+func resolveRequestedSnapshotType(mode, requested string) (string, error) {
+	if mode != firecrackerCheckpointModeIncremental {
+		switch requested {
+		case "", firecrackerSnapshotTypeFull:
+			return firecrackerSnapshotTypeFull, nil
+		default:
+			return "", fmt.Errorf(
+				"snapshot type %q requires checkpoint_mode = %q (currently %q)",
+				requested, firecrackerCheckpointModeIncremental, mode,
+			)
+		}
+	}
+	return requested, nil
+}
+
 // selectFirecrackerSnapshotTier resolves how the next generation is taken.
 // An empty request leaves the automatic three-tier choice to the recorded
 // lineage: Incremental after a restore, SoftDirty windows afterwards, Full

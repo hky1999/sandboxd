@@ -54,6 +54,10 @@ const (
 	firecrackerFlushTimeout = 2 * time.Second
 	firecrackerMinMemoryMiB = uint32(128)
 	firecrackerMaxVCPUs     = uint32(32)
+	// checkpoint_mode values: the conservative default and the incremental
+	// chain. An unset value normalizes to full.
+	firecrackerCheckpointModeFull        = "full"
+	firecrackerCheckpointModeIncremental = "incremental"
 )
 
 var (
@@ -229,6 +233,16 @@ type Handler struct {
 	// restores from a stable directory skip the re-hash.
 	digestCache checkpointDigestCache
 
+	// checkpointMode is the validated plugin.runtime.firecracker
+	// checkpoint_mode: full keeps upstream Full snapshots, incremental
+	// enables the three-tier chain.
+	checkpointMode string
+	// deferredSnapshotSync mirrors plugin.runtime.firecracker
+	// deferred_snapshot_sync: when false the snapshot request omits the
+	// deferred_sync member entirely so official (deny_unknown_fields)
+	// VMMs keep accepting it.
+	deferredSnapshotSync bool
+
 	// shrinkBeforeCheckpoint gates the pre-pause guest page-cache drop;
 	// see FirecrackerConfig.ShrinkBeforeCheckpoint for why it is off by
 	// default.
@@ -288,6 +302,9 @@ func NewHandler(
 	if err := validateFirecrackerKVM(firecrackerConfig.KVMDevice); err != nil {
 		return nil, err
 	}
+	if err := validateFirecrackerCheckpointMode(firecrackerConfig.CheckpointMode); err != nil {
+		return nil, err
+	}
 	if filepath.Clean(firecrackerConfig.KVMDevice) !=
 		filepath.Clean(config.DefaultKVMDevice) {
 		return nil, fmt.Errorf(
@@ -324,6 +341,8 @@ func NewHandler(
 		defaultVCPUs:           firecrackerConfig.DefaultVCPUCount,
 		defaultMem:             firecrackerConfig.DefaultMemoryMiB,
 		shrinkBeforeCheckpoint: firecrackerConfig.ShrinkBeforeCheckpoint,
+		checkpointMode:         firecrackerConfig.CheckpointMode,
+		deferredSnapshotSync:   firecrackerConfig.DeferredSnapshotSync,
 		defaultDisk:            firecrackerConfig.DefaultOverlaySizeBytes,
 		ociLoader:              loader,
 		instances:              make(map[string]*firecrackerInstance),
@@ -353,6 +372,24 @@ func applyFirecrackerDefaults(value *config.FirecrackerConfig) {
 	}
 	if value.DefaultOverlaySizeBytes == 0 {
 		value.DefaultOverlaySizeBytes = config.DefaultFirecrackerOverlayBytes
+	}
+	if value.CheckpointMode == "" {
+		value.CheckpointMode = firecrackerCheckpointModeFull
+	}
+}
+
+func validateFirecrackerCheckpointMode(mode string) error {
+	switch mode {
+	// "" is the unset value: applyFirecrackerDefaults normalizes it to
+	// full before validation runs, but accepting it here keeps the check
+	// order-independent for direct callers.
+	case "", firecrackerCheckpointModeFull, firecrackerCheckpointModeIncremental:
+		return nil
+	default:
+		return fmt.Errorf(
+			"invalid firecracker checkpoint_mode %q: want %q or %q",
+			mode, firecrackerCheckpointModeFull, firecrackerCheckpointModeIncremental,
+		)
 	}
 }
 

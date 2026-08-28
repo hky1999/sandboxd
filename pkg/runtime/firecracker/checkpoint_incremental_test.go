@@ -19,6 +19,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/inclusionAI/sandboxd/config"
 )
 
 func TestSelectFirecrackerSnapshotTier(t *testing.T) {
@@ -336,5 +338,65 @@ func TestDiscardUnsealedFirecrackerCheckpoint(t *testing.T) {
 		if _, err := os.Lstat(path); !os.IsNotExist(err) {
 			t.Fatalf("component %s survived the discard: %v", path, err)
 		}
+	}
+}
+
+func TestResolveRequestedSnapshotTypeGatesIncrementalOnMode(t *testing.T) {
+	for _, tc := range []struct {
+		mode      string
+		requested string
+		want      string
+		wantErr   bool
+	}{
+		// Default mode: everything becomes Full or is rejected outright.
+		{mode: firecrackerCheckpointModeFull, requested: "", want: firecrackerSnapshotTypeFull},
+		{mode: firecrackerCheckpointModeFull, requested: firecrackerSnapshotTypeFull, want: firecrackerSnapshotTypeFull},
+		{mode: firecrackerCheckpointModeFull, requested: firecrackerSnapshotTypeSoftDirty, wantErr: true},
+		{mode: firecrackerCheckpointModeFull, requested: firecrackerSnapshotTypeIncremental, wantErr: true},
+		// Opt-in mode: the request passes through untouched for tier
+		// selection to validate.
+		{mode: firecrackerCheckpointModeIncremental, requested: "", want: ""},
+		{mode: firecrackerCheckpointModeIncremental, requested: firecrackerSnapshotTypeFull, want: firecrackerSnapshotTypeFull},
+		{mode: firecrackerCheckpointModeIncremental, requested: firecrackerSnapshotTypeSoftDirty, want: firecrackerSnapshotTypeSoftDirty},
+	} {
+		got, err := resolveRequestedSnapshotType(tc.mode, tc.requested)
+		if tc.wantErr {
+			if err == nil {
+				t.Fatalf("mode=%q requested=%q: gate accepted it as %q", tc.mode, tc.requested, got)
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatalf("mode=%q requested=%q: %v", tc.mode, tc.requested, err)
+		}
+		if got != tc.want {
+			t.Fatalf("mode=%q requested=%q: got %q want %q", tc.mode, tc.requested, got, tc.want)
+		}
+	}
+}
+
+func TestValidateFirecrackerCheckpointMode(t *testing.T) {
+	for _, mode := range []string{"", "full", "incremental"} {
+		if err := validateFirecrackerCheckpointMode(mode); err != nil {
+			t.Fatalf("mode %q rejected: %v", mode, err)
+		}
+	}
+	for _, mode := range []string{"Full", "INCREMENTAL", "soft-dirty", "auto"} {
+		if err := validateFirecrackerCheckpointMode(mode); err == nil {
+			t.Fatalf("mode %q accepted", mode)
+		}
+	}
+}
+
+func TestApplyFirecrackerDefaultsNormalizesCheckpointMode(t *testing.T) {
+	value := config.FirecrackerConfig{}
+	applyFirecrackerDefaults(&value)
+	if value.CheckpointMode != firecrackerCheckpointModeFull {
+		t.Fatalf("unset checkpoint_mode defaulted to %q", value.CheckpointMode)
+	}
+	value = config.FirecrackerConfig{CheckpointMode: firecrackerCheckpointModeIncremental}
+	applyFirecrackerDefaults(&value)
+	if value.CheckpointMode != firecrackerCheckpointModeIncremental {
+		t.Fatalf("explicit checkpoint_mode overwritten: %q", value.CheckpointMode)
 	}
 }

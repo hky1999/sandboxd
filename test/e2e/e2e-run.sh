@@ -28,6 +28,8 @@ EROFS_ROOTFS="${E2E_EROFS_ROOTFS:-/e2e/rootfs.erofs}"
 EROFS_MOUNT_ROOT="${E2E_EROFS_MOUNT_ROOT:-/e2e/erofs-mount-root}"
 EROFS_MOUNT_IMAGE="${E2E_EROFS_MOUNT_IMAGE:-/e2e/data.erofs}"
 FIRECRACKER_KERNEL="${E2E_FIRECRACKER_KERNEL:-/opt/firecracker/vmlinux}"
+FIRECRACKER_CHECKPOINT_MODE="${E2E_FIRECRACKER_CHECKPOINT_MODE:-}"
+FIRECRACKER_DEFERRED_SYNC="${E2E_FIRECRACKER_DEFERRED_SYNC:-}"
 FIRECRACKER_INITRD="${E2E_FIRECRACKER_INITRD:-/opt/firecracker/initrd.img}"
 FIRECRACKER_OVERLAY_BYTES="${E2E_FIRECRACKER_OVERLAY_BYTES:-134217728}"
 HOST_MOUNT="${E2E_HOST_MOUNT:-/e2e/host-mount}"
@@ -351,6 +353,17 @@ EOF
             ;;
     esac
 
+    # Only emit the checkpoint knobs when the E2E case opts in: the plain
+    # firecracker job must keep exercising the unset (default full) path.
+    local e2e_fc_checkpoint_mode_cfg=""
+    if [ -n "${FIRECRACKER_CHECKPOINT_MODE}" ]; then
+        e2e_fc_checkpoint_mode_cfg="checkpoint_mode = "${FIRECRACKER_CHECKPOINT_MODE}""
+    fi
+    local e2e_fc_deferred_sync_cfg=""
+    if [ -n "${FIRECRACKER_DEFERRED_SYNC}" ]; then
+        e2e_fc_deferred_sync_cfg="deferred_snapshot_sync = true"
+    fi
+
     cat > "${CONFIG_FILE}" <<EOF
 rootDir = "${SANDBOXD_ROOT}"
 storeDir = "${SANDBOXD_STORE}"
@@ -401,6 +414,8 @@ kvm_device = "/dev/kvm"
 default_vcpu_count = 1
 default_memory_mib = 256
 default_overlay_size_bytes = ${FIRECRACKER_OVERLAY_BYTES}
+${e2e_fc_checkpoint_mode_cfg}
+${e2e_fc_deferred_sync_cfg}
 
 [plugin.runtime.basic_spec]
 runsc = ""
@@ -762,6 +777,18 @@ run_checkpoint_restore_check() {
             [ ! -s "${checkpoint_dir}/manifest.json" ]; then
             fail "${suffix} checkpoint ${checkpoint_index} artifact is missing or empty"
         fi
+        if [ "${runtime}" = "firecracker" ] &&
+            [ -s "${checkpoint_dir}/manifest.json" ]; then
+            # Default (checkpoint_mode=full) keeps every generation Full;
+            # the incremental case expects the rolling chain shape.
+            if [ -n "${FIRECRACKER_CHECKPOINT_MODE}" ]; then
+                assert_snapshot_type "${checkpoint_dir}" "SoftDirty" \
+                    "${suffix} rolling checkpoint ${checkpoint_index}"
+            else
+                assert_snapshot_type "${checkpoint_dir}" "Full" \
+                    "${suffix} default-mode checkpoint ${checkpoint_index}"
+            fi
+        fi
 
         source_after=""
         for attempt in $(seq 1 600); do
@@ -835,11 +862,133 @@ run_checkpoint_restore_check() {
         /bin/wget -qO- "http://${GATEWAY_IP}:${HTTP_PORT}/health.txt")"
     assert_eq "${restored_network}" "sandboxd-network-ok" "${suffix} restored network"
 
+    if [ "${runtime}" = "firecracker" ]; then
+        run_firecracker_post_restore_chain \
+            "${suffix}" "${checkpoint_root}" "${advanced}" "${request_file}"
+    fi
+
     rm -rf -- "${checkpoint_root}"
     [ ! -e "${checkpoint_root}" ] || fail "${suffix} caller cleanup retained checkpoint"
     persisted="$(sbox_cmd exec "${SANDBOX_ID}" /bin/cat /var/checkpoint-persist)"
     assert_eq "${persisted}" "checkpoint-state-ok" \
         "${suffix} target independent of checkpoint directory"
+    sbox_cmd delete "${SANDBOX_ID}"
+    SANDBOX_ID=""
+}
+
+# run_firecracker_post_restore_chain exercises the checkpoint-after-restore
+# path and the lineage-loss Full fallback on the already restored sandbox.
+# It runs with SANDBOX_ID pointing at the running restored target and leaves
+# the sandbox deleted on success. In the incremental case this covers the
+# post-restore Incremental baseline (and the VMM's arm-after-Incremental
+# fix: the generation after it must be a SoftDirty window delta); with the
+# default configuration everything stays Full.
+run_firecracker_post_restore_chain() {
+    local suffix="$1"
+    local checkpoint_root="$2"
+    local counter_floor="$3"
+    local request_file="$4"
+    local sandbox_id="${SANDBOX_ID}"
+    local incremental=""
+    [ -n "${FIRECRACKER_CHECKPOINT_MODE}" ] && incremental=1
+
+    log "testing ${suffix} checkpoint-after-restore chain"
+    sbox_cmd exec "${sandbox_id}" /bin/sh -c \
+        'echo post-restore-ok > /var/checkpoint-post-restore'
+
+    # Generation taken from a restored VM.
+    local post1="${checkpoint_root}/post-restore-1"
+    checkpoint-restore \
+        --action checkpoint \
+        --socket "${SOCKET}" \
+        --sandbox-id "${sandbox_id}" \
+        --request-file "${request_file}" \
+        --checkpoint-dir "${post1}" \
+        --checkpoint-timeout-seconds 180 \
+        --compress=true \
+        --leave-running=true
+    if [ -n "${incremental}" ]; then
+        assert_snapshot_type "${post1}" "Incremental" \
+            "${suffix} post-restore checkpoint"
+    else
+        assert_snapshot_type "${post1}" "Full" \
+            "${suffix} post-restore checkpoint"
+    fi
+
+    # Mutate and checkpoint again: incremental mode must land on a SoftDirty
+    # window delta against the Incremental baseline (pinning the VMM's
+    # arm-after-Incremental behavior through the selector's output).
+    sleep 1
+    local post2="${checkpoint_root}/post-restore-2"
+    checkpoint-restore \
+        --action checkpoint \
+        --socket "${SOCKET}" \
+        --sandbox-id "${sandbox_id}" \
+        --request-file "${request_file}" \
+        --checkpoint-dir "${post2}" \
+        --checkpoint-timeout-seconds 180 \
+        --compress=true \
+        --leave-running=true
+    if [ -n "${incremental}" ]; then
+        assert_snapshot_type "${post2}" "SoftDirty" \
+            "${suffix} post-restore follow-up checkpoint"
+    else
+        assert_snapshot_type "${post2}" "Full" \
+            "${suffix} post-restore follow-up checkpoint"
+    fi
+
+    # Lineage loss: delete the current base (the newest artifact) and take
+    # another generation. Automatic selection must degrade to Full in the
+    # incremental case instead of patching a window onto a vanished base.
+    local counter_before_loss
+    counter_before_loss="$(sbox_cmd exec "${sandbox_id}" \
+        /bin/cat /var/checkpoint-counter)"
+    rm -rf -- "${post2}"
+    sleep 1
+    local loss_dir="${checkpoint_root}/lineage-loss"
+    checkpoint-restore \
+        --action checkpoint \
+        --socket "${SOCKET}" \
+        --sandbox-id "${sandbox_id}" \
+        --request-file "${request_file}" \
+        --checkpoint-dir "${loss_dir}" \
+        --checkpoint-timeout-seconds 180 \
+        --compress=true \
+        --leave-running=true
+    assert_snapshot_type "${loss_dir}" "Full" \
+        "${suffix} checkpoint after losing the current base"
+
+    # Restore the lineage-loss artifact into a fresh sandbox and verify the
+    # data written before and after the lost base survived.
+    local loss_target="sbox-e2e-${suffix}-cr-loss"
+    sbox_cmd delete "${sandbox_id}"
+    SANDBOX_ID="$(checkpoint-restore \
+        --action restore \
+        --socket "${SOCKET}" \
+        --target-id "${loss_target}" \
+        --request-file "${request_file}" \
+        --checkpoint-dir "${loss_dir}")"
+    assert_eq "${SANDBOX_ID}" "${loss_target}" \
+        "${suffix} lineage-loss restored sandbox ID"
+    wait_for_state "${SANDBOX_ID}" "SANDBOX_STATE_RUNNING" 300
+    local loss_persisted
+    loss_persisted="$(sbox_cmd exec "${SANDBOX_ID}" \
+        /bin/cat /var/checkpoint-post-restore)"
+    assert_eq "${loss_persisted}" "post-restore-ok" \
+        "${suffix} lineage-loss restore kept post-restore state"
+    local loss_counter
+    for attempt in $(seq 1 600); do
+        loss_counter="$(sbox_cmd exec "${SANDBOX_ID}" \
+            /bin/cat /var/checkpoint-counter 2>/dev/null || true)"
+        if [[ "${loss_counter}" =~ ^[0-9]+$ ]] &&
+            [ "${loss_counter}" -ge "${counter_before_loss}" ]; then
+            break
+        fi
+        sleep 0.1
+    done
+    [[ "${loss_counter}" =~ ^[0-9]+$ ]] &&
+        [ "${loss_counter}" -ge "${counter_before_loss}" ] ||
+        fail "${suffix} lineage-loss restore lost counter state: before=${counter_before_loss} restored=${loss_counter}"
     sbox_cmd delete "${SANDBOX_ID}"
     SANDBOX_ID=""
 }
@@ -958,6 +1107,23 @@ wait_for_state() {
         sleep 0.1
     done
     fail "sandbox ${sandbox_id} did not reach ${expected}; last state: ${line}"
+}
+
+# manifest_snapshot_type prints the recorded snapshot type of a v2 artifact
+# directory. The manifest is the commit point, so the recorded type proves
+# which selector branch actually produced the generation.
+manifest_snapshot_type() {
+    grep -o '"snapshot_type": *"[^"]*"' "${1}/manifest.json" 2>/dev/null |
+        sed 's/.*: *"\([^"]*\)"/\1/'
+}
+
+assert_snapshot_type() {
+    local dir="$1"
+    local want="$2"
+    local label="$3"
+    local got
+    got="$(manifest_snapshot_type "${dir}")"
+    assert_eq "${got}" "${want}" "${label} (manifest snapshot_type)"
 }
 
 wait_for_exec_output() {

@@ -170,6 +170,19 @@ type FirecrackerConfig struct {
 	// continuous 512MiB re-read loop), and only helps long parks of
 	// cold-cache sandboxes. Default false.
 	ShrinkBeforeCheckpoint bool `toml:"shrink_before_checkpoint" json:"shrinkBeforeCheckpoint"`
+	// CheckpointMode selects the checkpoint algorithm Firecracker uses.
+	// "full" (the default, and the meaning of an unset value) keeps the
+	// conservative upstream behavior: every generation is a Full snapshot
+	// owned and synced by the VMM. "incremental" enables the three-tier
+	// incremental chain (post-restore Incremental baselines, SoftDirty
+	// windows afterwards) against a fork VMM that supports it.
+	CheckpointMode string `toml:"checkpoint_mode" json:"checkpointMode"`
+	// DeferredSnapshotSync delegates memory/state durability to sandboxd:
+	// the VMM skips its in-request fsync (deferred_sync) and sandboxd fsyncs
+	// the artifacts after the guest resumes, right before the manifest
+	// commits the generation. Default false keeps the upstream contract
+	// that a successful create request left the files durably written.
+	DeferredSnapshotSync bool `toml:"deferred_snapshot_sync" json:"deferredSnapshotSync"`
 }
 
 type ResourceConfig struct {

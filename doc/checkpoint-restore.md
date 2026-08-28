@@ -76,15 +76,29 @@ caller that deletes or mutates the most recent checkpoint directory invalidates
 the lineage: the next checkpoint takes a `Full` snapshot (see the lineage-loss
 rules below); deleting older generations is always safe.
 
-Durability is deliberately kept out of the pause window. Firecracker is asked
-to create the snapshot with `deferred_sync`, so its writes only reach the page
-cache while the guest is paused; the overlay reflink clone is likewise created
-without an in-clone fsync (a sync there would wait behind the snapshot's
-deferred dirty writeback on the same filesystem); and after the guest resumes,
-sandboxd fsyncs the components and only then lands the manifest. The pause
-window is therefore pause → snapshot writes → overlay clone → resume with no
-fsync on the path, and the manifest remains the
-commit point: a generation without a manifest is partial output. A crash
+Durability is deliberately kept out of the pause window, and independently
+configurable. `deferred_snapshot_sync` (default **false**) controls who owns
+memory/state durability:
+
+- **false (default, upstream contract):** the snapshot request carries no
+  `deferred_sync` member at all (official VMM builds parse the request with
+  `deny_unknown_fields`), and Firecracker fsyncs the state and memory files
+  inside the request. The overlay clone still never fsyncs in-clone; sandboxd
+  fsyncs the overlay before the manifest commits.
+- **true:** the request carries `deferred_sync: true`, so the VMM writes only
+  reach the page cache while the guest is paused, and after the guest resumes
+  sandboxd fsyncs the components and only then lands the manifest. This keeps
+  the multi-second memory-file fsync out of the pause window.
+
+Inside the pause window the overlay reflink clone happens **before** the
+snapshot request: cloning first runs with a page cache that does not yet hold
+the snapshot's dirty writeback (an overlay clone after the snapshot was
+measured stalling for seconds behind that writeback), and it deliberately
+carries no in-clone fsync — a sync there would wait behind the deferred dirty
+writeback on the same filesystem. The pause window is therefore pause →
+overlay clone → snapshot writes → resume with no fsync on the path, and the
+manifest remains the commit point: a generation without a manifest is partial
+output. A crash
 between resume and manifest commit discards the newest generation and restores
 from the previous one — sound because each generation writes into a fresh
 clone and never mutates its base. Firecracker re-arms its soft-dirty window
@@ -96,15 +110,25 @@ at the post-resume fsync instead of the snapshot request; sandboxd treats this
 like any seal failure: the partial generation is discarded, the lineage is
 marked lost, and the next checkpoint takes a `Full` snapshot.
 
-`snapshot_type` is a Firecracker-specific control with a validated enum: an
-empty value keeps the automatic tier selection above (a pagemap `Incremental`
-generation against the memory file a restore loaded, `SoftDirty` windows
-against a previous checkpoint afterwards, a `SoftDirty` first window on a
-sandbox that never checkpointed). An explicit `Full` drops the lineage for one
-generation and has Firecracker write the whole memory file. An explicit
-`Incremental` requires the restore-established pagemap base and fails
-otherwise. An explicit `SoftDirty` requires a usable base. Runtimes without
-incremental checkpoints (runsc) ignore the field.
+`snapshot_type` is a Firecracker-specific control, gated by
+`checkpoint_mode` (`plugin.runtime.firecracker`):
+
+- **`checkpoint_mode = "full"` (default, and the meaning of an unset value):**
+  every generation is a `Full` snapshot. An empty `snapshot_type` selects
+  `Full`; an explicit `Full` is allowed; an explicit `SoftDirty` or
+  `Incremental` is rejected with a configuration error rather than silently
+  reinterpreted. An unknown `checkpoint_mode` value fails sandboxd startup.
+- **`checkpoint_mode = "incremental"`** (requires a fork VMM with the
+  incremental snapshot API): an empty `snapshot_type` keeps the automatic
+  tier selection (a pagemap `Incremental` generation against the memory file
+  a restore loaded, `SoftDirty` windows against a previous checkpoint
+  afterwards, a `SoftDirty` first window on a sandbox that never
+  checkpointed). An explicit `Full` drops the lineage for one generation and
+  has Firecracker write the whole memory file. An explicit `Incremental`
+  requires the restore-established pagemap base and fails otherwise. An
+  explicit `SoftDirty` requires a usable base.
+
+Runtimes without incremental checkpoints (runsc) ignore the field.
 
 Lineage-loss rules: the VMM keeps its soft-dirty ledger in process memory, and
 an armed ledger writes only the window delta regardless of which base sandboxd

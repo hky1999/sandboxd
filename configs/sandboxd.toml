@@ -94,6 +94,15 @@ runsc = ""
 #default_vcpu_count = 1
 #default_memory_mib = 512
 #default_overlay_size_bytes = 10737418240
+# Checkpoint algorithm: "full" (default) keeps the conservative upstream
+# behavior where every generation is a Full snapshot; "incremental" enables
+# the three-tier incremental chain and requires a fork VMM that supports it.
+#checkpoint_mode = "full"
+# Keep the VMM-side fsync out of the pause window by delegating durability
+# to sandboxd (fsync after resume, before the manifest commits). Default
+# false preserves the upstream durability contract, and the request omits
+# the deferred_sync member entirely so official VMM builds stay compatible.
+#deferred_snapshot_sync = false
 
 [plugin.runtime.runtime_binary]
 runsc = "/usr/local/bin/runsc"
