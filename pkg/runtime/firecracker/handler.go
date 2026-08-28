@@ -246,6 +246,11 @@ type Handler struct {
 	// default.
 	shrinkBeforeCheckpoint bool
 
+	// memBackend selects the restore memory backend ("file" or "uffd");
+	// uffdHandlerBin is the page-fault handler executable for uffd restores.
+	memBackend     string
+	uffdHandlerBin string
+
 	// digestMemory records a sha256 of the memory artifact in the sealed
 	// manifest so restores can reject corrupted transfers. Default on; the
 	// cost lands in the post-resume tail (see FirecrackerConfig.DigestMemory).

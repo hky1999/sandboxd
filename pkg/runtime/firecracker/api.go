@@ -144,12 +144,18 @@ func (api *firecrackerAPI) loadSnapshot(
 	memoryPath,
 	tapName,
 	vsockPath string,
+	memBackendType,
+	memBackendPath string,
 ) error {
+	if memBackendType == "" {
+		memBackendType = "File"
+		memBackendPath = memoryPath
+	}
 	return api.put(ctx, "/snapshot/load", map[string]any{
 		"snapshot_path": statePath,
 		"mem_backend": map[string]string{
-			"backend_type": "File",
-			"backend_path": memoryPath,
+			"backend_type": memBackendType,
+			"backend_path": memBackendPath,
 		},
 		"track_dirty_pages": true,
 		"resume_vm":         true,

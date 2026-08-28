@@ -184,6 +184,8 @@ func TestFirecrackerSnapshotAPI(t *testing.T) {
 		"/tmp/memory",
 		"tap-restored",
 		"/run/firecracker/restored.vsock",
+		"File",
+		"/tmp/memory",
 	); err != nil {
 		t.Fatal(err)
 	}

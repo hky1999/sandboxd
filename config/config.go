@@ -182,6 +182,15 @@ type FirecrackerConfig struct {
 	// MkfsEROFSPath selects the mkfs.erofs executable used for materialization.
 	MkfsEROFSPath string `toml:"mkfs_erofs_path" json:"mkfsEROFSPath"`
 
+	// MemBackend selects how a restore maps guest memory: "file" maps the
+	// checkpoint memory file directly (default), "uffd" restores through a
+	// userfaultfd handler process that populates guest memory on demand.
+	MemBackend string `toml:"mem_backend" json:"memBackend,omitempty"`
+	// UffdHandlerBin is the page-fault handler executable spawned for uffd
+	// restores. Empty looks for firecracker-uffd-handler next to the
+	// sandboxd binary.
+	UffdHandlerBin string `toml:"uffd_handler_bin" json:"uffdHandlerBin,omitempty"`
+
 	// DigestMemory seals a sha256 of the memory artifact into the
 	// checkpoint manifest so restores reject corrupted artifacts up front
 	// instead of failing inside the restored guest. The hash runs in the

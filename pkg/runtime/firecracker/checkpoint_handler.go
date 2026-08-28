@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -851,12 +852,26 @@ func (handler *Handler) Restore(
 	}
 	readyCancel()
 	tReady := time.Now()
+	// The uffd backend hands page population to an external handler: spawn
+	// it before loadSnapshot so it is listening when Firecracker connects.
+	memBackendType, memBackendPath := "", checkpointFiles.Memory
+	if handler.memBackend == "uffd" {
+		uffdSock := filepath.Join(filepath.Dir(apiPath), "uffd.sock")
+		if err := handler.launchUffdHandler(
+			startConfig.ID, uffdSock, checkpointFiles.Memory, stateDir,
+		); err != nil {
+			return fmt.Errorf("launch uffd handler for %s: %w", startConfig.ID, err)
+		}
+		memBackendType, memBackendPath = "Uffd", uffdSock
+	}
 	if err := api.loadSnapshot(
 		ctx,
 		checkpointFiles.State,
 		checkpointFiles.Memory,
 		startConfig.Network.Interface.Name,
 		vsockPath,
+		memBackendType,
+		memBackendPath,
 	); err != nil {
 		return fmt.Errorf("load Firecracker checkpoint for %s: %w", startConfig.ID, err)
 	}
@@ -913,4 +928,54 @@ func (handler *Handler) Restore(
 		phaseMS(tStarted, tEnd),
 	)
 	return nil
+}
+
+// launchUffdHandler starts the external page-fault handler for a uffd restore
+// and waits until its socket is accepting. The handler is a separate process
+// by design: sandboxd never serves faults itself, and a handler crash takes
+// down only its VM, not the daemon. The handler exits by itself once the VMM
+// disconnects, so no explicit lifecycle tracking is kept here.
+func (handler *Handler) launchUffdHandler(sandboxID, sockPath, backingPath, stateDir string) error {
+	bin := handler.uffdHandlerBin
+	if bin == "" {
+		self, err := os.Executable()
+		if err != nil {
+			return fmt.Errorf("locate uffd handler: %w", err)
+		}
+		bin = filepath.Join(filepath.Dir(self), "uffd-handler")
+	}
+	info, err := os.Stat(bin)
+	if err != nil {
+		return fmt.Errorf("inspect uffd handler %s: %w", bin, err)
+	}
+	if !info.Mode().IsRegular() || info.Mode()&0o111 == 0 {
+		return fmt.Errorf("uffd handler %s is not an executable regular file", bin)
+	}
+	logPath := filepath.Join(stateDir, "uffd-handler.log")
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		return fmt.Errorf("open uffd handler log: %w", err)
+	}
+	defer logFile.Close()
+	cmd := exec.Command(bin, "-sock", sockPath, "-backing", backingPath)
+	cmd.Dir = stateDir
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("start uffd handler: %w", err)
+	}
+	go func() { _ = cmd.Wait() }() //nolint:errcheck // exit status surfaces in its log
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if conn, err := net.DialTimeout("unix", sockPath, 100*time.Millisecond); err == nil {
+			_ = conn.Close()
+			return nil
+		}
+		if cmd.ProcessState != nil && cmd.ProcessState.Exited() {
+			return fmt.Errorf("uffd handler exited early for %s", sandboxID)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return fmt.Errorf("uffd handler socket %s never accepted", sockPath)
 }
