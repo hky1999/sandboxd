@@ -351,6 +351,8 @@ set +e
     -e "E2E_CPU_LIMIT_MODE=${E2E_CPU_LIMIT_MODE}" \
     -e "E2E_RUNTIME=${E2E_RUNTIME}" \
     -e "E2E_RUNSC_PLATFORM=${E2E_RUNSC_PLATFORM}" \
+    -e "E2E_FIRECRACKER_CHECKPOINT_MODE=${E2E_FIRECRACKER_CHECKPOINT_MODE:-}" \
+    -e "E2E_FIRECRACKER_DEFERRED_SYNC=${E2E_FIRECRACKER_DEFERRED_SYNC:-}" \
     "${network_soak_args[@]}" \
     --tmpfs /home/akernel:rw,exec,size=2g \
     --tmpfs /e2e:rw,exec,size=512m \
