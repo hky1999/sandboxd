@@ -127,6 +127,7 @@ func (r *BundleLoader) GenerateOci(options OciLoadOptions) (string, *Spec, error
 		ociSpec.Process.Env = combineEnvs(ociSpec.Process.Env, options.Config.Envs)
 	}
 
+	ociSpec.Mounts = supersedeBaseMounts(ociSpec.Mounts, options.Config.Mounts)
 	for _, mnt := range options.Config.Mounts {
 		ociSpec.Mounts = append(ociSpec.Mounts, Mount{
 			Destination: mnt.GetTarget(),
@@ -528,4 +529,41 @@ func defaultSandboxSpec() *Spec {
 			},
 		},
 	}
+}
+
+// supersedeBaseMounts drops base-spec mounts whose destination is claimed by
+// a requested mount instead of letting both coexist. A duplicate destination
+// is at best redundant (the runtime mounts the last entry twice or ignores
+// one) and at worst breaks checkpoint restore: runsc's restore spec
+// validation rejects duplicate-destination mounts unless every field
+// including Source matches exactly. This path is how the managed-DNS
+// resolver mount takes over a base-spec (ociConfig) resolv.conf entry.
+func supersedeBaseMounts(base []Mount, requested []*runtime.Mount) []Mount {
+	if len(requested) == 0 {
+		return base
+	}
+	claimed := make(map[string]bool, len(requested))
+	for _, mnt := range requested {
+		if target := mnt.GetTarget(); target != "" {
+			claimed[target] = true
+		}
+	}
+	dupes := false
+	for _, mount := range base {
+		if claimed[mount.Destination] {
+			dupes = true
+			break
+		}
+	}
+	if !dupes {
+		return base
+	}
+	kept := base[:0]
+	for _, mount := range base {
+		if claimed[mount.Destination] {
+			continue
+		}
+		kept = append(kept, mount)
+	}
+	return kept
 }
