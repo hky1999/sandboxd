@@ -371,8 +371,6 @@ func (handler *Handler) finishCheckpointedSandbox(
 	return nil
 }
 
-// firecrackerBaseMemoryUsable reports whether the recorded base can still be
-// patched by an incremental snapshot of a guest with the given memory size.
 // resolveRequestedSnapshotType applies the checkpoint_mode gate to a
 // checkpoint request. Outside the incremental mode every generation is a
 // Full snapshot; the incremental types stay available only to deployments
