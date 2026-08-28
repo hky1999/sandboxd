@@ -969,9 +969,6 @@ func (handler *Handler) launchUffdHandler(sandboxID, sockPath, backingPath, stat
 			return fmt.Errorf("create uffd cache dir: %w", err)
 		}
 		args = append(args, "-remote", remote, "-cache", cachePath)
-		if info, err := os.Stat(backingPath); err == nil {
-			args = append(args, "-cache-size", strconv.FormatInt(info.Size(), 10))
-		}
 	} else {
 		args = append(args, "-backing", backingPath)
 	}

@@ -153,6 +153,7 @@ func (s *faultServer) fetchChunk(chunkIdx uint64) error {
 				return fmt.Errorf("range fetch %s [%d,+%d): %w", src.remote, start, src.chunk, err)
 			}
 			defer resp.Body.Close()
+			log.Printf("DEBUG fetch chunk=%d status=%s contentLen=%s", chunkIdx, resp.Status, resp.Header.Get("Content-Length"))
 			if resp.StatusCode != http.StatusPartialContent && resp.StatusCode != http.StatusOK {
 				return fmt.Errorf("range fetch %s: status %s", src.remote, resp.Status)
 			}
@@ -301,7 +302,6 @@ func main() {
 	backingPath := flag.String("backing", "", "local checkpoint memory file (local mode)")
 	remoteURL := flag.String("remote", "", "HTTP(S) URL of the artifact memory file (remote mode)")
 	cachePath := flag.String("cache", "", "sparse local cache file (remote mode)")
-	cacheSize := flag.Int64("cache-size", 0, "pre-size the cache file in bytes (remote mode, 0 = skip)")
 	chunkKB := flag.Uint("chunk-kb", 4, "bytes copied per fault, in KiB")
 	workers := flag.Int("workers", 8, "concurrent UFFDIO_COPY workers")
 	flag.Parse()
@@ -332,9 +332,10 @@ func main() {
 		source.client = &http.Client{Transport: &http.Transport{
 			MaxIdleConnsPerHost: 16,
 		}}
-		if err := truncateIfNeeded(cacheFile, *cacheSize); err != nil {
-			log.Fatalf("size cache file: %v", err)
-		}
+		// Do NOT pre-truncate the cache: reading a sparse hole returns
+		// zeros (not EOF), so readCache would treat every unfetched chunk
+		// as a cache hit with zero data. The file grows naturally as
+		// WriteAt extends it to each fetched chunk offset.
 	} else {
 		file, err := os.Open(*backingPath)
 		if err != nil {
@@ -444,20 +445,4 @@ func main() {
 	total := s.served
 	s.mu.Unlock()
 	log.Printf("handler exiting, total faults served=%d", total)
-}
-
-// truncateIfNeeded pre-extends a fresh cache file so writes at arbitrary
-// chunk offsets stay inside the file.
-func truncateIfNeeded(f *os.File, size int64) error {
-	if size <= 0 {
-		return nil
-	}
-	info, err := f.Stat()
-	if err != nil {
-		return err
-	}
-	if info.Size() >= size {
-		return nil
-	}
-	return f.Truncate(size)
 }
