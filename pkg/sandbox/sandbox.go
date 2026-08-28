@@ -15,6 +15,9 @@
 package sandbox
 
 import (
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -142,11 +145,23 @@ func (c *Sandbox) ApiStatus() *runtime.SandboxStatus {
 	// annotation) so List/Stats consumers can join connection source IPs
 	// back to sandboxes without reading OCI specs off disk.
 	var sandboxIP string
+	ifaceStr := ""
 	if c.Spec != nil {
-		if ifaceStr, ok := c.Spec.Annotations[config.ResourceAnnotationKeyPrefix+config.ResourceNameInterface]; ok {
-			if netRes, err := networkmanager.NewNetResource(ifaceStr); err == nil && netRes.Ip != nil {
-				sandboxIP = netRes.Ip.String()
+		ifaceStr = c.Spec.Annotations[config.ResourceAnnotationKeyPrefix+config.ResourceNameInterface]
+	}
+	if ifaceStr == "" && c.PATH != "" {
+		// the in-memory spec can predate the resource-annotation merge; the
+		// persisted bundle always carries it (W18)
+		if raw, err := os.ReadFile(filepath.Join(c.PATH, config.SandboxSpecFile)); err == nil {
+			var bundle spec.Spec
+			if err := json.Unmarshal(raw, &bundle); err == nil {
+				ifaceStr = bundle.Annotations[config.ResourceAnnotationKeyPrefix+config.ResourceNameInterface]
 			}
+		}
+	}
+	if ifaceStr != "" {
+		if netRes, err := networkmanager.NewNetResource(ifaceStr); err == nil && netRes.Ip != nil {
+			sandboxIP = netRes.Ip.String()
 		}
 	}
 
