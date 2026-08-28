@@ -46,7 +46,7 @@ const (
 	firecrackerStateFilename   = "state.json"
 	firecrackerAPISocket       = "api.sock"
 	firecrackerVsock           = firecrackerproto.HostAgentSocketName
-	firecrackerAgentTimeout    = 15 * time.Second
+	firecrackerAgentTimeout    = 120 * time.Second // generous for uffd cold restores
 	firecrackerShutdownTimeout = 2 * time.Second
 	// Guest flush budget before pausing for a checkpoint. Syncing a heavily
 	// dirty writable layer can exceed the default 1s agent round-trip, but
