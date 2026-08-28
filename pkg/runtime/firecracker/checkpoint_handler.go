@@ -21,7 +21,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -966,10 +965,13 @@ func (handler *Handler) launchUffdHandler(sandboxID, sockPath, backingPath, stat
 		return fmt.Errorf("start uffd handler: %w", err)
 	}
 	go func() { _ = cmd.Wait() }() //nolint:errcheck // exit status surfaces in its log
+	// Wait for the handler's listening socket without dialing it: the
+	// handler treats its first and only connection as Firecracker's
+	// handshake, so a liveness probe connection would be mistaken for the
+	// VMM and tear the handler down.
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		if conn, err := net.DialTimeout("unix", sockPath, 100*time.Millisecond); err == nil {
-			_ = conn.Close()
+		if _, err := os.Stat(sockPath); err == nil {
 			return nil
 		}
 		if cmd.ProcessState != nil && cmd.ProcessState.Exited() {
@@ -977,5 +979,5 @@ func (handler *Handler) launchUffdHandler(sandboxID, sockPath, backingPath, stat
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	return fmt.Errorf("uffd handler socket %s never accepted", sockPath)
+	return fmt.Errorf("uffd handler socket %s never appeared", sockPath)
 }
