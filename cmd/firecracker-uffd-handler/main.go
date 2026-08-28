@@ -316,10 +316,9 @@ func main() {
 	}
 	defer os.Remove(*sockPath)
 
-	regions, fd, err := recvHandshake(l)
-	if err != nil {
-		log.Fatalf("handshake: %v", err)
-	}
+	// Bulk download BEFORE accepting the handshake: a single sequential
+	// stream eliminates the concurrent-write corruption; FC's connect+send
+	// buffers in the kernel while we download, so delaying accept() is safe.
 	chunk := uint64(*chunkKB) << 10
 	source := &pageSource{chunk: chunk, inflight: make(map[uint64]*sync.WaitGroup)}
 	if *remoteURL != "" {
@@ -333,10 +332,41 @@ func main() {
 		source.client = &http.Client{Transport: &http.Transport{
 			MaxIdleConnsPerHost: 16,
 		}}
-		// Do NOT pre-truncate the cache: reading a sparse hole returns
-		// zeros (not EOF), so readCache would treat every unfetched chunk
-		// as a cache hit with zero data. The file grows naturally as
-		// WriteAt extends it to each fetched chunk offset.
+		// Bulk download before the handshake: a single sequential stream
+		// eliminates the concurrent-write corruption (interleaved WriteAt
+		// from multiple goroutines produced zeros at scattered offsets).
+		// FC's connect+send buffers in the kernel, so delaying accept()
+		// while downloading is safe.
+		if *prefetch > 0 {
+			info, err := os.Stat(*backingPath)
+			if err != nil {
+				log.Fatalf("prefetch: stat backing %s: %v", *backingPath, err)
+			}
+			total := info.Size()
+			log.Printf("prefetch: bulk downloading %d bytes from %s", total, source.remote)
+			startT := time.Now()
+			req, _ := http.NewRequest(http.MethodGet, source.remote, nil)
+			resp, err := source.client.Do(req)
+			if err != nil {
+				log.Fatalf("prefetch: fetch: %v", err)
+			}
+			if resp.StatusCode != http.StatusOK {
+				resp.Body.Close()
+				log.Fatalf("prefetch: status %s", resp.Status)
+			}
+			written, err := io.Copy(source.cache, resp.Body)
+			resp.Body.Close()
+			if err != nil {
+				log.Fatalf("prefetch: copy: %v", err)
+			}
+			if written != total {
+				log.Fatalf("prefetch: wrote %d bytes, expected %d", written, total)
+			}
+			_ = source.cache.Sync()
+			log.Printf("prefetch: %d bytes in %.2fs (%.0f MiB/s)",
+				written, time.Since(startT).Seconds(),
+				float64(written)/time.Since(startT).Seconds()/(1<<20))
+		}
 	} else {
 		file, err := os.Open(*backingPath)
 		if err != nil {
@@ -344,55 +374,22 @@ func main() {
 		}
 		source.file = file
 	}
+	regions, fd, err := recvHandshake(l)
+	if err != nil {
+		log.Fatalf("handshake: %v", err)
+	}
 	s := &faultServer{
 		regions: regions,
 		chunk:   chunk,
 		uffdFd:  fd,
 		source:  source,
 	}
-	log.Printf("handler ready: %d regions, chunk=%dKiB, workers=%d, prefetch=%d",
-		len(regions), *chunkKB, *workers, *prefetch)
+	log.Printf("handler ready: %d regions, chunk=%dKiB, workers=%d",
+		len(regions), *chunkKB, *workers)
 
 	faults := make(chan uint64, 4096)
 	var wg sync.WaitGroup
 	stop := make(chan struct{})
-	// Bulk pre-download: fetch the entire artifact into the cache sequentially
-	// BEFORE serving faults. The earlier concurrent per-chunk prefetch
-	// corrupted data (interleaved WriteAt from multiple goroutines produced
-	// zeros at scattered offsets despite the range server serving correct
-	// bytes); a single sequential stream eliminates the race entirely.
-	if *prefetch > 0 && source.remote != "" {
-		info, err := os.Stat(*backingPath)
-		if err != nil {
-			log.Fatalf("prefetch: stat backing %s: %v", *backingPath, err)
-		}
-		total := info.Size()
-		log.Printf("prefetch: bulk downloading %d bytes from %s", total, source.remote)
-		startT := time.Now()
-		req, _ := http.NewRequest(http.MethodGet, source.remote, nil)
-		resp, err := source.client.Do(req)
-		if err != nil {
-			log.Fatalf("prefetch: fetch: %v", err)
-		}
-		if resp.StatusCode != http.StatusOK {
-			resp.Body.Close()
-			log.Fatalf("prefetch: status %s", resp.Status)
-		}
-		written, err := io.Copy(source.cache, resp.Body)
-		resp.Body.Close()
-		if err != nil {
-			log.Fatalf("prefetch: copy: %v", err)
-		}
-		if written != total {
-			log.Fatalf("prefetch: wrote %d bytes, expected %d", written, total)
-		}
-		if err := source.cache.Sync(); err != nil {
-			log.Printf("prefetch: fsync: %v", err)
-		}
-		log.Printf("prefetch: %d bytes in %.2fs (%.0f MiB/s)",
-			written, time.Since(startT).Seconds(),
-			float64(written)/time.Since(startT).Seconds()/(1<<20))
-	}
 
 	for i := 0; i < *workers; i++ {
 		wg.Add(1)
