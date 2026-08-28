@@ -388,6 +388,8 @@ func NewHandler(
 		shrinkBeforeCheckpoint: firecrackerConfig.ShrinkBeforeCheckpoint,
 		checkpointMode:         firecrackerConfig.CheckpointMode,
 		checkpointWriteback:    newCheckpointWritebackScheduler(),
+		memBackend:             firecrackerConfig.MemBackend,
+		uffdHandlerBin:         firecrackerConfig.UffdHandlerBin,
 		digestMemory:           firecrackerConfig.DigestMemoryOrDefault(),
 		defaultDisk:            firecrackerConfig.DefaultOverlaySizeBytes,
 		ociLoader:              loader,
