@@ -304,6 +304,7 @@ func main() {
 	cachePath := flag.String("cache", "", "sparse local cache file (remote mode)")
 	chunkKB := flag.Uint("chunk-kb", 4, "bytes copied per fault, in KiB")
 	workers := flag.Int("workers", 8, "concurrent UFFDIO_COPY workers")
+	prefetch := flag.Int("prefetch", 4, "background chunk prefetch concurrency (0 = disabled)")
 	flag.Parse()
 	if *sockPath == "" || (*backingPath == "" && *remoteURL == "") {
 		log.Fatal("-sock plus -backing or -remote is required")
@@ -349,12 +350,44 @@ func main() {
 		uffdFd:  fd,
 		source:  source,
 	}
-	log.Printf("handler ready: %d regions, chunk=%dKiB, workers=%d",
-		len(regions), *chunkKB, *workers)
+	log.Printf("handler ready: %d regions, chunk=%dKiB, workers=%d, prefetch=%d",
+		len(regions), *chunkKB, *workers, *prefetch)
 
 	faults := make(chan uint64, 4096)
 	var wg sync.WaitGroup
 	stop := make(chan struct{})
+	// Background prefetch: sequentially fill the cache ahead of the guest's
+	// fault pattern. Guest boot faults cluster in low addresses (kernel image
+	// + init data), so a linear sweep with a few concurrent fetchers warms the
+	// working set far faster than per-fault fetches could. The inflight dedup
+	// in fetchChunk naturally skips chunks the foreground already served.
+	if *prefetch > 0 {
+		totalChunks := uint64(0)
+		for _, r := range regions {
+			totalChunks += (r.Size + chunk - 1) / chunk
+		}
+		go func() {
+			sem := make(chan struct{}, *prefetch)
+			var wg sync.WaitGroup
+			for idx := uint64(0); idx < totalChunks; idx++ {
+				select {
+				case sem <- struct{}{}:
+					wg.Add(1)
+					go func(i uint64) {
+						defer wg.Done()
+						defer func() { <-sem }()
+						_ = s.fetchChunk(i) // idempotent via inflight map
+					}(idx)
+				case <-stop:
+					wg.Wait()
+					return
+				}
+			}
+			wg.Wait()
+			log.Printf("prefetch complete: %d chunks", totalChunks)
+		}()
+	}
+
 	for i := 0; i < *workers; i++ {
 		wg.Add(1)
 		go func() {
