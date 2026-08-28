@@ -1581,6 +1581,15 @@ func (h *sandboxService) createSandbox(
 	}
 
 	metadata.PhysicalPhase = runtime.SandboxPhysicalPhase_SANDBOX_PHYSICAL_PHASE_COMMITTED
+	if preparedResources != nil && preparedResources.network != nil && preparedResources.network.Ip != nil {
+		// W18: persist the bridge IP in metric labels so List exposes
+		// sandbox_id <-> ip without reading OCI bundles off disk (bundles are
+		// cleaned up while the sandbox runs).
+		if metadata.MetricLabels == nil {
+			metadata.MetricLabels = map[string]string{}
+		}
+		metadata.MetricLabels["bridge_ip"] = preparedResources.network.Ip.String()
+	}
 	if err := h.sandboxManager.PersistMetadata(sandboxID, metadata); err != nil {
 		return &runtime.StartResponse{
 			Code: -1, Message: fmt.Sprintf("Failed to commit sandbox physical identity: %v", err),

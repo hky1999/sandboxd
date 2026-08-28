@@ -164,6 +164,14 @@ func (c *Sandbox) ApiStatus() *runtime.SandboxStatus {
 			sandboxIP = netRes.Ip.String()
 		}
 	}
+	if sandboxIP == "" {
+		// W18: the create path persists the bridge IP in metric labels (the
+		// OCI bundle is cleaned up while the sandbox runs, and the in-memory
+		// spec predates the resource-annotation merge).
+		if ip := c.Metadata.MetricLabels["bridge_ip"]; ip != "" {
+			sandboxIP = ip
+		}
+	}
 
 	return &runtime.SandboxStatus{
 		ID:           c.Metadata.ID,
