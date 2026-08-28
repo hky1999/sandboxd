@@ -34,15 +34,6 @@ type checkpointDirectory struct {
 	created bool
 }
 
-// Checkpoint snapshot flavors a caller may request explicitly; the strings
-// match the Firecracker API SnapshotCreateParams values. Empty means the
-// runtime picks automatically.
-const (
-	checkpointSnapshotTypeFull        = "Full"
-	checkpointSnapshotTypeIncremental = "Incremental"
-	checkpointSnapshotTypeSoftDirty   = "SoftDirty"
-)
-
 func (h *sandboxService) Checkpoint(
 	ctx context.Context,
 	request *runtime.CheckpointRequest,
@@ -57,18 +48,6 @@ func (h *sandboxService) Checkpoint(
 		return nil, errord.ToGRPCf(
 			errord.ErrInvalidArgument,
 			"checkpoint timeout_seconds must be greater than zero",
-		)
-	}
-	switch request.SnapshotType {
-	case "":
-		// Automatic tier selection.
-	case checkpointSnapshotTypeFull,
-		checkpointSnapshotTypeIncremental,
-		checkpointSnapshotTypeSoftDirty:
-	default:
-		return nil, errord.ToGRPCf(
-			errord.ErrInvalidArgument,
-			"checkpoint snapshot_type must be empty, Full, Incremental, or SoftDirty",
 		)
 	}
 

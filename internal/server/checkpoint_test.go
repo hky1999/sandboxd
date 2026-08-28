@@ -233,35 +233,6 @@ func TestCheckpointValidatesRequestAndRuntime(t *testing.T) {
 	assert.Equal(t, codes.Unimplemented, status.Code(err))
 }
 
-func TestCheckpointValidatesAndForwardsSnapshotType(t *testing.T) {
-	handler := newCheckpointTestHandler()
-	service := newTestService(t, map[string]svc.Handler{"runsc": handler})
-	storeRunningSandbox(t, service, "sbox-flavor", "runsc")
-
-	_, err := service.Checkpoint(context.Background(), &runtime.CheckpointRequest{
-		ID:             "sbox-flavor",
-		CheckpointDir:  filepath.Join(t.TempDir(), "checkpoint"),
-		TimeoutSeconds: 5,
-		SnapshotType:   "Lazy",
-	})
-	assert.Equal(t, codes.InvalidArgument, status.Code(err))
-	require.Empty(t, handler.checkpoints)
-
-	for _, flavor := range []string{"", "Full", "Incremental", "SoftDirty"} {
-		_, err := service.Checkpoint(context.Background(), &runtime.CheckpointRequest{
-			ID:             "sbox-flavor",
-			CheckpointDir:  filepath.Join(t.TempDir(), "checkpoint-"+flavor),
-			TimeoutSeconds: 5,
-			SnapshotType:   flavor,
-		})
-		require.NoError(t, err)
-	}
-	require.Len(t, handler.checkpoints, 4)
-	for index, flavor := range []string{"", "Full", "Incremental", "SoftDirty"} {
-		assert.Equal(t, flavor, handler.checkpoints[index].SnapshotType)
-	}
-}
-
 func TestCheckpointDirectoryValidation(t *testing.T) {
 	root := t.TempDir()
 	t.Run("missing leaf is created and removed on cleanup", func(t *testing.T) {
