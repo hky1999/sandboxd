@@ -63,12 +63,14 @@ reflink sharing and incremental writes survive. `compress` has no effect on
 this layout (it only applies to legacy artifacts). Legacy single-file
 `checkpoint.img` archives can still be restored but are no longer written.
 
-Repeated checkpoints of the same running sandbox are incremental: each
-generation clones the previous generation's memory (a copy-on-write reflink
-when both directories share a reflink-capable filesystem) and Firecracker
-rewrites only the pages that changed, both into the artifact and on disk. Each
-generation is still a complete, independently restorable artifact; incremental
-behavior affects only how much host work and disk space a generation costs.
+With `checkpoint_mode = "incremental"`, repeated checkpoints of the same
+running sandbox clone the previous generation's memory (a copy-on-write
+reflink when both directories share a reflink-capable filesystem) and
+Firecracker rewrites only the pages that changed, both into the artifact and
+on disk. The default `checkpoint_mode = "full"` writes the complete memory
+file for every generation. Each generation is still a complete, independently
+restorable artifact; incremental mode affects only how much host work and disk
+space a generation costs.
 Consecutive generations must use distinct `checkpoint_dir` values — sandboxd
 refuses to overwrite a directory that already holds a checkpoint. The
 incremental chain references the latest artifact's memory file directly, so a
@@ -93,9 +95,10 @@ memory/state durability:
 Inside the pause window the overlay reflink clone happens **before** the
 snapshot request: cloning first runs with a page cache that does not yet hold
 the snapshot's dirty writeback (an overlay clone after the snapshot was
-measured stalling for seconds behind that writeback), and it deliberately
-carries no in-clone fsync — a sync there would wait behind the deferred dirty
-writeback on the same filesystem. The pause window is therefore pause →
+measured stalling for seconds behind that writeback). When
+`deferred_snapshot_sync = true`, it deliberately carries no in-clone fsync —
+a sync there would wait behind the deferred dirty writeback on the same
+filesystem. In that mode the pause window is therefore pause →
 overlay clone → snapshot writes → resume with no fsync on the path, and the
 manifest remains the commit point: a generation without a manifest is partial
 output. A crash

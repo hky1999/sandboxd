@@ -76,6 +76,14 @@ fail() {
     exit 1
 }
 
+assert_sandboxd_home_is_disk_backed() {
+    local fs_type
+    fs_type="$(stat -f -c %T /home/akernel)"
+    if [ "${fs_type}" = "tmpfs" ]; then
+        fail "/home/akernel must be disk-backed, not tmpfs"
+    fi
+}
+
 select_iptables_backend() {
     if iptables -t nat -L >/dev/null 2>&1; then
         return
@@ -175,6 +183,8 @@ cleanup() {
 trap cleanup EXIT
 
 preflight() {
+    mkdir -p /home/akernel
+    assert_sandboxd_home_is_disk_backed
     [ "$(id -u)" = "0" ] || fail "e2e container must run as root"
     [[ "${STRESS_ROUNDS}" =~ ^[0-9]+$ ]] || fail "E2E_STRESS_ROUNDS must be a non-negative integer"
     [[ "${STRESS_CONCURRENCY}" =~ ^[1-8]$ ]] || fail "E2E_STRESS_CONCURRENCY must be between 1 and 8"

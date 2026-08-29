@@ -16,9 +16,7 @@ package server
 
 import (
 	"context"
-	"errors"
 	"math"
-	"strings"
 	"testing"
 	"time"
 
@@ -67,25 +65,31 @@ func TestFirecrackerCheckpointMemorySlotHonorsCancellation(t *testing.T) {
 	release()
 }
 
-func TestWithTransientFirecrackerCheckpointMemoryFailsClosedOnMissingResources(t *testing.T) {
-	h := &sandboxService{
-		firecrackerCheckpointMemorySlot: nil,
+func TestShouldRaiseFirecrackerCheckpointMemoryLimit(t *testing.T) {
+	tests := []struct {
+		name      string
+		live      int64
+		wantRaise bool
+		wantErr   bool
+	}{
+		{name: "normal", live: 320 << 20, wantRaise: true},
+		{name: "leftover expanded", live: 832 << 20},
+		{name: "unexpected", live: 576 << 20, wantErr: true},
+		{name: "unlimited or invalid", live: 0, wantErr: true},
 	}
-	// The wrapper must fail closed when it cannot determine the memory limit,
-	// instead of silently skipping the expansion.
-	err := h.withTransientFirecrackerCheckpointMemory(
-		context.Background(),
-		"firecracker",
-		"test-sandbox",
-		"/nonexistent/cgroup",
-		nil, // guestResources
-		nil, // handler without HostResourcesProvider
-		func() error { return errors.New("should not reach here") },
-	)
-	if err == nil {
-		t.Fatal("expected error when memory limit is undeterminable")
-	}
-	if !strings.Contains(err.Error(), "guest memory limit") && !strings.Contains(err.Error(), "managed cgroup") {
-		t.Fatalf("error should mention the memory limit: %v", err)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			raise, err := shouldRaiseFirecrackerCheckpointMemoryLimit(
+				320<<20,
+				832<<20,
+				test.live,
+			)
+			if test.wantErr {
+				assert.Error(t, err)
+				return
+			}
+			assert.NoError(t, err)
+			assert.Equal(t, test.wantRaise, raise)
+		})
 	}
 }
