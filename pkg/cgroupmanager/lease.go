@@ -54,3 +54,16 @@ func (c *CgroupManager) Stats(name string) (Stats, error) {
 	}
 	return c.ops.stat(name)
 }
+
+// ReadMemoryLimit reports the effective memory.max (cgroup v2) or
+// memory.limit_in_bytes (cgroup v1) of the named cgroup in bytes.
+// It is used by callers that need the authoritative limit the manager
+// enforced at Prepare time, regardless of what the caller's resource
+// bookkeeping says.
+func (c *CgroupManager) ReadMemoryLimit(name string) (int64, error) {
+	stats, err := c.Stats(name)
+	if err != nil {
+		return 0, err
+	}
+	return int64(stats.MemoryLimitBytes), nil
+}

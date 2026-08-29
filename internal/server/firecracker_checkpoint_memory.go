@@ -99,12 +99,37 @@ func (h *sandboxService) withTransientFirecrackerCheckpointMemory(
 	} else if guestResources != nil {
 		normalResources = proto.Clone(guestResources).(*runtime.LinuxSandboxResources)
 	}
-	headroom := int64(0)
-	if guestResources != nil {
-		headroom = firecrackerCheckpointHeadroom(guestResources.MemoryLimitInBytes)
+	// A normally created sandbox may not carry Status.Resources (it is nil
+	// until something populates it); fall back to the live cgroup limit,
+	// which is the authoritative value the cgroup manager enforced at
+	// Start time. Without this, the wrapper silently skips the transient
+	// expansion and Firecracker is cgroup-OOM-killed mid-snapshot.
+	if normalResources == nil || normalResources.MemoryLimitInBytes <= 0 {
+		limit, readErr := h.cgroupMgr.ReadMemoryLimit(cgroupPath)
+		if readErr != nil {
+			return fmt.Errorf(
+				"Firecracker checkpoint needs the guest memory limit for sandbox %s: "+
+					"Status.Resources is empty and reading cgroup %s failed: %w",
+				sandboxID, cgroupPath, readErr,
+			)
+		}
+		if limit <= 0 {
+			return fmt.Errorf(
+				"Firecracker checkpoint needs a positive guest memory limit for sandbox %s: "+
+					"Status.Resources is empty and cgroup %s reports %d",
+				sandboxID, cgroupPath, limit,
+			)
+		}
+		normalResources = &runtime.LinuxSandboxResources{
+			MemoryLimitInBytes: limit,
+		}
 	}
-	if normalResources == nil || headroom == 0 {
-		return operation()
+	headroom := firecrackerCheckpointHeadroom(normalResources.MemoryLimitInBytes)
+	if headroom == 0 {
+		return fmt.Errorf(
+			"Firecracker checkpoint headroom is zero for sandbox %s (memory limit %d)",
+			sandboxID, normalResources.MemoryLimitInBytes,
+		)
 	}
 	expandedResources := proto.Clone(normalResources).(*runtime.LinuxSandboxResources)
 	addResourceMemory(expandedResources, headroom)

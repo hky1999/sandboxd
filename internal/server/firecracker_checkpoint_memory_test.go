@@ -16,7 +16,9 @@ package server
 
 import (
 	"context"
+	"errors"
 	"math"
+	"strings"
 	"testing"
 	"time"
 
@@ -63,4 +65,27 @@ func TestFirecrackerCheckpointMemorySlotHonorsCancellation(t *testing.T) {
 	)
 	assert.NoError(t, err)
 	release()
+}
+
+func TestWithTransientFirecrackerCheckpointMemoryFailsClosedOnMissingResources(t *testing.T) {
+	h := &sandboxService{
+		firecrackerCheckpointMemorySlot: nil,
+	}
+	// The wrapper must fail closed when it cannot determine the memory limit,
+	// instead of silently skipping the expansion.
+	err := h.withTransientFirecrackerCheckpointMemory(
+		context.Background(),
+		"firecracker",
+		"test-sandbox",
+		"/nonexistent/cgroup",
+		nil, // guestResources
+		nil, // handler without HostResourcesProvider
+		func() error { return errors.New("should not reach here") },
+	)
+	if err == nil {
+		t.Fatal("expected error when memory limit is undeterminable")
+	}
+	if !strings.Contains(err.Error(), "guest memory limit") && !strings.Contains(err.Error(), "managed cgroup") {
+		t.Fatalf("error should mention the memory limit: %v", err)
+	}
 }
