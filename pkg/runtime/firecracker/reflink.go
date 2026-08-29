@@ -53,10 +53,10 @@ func cloneFile(sourcePath, destinationPath string) (reflinked bool, retErr error
 }
 
 // cloneFileNoSync is cloneFile without the destination fsync, for callers
-// that fsync the clone later as part of their own durability point. Syncing
-// inside the clone is not free: an fsync on the destination can wait behind
-// unrelated dirty writeback on the same filesystem, which is exactly the
-// pause-window cost this variant exists to avoid.
+// that intentionally leave the clone in the page cache. Syncing inside the
+// clone is not free: an fsync on the destination can wait behind unrelated
+// dirty writeback on the same filesystem, which is exactly the checkpoint
+// latency this variant exists to avoid.
 func cloneFileNoSync(sourcePath, destinationPath string) (reflinked bool, retErr error) {
 	return cloneFileOpts(sourcePath, destinationPath, false)
 }

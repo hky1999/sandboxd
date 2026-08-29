@@ -172,18 +172,6 @@ func TestFirecrackerSnapshotAPI(t *testing.T) {
 		"/tmp/vmstate",
 		"/tmp/memory",
 		firecrackerSnapshotTypeFull,
-		true,
-	); err != nil {
-		t.Fatal(err)
-	}
-	// deferred_sync=false must omit the member entirely: official VMM
-	// builds parse CreateSnapshotParams with deny_unknown_fields.
-	if err := api.createSnapshot(
-		ctx,
-		"/tmp/vmstate2",
-		"/tmp/memory2",
-		firecrackerSnapshotTypeFull,
-		false,
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -202,7 +190,7 @@ func TestFirecrackerSnapshotAPI(t *testing.T) {
 
 	mu.Lock()
 	defer mu.Unlock()
-	if len(calls) != 5 {
+	if len(calls) != 4 {
 		t.Fatalf("snapshot API calls = %+v", calls)
 	}
 	if calls[0].method != http.MethodPatch || calls[0].path != "/vm" ||
@@ -215,25 +203,22 @@ func TestFirecrackerSnapshotAPI(t *testing.T) {
 		calls[1].payload["deferred_sync"] != true {
 		t.Fatalf("create snapshot call = %+v", calls[1])
 	}
-	if _, present := calls[2].payload["deferred_sync"]; present {
-		t.Fatalf("deferred_sync=false call still sent the member: %+v", calls[2])
+	if calls[2].method != http.MethodPatch ||
+		calls[2].payload["state"] != "Resumed" {
+		t.Fatalf("resume call = %+v", calls[2])
 	}
-	if calls[3].method != http.MethodPatch ||
-		calls[3].payload["state"] != "Resumed" {
-		t.Fatalf("resume call = %+v", calls[3])
+	if calls[3].method != http.MethodPut ||
+		calls[3].path != "/snapshot/load" ||
+		calls[3].payload["resume_vm"] != true ||
+		calls[3].payload["track_dirty_pages"] != true {
+		t.Fatalf("load snapshot call = %+v", calls[3])
 	}
-	if calls[4].method != http.MethodPut ||
-		calls[4].path != "/snapshot/load" ||
-		calls[4].payload["resume_vm"] != true ||
-		calls[4].payload["track_dirty_pages"] != true {
-		t.Fatalf("load snapshot call = %+v", calls[4])
-	}
-	backends, ok := calls[4].payload["network_overrides"].([]any)
+	backends, ok := calls[3].payload["network_overrides"].([]any)
 	if !ok || len(backends) != 1 ||
 		backends[0].(map[string]any)["host_dev_name"] != "tap-restored" {
-		t.Fatalf("network overrides = %+v", calls[4].payload["network_overrides"])
+		t.Fatalf("network overrides = %+v", calls[3].payload["network_overrides"])
 	}
-	vsock := calls[4].payload["vsock_override"].(map[string]any)
+	vsock := calls[3].payload["vsock_override"].(map[string]any)
 	if vsock["uds_path"] != "/run/firecracker/restored.vsock" {
 		t.Fatalf("vsock override = %+v", vsock)
 	}

@@ -208,8 +208,8 @@ func (handler *Handler) Checkpoint(
 	// overlay FICLONE after it can stall for seconds on the same filesystem's
 	// writeback of that fresh dirty data (measured 12.8s at a 2GiB layer after
 	// a 4GiB snapshot). Cloning first runs with a cache that does not yet hold
-	// the snapshot, removing the interaction. No in-clone fsync either — the
-	// seal-phase fsync covers durability.
+	// the snapshot, removing the interaction. No in-clone fsync is needed because
+	// checkpoint artifacts deliberately remain in the page cache.
 	if _, err := cloneFileNoSync(state.OverlayPath, files.Overlay); err != nil {
 		discardUnsealedFirecrackerCheckpoint(files)
 		// The deferred handoff cleanup above resumes the guest and sends
@@ -218,7 +218,7 @@ func (handler *Handler) Checkpoint(
 	}
 	tOverlay := time.Now()
 	if err := api.createSnapshot(
-		ctx, files.State, files.Memory, snapshotType, handler.deferredSnapshotSync,
+		ctx, files.State, files.Memory, snapshotType,
 	); err != nil {
 		// The VMM disarms its ledger on write failures, but not on every
 		// failure shape (a request can fail after the memory write already
@@ -259,9 +259,9 @@ func (handler *Handler) Checkpoint(
 	}
 	tResumed := time.Now()
 
-	// Post-resume tail: fsyncing the artifacts, sealing digests and adopting
-	// the base cost seconds per GiB on I/O and hashing and must not extend
-	// the pause window.
+	// Post-resume tail: seal the logical generation and adopt its base without
+	// forcing dirty checkpoint pages to stable storage. Hashing and manifest
+	// publication remain outside the pause window.
 	//
 	// Failure handling past this point: the VMM already wrote the delta and
 	// re-armed its window, so discarding the artifact invalidates the
@@ -276,17 +276,6 @@ func (handler *Handler) Checkpoint(
 			"inspect Firecracker checkpoint memory for %s: %w", sandboxID, err,
 		))
 	}
-	// The snapshot was created with deferred_sync, so its writes only reached
-	// the page cache: durability happens here, before the manifest commits
-	// the generation.
-	if err := fsyncFirecrackerCheckpointData(files); err != nil {
-		instance.markBaseMemoryLineageLost()
-		discardUnsealedFirecrackerCheckpoint(files)
-		return errors.Join(resumeErr, fmt.Errorf(
-			"fsync Firecracker checkpoint data for %s: %w", sandboxID, err,
-		))
-	}
-	tFsynced := time.Now()
 	manifest := &firecrackerCheckpointManifest{
 		SnapshotType: snapshotType,
 		MemorySize:   memoryInfo.Size(),
@@ -330,13 +319,13 @@ func (handler *Handler) Checkpoint(
 	logrus.Infof(
 		"firecracker: checkpointed sandbox %s type=%s memory=%dMiB dir=%s "+
 			"phases: layout=%dms flush=%dms pause=%dms snapshot=%dms overlay=%dms "+
-			"resume=%dms fsync=%dms seal=%dms total=%dms",
+			"resume=%dms seal=%dms total=%dms",
 		sandboxID, snapshotType, memoryInfo.Size()>>20, config.Directory,
 		phaseMS(tStarted, tPrepared), phaseMS(tPrepared, tFlushed),
 		phaseMS(tFlushed, tPaused), phaseMS(tOverlay, tSnapshotted),
 		phaseMS(tPaused, tOverlay),
-		phaseMS(tSnapshotted, tResumed), phaseMS(tResumed, tFsynced),
-		phaseMS(tFsynced, tEnd), phaseMS(tStarted, tEnd),
+		phaseMS(tSnapshotted, tResumed), phaseMS(tResumed, tEnd),
+		phaseMS(tStarted, tEnd),
 	)
 
 	if !config.LeaveRunning {

@@ -147,7 +147,6 @@ jobs:
           - name: firecracker-incremental
             needs_kvm: true
             checkpoint_mode: incremental
-            deferred_sync: "1"
           - name: runc
             needs_kvm: false
 
@@ -191,7 +190,6 @@ jobs:
         env:
           E2E_CASE: ${{ matrix.name }}
           E2E_FIRECRACKER_CHECKPOINT_MODE: ${{ matrix.checkpoint_mode }}
-          E2E_FIRECRACKER_DEFERRED_SYNC: ${{ matrix.deferred_sync }}
         run: make e2e-runtime-case
 
   protobuf:

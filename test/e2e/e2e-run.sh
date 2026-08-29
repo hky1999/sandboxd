@@ -29,7 +29,6 @@ EROFS_MOUNT_ROOT="${E2E_EROFS_MOUNT_ROOT:-/e2e/erofs-mount-root}"
 EROFS_MOUNT_IMAGE="${E2E_EROFS_MOUNT_IMAGE:-/e2e/data.erofs}"
 FIRECRACKER_KERNEL="${E2E_FIRECRACKER_KERNEL:-/opt/firecracker/vmlinux}"
 FIRECRACKER_CHECKPOINT_MODE="${E2E_FIRECRACKER_CHECKPOINT_MODE:-}"
-FIRECRACKER_DEFERRED_SYNC="${E2E_FIRECRACKER_DEFERRED_SYNC:-}"
 FIRECRACKER_INITRD="${E2E_FIRECRACKER_INITRD:-/opt/firecracker/initrd.img}"
 FIRECRACKER_OVERLAY_BYTES="${E2E_FIRECRACKER_OVERLAY_BYTES:-134217728}"
 HOST_MOUNT="${E2E_HOST_MOUNT:-/e2e/host-mount}"
@@ -383,11 +382,6 @@ EOF
         e2e_fc_checkpoint_mode_cfg="$(printf 'checkpoint_mode = "%s"' \
             "${FIRECRACKER_CHECKPOINT_MODE}")"
     fi
-    local e2e_fc_deferred_sync_cfg=""
-    if [ -n "${FIRECRACKER_DEFERRED_SYNC}" ]; then
-        e2e_fc_deferred_sync_cfg="deferred_snapshot_sync = true"
-    fi
-
     cat > "${CONFIG_FILE}" <<EOF
 rootDir = "${SANDBOXD_ROOT}"
 storeDir = "${SANDBOXD_STORE}"
@@ -441,7 +435,6 @@ default_vcpu_count = 1
 default_memory_mib = 256
 default_overlay_size_bytes = ${FIRECRACKER_OVERLAY_BYTES}
 ${e2e_fc_checkpoint_mode_cfg}
-${e2e_fc_deferred_sync_cfg}
 
 [plugin.runtime.basic_spec]
 runsc = ""

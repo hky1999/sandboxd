@@ -55,9 +55,10 @@ to the runtime that created them.
 
 The Firecracker runtime writes *uncompressed* checkpoint directories (layout
 version 2): `manifest.json` plus the `vmstate`, `memory`, and `overlay.ext4`
-components. The manifest is written last, so a directory that shows a manifest
-is a self-consistent artifact; a directory without one is partial output that
-sandboxd cleans up. The memory file stays a plain file that Firecracker
+components. The manifest is written last as the logical commit marker: under
+normal same-boot operation, a directory that shows a manifest is complete; a
+directory without one is partial output that sandboxd cleans up. The memory
+file stays a plain file that Firecracker
 patches in place — the layout deliberately avoids archiving or compression so
 reflink sharing and incremental writes survive. `compress` has no effect on
 this layout (it only applies to legacy artifacts). Legacy single-file
@@ -78,40 +79,34 @@ caller that deletes or mutates the most recent checkpoint directory invalidates
 the lineage: the next checkpoint takes a `Full` snapshot (see the lineage-loss
 rules below); deleting older generations is always safe.
 
-Durability is deliberately kept out of the pause window, and independently
-configurable. `deferred_snapshot_sync` (default **false**) controls who owns
-memory/state durability:
+Checkpoint completion deliberately uses host page-cache semantics. Every
+Firecracker snapshot request carries `deferred_sync: true`: Firecracker returns
+after buffered writes, and sandboxd does not fsync the memory, state, overlay,
+manifest, or checkpoint directory. The Linux kernel may write dirty pages back
+later under its normal dirty-page policy.
 
-- **false (default, upstream contract):** the snapshot request carries no
-  `deferred_sync` member at all (official VMM builds parse the request with
-  `deny_unknown_fields`), and Firecracker fsyncs the state and memory files
-  inside the request. The overlay clone still never fsyncs in-clone; sandboxd
-  fsyncs the overlay before the manifest commits.
-- **true:** the request carries `deferred_sync: true`, so the VMM writes only
-  reach the page cache while the guest is paused, and after the guest resumes
-  sandboxd fsyncs the components and only then lands the manifest. This keeps
-  the multi-second memory-file fsync out of the pause window.
+A successful checkpoint therefore means the generation is logically complete
+and available for restore; it does **not** promise immediate power-loss
+durability. `close(2)` does not surface delayed writeback failures, so an abrupt
+host loss or a later `ENOSPC`/`EIO` can make the newest generation incomplete
+even though the RPC succeeded. A caller that requires a durable external
+artifact must establish that durability outside the checkpoint RPC.
 
 Inside the pause window the overlay reflink clone happens **before** the
 snapshot request: cloning first runs with a page cache that does not yet hold
 the snapshot's dirty writeback (an overlay clone after the snapshot was
-measured stalling for seconds behind that writeback). When
-`deferred_snapshot_sync = true`, it deliberately carries no in-clone fsync —
-a sync there would wait behind the deferred dirty writeback on the same
-filesystem. In that mode the pause window is therefore pause →
-overlay clone → snapshot writes → resume with no fsync on the path, and the
-manifest remains the commit point: a generation without a manifest is partial
-output. A crash
-between resume and manifest commit discards the newest generation and restores
-from the previous one — sound because each generation writes into a fresh
-clone and never mutates its base. Firecracker re-arms its soft-dirty window
-before the artifact is durable (an ordering that predates the deferral), so
-writes the guest performed during that gap belong to a generation that is
-discarded with the artifact; checkpoint success is only reported after the
-manifest commits. Write errors such as `ENOSPC` or `EIO` can therefore surface
-at the post-resume fsync instead of the snapshot request; sandboxd treats this
-like any seal failure: the partial generation is discarded, the lineage is
-marked lost, and the next checkpoint takes a `Full` snapshot.
+measured stalling for seconds behind that writeback). The clone deliberately
+carries no fsync because it can wait behind dirty writeback on the same
+filesystem. The pause window is therefore pause → overlay clone → snapshot
+writes → resume, with no fsync on the path. The manifest remains the logical
+commit point: a generation without a manifest is partial output.
+
+A sandboxd crash between resume and manifest publication discards the newest
+generation and restores from the previous one. This is sound because every
+generation writes into a fresh clone and never mutates its base. Firecracker
+re-arms its soft-dirty window before manifest publication, so writes the guest
+performed during that gap belong to the generation discarded with the
+artifact; checkpoint success is reported only after the manifest is published.
 
 `snapshot_type` is a Firecracker-specific control, gated by
 `checkpoint_mode` (`plugin.runtime.firecracker`):
@@ -137,7 +132,7 @@ Lineage-loss rules: the VMM keeps its soft-dirty ledger in process memory, and
 an armed ledger writes only the window delta regardless of which base sandboxd
 holds. Whenever sandboxd can no longer prove that its base is the one the
 ledger tracks — a checkpoint failed after the VMM wrote and re-armed (snapshot
-error, post-resume fsync error, seal error), the recorded base drifted or was
+or seal error), the recorded base drifted or was
 deleted, or the sandboxd daemon restarted — the lineage is marked lost and the
 next checkpoint takes a `Full` snapshot. `Full` ignores the ledger and writes
 the complete memory image; the window re-opens only after that write, so
@@ -155,10 +150,11 @@ digest `overlay.ext4`; rolling incremental generations skip the overlay digest
 for the same reason — hashing it costs ~5ms/MiB of CPU and re-reads it into
 the page cache on every generation, and a rolling generation's integrity rests
 on the reflink copy-on-write and Firecracker's own writes. Restores skip
-components without a recorded digest either way. Digests are computed
-after the post-resume fsync, so the manifest attests durable bytes. On restore
-the verification is memoized per sandboxd process: a component whose size and
-mtime are unchanged since a previous successful verification is not re-hashed,
+components without a recorded digest either way. Digests are computed from the
+page-cache-visible contents before manifest publication, so the manifest
+attests the logical generation rather than stable-storage durability. On
+restore the verification is memoized per sandboxd process: a component whose
+size and mtime are unchanged since a previous successful verification is not re-hashed,
 so warm starts from a stable template directory skip the cost. The tradeoff is
 that a content swap which preserves both size and mtime within the filesystem's
 timestamp granularity goes undetected — the same granularity the nydus

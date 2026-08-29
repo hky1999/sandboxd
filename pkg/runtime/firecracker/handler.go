@@ -237,11 +237,6 @@ type Handler struct {
 	// checkpoint_mode: full keeps upstream Full snapshots, incremental
 	// enables the three-tier chain.
 	checkpointMode string
-	// deferredSnapshotSync mirrors plugin.runtime.firecracker
-	// deferred_snapshot_sync: when false the snapshot request omits the
-	// deferred_sync member entirely so official (deny_unknown_fields)
-	// VMMs keep accepting it.
-	deferredSnapshotSync bool
 
 	// shrinkBeforeCheckpoint gates the pre-pause guest page-cache drop;
 	// see FirecrackerConfig.ShrinkBeforeCheckpoint for why it is off by
@@ -342,7 +337,6 @@ func NewHandler(
 		defaultMem:             firecrackerConfig.DefaultMemoryMiB,
 		shrinkBeforeCheckpoint: firecrackerConfig.ShrinkBeforeCheckpoint,
 		checkpointMode:         firecrackerConfig.CheckpointMode,
-		deferredSnapshotSync:   firecrackerConfig.DeferredSnapshotSync,
 		defaultDisk:            firecrackerConfig.DefaultOverlaySizeBytes,
 		ociLoader:              loader,
 		instances:              make(map[string]*firecrackerInstance),

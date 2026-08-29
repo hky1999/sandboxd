@@ -125,21 +125,16 @@ func (api *firecrackerAPI) createSnapshot(
 	statePath,
 	memoryPath,
 	snapshotType string,
-	deferredSync bool,
 ) error {
 	body := map[string]any{
 		"snapshot_type": snapshotType,
 		"snapshot_path": statePath,
 		"mem_file_path": memoryPath,
+		"deferred_sync": true,
 	}
-	if deferredSync {
-		// Durability is delegated: the checkpoint is fsynced after the guest
-		// resumes, right before the manifest commits the generation. This
-		// keeps the multi-second memory-file fsync out of the pause window.
-		// The member is omitted entirely when false: official VMM builds
-		// parse CreateSnapshotParams with deny_unknown_fields.
-		body["deferred_sync"] = true
-	}
+	// Checkpoint artifacts deliberately remain in the host page cache. The
+	// caller accepts that success does not imply immediate power-loss
+	// durability; avoiding a forced writeback keeps the pause path short.
 	return api.put(ctx, "/snapshot/create", body)
 }
 

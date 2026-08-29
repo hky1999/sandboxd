@@ -127,7 +127,7 @@ func prepareFirecrackerCheckpointV2(
 			return files, fmt.Errorf("create Firecracker checkpoint memory: %w", err)
 		}
 		defer func() {
-			retErr = errors.Join(retErr, memory.Sync(), memory.Close())
+			retErr = errors.Join(retErr, memory.Close())
 		}()
 		// A sparse zero file: reads see zeroes without allocating extents,
 		// and the pages the snapshot writes out become the only real
@@ -138,7 +138,7 @@ func prepareFirecrackerCheckpointV2(
 		return files, nil
 	}
 
-	if _, err := cloneFile(baseMemoryPath, files.Memory); err != nil {
+	if _, err := cloneFileNoSync(baseMemoryPath, files.Memory); err != nil {
 		return files, err
 	}
 	return files, nil
@@ -170,9 +170,8 @@ func checkFirecrackerCheckpointDirVacant(dir string) error {
 
 // finalizeFirecrackerCheckpointV2 seals a v2 checkpoint after Firecracker has
 // written its components: it records the component digests and lands the
-// manifest last, fsynced, so the directory becomes self-consistent in one
-// step. The manifest is created with O_EXCL; finalizing an already sealed
-// directory is an error.
+// manifest last as the logical commit marker. O_EXCL makes finalizing an
+// already sealed directory an error.
 func finalizeFirecrackerCheckpointV2(
 	ctx context.Context,
 	files firecrackerCheckpointFiles,
@@ -229,18 +228,15 @@ func finalizeFirecrackerCheckpointV2(
 	if err != nil {
 		return fmt.Errorf("create Firecracker checkpoint manifest: %w", err)
 	}
-	// Sync the manifest file before the directory: the manifest is the
-	// commit marker, and a crash between a durable directory entry and an
-	// undurable file would make an incomplete generation look committed.
+	// Keep the manifest in the page cache with the checkpoint components.
+	// Success publishes a logically complete generation but deliberately
+	// does not promise immediate power-loss durability.
 	writeErr := error(nil)
 	if _, err := onDisk.Write(append(encoded, '\n')); err != nil {
 		writeErr = fmt.Errorf("write Firecracker checkpoint manifest: %w", err)
 	}
-	retErr = errors.Join(writeErr, onDisk.Sync(), onDisk.Close())
-	if retErr != nil {
-		return retErr
-	}
-	return syncFirecrackerCheckpointDir(filepath.Dir(manifestPath))
+	retErr = errors.Join(writeErr, onDisk.Close())
+	return retErr
 }
 
 // openFirecrackerCheckpoint inspects a caller-owned checkpoint directory and
@@ -504,47 +500,4 @@ func digestFirecrackerCheckpointComponent(
 		)
 	}
 	return hex.EncodeToString(hash.Sum(nil)), nil
-}
-
-func syncFirecrackerCheckpointDir(dir string) error {
-	handle, err := os.Open(dir)
-	if err != nil {
-		return fmt.Errorf("open Firecracker checkpoint directory: %w", err)
-	}
-	defer handle.Close()
-	if err := handle.Sync(); err != nil {
-		return fmt.Errorf("fsync Firecracker checkpoint directory: %w", err)
-	}
-	return nil
-}
-
-// fsyncFirecrackerCheckpointData flushes the checkpoint components to stable
-// storage. Firecracker is asked to create snapshots with deferred_sync, so
-// the memory and state files only reach the page cache inside the pause
-// window; this pass, run after the guest resumes and before the manifest
-// lands, is what makes the sealed directory actually durable. The overlay is
-// already synced by its reflink clone but is fsynced again here to keep the
-// invariant uniform: everything in the directory is durable before the
-// manifest exists.
-func fsyncFirecrackerCheckpointData(files firecrackerCheckpointFiles) error {
-	for _, component := range firecrackerCheckpointComponents(files) {
-		file, err := os.OpenFile(component.path, os.O_RDWR, 0)
-		if err != nil {
-			return fmt.Errorf(
-				"open Firecracker checkpoint component %s for fsync: %w",
-				component.name, err,
-			)
-		}
-		err = file.Sync()
-		if closeErr := file.Close(); err == nil {
-			err = closeErr
-		}
-		if err != nil {
-			return fmt.Errorf(
-				"fsync Firecracker checkpoint component %s: %w",
-				component.name, err,
-			)
-		}
-	}
-	return nil
 }
