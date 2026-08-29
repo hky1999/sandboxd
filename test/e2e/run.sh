@@ -58,6 +58,25 @@ fail() {
     exit 1
 }
 
+cleanup_disk_fixture() {
+    local dir="$1"
+
+    [ -n "${dir}" ] || return
+    [ -d "${dir}" ] || return
+
+    # The privileged E2E container writes root-owned runtime state into this
+    # host bind mount. A non-root CI runner cannot necessarily remove that
+    # state directly, so use the already-built E2E image for cleanup before
+    # removing the empty runner-owned directory on the host. Always take this
+    # path so root-run local tests exercise the same cleanup as CI.
+    "${DOCKER}" run --rm \
+        --entrypoint /bin/sh \
+        -v "${dir}:/cleanup:rw" \
+        "${IMAGE}" \
+        -c 'rm -rf /cleanup/* /cleanup/.[!.]* /cleanup/..?*'
+    rmdir -- "${dir}"
+}
+
 cleanup_container() {
     local name
     for name in \
@@ -75,11 +94,11 @@ cleanup_container() {
         REDIS_FIXTURE_DIR=""
     fi
     if [ -n "${SANDBOXD_HOME_FIXTURE_DIR}" ]; then
-        rm -rf -- "${SANDBOXD_HOME_FIXTURE_DIR}"
+        cleanup_disk_fixture "${SANDBOXD_HOME_FIXTURE_DIR}"
         SANDBOXD_HOME_FIXTURE_DIR=""
     fi
     if [ -n "${DISABLED_HOME_FIXTURE_DIR}" ]; then
-        rm -rf -- "${DISABLED_HOME_FIXTURE_DIR}"
+        cleanup_disk_fixture "${DISABLED_HOME_FIXTURE_DIR}"
         DISABLED_HOME_FIXTURE_DIR=""
     fi
     if [ "${E2E_SKIP_BUILD}" = "0" ] && [ "${E2E_RUNTIME}" = "kata" ]; then
