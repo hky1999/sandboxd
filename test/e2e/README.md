@@ -153,10 +153,11 @@ wrapper.
 The test detects cgroup mode from `/sys/fs/cgroup/cgroup.controllers`.
 There is no sandboxd cgroup-version switch. The separate disabled-mode
 container does not use the host cgroup namespace and bind-mounts the hierarchy
-read-only. Test containers keep `/home/akernel`, including sandboxd state,
-rootfs work trees, and checkpoint artifacts, on Docker's disk-backed writable
-layer. The harness rejects tmpfs-backed sandboxd state so checkpoint memory
-files exercise normal writeback and cgroup reclaim behavior.
+read-only. Each test container bind-mounts a dedicated host disk directory at
+`/home/akernel` for sandboxd state, rootfs work trees, and checkpoint
+artifacts. This avoids both tmpfs-only checkpoint behavior and nested private
+overlays in Docker's writable layer. The harness rejects a tmpfs-backed source
+and verifies the mount again inside the container.
 
 GitHub Actions builds the project-owned E2E binaries once and uploads them as
 a short-lived artifact. Five dependent matrix jobs then build targeted images
