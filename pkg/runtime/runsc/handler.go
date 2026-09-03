@@ -191,13 +191,18 @@ func (r *Handler) Start(ctx context.Context, config runtimecore.StartConfig) err
 }
 
 func (r *Handler) Checkpoint(ctx context.Context, config runtimecore.CheckpointConfig) error {
-	return r.runsc.Checkpoint(
+	if err := r.runsc.Checkpoint(
 		ctx,
 		config.ID,
 		config.Directory,
 		config.Compress,
 		config.LeaveRunning,
-	)
+	); err != nil {
+		return err
+	}
+	// Seal the artifacts with per-file digests after runsc finishes: the
+	// manifest is the commit marker and what restores verify against.
+	return sealRunscCheckpoint(ctx, config.Directory)
 }
 
 func (r *Handler) Restore(
@@ -272,6 +277,9 @@ func (r *Handler) Restore(
 	}
 	start := time.Now()
 	if err := r.runsc.Create(ctx, startArgs); err != nil {
+		return errors.Join(err, cleanupFailure())
+	}
+	if err := verifyRunscCheckpoint(ctx, config.CheckpointDir); err != nil {
 		return errors.Join(err, cleanupFailure())
 	}
 	imagePath := filepath.Join(config.CheckpointDir, checkpointImageName)
