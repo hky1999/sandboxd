@@ -12,7 +12,9 @@
 package main
 
 import (
+	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -22,11 +24,14 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/inclusionAI/sandboxd/pkg/checkpointchunks"
 )
 
 // regionMapping mirrors firecracker's GuestRegionUffdMapping.
@@ -77,6 +82,12 @@ type pageSource struct {
 	remote    string // base URL of the artifact memory file (remote mode)
 	chunk     uint64
 	client    *http.Client
+
+	// chunkManifest/chunkStore switch fetchChunk to digest-addressed reads
+	// from a content-addressed store (B-line distribution); nil keeps the
+	// backing-file or HTTP-range source.
+	chunkManifest *checkpointchunks.Manifest
+	chunkStore    string
 
 	inflightMu sync.Mutex
 	inflight   map[uint64]*sync.WaitGroup // chunk index -> waiters' group
@@ -180,6 +191,9 @@ func (s *faultServer) fetchChunk(chunkIdx uint64) error {
 				delete(src.inflight, chunkIdx)
 				src.inflightMu.Unlock()
 			}()
+			if src.chunkManifest != nil {
+				return s.fetchChunkFromStore(chunkIdx)
+			}
 			start := chunkIdx * src.chunk
 			req, err := http.NewRequest(http.MethodGet, src.remote, nil)
 			if err != nil {
@@ -230,6 +244,52 @@ func (s *faultServer) fetchChunk(chunkIdx uint64) error {
 		lastErr = err
 	}
 	return lastErr
+}
+
+// fetchChunkFromStore fills one cache chunk from the content-addressed
+// store: the chunk manifest names the digest for this offset, the object is
+// streamed into the cache while being hashed, and a digest mismatch aborts
+// WITHOUT publishing the bitmap — corrupted or missing objects are retried,
+// never served. The retry loop around fetchChunk applies unchanged.
+func (s *faultServer) fetchChunkFromStore(chunkIdx uint64) error {
+	src := s.source
+	manifest := src.chunkManifest
+	if chunkIdx >= uint64(manifest.ChunkCount) {
+		// Past the manifest: the artifact tail beyond the last chunk reads
+		// as zeros. Touch the cache so readers see a present chunk.
+		start := chunkIdx * src.chunk
+		_, _ = src.cache.WriteAt(make([]byte, 1), int64(start))
+		return nil
+	}
+	entry := manifest.Entries[chunkIdx]
+	start := uint64(entry.Offset)
+	end := start + uint64(manifest.ChunkBytes)
+	if end > uint64(manifest.FileSize) {
+		end = uint64(manifest.FileSize)
+	}
+	length := end - start
+
+	objectPath := filepath.Join(src.chunkStore, entry.Digest[:2], entry.Digest)
+	f, err := os.Open(objectPath)
+	if err != nil {
+		return fmt.Errorf("open store chunk %s: %w", entry.Digest, err)
+	}
+	defer f.Close()
+
+	hash := sha256.New()
+	written, err := io.Copy(newOffsetWriter(src.cache, int64(start)), io.TeeReader(
+		io.LimitReader(f, int64(length)), hash))
+	if err != nil {
+		return fmt.Errorf("cache chunk %d from store: %w", chunkIdx, err)
+	}
+	if uint64(written) != length {
+		return fmt.Errorf("store chunk %s short: %d bytes, want %d", entry.Digest, written, length)
+	}
+	if got := hex.EncodeToString(hash.Sum(nil)); got != entry.Digest {
+		return fmt.Errorf("store chunk %s digest mismatch: hashed %s", entry.Digest, got)
+	}
+	log.Printf("DEBUG store chunk=%d digest=%s bytes=%d", chunkIdx, entry.Digest[:12], length)
+	return nil
 }
 
 // offsetWriter adapts io.Copy onto an *os.File section.
@@ -378,6 +438,8 @@ func main() {
 	backingPath := flag.String("backing", "", "local checkpoint memory file (local mode)")
 	remoteURL := flag.String("remote", "", "HTTP(S) URL of the artifact memory file (remote mode)")
 	cachePath := flag.String("cache", "", "sparse local cache file (remote mode)")
+	chunkStorePath := flag.String("chunk-store", "",
+		"content-addressed chunk store directory; a chunks.json next to the backing file switches fetches to per-chunk digest lookups")
 	chunkKB := flag.Uint("chunk-kb", 4, "bytes copied per fault, in KiB")
 	workers := flag.Int("workers", 8, "concurrent UFFDIO_COPY workers")
 	prefetch := flag.Int("prefetch", 4, "background chunk prefetch concurrency (0 = disabled)")
@@ -415,6 +477,34 @@ func main() {
 			MaxIdleConnsPerHost: 16,
 		}}
 		// Cache writes go through fetchChunk which serializes via inflight.
+	} else if *chunkStorePath != "" {
+		// Chunk mode: serve from a content-addressed store when the
+		// artifact carries a chunk manifest; without one, degrade to the
+		// plain backing-file path below (full mode, backward compatible).
+		manifest, err := checkpointchunks.Load(filepath.Dir(*backingPath))
+		if err == nil {
+			cacheFile, cerr := os.OpenFile(*cachePath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o600)
+			if cerr != nil {
+				log.Fatalf("open cache file %s: %v", *cachePath, cerr)
+			}
+			source.cache = cacheFile
+			source.cachePath = *cachePath
+			source.chunkManifest = manifest
+			source.chunkStore = *chunkStorePath
+			if uint64(manifest.ChunkBytes) != chunk {
+				log.Printf("chunk size %dKiB from manifest overrides flag (%dKiB)",
+					manifest.ChunkBytes>>10, chunk>>10)
+				source.chunk = uint64(manifest.ChunkBytes)
+			}
+			log.Printf("chunk source: %d chunks from store %s", manifest.ChunkCount, *chunkStorePath)
+		} else {
+			log.Printf("no usable chunk manifest next to %s (%v); falling back to the backing file", *backingPath, err)
+			file, ferr := os.Open(*backingPath)
+			if ferr != nil {
+				log.Fatalf("open backing file: %v", ferr)
+			}
+			source.file = file
+		}
 	} else {
 		file, err := os.Open(*backingPath)
 		if err != nil {

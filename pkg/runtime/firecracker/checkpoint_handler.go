@@ -966,17 +966,24 @@ func (handler *Handler) launchUffdHandler(sandboxID, sockPath, backingPath, stat
 	}
 	defer logFile.Close()
 	args := []string{"-sock", sockPath}
+	cacheDir := handler.uffdCacheDir
+	if cacheDir == "" {
+		cacheDir = stateDir
+	}
+	// One cache file per sandbox: concurrent restores must never share a
+	// sparse cache (O_TRUNC would clobber a live handler's chunks).
+	cachePath := filepath.Join(cacheDir, "uffd-cache-"+sandboxID)
 	if handler.uffdRemoteURL != "" {
 		remote := strings.ReplaceAll(handler.uffdRemoteURL, "%s", backingPath)
-		cacheDir := handler.uffdCacheDir
-		if cacheDir == "" {
-			cacheDir = stateDir
-		}
-		cachePath := filepath.Join(cacheDir, "uffd-cache")
 		if err := os.MkdirAll(filepath.Dir(cachePath), 0o755); err != nil {
 			return fmt.Errorf("create uffd cache dir: %w", err)
 		}
 		args = append(args, "-remote", remote, "-cache", cachePath)
+	} else if handler.uffdChunkStore != "" {
+		if err := os.MkdirAll(filepath.Dir(cachePath), 0o755); err != nil {
+			return fmt.Errorf("create uffd cache dir: %w", err)
+		}
+		args = append(args, "-chunk-store", handler.uffdChunkStore, "-cache", cachePath)
 	} else {
 		args = append(args, "-backing", backingPath)
 	}

@@ -386,6 +386,14 @@ directly; `"uffd"` hands page population to an external handler):
   once the handler has fetched what it needs (or left in place for
   background prefetch). Restores through the file backend keep the
   mapped-directory exception above.
+- `uffd_chunk_store` switches the handler to chunked serving for artifacts
+  that carry a `chunks.json`: page faults resolve through the same sparse
+  cache, but each chunk is fetched from the content-addressed store by
+  digest and verified while copying — a corrupted or missing object is
+  retried, never served. Artifacts without a chunk manifest transparently
+  fall back to the plain backing file. Each sandbox stages in its own
+  cache file (`uffd-cache-<sandbox-id>`), so concurrent restores never
+  share sparse caches.
 
 ## Node-local checkpoint catalog
 

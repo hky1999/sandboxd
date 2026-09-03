@@ -234,6 +234,11 @@ type FirecrackerConfig struct {
 	// second per GiB of checkpointed memory. Nil (key absent) means true;
 	// set digest_memory=false to opt out for latency-sensitive setups.
 	DigestMemory *bool `toml:"digest_memory" json:"digestMemory,omitempty"`
+	// UffdChunkStore points uffd restores at a content-addressed chunk
+	// store. Artifacts carrying a chunks.json next to their memory file are
+	// then served per-chunk by digest (verified while copying); artifacts
+	// without one fall back to the plain backing file.
+	UffdChunkStore string `toml:"uffd_chunk_store" json:"uffdChunkStore,omitempty"`
 }
 
 // DigestMemoryOrDefault resolves the tri-state digest_memory knob with the
