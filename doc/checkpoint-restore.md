@@ -364,6 +364,29 @@ the checkpoint directory intact until the restored sandbox exits. The next
 checkpoint of the restored sandbox also diffs against that memory file
 (the tier-2 base below).
 
+### On-demand memory restore (uffd backend)
+
+`mem_backend` under `[plugin.runtime.firecracker]` selects how the memory
+artifact reaches the restored guest (`"file"`, the default, maps the artifact
+directly; `"uffd"` hands page population to an external handler):
+
+- With `"uffd"`, sandboxd spawns the `uffd-handler` binary (found via
+  `uffd_handler_bin`, or next to the sandboxd executable), passes it the
+  Firecracker uffd socket, and serves guest page faults with 4 KiB
+  `UFFDIO_COPY`s. The handler fetches in larger chunks (`uffd_chunk_kb`,
+  default 256) and backgrounds a sequential prefetch after the handshake.
+- `uffd_remote_url` (a template whose `%s` is replaced with the artifact
+  memory file path, e.g. `http://source:8080/%s`) switches the handler from
+  reading the local backing file to HTTP range fetches against the node that
+  holds the artifact, staging fetched chunks in `uffd_cache_dir`. This is
+  the cross-node restore path: the memory artifact never has to be copied
+  in full before the VM resumes.
+- The handler serves pages from its own staging, so the restored VM does not
+  map the artifact's `memory` file; the source directory may be reclaimed
+  once the handler has fetched what it needs (or left in place for
+  background prefetch). Restores through the file backend keep the
+  mapped-directory exception above.
+
 ## Runtime support and compatibility
 
 | Runtime | Checkpoint and restore |
