@@ -415,6 +415,26 @@ Unsealed directories (no manifest, or a manifest version other than 2) are
 skipped rather than reported as broken: a restore never sees a half-written
 checkpoint, and neither does the catalog.
 
+`listen` optionally serves the same endpoints over TCP for off-node
+consumers, and the node additionally advertises itself at
+`GET /api/v1/node`: its ID (or hostname), the software stack each enabled
+runtime restores with (the same digests the compatibility tuple seals,
+served by `pkg/checkpointlocator`'s record shape), and informational CPU
+and kernel facts that do not gate placement today.
+
+### Placement (checkpointlocator)
+
+`pkg/checkpointlocator` decides which node may restore a checkpoint. Its
+matrix mirrors the restore-side verification exactly: equality on every
+tuple field the checkpoint recorded, unrecorded fields never gate, and a
+pre-tuple artifact verifies anywhere. Its placement tree runs
+origin-first — the node a checkpoint was created on wins whenever it is
+registered — then the earliest compatible candidate in stable node order,
+and an unsatisfiable request fails closed with per-node reasons instead of
+degrading. `PinToOrigin` models checkpoints that cannot leave their origin
+(for example, host-local mounts). The `cn-locator` command federates the
+node records over the catalogs' TCP endpoints and prints the decision.
+
 ## Runtime support and compatibility
 
 | Runtime | Checkpoint and restore |

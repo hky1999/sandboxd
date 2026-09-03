@@ -83,6 +83,12 @@ type CheckpointCatalogConfig struct {
 	// checkpoint directories (an immediate subdirectory carrying a
 	// manifest.json).
 	Dirs []string `toml:"dirs" json:"dirs"`
+	// Listen optionally exposes the same catalog endpoints over TCP
+	// (host:port) so an off-node placement locator can reach them.
+	Listen string `toml:"listen" json:"listen"`
+	// NodeID identifies this node in placement decisions. Empty defaults to
+	// the hostname.
+	NodeID string `toml:"node_id" json:"nodeId"`
 }
 
 // NodeResourceConfig configures optional node-resource reporting. Provider

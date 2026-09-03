@@ -530,6 +530,14 @@ func (handler *Handler) verifyCheckpointCompat(
 	return nil
 }
 
+// StackFileDigest returns the sha256 hex of a runtime stack file (VMM
+// binary, guest kernel, initrd). It backs both the compatibility tuple a
+// checkpoint seals and the node record the catalog advertises, so both sides
+// always speak the same digest language.
+func StackFileDigest(path string) (string, error) {
+	return digestFirecrackerStackFile(path)
+}
+
 func digestFirecrackerStackFile(path string) (string, error) {
 	file, err := os.Open(path)
 	if err != nil {

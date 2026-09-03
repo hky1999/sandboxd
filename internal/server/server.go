@@ -746,15 +746,21 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 	// consumers. Gated on [plugin.checkpoint_catalog]: nothing to serve
 	// without configured roots.
 	if catalogCfg := cfg.CheckpointCatalogConfig; catalogCfg.SockPath != "" {
+		nodeRecord, nerr := buildCheckpointCatalogNode(cfg, catalogCfg)
+		if nerr != nil {
+			return nil, fmt.Errorf("checkpoint catalog node record: %w", nerr)
+		}
 		catalogMod, cerr := checkpointcatalog.NewModule(checkpointcatalog.Config{
 			SockPath: catalogCfg.SockPath,
+			Listen:   catalogCfg.Listen,
 			Dirs:     catalogCfg.Dirs,
+			Node:     nodeRecord,
 		})
 		if cerr != nil {
 			return nil, fmt.Errorf("checkpoint catalog module init: %w", cerr)
 		}
-		logrus.Infof("checkpoint catalog module ready, sock=%s dirs=%v",
-			catalogCfg.SockPath, catalogCfg.Dirs)
+		logrus.Infof("checkpoint catalog module ready, sock=%s listen=%s dirs=%v node=%s",
+			catalogCfg.SockPath, catalogCfg.Listen, catalogCfg.Dirs, nodeRecord.ID)
 		defer func() {
 			if retErr != nil {
 				catalogMod.Close()
