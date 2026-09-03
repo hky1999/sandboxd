@@ -146,10 +146,18 @@ func (s *faultServer) readCache(cacheOff uint64, full bool) ([]byte, bool) {
 }
 
 // fetchChunk pulls one chunk from the remote source, collapsing concurrent
-// misses of the same chunk into a single request.
+// misses of the same chunk into a single request. A short response body is
+// an error, never a partial cache fill: a truncated chunk reads back as a
+// mix of stale bytes and holes (zeros), and serving that corrupts restored
+// guest memory one silent page at a time.
 func (s *faultServer) fetchChunk(chunkIdx uint64) error {
 	src := s.source
-	for {
+	const attempts = 3
+	var lastErr error
+	for attempt := 0; attempt < attempts; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(attempt) * 50 * time.Millisecond)
+		}
 		src.inflightMu.Lock()
 		if wg, ok := src.inflight[chunkIdx]; ok {
 			src.inflightMu.Unlock()
@@ -182,10 +190,22 @@ func (s *faultServer) fetchChunk(chunkIdx uint64) error {
 			if resp.StatusCode != http.StatusPartialContent && resp.StatusCode != http.StatusOK {
 				return fmt.Errorf("range fetch %s: status %s", src.remote, resp.Status)
 			}
+			// The body must deliver the whole chunk. A server that
+			// advertises a shorter Content-Length is describing the
+			// artifact tail; anything less than that is a truncated
+			// transfer and must be retried, not cached.
+			expected := int64(src.chunk)
+			if resp.ContentLength >= 0 && resp.ContentLength < expected {
+				expected = resp.ContentLength
+			}
 			// Copy straight into the sparse cache at the chunk offset.
 			written, err := io.Copy(newOffsetWriter(src.cache, int64(start)), resp.Body)
 			if err != nil {
 				return fmt.Errorf("cache chunk %d: %w", chunkIdx, err)
+			}
+			if written < expected {
+				return fmt.Errorf("chunk %d: truncated body %d bytes, want %d",
+					chunkIdx, written, expected)
 			}
 			if written == 0 {
 				// Zero-length chunk past the artifact end: touch the cache so
@@ -197,8 +217,9 @@ func (s *faultServer) fetchChunk(chunkIdx uint64) error {
 		if err == nil {
 			return nil
 		}
-		return err
+		lastErr = err
 	}
+	return lastErr
 }
 
 // offsetWriter adapts io.Copy onto an *os.File section.
