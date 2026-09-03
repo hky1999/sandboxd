@@ -751,10 +751,11 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 			return nil, fmt.Errorf("checkpoint catalog node record: %w", nerr)
 		}
 		catalogMod, cerr := checkpointcatalog.NewModule(checkpointcatalog.Config{
-			SockPath: catalogCfg.SockPath,
-			Listen:   catalogCfg.Listen,
-			Dirs:     catalogCfg.Dirs,
-			Node:     nodeRecord,
+			SockPath:      catalogCfg.SockPath,
+			Listen:        catalogCfg.Listen,
+			Dirs:          catalogCfg.Dirs,
+			TemplateRoots: catalogCfg.TemplateRoots,
+			Node:          nodeRecord,
 		})
 		if cerr != nil {
 			return nil, fmt.Errorf("checkpoint catalog module init: %w", cerr)

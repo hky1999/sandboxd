@@ -201,3 +201,67 @@ func (in Input) runtimeName() string {
 	}
 	return ""
 }
+
+// NodeHolder pairs a node record with the content-addressed template ids it
+// holds, so a template placement can require both presence and stack
+// compatibility in one pass.
+type NodeHolder struct {
+	Record NodeRecord
+	Holds  []string
+}
+
+// TemplateInput selects a placement for deriving from one template.
+type TemplateInput struct {
+	// TemplateID is the content address being derived from.
+	TemplateID string
+	// Compat is the template's recorded tuple; nil verifies anywhere.
+	Compat *CheckpointCompat
+	// Nodes pairs every registry node with the templates it holds.
+	Nodes []NodeHolder
+}
+
+// DecideTemplate places a template derivation: the earliest node in stable
+// order that both holds the template and passes the compatibility matrix.
+// Templates have no origin affinity — every holder is equivalent — so the
+// decision is exactly "compatible holder or fail closed".
+func DecideTemplate(in TemplateInput) (Placement, error) {
+	order := make([]string, 0, len(in.Nodes))
+	byID := make(map[string]NodeHolder, len(in.Nodes))
+	for _, holder := range in.Nodes {
+		if _, dup := byID[holder.Record.ID]; dup {
+			continue
+		}
+		byID[holder.Record.ID] = holder
+		order = append(order, holder.Record.ID)
+	}
+	sort.Strings(order)
+
+	var whyNot []string
+	for _, id := range order {
+		holder := byID[id]
+		holds := false
+		for _, tid := range holder.Holds {
+			if tid == in.TemplateID {
+				holds = true
+				break
+			}
+		}
+		if !holds {
+			whyNot = append(whyNot, fmt.Sprintf("%s: does not hold %s", id, in.TemplateID))
+			continue
+		}
+		for _, face := range holder.Record.Runtimes {
+			eval := Evaluate(in.Compat, face)
+			if eval.Compatible {
+				return Placement{
+					NodeID:  holder.Record.ID,
+					Address: holder.Record.Address,
+					Runtime: face.Name,
+				}, nil
+			}
+			whyNot = append(whyNot, fmt.Sprintf("%s/%s: %v", id, face.Name, eval.Reasons))
+		}
+	}
+	return Placement{}, fmt.Errorf(
+		"template %s has no compatible holder (%v)", in.TemplateID, whyNot)
+}

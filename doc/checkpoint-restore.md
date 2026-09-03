@@ -422,6 +422,22 @@ runtime restores with (the same digests the compatibility tuple seals,
 served by `pkg/checkpointlocator`'s record shape), and informational CPU
 and kernel facts that do not gate placement today.
 
+`templates` adds the template-manufacture roots (deploy/fc-template.sh
+layout: content-addressed directories plus a `templates.json` registry) to
+the same view:
+
+- `GET /api/v1/templates` lists registered templates whose directory still
+  exists, with the compat tuple a placer matches against.
+- `GET /api/v1/templates/{id}/verify` re-derives the content address — the
+  same ordered concatenation the manufacture pipeline hashed — and re-checks
+  the recorded component digests. A template whose bytes drifted from its
+  registered id must not be derived from.
+
+Template placement (`checkpointlocator.DecideTemplate`, `cn-locator
+-template-id`) requires a node to both hold the template and pass the
+compatibility matrix; derivation itself is the ordinary restore path with
+the template directory as `checkpoint_dir`.
+
 ### Placement (checkpointlocator)
 
 `pkg/checkpointlocator` decides which node may restore a checkpoint. Its
