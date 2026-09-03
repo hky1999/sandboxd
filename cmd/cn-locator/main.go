@@ -56,6 +56,10 @@ func main() {
 		flag.Usage()
 		os.Exit(2)
 	}
+	if *templateID != "" && *templateCompat == "" && *templateRoot == "" {
+		fmt.Fprintln(os.Stderr, "error: -template-id needs -template-root or -template-compat to read the tuple from")
+		os.Exit(2)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()

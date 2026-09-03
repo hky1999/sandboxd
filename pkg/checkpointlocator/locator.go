@@ -143,14 +143,22 @@ func Decide(in Input) (Placement, error) {
 		byID[n.ID] = n
 	}
 
-	// The origin wins whenever it is registered — a compatible local restore
-	// is always at least as good as a cross-node one.
+	// The origin wins whenever it is registered AND compatible. Origin
+	// preference selects among nodes the restore can actually succeed on:
+	// if the origin's stack drifted since the checkpoint was made (a binary
+	// upgrade), its own restore-side verification would refuse the artifact,
+	// and the tree must fall through to a compatible peer instead of
+	// returning a placement that deterministically fails.
 	if origin, ok := byID[in.OriginNodeID]; ok {
-		return Placement{
-			NodeID:  origin.ID,
-			Address: origin.Address,
-			Runtime: in.runtimeName(),
-		}, nil
+		for _, face := range origin.Runtimes {
+			if eval := Evaluate(in.Compat, face); eval.Compatible {
+				return Placement{
+					NodeID:  origin.ID,
+					Address: origin.Address,
+					Runtime: face.Name,
+				}, nil
+			}
+		}
 	}
 
 	if in.PinToOrigin {
@@ -186,20 +194,6 @@ func Decide(in Input) (Placement, error) {
 	return Placement{}, fmt.Errorf(
 		"checkpoint %s cannot restore cross-node (origin %q unavailable, no compatible node: %v)",
 		in.CheckpointID, in.OriginNodeID, whyNot)
-}
-
-// runtimeName reports a runtime for an origin placement: the first
-// registered face's name, or the conventional default.
-func (in Input) runtimeName() string {
-	for _, n := range in.Nodes {
-		if n.ID != in.OriginNodeID {
-			continue
-		}
-		for _, f := range n.Runtimes {
-			return f.Name
-		}
-	}
-	return ""
 }
 
 // NodeHolder pairs a node record with the content-addressed template ids it
