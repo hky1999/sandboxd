@@ -54,6 +54,8 @@ type PluginConfig struct {
 	NodeResourceConfig `toml:"node_resource" json:"nodeResource"`
 
 	ImageManagerConfig `toml:"image" json:"image"`
+
+	CheckpointCatalogConfig `toml:"checkpoint_catalog" json:"checkpointCatalog"`
 }
 
 // ImageManagerConfig configures image and mount lifecycle management.
@@ -66,6 +68,21 @@ type ImageManagerConfig struct {
 	OSSAuthsPath      string `toml:"oss_auths_path" json:"ossAuthsPath"`
 	RegistryAuthsPath string `toml:"registry_auths_path" json:"registryAuthsPath"`
 	CgroupMemoryLimit string `toml:"cgroup_memory_limit" json:"cgroupMemoryLimit"`
+}
+
+// CheckpointCatalogConfig configures the node-local checkpoint inventory
+// view: which caller-owned roots to scan and which socket serves the read-only
+// admin API. The catalog is a live view over artifact directories, so entries
+// appear and disappear with the artifacts themselves.
+type CheckpointCatalogConfig struct {
+	// SockPath exposes GET /api/v1/checkpoints and
+	// GET /api/v1/checkpoints/{id}/verify over a Unix socket. Empty disables
+	// the catalog.
+	SockPath string `toml:"sock_path" json:"sockPath"`
+	// Dirs are caller-owned roots scanned one level deep for Firecracker v2
+	// checkpoint directories (an immediate subdirectory carrying a
+	// manifest.json).
+	Dirs []string `toml:"dirs" json:"dirs"`
 }
 
 // NodeResourceConfig configures optional node-resource reporting. Provider
