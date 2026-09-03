@@ -437,6 +437,9 @@ func (m *InterfaceManager) cacheNum() int {
 // Fast path: pop the idle queue. On a miss it either reserves a slot and waits
 // for the maintenance goroutine to create one on demand (when below max), or
 // fails fast with ErrResourceExhausted (at max, no blocking, no timeout).
+//
+// The lease is made durable in the active set before it is returned, matching
+// the write-before-handoff boundary AllocateEphemeral already uses.
 func (m *InterfaceManager) Allocate() (string, error) {
 	m.lifecycleMu.RLock()
 	defer m.lifecycleMu.RUnlock()
@@ -445,7 +448,7 @@ func (m *InterfaceManager) Allocate() (string, error) {
 	}
 
 	if netResourceStr := m.interfaces.Pop(); netResourceStr != "" {
-		return m.markUsing(netResourceStr)
+		return m.markUsingPooled(netResourceStr)
 	}
 
 	m.mu.Lock()
@@ -463,7 +466,52 @@ func (m *InterfaceManager) Allocate() (string, error) {
 		// total was already decremented by the maintenance goroutine.
 		return "", res.err
 	}
-	return m.markUsing(res.id)
+	return m.markUsingPooled(res.id)
+}
+
+// markUsingPooled marks a popped or freshly created TAP as leased and persists
+// the durable active set before the lease leaves the manager — the pooled
+// counterpart of the write-before-handoff boundary AllocateEphemeral uses.
+// Without it the lease only reaches the store on keepStoring's next tick, so a
+// daemon that exits after handing the TAP to a runtime but before that tick
+// recovers the TAP as idle and may lease it to a second sandbox while the
+// first runtime still holds the device. A store failure fails the allocation;
+// the endpoint returns to the idle pool only when rollback proves it converged
+// back to the idle state, otherwise it stays leased and quarantined. The
+// pending storeMark is deliberately left set on success: keepStoring may then
+// re-store the same set once, which is harmless, while clearing it could drop
+// a concurrent Recycle's removal from the next flush.
+func (m *InterfaceManager) markUsingPooled(netResourceStr string) (string, error) {
+	marked, err := m.markUsing(netResourceStr)
+	if err != nil {
+		return "", err
+	}
+	if err := m.store(); err != nil {
+		return "", errors.Join(err, m.rollbackPooledHandout(marked))
+	}
+	return marked, nil
+}
+
+// rollbackPooledHandout undoes a pooled handout whose lease could not be made
+// durable. The caller never saw the lease, so returning the endpoint to the
+// idle pool is safe once setTapState has converged it back to the idle state;
+// a rollback failure keeps the lease active so the endpoint stays quarantined
+// and counted instead of being reused.
+func (m *InterfaceManager) rollbackPooledHandout(marked string) error {
+	resource, err := NewNetResource(marked)
+	if err == nil {
+		err = m.setTapState(resource, false)
+	}
+	if err != nil {
+		m.storeMark.Store(true)
+		return fmt.Errorf("rollback pooled handout of %q: %w; lease stays active (quarantined)", marked, err)
+	}
+	// using -> idle, total unchanged. Queue the serialization refreshed by
+	// setTapState, as Recycle does, so the idle lease carries current
+	// bookkeeping (ifindex).
+	m.usingInterfaces.Pop(marked)
+	m.interfaces.Push(resource.ToString())
+	return nil
 }
 
 // AllocateEphemeral creates a fresh veth and named network namespace for one
@@ -516,8 +564,9 @@ func (m *InterfaceManager) AllocateEphemeral(sandboxID string) (string, error) {
 	}
 	created = marked
 	// Unlike the reusable cache, an ephemeral link leaves the host namespace.
-	// Persist its lease before handing it to the caller so crash recovery never
-	// treats the IP as free during the normal five-second store interval.
+	// Persist its lease before handing it to the caller — the same
+	// write-before-handoff boundary as the pooled path in markUsingPooled — so
+	// crash recovery never treats the IP as free.
 	if err := m.store(); err != nil {
 		m.usingInterfaces.Pop(created)
 		return "", errors.Join(err, m.rollbackEphemeralCreation(created, path))

@@ -580,6 +580,95 @@ func TestAllocateEphemeralCreatesDedicatedLease(t *testing.T) {
 	assert.Equal(t, []string{lease}, state.Items)
 }
 
+// flakyRawStore injects StoreRaw failures on demand while delegating the rest
+// of the DbStore contract to the mock store.
+type flakyRawStore struct {
+	*store.MockStore
+	rawErr error
+}
+
+func (f *flakyRawStore) StoreRaw(key string, data []byte) error {
+	if f.rawErr != nil {
+		return f.rawErr
+	}
+	return f.MockStore.StoreRaw(key, data)
+}
+
+// TestAllocatePersistsPooledLeaseBeforeHandoff pins the crash-consistency
+// boundary requested in review: a pooled lease must already sit in the durable
+// active set when Allocate returns, not only on keepStoring's next tick. A
+// daemon exiting between handoff and that tick must never recover a leased TAP
+// as idle and hand it to a second sandbox.
+func TestAllocatePersistsPooledLeaseBeforeHandoff(t *testing.T) {
+	f := newTapRecoveryFixture(t, convergedTap(t, 13))
+	f.manager.db = store.NewMockStore()
+	// Seed the idle queue with a stale-ifindex lease: markUsing refreshes the
+	// serialization, and the refreshed key is what must be durable.
+	f.manager.interfaces.Push(activeLeaseWithIfindex(t, 7))
+
+	lease, err := f.manager.Allocate()
+	require.NoError(t, err)
+
+	stored, err := f.manager.db.LoadRaw(config.BridgeIpBucket)
+	require.NoError(t, err)
+	var state storedInterfaceIDs
+	require.NoError(t, json.Unmarshal(stored, &state))
+	assert.Equal(t, []string{lease}, state.Items,
+		"the pooled lease must be durable before Allocate returns")
+	assert.True(t, f.manager.usingInterfaces.Has(lease))
+}
+
+// TestAllocateFailsClosedWhenLeaseCannotBeDurable is the failure half of the
+// boundary: a StoreRaw failure must prevent allocation from succeeding. No
+// lease is returned, and the TAP is rolled back to a proven-safe idle state
+// (link down, refreshed bookkeeping) so it stays reusable instead of leaking.
+func TestAllocateFailsClosedWhenLeaseCannotBeDurable(t *testing.T) {
+	f := newTapRecoveryFixture(t, convergedTap(t, 13))
+	db := &flakyRawStore{MockStore: store.NewMockStore(), rawErr: errors.New("bbolt unavailable")}
+	f.manager.db = db
+	f.manager.interfaces.Push(activeLeaseWithIfindex(t, 7))
+
+	lease, err := f.manager.Allocate()
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "bbolt unavailable")
+	assert.Empty(t, lease, "no lease may be returned when it cannot be made durable")
+
+	// The endpoint was activated for the handout and converged back down; it
+	// returns to the idle pool with current bookkeeping, so it is reusable
+	// rather than leaked or double-handed.
+	assert.Equal(t, 1, f.linkOps.setUpCount)
+	assert.Equal(t, 1, f.linkOps.setDownCount)
+	using, idle := f.manager.Status()
+	assert.Empty(t, using)
+	require.Len(t, idle, 1)
+	rolled, err := NewNetResource(idle[0])
+	require.NoError(t, err)
+	assert.EqualValues(t, 13, rolled.Interface.Index)
+}
+
+// TestAllocateQuarantinesEndpointWhenRollbackFails covers the rollback branch
+// that cannot be completed safely: if the TAP cannot be converged back to the
+// idle state, it must stay leased (quarantined and counted) instead of
+// returning to the reusable queue in an unknown state.
+func TestAllocateQuarantinesEndpointWhenRollbackFails(t *testing.T) {
+	f := newTapRecoveryFixture(t, convergedTap(t, 13))
+	f.linkOps.setDownErr = errors.New("link set down failed")
+	db := &flakyRawStore{MockStore: store.NewMockStore(), rawErr: errors.New("bbolt unavailable")}
+	f.manager.db = db
+	f.manager.interfaces.Push(activeLeaseWithIfindex(t, 7))
+
+	lease, err := f.manager.Allocate()
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "quarantined")
+	assert.Empty(t, lease)
+
+	using, idle := f.manager.Status()
+	assert.Empty(t, idle, "an endpoint that cannot be proven idle must not be reusable")
+	require.Len(t, using, 1)
+	assert.True(t, f.manager.storeMark.Load(),
+		"the quarantined lease stays pending for the periodic store")
+}
+
 func TestReleaseEphemeralDestroysInsteadOfRecycling(t *testing.T) {
 	resource := (&NetResource{
 		Interface: &net.Interface{Name: config.PeerVethPrefix + "0a580002"},
