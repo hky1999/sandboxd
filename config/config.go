@@ -83,6 +83,10 @@ type CheckpointCatalogConfig struct {
 	// checkpoint directories (an immediate subdirectory carrying a
 	// manifest.json).
 	Dirs []string `toml:"dirs" json:"dirs"`
+	// TemplateRoots are template roots (deploy/fc-template.sh layout): each
+	// holds content-addressed template directories plus a templates.json
+	// registry written by the manufacture pipeline.
+	TemplateRoots []string `toml:"templates" json:"templates"`
 	// Listen optionally exposes the same catalog endpoints over TCP
 	// (host:port) so an off-node placement locator can reach them.
 	Listen string `toml:"listen" json:"listen"`

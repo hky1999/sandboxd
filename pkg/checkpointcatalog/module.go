@@ -53,8 +53,8 @@ func NewModule(cfg Config) (*Module, error) {
 	if cfg.SockPath == "" {
 		return nil, errors.New("checkpoint catalog requires sock_path")
 	}
-	if len(cfg.Dirs) == 0 {
-		return nil, errors.New("checkpoint catalog requires at least one dir to inventory")
+	if len(cfg.Dirs) == 0 && len(cfg.TemplateRoots) == 0 {
+		return nil, errors.New("checkpoint catalog requires a dir or template root to inventory")
 	}
 	if _, err := os.Stat(cfg.SockPath); err == nil {
 		os.Remove(cfg.SockPath)
@@ -125,6 +125,40 @@ func (m *Module) handler() http.Handler {
 			return
 		}
 		writeJSON(w, map[string][]Entry{"checkpoints": entries})
+	})
+	mux.HandleFunc("/api/v1/templates", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+		defer cancel()
+		entries, err := ListTemplates(ctx, m.cfg)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, map[string][]TemplateEntry{"templates": entries})
+	})
+	mux.HandleFunc("/api/v1/templates/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		rest := strings.TrimPrefix(r.URL.Path, "/api/v1/templates/")
+		id, action, found := strings.Cut(rest, "/")
+		if id == "" || !found || action != "verify" || strings.Contains(action, "/") {
+			http.Error(w, "unknown endpoint", http.StatusNotFound)
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 120*time.Second)
+		defer cancel()
+		result, err := VerifyTemplate(ctx, m.cfg, id)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusNotFound)
+			return
+		}
+		writeJSON(w, result)
 	})
 	mux.HandleFunc("/api/v1/checkpoints/", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {

@@ -109,3 +109,37 @@ func ReadCheckpointCompat(dir string) (*CheckpointCompat, error) {
 	}
 	return manifest.Compat, nil
 }
+
+// FetchTemplates reads one node's template listing
+// (GET {address}/api/v1/templates) as plain ids.
+func FetchTemplates(ctx context.Context, address string) ([]string, error) {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	url := strings.TrimRight(address, "/") + "/api/v1/templates"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("fetch templates %s: %w", address, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("fetch templates %s: status %d", address, resp.StatusCode)
+	}
+	var listed struct {
+		Templates []struct {
+			ID     string            `json:"id"`
+			Compat *CheckpointCompat `json:"compat"`
+		} `json:"templates"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&listed); err != nil {
+		return nil, fmt.Errorf("decode templates %s: %w", address, err)
+	}
+	ids := make([]string, 0, len(listed.Templates))
+	for _, t := range listed.Templates {
+		ids = append(ids, t.ID)
+	}
+	return ids, nil
+}
