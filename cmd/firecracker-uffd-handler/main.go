@@ -396,7 +396,7 @@ func main() {
 	// are serialized by the sequential iteration (one fetchChunk at a time
 	// in this goroutine). Fault-serving workers may also call fetchChunk
 	// for the same chunk concurrently, which the inflight WaitGroup handles.
-	if *prefetch > 0 && source.remote != "" {
+	if *prefetch > 0 && source.remote != "" && os.Getenv("UFFD_NO_BULK") == "" {
 		go func() {
 			totalChunks := uint64(0)
 			for _, r := range regions {
