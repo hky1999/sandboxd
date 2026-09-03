@@ -387,6 +387,34 @@ directly; `"uffd"` hands page population to an external handler):
   background prefetch). Restores through the file backend keep the
   mapped-directory exception above.
 
+## Node-local checkpoint catalog
+
+`[plugin.checkpoint_catalog]` optionally exposes a read-only inventory of the
+node's Firecracker v2 checkpoint directories over a Unix socket:
+
+```toml
+[plugin.checkpoint_catalog]
+sock_path = "/var/run/checkpoint-catalog.sock"
+dirs = ["/mnt/cn/ck/nodeA"]
+```
+
+Each configured `dirs` root is scanned one level deep; an immediate
+subdirectory carrying a `manifest.json` is listed as a checkpoint. The
+catalog is a live view, not a database: every request re-reads the manifests,
+so entries appear and disappear with the artifacts and nothing drifts.
+
+- `GET /api/v1/checkpoints` returns `{id, dir, snapshot_type, memory_mib,
+  created_at, compat, digests}` per entry. The `compat` tuple is what a
+  cross-node consumer matches against a target node before placing a restore.
+- `GET /api/v1/checkpoints/{id}/verify` recomputes the sha256 of every
+  component with a recorded digest (memory included unless it was sealed with
+  `digest_memory = false`; the overlay is never digested by policy) and
+  reports per-component outcomes plus a single `digest_ok`.
+
+Unsealed directories (no manifest, or a manifest version other than 2) are
+skipped rather than reported as broken: a restore never sees a half-written
+checkpoint, and neither does the catalog.
+
 ## Runtime support and compatibility
 
 | Runtime | Checkpoint and restore |

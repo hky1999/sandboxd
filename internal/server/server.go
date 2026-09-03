@@ -42,6 +42,7 @@ import (
 	"github.com/inclusionAI/sandboxd/pkg/networkmanager/networkacl"
 	// The side-effect imports register the available NAT backends before
 	// InterfaceManager initialization while avoiding an import cycle.
+	"github.com/inclusionAI/sandboxd/pkg/checkpointcatalog"
 	_ "github.com/inclusionAI/sandboxd/pkg/networkmanager/bpfnat"
 	_ "github.com/inclusionAI/sandboxd/pkg/networkmanager/bridge"
 	"github.com/inclusionAI/sandboxd/pkg/resourcemanager"
@@ -711,8 +712,8 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 	// systemd restart sandboxd.
 	// Held in a local because s.resourceMod is back-filled once s exists below.
 	var nodeResMod *resourcemanager.Module
-	if cfg.SockPath != "" {
-		sockPath := cfg.SockPath
+	if cfg.NodeResourceConfig.SockPath != "" {
+		sockPath := cfg.NodeResourceConfig.SockPath
 		mod, merr := resourcemanager.NewModule(sockPath, cfg.NodeResourceConfig.Provider)
 		if merr != nil {
 			return nil, fmt.Errorf("node-resource module init: %w", merr)
@@ -738,6 +739,29 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 		}()
 	} else {
 		logrus.Infof("node-resource module disabled (no [plugin.node_resource] config)")
+	}
+
+	// The optional checkpoint catalog exposes the node's Firecracker v2
+	// checkpoint directories as a read-only inventory view for cross-node
+	// consumers. Gated on [plugin.checkpoint_catalog]: nothing to serve
+	// without configured roots.
+	if catalogCfg := cfg.CheckpointCatalogConfig; catalogCfg.SockPath != "" {
+		catalogMod, cerr := checkpointcatalog.NewModule(checkpointcatalog.Config{
+			SockPath: catalogCfg.SockPath,
+			Dirs:     catalogCfg.Dirs,
+		})
+		if cerr != nil {
+			return nil, fmt.Errorf("checkpoint catalog module init: %w", cerr)
+		}
+		logrus.Infof("checkpoint catalog module ready, sock=%s dirs=%v",
+			catalogCfg.SockPath, catalogCfg.Dirs)
+		defer func() {
+			if retErr != nil {
+				catalogMod.Close()
+			}
+		}()
+	} else {
+		logrus.Infof("checkpoint catalog module disabled (no [plugin.checkpoint_catalog] config)")
 	}
 
 	// Construct the in-process image manager before sandboxService so mount and
