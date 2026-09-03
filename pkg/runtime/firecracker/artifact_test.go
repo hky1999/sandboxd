@@ -16,11 +16,15 @@ package firecracker
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/inclusionAI/sandboxd/pkg/checkpointchunks"
 )
 
 func writeArtifactComponent(t *testing.T, path string, size int) {
@@ -423,5 +427,47 @@ func TestFinalizeCheckpointV2DigestPolicy(t *testing.T) {
 	cache = checkpointDigestCache{}
 	if err := cache.verifyFirecrackerCheckpointDigests(context.Background(), artifact); err != nil {
 		t.Fatalf("verify Full artifact digests (digest off): %v", err)
+	}
+}
+
+func TestFinalizeMemoryDigestMatchesPlainHashAndScansChunks(t *testing.T) {
+	dir := t.TempDir()
+	files := sealArtifactFixture(t, dir)
+	// 2.5 chunks of non-trivial data.
+	data := make([]byte, int64(2*checkpointchunks.DefaultChunkBytes)+131072)
+	for i := range data {
+		data[i] = byte(i*31 + 5)
+	}
+	if err := os.WriteFile(files.Memory, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	manifest := &firecrackerCheckpointManifest{
+		SnapshotType: firecrackerSnapshotTypeFull,
+		MemorySize:   int64(len(data)),
+	}
+	if err := finalizeFirecrackerCheckpointV2(context.Background(), files, manifest, true); err != nil {
+		t.Fatalf("finalize: %v", err)
+	}
+	plain := sha256.Sum256(data)
+	if got := manifest.Digests[firecrackerCheckpointMemoryName]; got != hex.EncodeToString(plain[:]) {
+		t.Fatalf("dual-hash digest %s != plain sha256 %s", got, hex.EncodeToString(plain[:]))
+	}
+	// The sidecar must equal what the standalone Compute produces.
+	scan, err := checkpointchunks.Load(dir)
+	if err != nil {
+		t.Fatalf("load sidecar: %v", err)
+	}
+	if scan.ChunkCount != 3 || scan.FileDigest != hex.EncodeToString(plain[:]) {
+		t.Fatalf("sidecar = %+v", scan)
+	}
+	reference, err := checkpointchunks.Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reference.Entries) != len(scan.Entries) {
+		t.Fatalf("entry count %d != %d", len(scan.Entries), len(reference.Entries))
+	}
+	if err := checkpointchunks.Verify(context.Background(), dir); err != nil {
+		t.Fatalf("sidecar verify: %v", err)
 	}
 }
