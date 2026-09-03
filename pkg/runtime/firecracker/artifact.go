@@ -582,7 +582,12 @@ func digestMemoryWithChunkScan(ctx context.Context, memoryPath, digestMode strin
 		}
 		n, rerr := io.ReadFull(f, buf)
 		if n > 0 {
-			fileHash.Write(buf[:n])
+			if digestMode != checkpointchunks.FileDigestChunks {
+				// Only the sequential mode pays the whole-file hash inline;
+				// in chunks mode it would chain the pass to a single
+				// core's sha256 throughput and starve the workers.
+				fileHash.Write(buf[:n])
+			}
 			block := make([]byte, n)
 			copy(block, buf[:n])
 			scan.Entries = append(scan.Entries, checkpointchunks.Chunk{Offset: offset})
