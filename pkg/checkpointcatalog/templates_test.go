@@ -124,8 +124,9 @@ func TestListTemplatesLiveView(t *testing.T) {
 	foreign := filepath.Join(t.TempDir(), "elsewhere", id)
 	raw := map[string]any{"templates": []any{map[string]any{
 		"id": id, "name": "warm", "dir": foreign,
-		"created_at": "x", "snapshot_type": "full", "memory_size": 1 << 20,
-		"compat": map[string]any{}, "digests": map[string]string{},
+		"created_at": "x", "snapshot_type": "full", "memory_size": 256 << 20,
+		"compat":  map[string]any{"arch": "amd64", "firecracker": "fc", "kernel": "k"},
+		"digests": map[string]string{},
 	}}}
 	encoded, _ := json.Marshal(raw)
 	if err := os.WriteFile(filepath.Join(root, registryName), encoded, 0o600); err != nil {
