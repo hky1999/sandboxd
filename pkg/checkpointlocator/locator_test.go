@@ -107,6 +107,39 @@ func TestDecidePrefersOrigin(t *testing.T) {
 	}
 }
 
+func TestDecideSkipsIncompatibleOrigin(t *testing.T) {
+	// The origin registered but its stack drifted after the checkpoint was
+	// made: origin preference must not return a node whose own restore
+	// verification would refuse the artifact.
+	nodes := []NodeRecord{
+		{ID: "origin", Runtimes: []RuntimeFace{face(func(f *RuntimeFace) { f.Kernel = "upgraded" })}},
+		{ID: "peer", Runtimes: []RuntimeFace{face()}},
+	}
+	got, err := Decide(Input{
+		CheckpointID: "C1",
+		Compat:       &CheckpointCompat{Kernel: "kernel-digest"},
+		OriginNodeID: "origin",
+		Nodes:        nodes,
+	})
+	if err != nil {
+		t.Fatalf("decide: %v", err)
+	}
+	if got.NodeID != "peer" || !got.CrossNode {
+		t.Fatalf("incompatible origin still preferred: %+v", got)
+	}
+
+	// With no compatible peer the request must fail closed rather than
+	// return the incompatible origin.
+	if _, err := Decide(Input{
+		CheckpointID: "C1",
+		Compat:       &CheckpointCompat{Kernel: "kernel-digest"},
+		OriginNodeID: "origin",
+		Nodes:        nodes[:1],
+	}); err == nil {
+		t.Fatal("incompatible-only origin accepted")
+	}
+}
+
 func TestDecideCrossNodeFallsBackInStableOrder(t *testing.T) {
 	nodes := []NodeRecord{
 		{ID: "node-b", Address: "http://b:18090", Runtimes: []RuntimeFace{face()}},

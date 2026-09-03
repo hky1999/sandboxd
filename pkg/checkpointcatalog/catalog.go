@@ -28,6 +28,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"time"
 
 	"github.com/inclusionAI/sandboxd/pkg/checkpointlocator"
@@ -186,7 +187,13 @@ func Verify(ctx context.Context, cfg Config, id string) (VerifyResult, error) {
 		return VerifyResult{}, err
 	}
 	result := VerifyResult{ID: entry.ID, Dir: entry.Dir, DigestOK: true}
-	for name, want := range entry.Digests {
+	names := make([]string, 0, len(entry.Digests))
+	for name := range entry.Digests {
+		names = append(names, name)
+	}
+	sort.Strings(names) // stable component order in the response
+	for _, name := range names {
+		want := entry.Digests[name]
 		check := ComponentCheck{Name: name, Path: filepath.Join(entry.Dir, name), Record: true}
 		got, err := digestFile(ctx, check.Path)
 		switch {

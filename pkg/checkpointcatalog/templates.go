@@ -96,6 +96,9 @@ func ListTemplates(ctx context.Context, cfg Config) ([]TemplateEntry, error) {
 			if err := ctx.Err(); err != nil {
 				return nil, err
 			}
+			if t.ID == "" {
+				continue // an unaddressable registry entry is unusable
+			}
 			// The registry's dir is written from the node that
 			// manufactured the template and may be absolute there but
 			// absent here: the same registry is mounted at different
