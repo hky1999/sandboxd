@@ -103,7 +103,7 @@ func (s *faultServer) resolveChunk(fileOff uint64) ([]byte, error) {
 		}
 		return buf[subOff:]
 	}
-	if buf, ok := s.readCache(cacheOff); ok {
+	if buf, ok := s.readCache(cacheOff, true); ok {
 		if out := sliceAt(buf); out != nil {
 			return out, nil
 		}
@@ -112,7 +112,7 @@ func (s *faultServer) resolveChunk(fileOff uint64) ([]byte, error) {
 	if err := s.fetchChunk(chunkIdx); err != nil {
 		return nil, err
 	}
-	buf, ok := s.readCache(cacheOff)
+	buf, ok := s.readCache(cacheOff, false)
 	if !ok {
 		return nil, fmt.Errorf("chunk %d missing from cache after fetch", chunkIdx)
 	}
@@ -122,13 +122,24 @@ func (s *faultServer) resolveChunk(fileOff uint64) ([]byte, error) {
 	return nil, fmt.Errorf("offset %d beyond fetched chunk %d", fileOff, chunkIdx)
 }
 
-func (s *faultServer) readCache(cacheOff uint64) ([]byte, bool) {
+// readCache reads the chunk at cacheOff back from the sparse cache. With
+// full=true a hit requires the COMPLETE chunk: the bulk download writes a
+// chunk through several WriteAt calls, so a racing read observes a partial
+// chunk, and serving that slice injects truncated (effectively zero) pages
+// into the guest — the VM stalls a few pages into boot. A partial chunk is
+// therefore a miss, and the miss path waits on the inflight fetch instead
+// of racing the writer. After fetchChunk returns, a short read is the true
+// artifact tail and is served as-is (full=false).
+func (s *faultServer) readCache(cacheOff uint64, full bool) ([]byte, bool) {
 	buf := make([]byte, s.source.chunk)
 	n, err := s.source.cache.ReadAt(buf, int64(cacheOff))
 	if err != nil && !errors.Is(err, io.EOF) {
 		return nil, false
 	}
 	if n == 0 {
+		return nil, false
+	}
+	if full && uint64(n) < s.source.chunk {
 		return nil, false
 	}
 	return buf[:n], true
@@ -336,9 +347,11 @@ func main() {
 	}
 	defer os.Remove(*sockPath)
 
-	// Bulk download BEFORE accepting the handshake: a single sequential
-	// stream eliminates the concurrent-write corruption; FC's connect+send
-	// buffers in the kernel while we download, so delaying accept() is safe.
+	// Remote mode stages chunks in a sparse local cache. The bulk download
+	// runs after the handshake (below) concurrently with fault serving: a
+	// single sequential stream keeps cache writes ordered, and resolveChunk
+	// treats partially written chunks as misses so faults never race the
+	// writer (see readCache).
 	chunk := uint64(*chunkKB) << 10
 	source := &pageSource{chunk: chunk, inflight: make(map[uint64]*sync.WaitGroup)}
 	if *remoteURL != "" {
