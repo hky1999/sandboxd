@@ -330,40 +330,46 @@ func (s *faultServer) wake(start, length uint64) {
 
 // recvHandshake accepts Firecracker's connection and decodes the JSON mapping
 // table plus the uffd descriptor passed via SCM_RIGHTS.
-func recvHandshake(l net.Listener) ([]regionMapping, int, error) {
+// recvHandshake accepts Firecracker's connection and decodes the JSON mapping
+// table plus the uffd descriptor passed via SCM_RIGHTS. The connection is
+// returned OPEN: Firecracker never sends more data on it, so a read-side EOF
+// is the reliable signal that the VMM process is gone — the uffd descriptor
+// itself cannot provide one, because this handler holds the last reference
+// after the VMM exits and userfaultfd never polls HUP for its holder.
+func recvHandshake(l net.Listener) ([]regionMapping, int, *net.UnixConn, error) {
 	conn, err := l.Accept()
 	if err != nil {
-		return nil, -1, fmt.Errorf("accept: %w", err)
+		return nil, -1, nil, fmt.Errorf("accept: %w", err)
 	}
-	defer conn.Close()
 	c, ok := conn.(*net.UnixConn)
 	if !ok {
-		return nil, -1, errors.New("unexpected connection type")
+		conn.Close()
+		return nil, -1, nil, errors.New("unexpected connection type")
 	}
 	buf := make([]byte, 4096)
 	oob := make([]byte, 128)
 	n, oobn, _, _, err := c.ReadMsgUnix(buf, oob)
 	if err != nil {
-		return nil, -1, fmt.Errorf("read handshake: %w", err)
+		return nil, -1, nil, fmt.Errorf("read handshake: %w", err)
 	}
 	var regions []regionMapping
 	if err := json.Unmarshal(buf[:n], &regions); err != nil {
-		return nil, -1, fmt.Errorf("decode mappings %q: %w", string(buf[:n]), err)
+		return nil, -1, nil, fmt.Errorf("decode mappings %q: %w", string(buf[:n]), err)
 	}
 	cmsgs, err := unix.ParseSocketControlMessage(oob[:oobn])
 	if err != nil {
-		return nil, -1, fmt.Errorf("parse control message: %w", err)
+		return nil, -1, nil, fmt.Errorf("parse control message: %w", err)
 	}
 	for _, cm := range cmsgs {
 		if cm.Header.Type == unix.SCM_RIGHTS {
 			fds, err := unix.ParseUnixRights(&cm)
 			if err != nil || len(fds) == 0 {
-				return nil, -1, fmt.Errorf("parse SCM_RIGHTS: %v", err)
+				return nil, -1, nil, fmt.Errorf("parse SCM_RIGHTS: %v", err)
 			}
-			return regions, fds[0], nil
+			return regions, fds[0], c, nil
 		}
 	}
-	return nil, -1, errors.New("handshake carried no file descriptor")
+	return nil, -1, nil, errors.New("handshake carried no file descriptor")
 }
 
 func main() {
@@ -416,10 +422,11 @@ func main() {
 		}
 		source.file = file
 	}
-	regions, fd, err := recvHandshake(l)
+	regions, fd, vmmConn, err := recvHandshake(l)
 	if err != nil {
 		log.Fatalf("handshake: %v", err)
 	}
+	defer vmmConn.Close()
 	s := &faultServer{
 		regions: regions,
 		chunk:   chunk,
@@ -438,6 +445,27 @@ func main() {
 	faults := make(chan uint64, 4096)
 	var wg sync.WaitGroup
 	stop := make(chan struct{})
+	var stopOnce sync.Once
+	shutdown := func() { stopOnce.Do(func() { close(stop) }) }
+
+	// The VMM never writes after the handshake, so a read-side EOF on the
+	// handshake connection means the Firecracker process is gone (stopped,
+	// crashed, or the sandbox was deleted) and this handler must exit
+	// instead of lingering as an orphan. The uffd descriptor cannot signal
+	// this: after the VMM exits this handler holds the last reference, and
+	// userfaultfd never reports HUP to its own holder.
+	go func() {
+		buf := make([]byte, 1)
+		for {
+			if _, err := vmmConn.Read(buf); err != nil {
+				log.Printf("vmm connection closed (%v); exiting", err)
+				shutdown()
+				return
+			}
+			// Any unexpected inbound byte is ignored; the protocol has no
+			// further messages.
+		}
+	}()
 
 	// Background bulk download: sequentially fetchChunk every chunk. This
 	// runs concurrently with fault serving — the inflight dedup in
@@ -512,6 +540,11 @@ func main() {
 		if err != nil && err != unix.EINTR {
 			log.Fatalf("poll uffd: %v", err)
 		}
+		select {
+		case <-stop:
+			goto done
+		default:
+		}
 		if n == 0 {
 			continue
 		}
@@ -551,7 +584,8 @@ func main() {
 			}
 		}
 	}
-	close(stop)
+done:
+	shutdown()
 	close(faults)
 	wg.Wait()
 	s.mu.Lock()
