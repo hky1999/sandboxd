@@ -69,6 +69,12 @@ type firecrackerCheckpointManifest struct {
 	Compat       *firecrackerCheckpointCompat `json:"compat,omitempty"`
 	CreatedAt    time.Time                    `json:"created_at"`
 	Digests      map[string]string            `json:"digests"`
+	// MemoryDigestMode records how the memory digest was derived:
+	// "" or "sha256" — a plain sequential whole-file hash; "chunks" —
+	// the chunk root (sha256 over concatenated chunk digests), verified
+	// chunk-by-chunk in parallel against the chunks.json sidecar.
+	// The manifest is authoritative: verifiers follow what it records.
+	MemoryDigestMode string `json:"memory_digest_mode,omitempty"`
 }
 
 type firecrackerCheckpointLayout int
@@ -210,13 +216,13 @@ func finalizeFirecrackerCheckpointV2(
 			continue
 		}
 		if component.name == firecrackerCheckpointMemoryName {
-			// One-pass dual-hash: a single sequential read feeds the
-			// manifest's whole-file sha256 (semantics unchanged) while a
-			// worker pool digests 256KiB chunks in parallel and the
-			// chunks.json sidecar is written from the same pass. Wall time
-			// becomes max(io, hashing/cores) instead of their sum, and
-			// publishing no longer re-reads the artifact.
-			fileDigest, derr := digestMemoryWithChunkScan(ctx, files.Memory)
+			// One-pass dual-hash: a single sequential read feeds either the
+			// manifest's whole-file sha256 (semantics unchanged) or, in
+			// chunks mode, nothing at all — the digest becomes the chunk
+			// root, fully parallel — while a worker pool digests 256KiB
+			// chunks and the chunks.json sidecar is written from the same
+			// pass. Publishing no longer re-reads the artifact either way.
+			fileDigest, derr := digestMemoryWithChunkScan(ctx, files.Memory, manifest.MemoryDigestMode)
 			if derr != nil {
 				return derr
 			}
@@ -415,10 +421,22 @@ func (cache *checkpointDigestCache) verifyFirecrackerCheckpointDigests(
 ) error {
 	cache.mu.Lock()
 	defer cache.mu.Unlock()
+	if artifact.Manifest.MemoryDigestMode == checkpointchunks.FileDigestChunks {
+		// Chunks mode: the recorded digest is the chunk root; verify the
+		// sidecar chunk-by-chunk in parallel instead of one serial
+		// whole-file pass, then compare the root.
+		if err := cache.verifyFirecrackerCheckpointMemoryChunks(ctx, artifact); err != nil {
+			return err
+		}
+	}
 	for _, component := range firecrackerCheckpointComponents(artifact.Files) {
 		expected, recorded := artifact.Manifest.Digests[component.name]
 		if !recorded || expected == "" {
 			continue
+		}
+		if component.name == firecrackerCheckpointMemoryName &&
+			artifact.Manifest.MemoryDigestMode == checkpointchunks.FileDigestChunks {
+			continue // already verified through the chunk scan above
 		}
 		info, err := os.Lstat(component.path)
 		if err != nil {
@@ -492,7 +510,7 @@ func firecrackerCheckpointComponents(
 // digest is byte-for-byte what a plain sequential sha256 yields, so
 // verification and pre-existing manifests are unaffected; the sidecar is
 // what lets cn-publish skip re-reading the artifact.
-func digestMemoryWithChunkScan(ctx context.Context, memoryPath string) (string, error) {
+func digestMemoryWithChunkScan(ctx context.Context, memoryPath, digestMode string) (string, error) {
 	f, err := os.Open(memoryPath)
 	if err != nil {
 		return "", fmt.Errorf("open Firecracker checkpoint memory: %w", err)
@@ -590,7 +608,14 @@ func digestMemoryWithChunkScan(ctx context.Context, memoryPath string) (string, 
 		scan.Entries[i].Digest = digest
 	}
 	scan.ChunkCount = len(scan.Entries)
-	scan.FileDigest = hex.EncodeToString(fileHash.Sum(nil))
+	if digestMode == checkpointchunks.FileDigestChunks {
+		// The whole-file digest is the chunk root: no serial hash chains
+		// the pass to a single core's throughput.
+		scan.FileDigestMode = checkpointchunks.FileDigestChunks
+		scan.FileDigest = checkpointchunks.RootDigest(scan.Entries)
+	} else {
+		scan.FileDigest = hex.EncodeToString(fileHash.Sum(nil))
+	}
 	if err := checkpointchunks.Write(filepath.Dir(memoryPath), scan); err != nil {
 		return "", fmt.Errorf("write chunk manifest: %w", err)
 	}
@@ -629,4 +654,102 @@ func digestFirecrackerCheckpointComponent(
 		)
 	}
 	return hex.EncodeToString(hash.Sum(nil)), nil
+}
+
+// verifyFirecrackerCheckpointMemoryChunks re-hashes the memory artifact's
+// chunks in parallel and checks each digest plus the root against the
+// sidecar manifest. Memoized per chunk file identity is not needed: this
+// runs instead of the whole-file hash it replaces.
+func (cache *checkpointDigestCache) verifyFirecrackerCheckpointMemoryChunks(
+	ctx context.Context,
+	artifact *firecrackerCheckpointArtifact,
+) error {
+	scan, err := checkpointchunks.Load(filepath.Dir(artifact.Files.Memory))
+	if err != nil {
+		return fmt.Errorf("load chunk manifest for memory verification: %w", err)
+	}
+	if scan.FileDigestMode != checkpointchunks.FileDigestChunks {
+		return fmt.Errorf("chunk manifest digest mode %q, want %q",
+			scan.FileDigestMode, checkpointchunks.FileDigestChunks)
+	}
+	f, err := os.Open(artifact.Files.Memory)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	workers := runtime.GOMAXPROCS(0)
+	if workers > 8 {
+		workers = 8
+	}
+	type job struct {
+		index int
+		buf   []byte
+	}
+	type result struct {
+		index  int
+		digest string
+		err    error
+	}
+	jobs := make(chan job, workers*2)
+	results := make(chan result, workers*2)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := range jobs {
+				sum := sha256.Sum256(j.buf)
+				results <- result{index: j.index, digest: hex.EncodeToString(sum[:])}
+			}
+		}()
+	}
+	go func() { wg.Wait(); close(results) }()
+	byIndex := make(map[int]result)
+	var collect sync.WaitGroup
+	collect.Add(1)
+	go func() {
+		defer collect.Done()
+		for res := range results {
+			byIndex[res.index] = res
+		}
+	}()
+
+	for i := range scan.Entries {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		want := scan.ChunkBytes
+		if tail := int(scan.FileSize - scan.Entries[i].Offset); tail < want {
+			want = tail
+		}
+		block := make([]byte, want)
+		if _, err := io.ReadFull(io.NewSectionReader(f, scan.Entries[i].Offset, int64(want)), block); err != nil {
+			return fmt.Errorf("read chunk %d: %w", i, err)
+		}
+		jobs <- job{index: i, buf: block}
+	}
+	close(jobs)
+	collect.Wait()
+	for i, entry := range scan.Entries {
+		res, ok := byIndex[i]
+		if !ok {
+			return fmt.Errorf("memory chunk %d was not hashed", i)
+		}
+		if res.err != nil {
+			return res.err
+		}
+		if res.digest != entry.Digest {
+			return fmt.Errorf(
+				"Firecracker checkpoint component memory chunk %d digest mismatch: manifest %s on disk %s",
+				i, entry.Digest, res.digest)
+		}
+	}
+	root := checkpointchunks.RootDigest(scan.Entries)
+	if expected := artifact.Manifest.Digests[firecrackerCheckpointMemoryName]; expected != "" && root != expected {
+		return fmt.Errorf(
+			"Firecracker checkpoint component memory chunk root mismatch: manifest %s on disk %s",
+			expected, root)
+	}
+	return nil
 }

@@ -265,6 +265,10 @@ type Handler struct {
 	// store when the artifact carries a chunk manifest.
 	uffdChunkStore string
 
+	// digestMemoryMode selects the memory digest derivation; see
+	// FirecrackerConfig.DigestMemoryMode.
+	digestMemoryMode string
+
 	// checkpointWriteback starts background writeback for completed memory
 	// artifacts so a later XFS reflink does not inherit the previous
 	// generation's buffered-I/O debt.
@@ -404,6 +408,7 @@ func NewHandler(
 		uffdChunkKB:            firecrackerConfig.UffdChunkKB,
 		digestMemory:           firecrackerConfig.DigestMemoryOrDefault(),
 		uffdChunkStore:         firecrackerConfig.UffdChunkStore,
+		digestMemoryMode:       firecrackerConfig.DigestMemoryMode,
 		defaultDisk:            firecrackerConfig.DefaultOverlaySizeBytes,
 		ociLoader:              loader,
 		ociRootfsEnabled:       firecrackerConfig.OCIRootfsEnabled,

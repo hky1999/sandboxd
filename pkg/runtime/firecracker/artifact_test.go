@@ -430,6 +430,61 @@ func TestFinalizeCheckpointV2DigestPolicy(t *testing.T) {
 	}
 }
 
+func TestFinalizeChunksModeRoundtrip(t *testing.T) {
+	dir := t.TempDir()
+	files := sealArtifactFixture(t, dir)
+	data := make([]byte, int64(3*checkpointchunks.DefaultChunkBytes)+4096)
+	for i := range data {
+		data[i] = byte(i*13 + 1)
+	}
+	if err := os.WriteFile(files.Memory, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	manifest := &firecrackerCheckpointManifest{
+		SnapshotType:     firecrackerSnapshotTypeFull,
+		MemorySize:       int64(len(data)),
+		MemoryDigestMode: checkpointchunks.FileDigestChunks,
+	}
+	if err := finalizeFirecrackerCheckpointV2(context.Background(), files, manifest, true); err != nil {
+		t.Fatalf("finalize chunks mode: %v", err)
+	}
+	// The recorded digest is the chunk root, not the plain file hash.
+	plain := sha256.Sum256(data)
+	if got := manifest.Digests[firecrackerCheckpointMemoryName]; got == hex.EncodeToString(plain[:]) {
+		t.Fatal("chunks mode recorded the sequential hash")
+	}
+	scan, err := checkpointchunks.Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if scan.FileDigestMode != checkpointchunks.FileDigestChunks ||
+		scan.FileDigest != manifest.Digests[firecrackerCheckpointMemoryName] {
+		t.Fatalf("sidecar = %+v", scan)
+	}
+	if err := checkpointchunks.Verify(context.Background(), dir); err != nil {
+		t.Fatalf("sidecar verify: %v", err)
+	}
+
+	// Restore-side verification honors the recorded mode.
+	artifact, err := openFirecrackerCheckpoint(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cache := checkpointDigestCache{}
+	if err := cache.verifyFirecrackerCheckpointDigests(context.Background(), artifact); err != nil {
+		t.Fatalf("verify chunks mode: %v", err)
+	}
+
+	// Tampering one byte fails the chunk verification.
+	data[70000] ^= 0xFF
+	if err := os.WriteFile(files.Memory, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := cache.verifyFirecrackerCheckpointDigests(context.Background(), artifact); err == nil {
+		t.Fatal("tampered memory passed chunks verification")
+	}
+}
+
 func TestFinalizeMemoryChunkScanScalesPastChannelBuffers(t *testing.T) {
 	// 64MiB = 256 chunks, far beyond the worker-pool channel buffers; the
 	// collector must drain concurrently with the reads or finalize

@@ -40,6 +40,15 @@ const ManifestName = "chunks.json"
 // generations re-publish little.
 const DefaultChunkBytes = 256 << 10
 
+// File digest modes. Sha256 is the plain sequential whole-file hash;
+// Chunks derives the file digest as the sha256 of the concatenated chunk
+// digests (offset order) — fully parallelizable, and equivalent for
+// corruption detection because every chunk digest is checked on its own.
+const (
+	FileDigestSha256 = "sha256"
+	FileDigestChunks = "chunks"
+)
+
 // Chunk is one content-addressed slice of the memory file.
 type Chunk struct {
 	Offset int64  `json:"offset"`
@@ -48,13 +57,27 @@ type Chunk struct {
 
 // Manifest is the chunk description of one memory file.
 type Manifest struct {
-	Version    int     `json:"version"`
-	File       string  `json:"file"`
-	FileSize   int64   `json:"file_size"`
-	FileDigest string  `json:"file_digest"`
-	ChunkBytes int     `json:"chunk_bytes"`
-	ChunkCount int     `json:"chunk_count"`
-	Entries    []Chunk `json:"entries"`
+	Version    int    `json:"version"`
+	File       string `json:"file"`
+	FileSize   int64  `json:"file_size"`
+	FileDigest string `json:"file_digest"`
+	// FileDigestMode names how FileDigest was derived: "sha256"
+	// (sequential whole-file hash, the default for pre-existing sidecars)
+	// or "chunks" (sha256 over the concatenated chunk digests).
+	FileDigestMode string  `json:"file_digest_mode,omitempty"`
+	ChunkBytes     int     `json:"chunk_bytes"`
+	ChunkCount     int     `json:"chunk_count"`
+	Entries        []Chunk `json:"entries"`
+}
+
+// RootDigest derives the "chunks"-mode file digest from ordered chunk
+// digests: sha256 over their hex concatenation.
+func RootDigest(entries []Chunk) string {
+	h := sha256.New()
+	for i := range entries {
+		h.Write([]byte(entries[i].Digest))
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // Compute chunks the checkpoint's memory file and writes the sidecar
@@ -109,6 +132,7 @@ func Compute(ctx context.Context, dir string, chunkBytes int) (*Manifest, error)
 	}
 	manifest.ChunkCount = len(manifest.Entries)
 	manifest.FileDigest = hex.EncodeToString(fileHash.Sum(nil))
+	manifest.FileDigestMode = FileDigestSha256
 
 	if err := Write(dir, manifest); err != nil {
 		return nil, fmt.Errorf("write chunk manifest: %w", err)
@@ -178,8 +202,19 @@ func Verify(ctx context.Context, dir string) error {
 				i, chunk.Offset, chunk.Digest, got)
 		}
 	}
-	if got := hex.EncodeToString(fileHash.Sum(nil)); got != manifest.FileDigest {
-		return fmt.Errorf("file digest mismatch: manifest %s on disk %s", manifest.FileDigest, got)
+	switch manifest.FileDigestMode {
+	case "", FileDigestSha256:
+		if got := hex.EncodeToString(fileHash.Sum(nil)); got != manifest.FileDigest {
+			return fmt.Errorf("file digest mismatch: manifest %s on disk %s", manifest.FileDigest, got)
+		}
+	case FileDigestChunks:
+		// Every chunk digest was checked above; the root binds them in
+		// order, so no second whole-file pass is needed.
+		if got := RootDigest(manifest.Entries); got != manifest.FileDigest {
+			return fmt.Errorf("chunk root digest mismatch: manifest %s on disk %s", manifest.FileDigest, got)
+		}
+	default:
+		return fmt.Errorf("unknown file digest mode %q", manifest.FileDigestMode)
 	}
 	return nil
 }

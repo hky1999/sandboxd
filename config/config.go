@@ -234,6 +234,13 @@ type FirecrackerConfig struct {
 	// second per GiB of checkpointed memory. Nil (key absent) means true;
 	// set digest_memory=false to opt out for latency-sensitive setups.
 	DigestMemory *bool `toml:"digest_memory" json:"digestMemory,omitempty"`
+	// DigestMemoryMode selects how the memory digest is derived when
+	// digest_memory is enabled: "sha256" (default, plain sequential
+	// whole-file hash) or "chunks" (per-chunk digests in parallel; the
+	// recorded digest becomes the chunk root and verification follows the
+	// manifest's recorded mode). Chunks mode trades a format marker for a
+	// multi-core seal; enable it cluster-wide so every verifier knows it.
+	DigestMemoryMode string `toml:"digest_memory_mode" json:"digestMemoryMode,omitempty"`
 	// UffdChunkStore points uffd restores at a content-addressed chunk
 	// store. Artifacts carrying a chunks.json next to their memory file are
 	// then served per-chunk by digest (verified while copying); artifacts
