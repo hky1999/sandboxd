@@ -96,12 +96,19 @@ func ListTemplates(ctx context.Context, cfg Config) ([]TemplateEntry, error) {
 			if err := ctx.Err(); err != nil {
 				return nil, err
 			}
+			// The registry's dir is written from the node that
+			// manufactured the template and may be absolute there but
+			// absent here: the same registry is mounted at different
+			// paths across nodes. Prefer the recorded path when it
+			// resolves, and fall back to this node's root-relative
+			// location before giving up on the entry.
 			dir := t.Dir
-			if dir == "" {
-				dir = filepath.Join(root, t.ID)
-			}
-			if info, err := os.Lstat(dir); err != nil || !info.IsDir() {
-				continue
+			if dir == "" || !dirExists(dir) {
+				local := filepath.Join(root, t.ID)
+				if !dirExists(local) {
+					continue
+				}
+				dir = local
 			}
 			if _, dup := seen[t.ID]; dup {
 				continue
@@ -190,4 +197,9 @@ func VerifyTemplate(ctx context.Context, cfg Config, id string) (TemplateVerifyR
 		result.Components = append(result.Components, check)
 	}
 	return result, nil
+}
+
+func dirExists(path string) bool {
+	info, err := os.Lstat(path)
+	return err == nil && info.IsDir()
 }
