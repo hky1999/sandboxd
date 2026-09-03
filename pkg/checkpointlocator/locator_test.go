@@ -245,6 +245,54 @@ func TestFetchAndReadCompat(t *testing.T) {
 	}
 }
 
+func TestDecidePublishedGate(t *testing.T) {
+	nodes := []NodeRecord{{ID: "peer", Runtimes: []RuntimeFace{face()}}}
+	base := Input{
+		CheckpointID: "C1",
+		Compat:       &CheckpointCompat{},
+		OriginNodeID: "gone",
+		Nodes:        nodes,
+	}
+
+	// Without the gate, cross-node placement proceeds.
+	if got, err := Decide(base); err != nil || got.NodeID != "peer" {
+		t.Fatalf("ungated = %+v, %v", got, err)
+	}
+
+	// Requiring publication locks cross-node until the state machine says
+	// published; every non-published state fails closed with the state named.
+	for _, state := range []string{"", "publishing", "publish_failed"} {
+		in := base
+		in.RequirePublished = true
+		in.PublishState = state
+		if _, err := Decide(in); err == nil ||
+			!strings.Contains(err.Error(), "cross-node restore is locked") {
+			t.Fatalf("state %q not locked: %v", state, err)
+		}
+	}
+
+	// Published unlocks it.
+	in := base
+	in.RequirePublished = true
+	in.PublishState = "published"
+	if got, err := Decide(in); err != nil || !got.CrossNode {
+		t.Fatalf("published not unlocked: %+v, %v", got, err)
+	}
+
+	// The origin is exempt: it holds the local artifact, published or not.
+	origin := []NodeRecord{{ID: "origin", Runtimes: []RuntimeFace{face()}}}
+	in2 := Input{
+		CheckpointID:     "C1",
+		Compat:           &CheckpointCompat{},
+		OriginNodeID:     "origin",
+		RequirePublished: true,
+		Nodes:            origin,
+	}
+	if got, err := Decide(in2); err != nil || got.NodeID != "origin" || got.CrossNode {
+		t.Fatalf("origin not exempt = %+v, %v", got, err)
+	}
+}
+
 func TestDecideTemplateHolderAndMatrix(t *testing.T) {
 	goodFace := face()
 	badFace := face(func(f *RuntimeFace) { f.Kernel = "other" })
