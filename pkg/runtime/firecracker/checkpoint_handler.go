@@ -983,7 +983,10 @@ func (handler *Handler) launchUffdHandler(sandboxID, sockPath, backingPath, stat
 		if err := os.MkdirAll(filepath.Dir(cachePath), 0o755); err != nil {
 			return fmt.Errorf("create uffd cache dir: %w", err)
 		}
-		args = append(args, "-chunk-store", handler.uffdChunkStore, "-cache", cachePath)
+		// The backing path still names the artifact: the handler looks for
+		// its chunk manifest next to it and falls back to it when none.
+		args = append(args, "-backing", backingPath,
+			"-chunk-store", handler.uffdChunkStore, "-cache", cachePath)
 	} else {
 		args = append(args, "-backing", backingPath)
 	}
