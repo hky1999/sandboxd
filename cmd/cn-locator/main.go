@@ -35,6 +35,7 @@ import (
 	"time"
 
 	"github.com/inclusionAI/sandboxd/pkg/checkpointlocator"
+	"github.com/inclusionAI/sandboxd/pkg/checkpointpublish"
 )
 
 func main() {
@@ -46,6 +47,8 @@ func main() {
 	templateRoot := flag.String("template-root", "", "local template root holding <id>/manifest.json for -template-id")
 	origin := flag.String("origin", "", "origin node ID (placement prefers it when registered)")
 	pin := flag.Bool("pin", false, "forbid cross-node placement even when a compatible peer exists")
+	requirePublished := flag.Bool("require-published", false,
+		"lock cross-node placement behind the chunk publish state machine (origin exempt)")
 	timeout := flag.Duration("timeout", 10*time.Second, "overall deadline")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "usage: cn-locator -nodes http://n1:18090,http://n2:18090 (-checkpoint-dir DIR [-origin ID] [-pin] | -template-id ID [-template-compat DIR])\n")
@@ -112,12 +115,25 @@ func main() {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			os.Exit(2)
 		}
+		publishState := ""
+		if *requirePublished {
+			state, perr := checkpointpublish.Status(*checkpointDir)
+			if perr != nil {
+				fmt.Fprintf(os.Stderr, "error: %v\n", perr)
+				os.Exit(2)
+			}
+			if state != nil {
+				publishState = state.State
+			}
+		}
 		placement, err = checkpointlocator.Decide(checkpointlocator.Input{
-			CheckpointID: id,
-			Compat:       compat,
-			OriginNodeID: *origin,
-			PinToOrigin:  *pin,
-			Nodes:        records,
+			CheckpointID:     id,
+			Compat:           compat,
+			OriginNodeID:     *origin,
+			PinToOrigin:      *pin,
+			RequirePublished: *requirePublished,
+			PublishState:     publishState,
+			Nodes:            records,
 		})
 	}
 	if err != nil {

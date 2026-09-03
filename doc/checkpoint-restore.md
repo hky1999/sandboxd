@@ -438,6 +438,29 @@ Template placement (`checkpointlocator.DecideTemplate`, `cn-locator
 compatibility matrix; derivation itself is the ordinary restore path with
 the template directory as `checkpoint_dir`.
 
+### Chunked distribution (checkpointchunks / chunkstore / checkpointpublish)
+
+A checkpoint's memory file can be distributed as fixed-size content-addressed
+chunks (default 256 KiB, matching the uffd handler's fetch granularity).
+`chunks.json`, a sidecar written after the artifact is sealed, lists every
+chunk's offset and sha256 plus the whole-file digest as a cross-check; it
+never participates in the seal or the template content address.
+
+`cn-publish -checkpoint-dir DIR -store DIR` drives the publish state machine
+(persisted at `<root>/.publish/<id>.json`, beside — never inside — the
+artifact): `local_ready -> publishing -> published | publish_failed`.
+Publishing is external orchestration: the checkpoint RPC has already
+returned, local restores are unaffected by its outcome, and a failed or
+interrupted run resumes and re-puts only the chunks the store is missing.
+Published objects are immutable and content-addressed in the store
+(`root/<aa>/<sha256>`), so generations sharing page ranges share objects and
+no consumer can fetch wrong bytes.
+
+Only `published` unlocks cross-node placement: `cn-locator
+-require-published` gates the cross-node branch of the placement tree on the
+persisted state (the origin is exempt — it holds the local artifact), and
+the catalog reports each entry's `publish_state`.
+
 ### Placement (checkpointlocator)
 
 `pkg/checkpointlocator` decides which node may restore a checkpoint. Its
