@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"os"
@@ -38,6 +39,8 @@ import (
 type Module struct {
 	cfg      Config
 	listener net.Listener
+
+	tcpListener net.Listener
 
 	mu     sync.Mutex
 	closed bool
@@ -67,6 +70,20 @@ func NewModule(cfg Config) (*Module, error) {
 			logrus.Warnf("checkpointcatalog: http server stopped: %v", err)
 		}
 	}()
+	if cfg.Listen != "" {
+		tcpLn, err := net.Listen("tcp", cfg.Listen)
+		if err != nil {
+			ln.Close()
+			return nil, fmt.Errorf("listen checkpoint catalog TCP %s: %w", cfg.Listen, err)
+		}
+		m.tcpListener = tcpLn
+		tcpSrv := &http.Server{Handler: m.handler(), ReadHeaderTimeout: 10 * time.Second}
+		go func() {
+			if err := tcpSrv.Serve(tcpLn); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				logrus.Warnf("checkpointcatalog: tcp server stopped: %v", err)
+			}
+		}()
+	}
 	return m, nil
 }
 
@@ -79,10 +96,22 @@ func (m *Module) Close() {
 	}
 	m.closed = true
 	m.listener.Close()
+	if m.tcpListener != nil {
+		m.tcpListener.Close()
+	}
 }
 
 func (m *Module) handler() http.Handler {
 	mux := http.NewServeMux()
+	if m.cfg.Node != nil {
+		mux.HandleFunc("/api/v1/node", func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodGet {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			writeJSON(w, *m.cfg.Node)
+		})
+	}
 	mux.HandleFunc("/api/v1/checkpoints", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)

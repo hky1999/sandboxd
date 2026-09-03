@@ -29,19 +29,28 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/inclusionAI/sandboxd/pkg/checkpointlocator"
 )
 
 // manifestName matches the Firecracker v2 layout; its presence is the
 // commit marker that makes a directory a sealed checkpoint.
 const manifestName = "manifest.json"
 
-// Config selects the socket path and the caller-owned roots to inventory.
+// Config selects the listen surfaces, the caller-owned roots to inventory,
+// and the node record to advertise.
 type Config struct {
 	// SockPath is the Unix socket the admin HTTP server listens on.
 	SockPath string
+	// Listen optionally serves the same endpoints over TCP (host:port) so
+	// off-node consumers — the placement locator — can reach the catalog.
+	Listen string
 	// Dirs are scanned one level deep: every immediate subdirectory that
 	// carries a manifest.json becomes an entry.
 	Dirs []string
+	// Node is the node record served at /api/v1/node. Nil disables the
+	// endpoint; the wiring fills it from the runtime configuration.
+	Node *checkpointlocator.NodeRecord
 }
 
 // Compat is the software-stack tuple a checkpoint pins. A cross-node
