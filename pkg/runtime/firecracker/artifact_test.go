@@ -16,11 +16,15 @@ package firecracker
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/inclusionAI/sandboxd/pkg/checkpointchunks"
 )
 
 func writeArtifactComponent(t *testing.T, path string, size int) {

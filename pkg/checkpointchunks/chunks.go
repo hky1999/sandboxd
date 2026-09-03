@@ -110,14 +110,22 @@ func Compute(ctx context.Context, dir string, chunkBytes int) (*Manifest, error)
 	manifest.ChunkCount = len(manifest.Entries)
 	manifest.FileDigest = hex.EncodeToString(fileHash.Sum(nil))
 
-	encoded, err := json.MarshalIndent(manifest, "", "  ")
-	if err != nil {
-		return nil, err
-	}
-	if err := os.WriteFile(filepath.Join(dir, ManifestName), append(encoded, '\n'), 0o600); err != nil {
+	if err := Write(dir, manifest); err != nil {
 		return nil, fmt.Errorf("write chunk manifest: %w", err)
 	}
 	return manifest, nil
+}
+
+// Write stores the manifest as the sidecar file. The checkpoint finalize
+// path uses it to persist chunk digests computed in its own single pass
+// over the memory file (one-pass dual-hash); Compute is the standalone
+// equivalent for artifacts that predate it.
+func Write(dir string, manifest *Manifest) error {
+	encoded, err := json.MarshalIndent(manifest, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(dir, ManifestName), append(encoded, '\n'), 0o600)
 }
 
 // Load reads the sidecar manifest from a checkpoint directory. A checkpoint
