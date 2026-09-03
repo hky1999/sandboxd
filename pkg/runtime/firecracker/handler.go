@@ -264,6 +264,10 @@ type Handler struct {
 	// cost lands in the post-resume tail (see FirecrackerConfig.DigestMemory).
 	digestMemory bool
 
+	// uffdChunkStore serves uffd restores from a content-addressed chunk
+	// store when the artifact carries a chunk manifest.
+	uffdChunkStore string
+
 	// checkpointWriteback starts background writeback for completed memory
 	// artifacts so a later XFS reflink does not inherit the previous
 	// generation's buffered-I/O debt.
@@ -404,6 +408,7 @@ func NewHandler(
 		uffdCacheDir:           firecrackerConfig.UffdCacheDir,
 		uffdChunkKB:            firecrackerConfig.UffdChunkKB,
 		digestMemory:           firecrackerConfig.DigestMemoryOrDefault(),
+		uffdChunkStore:         firecrackerConfig.UffdChunkStore,
 		defaultDisk:            firecrackerConfig.DefaultOverlaySizeBytes,
 		ociLoader:              loader,
 		virtiofsdPath:          firecrackerConfig.VirtioFSDPath,
