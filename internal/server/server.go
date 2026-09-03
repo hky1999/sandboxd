@@ -37,6 +37,7 @@ import (
 	"github.com/inclusionAI/sandboxd/pkg/cgroupmanager"
 	"github.com/inclusionAI/sandboxd/pkg/errord"
 	"github.com/inclusionAI/sandboxd/pkg/imagemanager"
+	imageapi "github.com/inclusionAI/sandboxd/pkg/imagemanager/api"
 	"github.com/inclusionAI/sandboxd/pkg/networkmanager"
 	"github.com/inclusionAI/sandboxd/pkg/networkmanager/networkacl"
 	// The side-effect imports register the available NAT backends before
@@ -45,6 +46,7 @@ import (
 	_ "github.com/inclusionAI/sandboxd/pkg/networkmanager/bridge"
 	"github.com/inclusionAI/sandboxd/pkg/resourcemanager"
 	svc "github.com/inclusionAI/sandboxd/pkg/runtime"
+	"github.com/inclusionAI/sandboxd/pkg/runtime/firecracker"
 	"github.com/inclusionAI/sandboxd/pkg/sandbox"
 	"github.com/inclusionAI/sandboxd/pkg/store"
 	"github.com/inclusionAI/sandboxd/pkg/volumemanager"
@@ -84,21 +86,27 @@ type sandboxService struct {
 	aclMgr       *networkacl.Manager
 	resourceMod  *resourcemanager.Module
 	imageMod     *imagemanager.Module
+	imageSvc     imageapi.Service
 	volumeMgr    *volumemanager.Module
 	xpuMgr       *xpumanager.Manager
 
 	store store.DbStore
+	// firecrackerOCIConverter is present only when the node explicitly enables
+	// eager OCI-to-EROFS materialization for Firecracker root filesystems.
+	firecrackerOCIConverter *firecracker.OCIRootfsConverter
 
 	runtime.UnimplementedSandboxServiceServer
 
 	fsMgr *fsManager
 
-	ready         atomic.Bool
-	recoveryReady atomic.Bool
-	deleteGroup   singleflight.Group
-	aclMu         sync.Mutex
-	checkpointMu  sync.Mutex
-	checkpointing map[string]struct{}
+	ready                             atomic.Bool
+	recoveryReady                     atomic.Bool
+	deleteGroup                       singleflight.Group
+	aclMu                             sync.Mutex
+	checkpointMu                      sync.Mutex
+	checkpointing                     map[string]struct{}
+	firecrackerCheckpointMemorySlotMu sync.Mutex
+	firecrackerCheckpointMemorySlot   chan struct{}
 }
 
 // loadRuntimeHandlers loads runtime handlers with exponential backoff.
@@ -221,7 +229,16 @@ func (h *sandboxService) startSandboxRuntime(
 				runtimeName,
 			)
 		}
-		err = checkpointHandler.Restore(ctx, startConfig)
+		err = h.withTransientFirecrackerCheckpointMemory(
+			ctx,
+			runtimeName,
+			startConfig.ID,
+			startConfig.CgroupPath,
+			startConfig.Resources,
+			handler,
+			false,
+			func() error { return checkpointHandler.Restore(ctx, startConfig) },
+		)
 	} else {
 		err = handler.Start(ctx, startConfig)
 	}
@@ -275,6 +292,11 @@ func (h *sandboxService) deleteSandboxRuntime(ctx context.Context, sandboxID str
 		return errord.ToGRPC(err)
 	}
 	metrics.RecordRuntimeCallResult("delete", "success", c.Metadata.RuntimeHandler)
+	if h.resourceMod != nil {
+		h.resourceMod.ReleaseTransientMemory(
+			firecrackerCheckpointReservationOwner(sandboxID),
+		)
+	}
 	if h.xpuMgr != nil {
 		h.xpuMgr.Release(sandboxID)
 	}
@@ -414,9 +436,32 @@ func (h *sandboxService) ListAvailableRuntimes(
 	}
 	runtimeClasses := h.serviceHandler.Keys()
 	sort.Strings(runtimeClasses)
+	runtimes := make([]*runtime.RuntimeInfo, 0, len(runtimeClasses))
+	for _, runtimeClass := range runtimeClasses {
+		info := &runtime.RuntimeInfo{RuntimeClass: runtimeClass}
+		handler, ok := h.serviceHandler.Get(runtimeClass)
+		if !ok {
+			logrus.Debugf(
+				"runtime handler %q disappeared while listing capabilities",
+				runtimeClass,
+			)
+			runtimes = append(runtimes, info)
+			continue
+		}
+		if _, ok := handler.(svc.CheckpointHandler); ok {
+			info.SupportsCheckpointRestore = true
+		}
+		if provider, ok := handler.(svc.CheckpointRestoreCapabilitiesProvider); ok {
+			capabilities := provider.CheckpointRestoreCapabilities()
+			info.CheckpointHandoffPath = capabilities.CheckpointHandoffPath
+			info.RestoreEnvPath = capabilities.RestoreEnvPath
+		}
+		runtimes = append(runtimes, info)
+	}
 
 	return &runtime.ListAvailableRuntimesResponse{
 		RuntimeClasses: runtimeClasses,
+		Runtimes:       runtimes,
 	}, nil
 }
 
@@ -733,6 +778,7 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 		serviceHandler:                    cmap.New[svc.Handler](),
 		fsMgr:                             newFSManager(imgSvc, stateStore),
 		imageMod:                          imgMod,
+		imageSvc:                          imgSvc,
 		resourceMod:                       nodeResMod,
 		xpuMgr:                            xpuMgr,
 	}
@@ -756,6 +802,24 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 			}
 		}
 	}()
+	if cfg.RuntimeConfig.Firecracker.OCIRootfsEnabled {
+		mkfsEROFS := strings.TrimSpace(
+			cfg.RuntimeConfig.Firecracker.MkfsEROFSPath,
+		)
+		if mkfsEROFS == "" {
+			mkfsEROFS = config.DefaultFirecrackerMkfsEROFS
+		}
+		converter, converterErr := firecracker.NewOCIRootfsConverter(
+			mkfsEROFS,
+		)
+		if converterErr != nil {
+			return nil, fmt.Errorf(
+				"initialize Firecracker OCI rootfs converter: %w",
+				converterErr,
+			)
+		}
+		s.firecrackerOCIConverter = converter
+	}
 
 	s.loadRuntimeHandlers()
 	if nodeResMod != nil && cfg.RuntimeConfig.FilestoreDir != "" {
@@ -1323,6 +1387,52 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 			ID:      "",
 		}, err
 	}
+	runtimeRootfs := preparedFilesystem.RootfsPath()
+	if startReq.Runtime == config.RuntimeNameFirecracker &&
+		startReq.Rootfs.GetType() == runtime.RootfsSrcType_IMAGE {
+		if h.firecrackerOCIConverter == nil {
+			err := errors.New(
+				"Firecracker OCI image rootfs conversion is not configured",
+			)
+			return &runtime.StartResponse{Code: -1, Message: err.Error()}, err
+		}
+		if h.imageSvc == nil {
+			err := errors.New("image manager is unavailable for Firecracker OCI rootfs conversion")
+			return &runtime.StartResponse{Code: -1, Message: err.Error()}, err
+		}
+		materialization, materializationErr := h.imageSvc.RootfsMaterialization(
+			startReq.Rootfs.GetImageUrl(),
+		)
+		if materializationErr != nil {
+			return &runtime.StartResponse{
+				Code: -1,
+				Message: fmt.Sprintf(
+					"failed to resolve Firecracker OCI rootfs metadata: %v",
+					materializationErr,
+				),
+			}, materializationErr
+		}
+		if materialization == nil {
+			err := errors.New("image manager returned empty Firecracker OCI rootfs metadata")
+			return &runtime.StartResponse{Code: -1, Message: err.Error()}, err
+		}
+		runtimeRootfs, err = h.firecrackerOCIConverter.Convert(
+			ctx,
+			startReq.Rootfs.GetImageUrl(),
+			materialization.ContentID,
+			materialization.ArtifactDir,
+			runtimeRootfs,
+		)
+		if err != nil {
+			return &runtime.StartResponse{
+				Code: -1,
+				Message: fmt.Sprintf(
+					"failed to prepare Firecracker OCI rootfs: %v",
+					err,
+				),
+			}, err
+		}
+	}
 	var specUpdates *svc.SpecUpdates
 	if len(startReq.XpuAllocations) > 0 {
 		if h.xpuMgr == nil {
@@ -1421,7 +1531,7 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 		ID:                      sandboxID,
 		Hostname:                defaults.Hostname,
 		Command:                 startReq.Command,
-		Rootfs:                  preparedFilesystem.RootfsPath(),
+		Rootfs:                  runtimeRootfs,
 		RootfsReadonly:          startReq.Rootfs.GetReadonly(),
 		Resources:               sandboxResources,
 		Mounts:                  sandboxFiles.Mounts(),
@@ -1435,6 +1545,7 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 		DisableCgroup:           h.config.DisableCgroup,
 		SpecUpdates:             specUpdates,
 		WritableLayerLimitBytes: startReq.WritableLayerLimitBytes,
+		ExtraConfig:             startReq.ExtraConfig,
 		EnableKVM:               extraConfig.EnableKVM,
 		CheckpointDir:           checkpointDir,
 	}

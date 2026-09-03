@@ -293,6 +293,11 @@ type restoreOpts struct {
 	UseCheckpointGofer bool `json:"use_checkpoint_gofer"`
 }
 
+const (
+	checkpointPagesMetadataName = "pages_meta.img"
+	checkpointPagesName         = "pages.img"
+)
+
 func (o *restoreOpts) filePayload() []*os.File {
 	return o.payload.Files
 }
@@ -302,7 +307,7 @@ func (o *restoreOpts) setFilePayload(files []*os.File) {
 }
 
 // Restore connects a runsc sandbox previously created with Create, installs
-// its target networking, and restores the single compressed checkpoint file.
+// its target networking, and restores the checkpoint files.
 // The Restore RPC has no fixed timeout because loading a large image may take
 // arbitrarily long; it remains cancellable through ctx.
 func (c *Client) Restore(ctx context.Context, args StartArgs, imagePath string) error {
@@ -339,13 +344,16 @@ func (c *Client) Restore(ctx context.Context, args StartArgs, imagePath string) 
 	if err := callContextWithTimeout(ctx, conn, contMgrSetNetworkArgs, networkArgs, nil, 30*time.Second); err != nil {
 		return fmt.Errorf("set network arguments for %s: %w", args.ID, err)
 	}
-	image, err := os.Open(imagePath)
+	files, havePagesFile, err := openRestoreFiles(imagePath)
 	if err != nil {
-		return fmt.Errorf("open checkpoint image for %s: %w", args.ID, err)
+		return fmt.Errorf("open checkpoint files for %s: %w", args.ID, err)
 	}
-	defer image.Close()
+	defer closeFiles(files)
 
-	opts := &restoreOpts{payload: filePayload{Files: []*os.File{image}}}
+	opts := &restoreOpts{
+		payload:       filePayload{Files: files},
+		HavePagesFile: havePagesFile,
+	}
 	device, err := c.openPlatformDevice()
 	if err != nil {
 		return fmt.Errorf("open platform device for %s: %w", args.ID, err)
@@ -362,6 +370,68 @@ func (c *Client) Restore(ctx context.Context, args StartArgs, imagePath string) 
 		return fmt.Errorf("mark runsc state running for %s: %w", args.ID, err)
 	}
 	return nil
+}
+
+func openRestoreFiles(imagePath string) ([]*os.File, bool, error) {
+	image, err := os.Open(imagePath)
+	if err != nil {
+		return nil, false, fmt.Errorf("open checkpoint image: %w", err)
+	}
+	files := []*os.File{image}
+
+	directory := filepath.Dir(imagePath)
+	metadataPath := filepath.Join(directory, checkpointPagesMetadataName)
+	pagesPath := filepath.Join(directory, checkpointPagesName)
+	metadataExists, err := fileExists(metadataPath)
+	if err != nil {
+		closeFiles(files)
+		return nil, false, err
+	}
+	pagesExist, err := fileExists(pagesPath)
+	if err != nil {
+		closeFiles(files)
+		return nil, false, err
+	}
+	if metadataExists != pagesExist {
+		closeFiles(files)
+		return nil, false, fmt.Errorf(
+			"incomplete checkpoint page files: %s exists=%t, %s exists=%t",
+			checkpointPagesMetadataName,
+			metadataExists,
+			checkpointPagesName,
+			pagesExist,
+		)
+	}
+	if !metadataExists {
+		return files, false, nil
+	}
+
+	for _, path := range []string{metadataPath, pagesPath} {
+		file, err := os.Open(path)
+		if err != nil {
+			closeFiles(files)
+			return nil, false, fmt.Errorf("open checkpoint page file %s: %w", path, err)
+		}
+		files = append(files, file)
+	}
+	return files, true, nil
+}
+
+func fileExists(path string) (bool, error) {
+	_, err := os.Stat(path)
+	if err == nil {
+		return true, nil
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	return false, fmt.Errorf("stat checkpoint page file %s: %w", path, err)
+}
+
+func closeFiles(files []*os.File) {
+	for _, file := range files {
+		_ = file.Close()
+	}
 }
 
 func (c *Client) openPlatformDevice() (*os.File, error) {

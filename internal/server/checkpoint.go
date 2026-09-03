@@ -24,8 +24,10 @@ import (
 	"time"
 
 	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
+	"github.com/inclusionAI/sandboxd/config"
 	"github.com/inclusionAI/sandboxd/pkg/errord"
 	svc "github.com/inclusionAI/sandboxd/pkg/runtime"
+	specs "github.com/opencontainers/runtime-spec/specs-go"
 )
 
 type checkpointDirectory struct {
@@ -100,12 +102,39 @@ func (h *sandboxService) Checkpoint(
 		time.Duration(request.TimeoutSeconds)*time.Second,
 	)
 	defer cancel()
-	err = checkpointHandler.Checkpoint(checkpointCtx, svc.CheckpointConfig{
-		ID:           request.ID,
-		Directory:    directory.path,
-		Compress:     request.Compress,
-		LeaveRunning: request.LeaveRunning,
-	})
+	cgroupPath := ""
+	var resources *runtime.LinuxSandboxResources
+	if sandbox.Metadata.RuntimeHandler == config.RuntimeNameFirecracker {
+		resource, resourceErr := h.sandboxManager.CollectResourceByID(request.ID)
+		if resourceErr != nil {
+			_ = directory.cleanup()
+			return nil, errord.ToGRPC(resourceErr)
+		}
+		cgroupPath = resource.Resources[config.ResourceNameCgroup]
+		resources = checkpointGuestMemoryResources(sandbox.Spec)
+		if resources == nil {
+			resources = sandbox.Status.Get().Resources
+		}
+	}
+	err = h.withTransientFirecrackerCheckpointMemory(
+		checkpointCtx,
+		sandbox.Metadata.RuntimeHandler,
+		request.ID,
+		cgroupPath,
+		resources,
+		handler,
+		true,
+		func() error {
+			return checkpointHandler.Checkpoint(checkpointCtx, svc.CheckpointConfig{
+				ID:           request.ID,
+				Directory:    directory.path,
+				CgroupPath:   cgroupPath,
+				Compress:     request.Compress,
+				LeaveRunning: request.LeaveRunning,
+				SnapshotType: request.SnapshotType,
+			})
+		},
+	)
 	if err != nil {
 		if checkpointCtx.Err() != nil {
 			err = checkpointCtx.Err()
@@ -125,6 +154,28 @@ func (h *sandboxService) Checkpoint(
 		return nil, errord.ToGRPC(operationErr)
 	}
 	return &runtime.CheckpointResponse{}, nil
+}
+
+// checkpointGuestMemoryResources returns the guest-visible limit persisted in
+// config.json. Unlike the live cgroup limit, this value cannot be confused
+// with transient host checkpoint headroom left behind by a daemon restart.
+func checkpointGuestMemoryResources(
+	sandboxSpec *specs.Spec,
+) *runtime.LinuxSandboxResources {
+	if sandboxSpec == nil || sandboxSpec.Linux == nil ||
+		sandboxSpec.Linux.Resources == nil ||
+		sandboxSpec.Linux.Resources.Memory == nil ||
+		sandboxSpec.Linux.Resources.Memory.Limit == nil ||
+		*sandboxSpec.Linux.Resources.Memory.Limit <= 0 {
+		return nil
+	}
+	resources := &runtime.LinuxSandboxResources{
+		MemoryLimitInBytes: *sandboxSpec.Linux.Resources.Memory.Limit,
+	}
+	if swap := sandboxSpec.Linux.Resources.Memory.Swap; swap != nil {
+		resources.MemorySwapLimitInBytes = *swap
+	}
+	return resources
 }
 
 func (h *sandboxService) beginCheckpoint(id string) bool {

@@ -17,9 +17,11 @@ package cgroupmanager
 import (
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -86,6 +88,94 @@ func TestReadV2PidsCurrent(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, ^uint64(0), value)
 	assert.True(t, tracked)
+}
+
+func TestCgroupV2KillUsesExplicitSignals(t *testing.T) {
+	mountpoint := t.TempDir()
+	name := "/sandbox/test"
+	groupPath := filepath.Join(mountpoint, name)
+	require.NoError(t, os.MkdirAll(groupPath, 0755))
+
+	cmd := exec.Command("sleep", "30")
+	require.NoError(t, cmd.Start())
+	drained := make(chan error, 1)
+	t.Cleanup(func() { _ = cmd.Process.Kill() })
+
+	procsPath := filepath.Join(groupPath, "cgroup.procs")
+	pidsCurrentPath := filepath.Join(groupPath, "pids.current")
+	killPath := filepath.Join(groupPath, "cgroup.kill")
+	require.NoError(t, os.WriteFile(
+		procsPath,
+		[]byte(strconv.Itoa(cmd.Process.Pid)),
+		0644,
+	))
+	require.NoError(t, os.WriteFile(pidsCurrentPath, []byte("1\n"), 0644))
+	require.NoError(t, os.WriteFile(killPath, []byte("untouched\n"), 0644))
+
+	go func() {
+		_ = cmd.Wait()
+		err := os.WriteFile(procsPath, nil, 0644)
+		if pidsErr := os.WriteFile(pidsCurrentPath, []byte("0\n"), 0644); err == nil {
+			err = pidsErr
+		}
+		drained <- err
+	}()
+
+	ops := &cgroupV2{mountpoint: mountpoint}
+	require.NoError(t, ops.kill(name))
+	require.NoError(t, <-drained)
+	data, err := os.ReadFile(killPath)
+	require.NoError(t, err)
+	assert.Equal(t, "untouched\n", string(data))
+}
+
+func TestCgroupV2ExplicitKillDoesNotPoisonReusedGroup(t *testing.T) {
+	if os.Getenv("SANDBOXD_RUN_CGROUP_INTEGRATION") != "1" {
+		t.Skip("set SANDBOXD_RUN_CGROUP_INTEGRATION=1 to run")
+	}
+	if detectCgroupMode() != cgroups.Unified {
+		t.Skip("requires cgroup v2")
+	}
+
+	ops := &cgroupV2{mountpoint: cgroupMountpoint}
+	name := "/sandboxd-explicit-kill-test-" + strconv.Itoa(os.Getpid())
+	require.NoError(t, ops.create(name, &specs.LinuxResources{}))
+	t.Cleanup(func() {
+		_ = ops.kill(name)
+		_ = ops.delete(name)
+	})
+
+	groupFD, err := unix.Open(
+		filepath.Join(cgroupMountpoint, name),
+		unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC,
+		0,
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = unix.Close(groupFD) })
+
+	sleeper := exec.Command("sleep", "30")
+	sleeper.SysProcAttr = &syscall.SysProcAttr{
+		UseCgroupFD: true,
+		CgroupFD:    groupFD,
+	}
+	require.NoError(t, sleeper.Start())
+	waited := make(chan error, 1)
+	go func() { waited <- sleeper.Wait() }()
+
+	require.NoError(t, ops.kill(name))
+	waitErr := <-waited
+	var exitErr *exec.ExitError
+	require.ErrorAs(t, waitErr, &exitErr)
+	status, ok := exitErr.Sys().(syscall.WaitStatus)
+	require.True(t, ok)
+	assert.Equal(t, syscall.SIGKILL, status.Signal())
+
+	next := exec.Command("true")
+	next.SysProcAttr = &syscall.SysProcAttr{
+		UseCgroupFD: true,
+		CgroupFD:    groupFD,
+	}
+	require.NoError(t, next.Run(), "reused cgroup killed the next process")
 }
 
 func TestSandboxResourcesConvertCoreControls(t *testing.T) {

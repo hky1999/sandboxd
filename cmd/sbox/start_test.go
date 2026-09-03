@@ -62,11 +62,54 @@ func TestStorageMBToBytes(t *testing.T) {
 }
 
 func TestStartExtraConfig(t *testing.T) {
-	value, err := startExtraConfig(false)
+	value, err := startExtraConfig("", false)
 	require.NoError(t, err)
 	assert.Empty(t, value)
 
-	value, err = startExtraConfig(true)
+	value, err = startExtraConfig("", true)
 	require.NoError(t, err)
 	assert.JSONEq(t, `{"enableKVM":true}`, value)
+
+	value, err = startExtraConfig(
+		`{"nativeWritableMounts":[{"target":"/var/lib/docker"}]}`,
+		false,
+	)
+	require.NoError(t, err)
+	assert.JSONEq(t,
+		`{"nativeWritableMounts":[{"target":"/var/lib/docker"}]}`,
+		value,
+	)
+
+	value, err = startExtraConfig(
+		`{"enableKVM":false,"runtimeOption":"kept"}`,
+		true,
+	)
+	require.NoError(t, err)
+	assert.JSONEq(t,
+		`{"enableKVM":true,"runtimeOption":"kept"}`,
+		value,
+	)
+
+	for _, invalid := range []string{"null", "[]", "not-json"} {
+		_, err = startExtraConfig(invalid, false)
+		require.Error(t, err)
+	}
+}
+
+func TestStartRootfs(t *testing.T) {
+	local, err := startRootfs("/rootfs", "", false)
+	require.NoError(t, err)
+	assert.Equal(t, runtime.RootfsSrcType_LOCAL, local.Type)
+	assert.Equal(t, "/rootfs", local.GetPath())
+
+	image, err := startRootfs("", "registry.example/image:tag", true)
+	require.NoError(t, err)
+	assert.Equal(t, runtime.RootfsSrcType_IMAGE, image.Type)
+	assert.Equal(t, "registry.example/image:tag", image.GetImageUrl())
+	assert.True(t, image.Readonly)
+
+	_, err = startRootfs("", "", false)
+	require.ErrorContains(t, err, "exactly one")
+	_, err = startRootfs("/rootfs", "registry.example/image:tag", false)
+	require.ErrorContains(t, err, "mutually exclusive")
 }

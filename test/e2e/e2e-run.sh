@@ -28,7 +28,9 @@ EROFS_ROOTFS="${E2E_EROFS_ROOTFS:-/e2e/rootfs.erofs}"
 EROFS_MOUNT_ROOT="${E2E_EROFS_MOUNT_ROOT:-/e2e/erofs-mount-root}"
 EROFS_MOUNT_IMAGE="${E2E_EROFS_MOUNT_IMAGE:-/e2e/data.erofs}"
 FIRECRACKER_KERNEL="${E2E_FIRECRACKER_KERNEL:-/opt/firecracker/vmlinux}"
+FIRECRACKER_CHECKPOINT_MODE="${E2E_FIRECRACKER_CHECKPOINT_MODE:-}"
 FIRECRACKER_INITRD="${E2E_FIRECRACKER_INITRD:-/opt/firecracker/initrd.img}"
+OCI_ROOTFS_IMAGE="${E2E_OCI_ROOTFS_IMAGE:-docker.io/library/redis:7-alpine}"
 FIRECRACKER_OVERLAY_BYTES="${E2E_FIRECRACKER_OVERLAY_BYTES:-134217728}"
 HOST_MOUNT="${E2E_HOST_MOUNT:-/e2e/host-mount}"
 WWW_ROOT="${E2E_WWW_ROOT:-/e2e/www}"
@@ -72,6 +74,14 @@ log() {
 fail() {
     printf '[e2e][error] %s\n' "$*" >&2
     exit 1
+}
+
+assert_sandboxd_home_is_disk_backed() {
+    local fs_type
+    fs_type="$(stat -f -c %T /home/akernel)"
+    if [ "${fs_type}" = "tmpfs" ]; then
+        fail "/home/akernel must be disk-backed, not tmpfs"
+    fi
 }
 
 select_iptables_backend() {
@@ -151,6 +161,17 @@ cleanup() {
         log "checkpoint runtime stderr tail"
         tail -200 /var/log/sandboxd/checkpoint-runtime.stderr >&2
     fi
+    if [ "${status}" -ne 0 ] && [ "${E2E_RUNTIME}" = "firecracker" ]; then
+        local firecracker_log
+        for firecracker_log in \
+            /tmp/firecracker-main.stdout \
+            /tmp/firecracker-main.stderr; do
+            if [ -f "${firecracker_log}" ]; then
+                log "Firecracker guest log tail: ${firecracker_log}"
+                tail -200 "${firecracker_log}" >&2
+            fi
+        done
+    fi
     if [ "${status}" -ne 0 ] && [ -d /home/akernel/logs/runsc ]; then
         local runsc_log
         while IFS= read -r runsc_log; do
@@ -162,6 +183,8 @@ cleanup() {
 trap cleanup EXIT
 
 preflight() {
+    mkdir -p /home/akernel
+    assert_sandboxd_home_is_disk_backed
     [ "$(id -u)" = "0" ] || fail "e2e container must run as root"
     [[ "${STRESS_ROUNDS}" =~ ^[0-9]+$ ]] || fail "E2E_STRESS_ROUNDS must be a non-negative integer"
     [[ "${STRESS_CONCURRENCY}" =~ ^[1-8]$ ]] || fail "E2E_STRESS_CONCURRENCY must be between 1 and 8"
@@ -204,7 +227,7 @@ preflight() {
     fi
 
     local bin
-    for bin in sandboxd sbox checkpoint-restore ip iptables busybox mkfs.erofs; do
+    for bin in sandboxd sbox checkpoint-restore ip ipset iptables ip6tables busybox mkfs.erofs; do
         command -v "${bin}" >/dev/null 2>&1 || fail "missing command: ${bin}"
     done
     case "${E2E_RUNTIME}" in
@@ -333,6 +356,7 @@ EOF
     fi
 
     local runtime_binaries
+    local node_resource_config=""
     case "${E2E_RUNTIME}" in
         all)
             runtime_binaries=$'runsc = "/usr/local/bin/runsc"\nrunc = "/usr/local/bin/runc"'
@@ -348,9 +372,17 @@ EOF
             ;;
         firecracker)
             runtime_binaries='firecracker = "/usr/local/bin/firecracker"'
+            node_resource_config=$'[plugin.node_resource]\nprovider = "cgroup"\nsock_path = "/run/sandboxd/resource.sock"'
             ;;
     esac
 
+    # Only emit the checkpoint knobs when the E2E case opts in: the plain
+    # firecracker job must keep exercising the unset (default full) path.
+    local e2e_fc_checkpoint_mode_cfg=""
+    if [ -n "${FIRECRACKER_CHECKPOINT_MODE}" ]; then
+        e2e_fc_checkpoint_mode_cfg="$(printf 'checkpoint_mode = "%s"' \
+            "${FIRECRACKER_CHECKPOINT_MODE}")"
+    fi
     cat > "${CONFIG_FILE}" <<EOF
 rootDir = "${SANDBOXD_ROOT}"
 storeDir = "${SANDBOXD_STORE}"
@@ -369,6 +401,8 @@ interface_cache_size = 1
 cgroup_root_name = "/${CGROUP_ROOT}"
 max_instance_num = 8
 pids_max = 64
+
+${node_resource_config}
 
 [plugin.runtime]
 image_lib_dir = "/e2e/images"
@@ -401,6 +435,9 @@ kvm_device = "/dev/kvm"
 default_vcpu_count = 1
 default_memory_mib = 256
 default_overlay_size_bytes = ${FIRECRACKER_OVERLAY_BYTES}
+oci_rootfs_enabled = true
+mkfs_erofs_path = "/usr/bin/mkfs.erofs"
+${e2e_fc_checkpoint_mode_cfg}
 
 [plugin.runtime.basic_spec]
 runsc = ""
@@ -694,15 +731,23 @@ run_checkpoint_restore_check() {
     local target_id="sbox-e2e-${suffix}-cr-target"
     local request_file="/tmp/${suffix}-checkpoint-request.json"
     local checkpoint_parent="${SANDBOXD_HOME}/e2e-checkpoints"
-    local checkpoint_dir="${checkpoint_parent}/${suffix}"
+    local checkpoint_root="${checkpoint_parent}/${suffix}"
+    local checkpoint_dir=""
+    local checkpoint_count=10
     local memory_mb=128
+    local extra_config_args=()
     if [ "${runtime}" = "firecracker" ]; then
         memory_mb=256
+        extra_config_args=(
+            --extra-config
+            '{"nativeWritableMounts":[{"target":"/var/lib/native-checkpoint"}]}'
+        )
     fi
 
-    log "testing ${suffix} checkpoint/restore with a new sandbox ID"
+    log "testing ${suffix} ${checkpoint_count} consecutive checkpoints and restoring the last"
     mkdir -p "${checkpoint_parent}"
-    rm -rf -- "${checkpoint_dir}"
+    rm -rf -- "${checkpoint_root}"
+    mkdir -p "${checkpoint_root}"
     rm -f -- "${request_file}"
     SANDBOX_ID="$(checkpoint-restore \
         --action start \
@@ -712,15 +757,28 @@ run_checkpoint_restore_check() {
         --sandbox-id "${source_id}" \
         --request-file "${request_file}" \
         --memory-mb "${memory_mb}" \
-        --storage-mb 64)"
+        --storage-mb 64 \
+        "${extra_config_args[@]}")"
     assert_eq "${SANDBOX_ID}" "${source_id}" "${suffix} checkpoint source ID"
     wait_for_state "${SANDBOX_ID}" "SANDBOX_STATE_RUNNING" 300
     sbox_cmd exec "${SANDBOX_ID}" /bin/sh -c \
         'echo checkpoint-state-ok > /var/checkpoint-persist'
+    if [ "${runtime}" = "firecracker" ]; then
+        local native_fstype
+        native_fstype="$(sbox_cmd exec "${SANDBOX_ID}" /bin/awk \
+            '$2 == "/var/lib/native-checkpoint" { print $3 }' /proc/mounts)"
+        assert_eq "${native_fstype}" "ext4" \
+            "${suffix} native writable mount filesystem"
+        sbox_cmd exec "${SANDBOX_ID}" /bin/sh -c \
+            'echo native-checkpoint-ok > /var/lib/native-checkpoint/state'
+    fi
 
     local before=""
     local attempt
-    for attempt in $(seq 1 100); do
+    # The workload writes a 100MiB blob before starting the counter; on
+    # slow CI runners (runsc-kvm) that can outlast a short budget, so
+    # allow up to ~60s for the first counter value.
+    for attempt in $(seq 1 600); do
         before="$(sbox_cmd exec "${SANDBOX_ID}" \
             /bin/cat /var/checkpoint-counter 2>/dev/null || true)"
         if [[ "${before}" =~ ^[0-9]+$ ]] && [ "${before}" -gt 2 ]; then
@@ -731,29 +789,66 @@ run_checkpoint_restore_check() {
     [[ "${before}" =~ ^[0-9]+$ ]] && [ "${before}" -gt 2 ] ||
         fail "${suffix} checkpoint source counter is invalid: ${before@Q}"
 
-    checkpoint-restore \
-        --action checkpoint \
-        --socket "${SOCKET}" \
-        --sandbox-id "${source_id}" \
-        --request-file "${request_file}" \
-        --checkpoint-dir "${checkpoint_dir}" \
-        --checkpoint-timeout-seconds 180 \
-        --compress=true \
-        --leave-running=true
-    [ -s "${checkpoint_dir}/checkpoint.img" ] ||
-        fail "${suffix} checkpoint artifact is missing or empty"
-
+    local checkpoint_index
+    local previous_checkpoint_dir=""
+    local restore_floor=""
     local source_after=""
-    for attempt in $(seq 1 100); do
-        source_after="$(sbox_cmd exec "${SANDBOX_ID}" \
-            /bin/cat /var/checkpoint-counter 2>/dev/null || true)"
-        if [[ "${source_after}" =~ ^[0-9]+$ ]] && [ "${source_after}" -gt "${before}" ]; then
-            break
+    for checkpoint_index in $(seq 1 "${checkpoint_count}"); do
+        checkpoint_dir="${checkpoint_root}/${checkpoint_index}"
+        sbox_cmd exec "${SANDBOX_ID}" /bin/sh -c \
+            "printf '%s\\n' '${checkpoint_index}' > /var/checkpoint-generation"
+        restore_floor="${before}"
+        log "checkpointing ${suffix} source ${checkpoint_index}/${checkpoint_count}"
+        checkpoint-restore \
+            --action checkpoint \
+            --socket "${SOCKET}" \
+            --sandbox-id "${source_id}" \
+            --request-file "${request_file}" \
+            --checkpoint-dir "${checkpoint_dir}" \
+            --checkpoint-timeout-seconds 180 \
+            --compress=true \
+            --leave-running=true
+        # Accept both the legacy v1 single-file archive and the v2 directory
+        # layout (manifest.json + vmstate + memory + overlay.ext4).
+        if [ ! -s "${checkpoint_dir}/checkpoint.img" ] &&
+            [ ! -s "${checkpoint_dir}/manifest.json" ]; then
+            fail "${suffix} checkpoint ${checkpoint_index} artifact is missing or empty"
         fi
-        sleep 0.1
+        if [ "${runtime}" = "firecracker" ] &&
+            [ -s "${checkpoint_dir}/manifest.json" ]; then
+            # Default (checkpoint_mode=full) keeps every generation Full;
+            # the incremental case starts with a Full baseline and then
+            # expects SoftDirty rolling generations.
+            if [ -n "${FIRECRACKER_CHECKPOINT_MODE}" ] &&
+                [ "${checkpoint_index}" -gt 1 ]; then
+                assert_snapshot_type "${checkpoint_dir}" "SoftDirty" \
+                    "${suffix} rolling checkpoint ${checkpoint_index}"
+            else
+                assert_snapshot_type "${checkpoint_dir}" "Full" \
+                    "${suffix} baseline checkpoint ${checkpoint_index}"
+            fi
+        fi
+
+        source_after=""
+        for attempt in $(seq 1 600); do
+            source_after="$(sbox_cmd exec "${SANDBOX_ID}" \
+                /bin/cat /var/checkpoint-counter 2>/dev/null || true)"
+            if [[ "${source_after}" =~ ^[0-9]+$ ]] &&
+                [ "${source_after}" -gt "${before}" ]; then
+                break
+            fi
+            sleep 0.1
+        done
+        [[ "${source_after}" =~ ^[0-9]+$ ]] &&
+            [ "${source_after}" -gt "${before}" ] ||
+            fail "${suffix} source stopped after checkpoint ${checkpoint_index}"
+        before="${source_after}"
+
+        if [ -n "${previous_checkpoint_dir}" ]; then
+            rm -rf -- "${previous_checkpoint_dir}"
+        fi
+        previous_checkpoint_dir="${checkpoint_dir}"
     done
-    [[ "${source_after}" =~ ^[0-9]+$ ]] && [ "${source_after}" -gt "${before}" ] ||
-        fail "${suffix} source did not continue after leave_running checkpoint"
     local source_network
     source_network="$(sbox_cmd exec "${SANDBOX_ID}" \
         /bin/wget -qO- "http://${GATEWAY_IP}:${HTTP_PORT}/health.txt")"
@@ -774,21 +869,40 @@ run_checkpoint_restore_check() {
     local persisted
     persisted="$(sbox_cmd exec "${SANDBOX_ID}" /bin/cat /var/checkpoint-persist)"
     assert_eq "${persisted}" "checkpoint-state-ok" "${suffix} restored writable state"
+    if [ "${runtime}" = "firecracker" ]; then
+        local restored_init
+        restored_init="$(sbox_cmd exec "${SANDBOX_ID}" /bin/sh -c \
+            'for namespace in mnt pid uts ipc; do test "$(readlink /proc/self/ns/$namespace)" = "$(readlink /proc/1/ns/$namespace)" || exit 1; done; test "$(hostname)" = akernel; cat /proc/1/comm')"
+        assert_eq "${restored_init}" "sh" \
+            "${suffix} restored exec joined sandbox namespaces"
+        local restored_native
+        restored_native="$(sbox_cmd exec "${SANDBOX_ID}" /bin/cat \
+            /var/lib/native-checkpoint/state)"
+        assert_eq "${restored_native}" "native-checkpoint-ok" \
+            "${suffix} restored native writable mount"
+    fi
+    local restored_generation
+    restored_generation="$(sbox_cmd exec "${SANDBOX_ID}" \
+        /bin/cat /var/checkpoint-generation)"
+    assert_eq "${restored_generation}" "${checkpoint_count}" \
+        "${suffix} restored the final checkpoint"
     if ! sbox_cmd exec "${SANDBOX_ID}" \
         /bin/sh -c 'test ! -e /var/checkpoint-restarted'; then
         fail "${suffix} restore re-executed the sandbox entrypoint"
     fi
     local restored=""
-    for attempt in $(seq 1 100); do
+    for attempt in $(seq 1 600); do
         restored="$(sbox_cmd exec "${SANDBOX_ID}" \
             /bin/cat /var/checkpoint-counter 2>/dev/null || true)"
-        if [[ "${restored}" =~ ^[0-9]+$ ]] && [ "${restored}" -ge "${before}" ]; then
+        if [[ "${restored}" =~ ^[0-9]+$ ]] &&
+            [ "${restored}" -ge "${restore_floor}" ]; then
             break
         fi
         sleep 0.1
     done
-    [[ "${restored}" =~ ^[0-9]+$ ]] && [ "${restored}" -ge "${before}" ] ||
-        fail "${suffix} restored counter lost checkpoint state: before=${before} restored=${restored}"
+    [[ "${restored}" =~ ^[0-9]+$ ]] &&
+        [ "${restored}" -ge "${restore_floor}" ] ||
+        fail "${suffix} restored counter lost final checkpoint state: before=${restore_floor} restored=${restored}"
     sleep 0.3
     local advanced
     advanced="$(sbox_cmd exec "${SANDBOX_ID}" /bin/cat /var/checkpoint-counter)"
@@ -799,13 +913,142 @@ run_checkpoint_restore_check() {
         /bin/wget -qO- "http://${GATEWAY_IP}:${HTTP_PORT}/health.txt")"
     assert_eq "${restored_network}" "sandboxd-network-ok" "${suffix} restored network"
 
-    rm -rf -- "${checkpoint_dir}"
-    [ ! -e "${checkpoint_dir}" ] || fail "${suffix} caller cleanup retained checkpoint"
+    if [ "${runtime}" = "firecracker" ]; then
+        run_firecracker_post_restore_chain \
+            "${suffix}" "${checkpoint_root}" "${advanced}" "${request_file}"
+    fi
+
+    rm -rf -- "${checkpoint_root}"
+    [ ! -e "${checkpoint_root}" ] || fail "${suffix} caller cleanup retained checkpoint"
     persisted="$(sbox_cmd exec "${SANDBOX_ID}" /bin/cat /var/checkpoint-persist)"
     assert_eq "${persisted}" "checkpoint-state-ok" \
         "${suffix} target independent of checkpoint directory"
+    if [ "${runtime}" = "firecracker" ]; then
+        persisted="$(sbox_cmd exec "${SANDBOX_ID}" /bin/cat \
+            /var/lib/native-checkpoint/state)"
+        assert_eq "${persisted}" "native-checkpoint-ok" \
+            "${suffix} native mount independent of checkpoint directory"
+    fi
     sbox_cmd delete "${SANDBOX_ID}"
     SANDBOX_ID=""
+}
+
+# run_firecracker_post_restore_chain exercises the checkpoint-after-restore
+# path and the lineage-loss Full fallback on the already restored sandbox.
+# It runs with SANDBOX_ID pointing at the running restored target and leaves
+# the sandbox deleted on success. In the incremental case this covers the
+# post-restore Incremental baseline (and the VMM's arm-after-Incremental
+# fix: the generation after it must be a SoftDirty window delta); with the
+# default configuration everything stays Full.
+run_firecracker_post_restore_chain() {
+    local suffix="$1"
+    local checkpoint_root="$2"
+    local counter_floor="$3"
+    local request_file="$4"
+    local sandbox_id="${SANDBOX_ID}"
+    local incremental=""
+    [ -n "${FIRECRACKER_CHECKPOINT_MODE}" ] && incremental=1
+
+    log "testing ${suffix} checkpoint-after-restore chain"
+    sbox_cmd exec "${sandbox_id}" /bin/sh -c \
+        'echo post-restore-ok > /var/checkpoint-post-restore'
+
+    # Generation taken from a restored VM.
+    local post1="${checkpoint_root}/post-restore-1"
+    checkpoint-restore \
+        --action checkpoint \
+        --socket "${SOCKET}" \
+        --sandbox-id "${sandbox_id}" \
+        --request-file "${request_file}" \
+        --checkpoint-dir "${post1}" \
+        --checkpoint-timeout-seconds 180 \
+        --compress=true \
+        --leave-running=true
+    if [ -n "${incremental}" ]; then
+        assert_snapshot_type "${post1}" "Incremental" \
+            "${suffix} post-restore checkpoint"
+    else
+        assert_snapshot_type "${post1}" "Full" \
+            "${suffix} post-restore checkpoint"
+    fi
+
+    # Mutate and checkpoint again: incremental mode must land on a SoftDirty
+    # window delta against the Incremental baseline (pinning the VMM's
+    # arm-after-Incremental behavior through the selector's output).
+    sleep 1
+    local post2="${checkpoint_root}/post-restore-2"
+    checkpoint-restore \
+        --action checkpoint \
+        --socket "${SOCKET}" \
+        --sandbox-id "${sandbox_id}" \
+        --request-file "${request_file}" \
+        --checkpoint-dir "${post2}" \
+        --checkpoint-timeout-seconds 180 \
+        --compress=true \
+        --leave-running=true
+    if [ -n "${incremental}" ]; then
+        assert_snapshot_type "${post2}" "SoftDirty" \
+            "${suffix} post-restore follow-up checkpoint"
+    else
+        assert_snapshot_type "${post2}" "Full" \
+            "${suffix} post-restore follow-up checkpoint"
+    fi
+
+    # Lineage loss: delete the current base (the newest artifact) and take
+    # another generation. Automatic selection must degrade to Full in the
+    # incremental case instead of patching a window onto a vanished base.
+    local counter_before_loss
+    counter_before_loss="$(sbox_cmd exec "${sandbox_id}" \
+        /bin/cat /var/checkpoint-counter)"
+    rm -rf -- "${post2}"
+    sleep 1
+    local loss_dir="${checkpoint_root}/lineage-loss"
+    checkpoint-restore \
+        --action checkpoint \
+        --socket "${SOCKET}" \
+        --sandbox-id "${sandbox_id}" \
+        --request-file "${request_file}" \
+        --checkpoint-dir "${loss_dir}" \
+        --checkpoint-timeout-seconds 180 \
+        --compress=true \
+        --leave-running=true
+    assert_snapshot_type "${loss_dir}" "Full" \
+        "${suffix} checkpoint after losing the current base"
+
+    # Restore the lineage-loss artifact into a fresh sandbox and verify the
+    # data written before and after the lost base survived.
+    local loss_target="sbox-e2e-${suffix}-cr-loss"
+    sbox_cmd delete "${sandbox_id}"
+    SANDBOX_ID="$(checkpoint-restore \
+        --action restore \
+        --socket "${SOCKET}" \
+        --target-id "${loss_target}" \
+        --request-file "${request_file}" \
+        --checkpoint-dir "${loss_dir}")"
+    assert_eq "${SANDBOX_ID}" "${loss_target}" \
+        "${suffix} lineage-loss restored sandbox ID"
+    wait_for_state "${SANDBOX_ID}" "SANDBOX_STATE_RUNNING" 300
+    local loss_persisted
+    loss_persisted="$(sbox_cmd exec "${SANDBOX_ID}" \
+        /bin/cat /var/checkpoint-post-restore)"
+    assert_eq "${loss_persisted}" "post-restore-ok" \
+        "${suffix} lineage-loss restore kept post-restore state"
+    local loss_counter
+    for attempt in $(seq 1 600); do
+        loss_counter="$(sbox_cmd exec "${SANDBOX_ID}" \
+            /bin/cat /var/checkpoint-counter 2>/dev/null || true)"
+        if [[ "${loss_counter}" =~ ^[0-9]+$ ]] &&
+            [ "${loss_counter}" -ge "${counter_before_loss}" ]; then
+            break
+        fi
+        sleep 0.1
+    done
+    [[ "${loss_counter}" =~ ^[0-9]+$ ]] &&
+        [ "${loss_counter}" -ge "${counter_before_loss}" ] ||
+        fail "${suffix} lineage-loss restore lost counter state: before=${counter_before_loss} restored=${loss_counter}"
+    # Deliberately leave the lineage-loss target running in SANDBOX_ID: the
+    # caller's tail reuses it for the checkpoint-directory-independence
+    # check and the final delete.
 }
 
 run_network_soak() {
@@ -922,6 +1165,23 @@ wait_for_state() {
         sleep 0.1
     done
     fail "sandbox ${sandbox_id} did not reach ${expected}; last state: ${line}"
+}
+
+# manifest_snapshot_type prints the recorded snapshot type of a v2 artifact
+# directory. The manifest is the commit point, so the recorded type proves
+# which selector branch actually produced the generation.
+manifest_snapshot_type() {
+    grep -o '"snapshot_type": *"[^"]*"' "${1}/manifest.json" 2>/dev/null |
+        sed 's/.*: *"\([^"]*\)"/\1/'
+}
+
+assert_snapshot_type() {
+    local dir="$1"
+    local want="$2"
+    local label="$3"
+    local got
+    got="$(manifest_snapshot_type "${dir}")"
+    assert_eq "${got}" "${want}" "${label} (manifest snapshot_type)"
 }
 
 wait_for_exec_output() {
@@ -1388,11 +1648,13 @@ run_firecracker_checks() {
         --mount "${HOST_MOUNT}/input.txt:/mnt/host/input.txt:bind:ro" \
         --mount "${EROFS_MOUNT_IMAGE}:/mnt/erofs:erofs:ro" \
         --mount "tmpfs:/mnt/ram:tmpfs:rw,nosuid,nodev,noexec,size=1m,mode=0755" \
+        --extra-config \
+        '{"nativeWritableMounts":[{"target":"/var/lib/docker"}]}' \
         --stdout "${main_stdout}" \
         --stderr "${main_stderr}" \
         --cpu-millicores 1500 \
         --memory-mb 256 \
-        /bin/sh -c 'echo "$E2E_MARKER" > /var/start-env; echo firecracker-main-stdout; sleep 300')"
+        /bin/sh -c 'echo "$E2E_MARKER" > /var/start-env; echo firecracker-main-stdout; while :; do sleep 300; done')"
     [ -n "${SANDBOX_ID}" ] || fail "Firecracker start returned empty sandbox id"
     wait_for_state "${SANDBOX_ID}" "SANDBOX_STATE_RUNNING"
 
@@ -1409,8 +1671,17 @@ run_firecracker_checks() {
     local got
     wait_for_exec_output "${SANDBOX_ID}" "firecracker-env-ok" /bin/cat /var/start-env
     got="$(sbox_cmd exec "${SANDBOX_ID}" /bin/sh -c \
+        'for namespace in mnt pid uts ipc; do test "$(readlink /proc/self/ns/$namespace)" = "$(readlink /proc/1/ns/$namespace)" || exit 1; done; test "$(hostname)" = akernel; cat /proc/1/comm')"
+    assert_eq "${got}" "sh" "Firecracker exec joined sandbox namespaces"
+    got="$(sbox_cmd exec "${SANDBOX_ID}" /bin/sh -c \
         'echo firecracker-write-ok > /var/firecracker-write && cat /var/firecracker-write')"
     assert_eq "${got}" "firecracker-write-ok" "Firecracker writable overlay"
+    got="$(sbox_cmd exec "${SANDBOX_ID}" /bin/awk \
+        '$2 == "/var/lib/docker" { print $3 }' /proc/mounts)"
+    assert_eq "${got}" "ext4" "Firecracker native writable mount filesystem"
+    got="$(sbox_cmd exec "${SANDBOX_ID}" /bin/sh -c \
+        'echo native-write-ok > /var/lib/docker/check && cat /var/lib/docker/check')"
+    assert_eq "${got}" "native-write-ok" "Firecracker native writable mount"
     got="$(sbox_cmd exec "${SANDBOX_ID}" /bin/sh -c \
         'echo tmpfs-ok > /mnt/ram/check && cat /mnt/ram/check')"
     assert_eq "${got}" "tmpfs-ok" "Firecracker private tmpfs mount"
@@ -1514,6 +1785,26 @@ run_firecracker_checks() {
         sbox_cmd delete "${rejected_id}" || true
         fail "Firecracker accepted a directory mount"
     fi
+
+    log "testing Firecracker OCI rootfs conversion"
+    local oci_root_id="sbox-e2e-firecracker-oci-root"
+    SANDBOX_ID="$(sbox_cmd start \
+        --quiet \
+        --runtime firecracker \
+        --sandbox-id "${oci_root_id}" \
+        --image-url "${OCI_ROOTFS_IMAGE}" \
+        --cpu-millicores 100 \
+        --memory-mb 256 \
+        /bin/sh -c 'echo firecracker-oci-ready > /var/oci-rootfs; sleep 300')"
+    wait_for_state "${SANDBOX_ID}" "SANDBOX_STATE_RUNNING"
+    wait_for_exec_output "${SANDBOX_ID}" "firecracker-oci-ready" \
+        /bin/cat /var/oci-rootfs
+    local redis_version
+    redis_version="$(sbox_cmd exec "${SANDBOX_ID}" redis-server --version)"
+    [[ "${redis_version}" == *"Redis server v="* ]] || \
+        fail "Firecracker OCI rootfs did not preserve image content: ${redis_version@Q}"
+    sbox_cmd delete "${SANDBOX_ID}"
+    SANDBOX_ID=""
 
     local cached_taps_before
     cached_taps_before="$(list_cached_taps)"

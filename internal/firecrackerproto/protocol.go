@@ -32,6 +32,10 @@ const (
 
 	maxMessageSize = 16 << 20
 	maxFrameSize   = 16 << 20
+
+	// Cooperative checkpoint handoff paths inside the guest (PR #30).
+	CheckpointHandoffPath = "/run/sandboxd/checkpoint"
+	RestoreEnvPath        = "/run/sandboxd/restore-environ"
 )
 
 var messageMagic = [4]byte{'A', 'K', 'F', 'C'}
@@ -46,8 +50,29 @@ const (
 	MessageExecTTY    MessageType = 5
 	MessageWait       MessageType = 6
 	MessageSetNetwork MessageType = 7
+	// MessageFlush asks the guest to sync its writable layer so a checkpoint
+	// captures the overlay in a quiesced state. Best-effort: the host treats
+	// errors and timeouts as advisory, never as checkpoint failures.
+	MessageFlush MessageType = 8
+	// MessageShrink asks the guest to drop its page caches before a
+	// checkpoint: cached file pages are re-materialized by block DMA on every
+	// re-read, which re-dirties them in the host ledger and lands them in
+	// every snapshot window. Dropping the caches right before the pause
+	// shrinks the working set the checkpoint has to carry. Same best-effort
+	// contract as MessageFlush.
+	MessageShrink MessageType = 9
+	// MessageCheckpoint tells the guest agent a checkpoint lifecycle event
+	// occurred (completed, failed, or restored) so it can signal the
+	// cooperative handoff FIFO inside the guest (PR #30).
+	MessageCheckpoint MessageType = 10
 	MessageResponse   MessageType = 100
 )
+
+// CheckpointRequest carries the checkpoint lifecycle event to the guest agent.
+type CheckpointRequest struct {
+	Outcome     string   `json:"outcome"`               // "resume", "error", or "restore"
+	Environment []string `json:"environment,omitempty"` // target env after restore
+}
 
 type Response struct {
 	OK       bool   `json:"ok"`
@@ -79,6 +104,12 @@ type MountSpec struct {
 	Options []string `json:"options,omitempty"`
 }
 
+// NativeWritableMountSpec exposes a directory from the sandbox's private
+// ext4 writable layer at a distinct path inside the guest root filesystem.
+type NativeWritableMountSpec struct {
+	Target string `json:"target"`
+}
+
 type FileSpec struct {
 	Target   string `json:"target"`
 	Content  []byte `json:"content"`
@@ -87,14 +118,15 @@ type FileSpec struct {
 }
 
 type ConfigureRequest struct {
-	Hostname      string      `json:"hostname"`
-	RootDevice    string      `json:"root_device"`
-	OverlayDevice string      `json:"overlay_device"`
-	RootReadonly  bool        `json:"root_readonly,omitempty"`
-	Process       ProcessSpec `json:"process"`
-	Network       NetworkSpec `json:"network"`
-	Mounts        []MountSpec `json:"mounts,omitempty"`
-	Files         []FileSpec  `json:"files,omitempty"`
+	Hostname             string                    `json:"hostname"`
+	RootDevice           string                    `json:"root_device"`
+	OverlayDevice        string                    `json:"overlay_device"`
+	RootReadonly         bool                      `json:"root_readonly,omitempty"`
+	Process              ProcessSpec               `json:"process"`
+	Network              NetworkSpec               `json:"network"`
+	Mounts               []MountSpec               `json:"mounts,omitempty"`
+	NativeWritableMounts []NativeWritableMountSpec `json:"native_writable_mounts,omitempty"`
+	Files                []FileSpec                `json:"files,omitempty"`
 }
 
 type ExecRequest struct {

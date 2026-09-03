@@ -54,3 +54,16 @@ func (c *CgroupManager) Stats(name string) (Stats, error) {
 	}
 	return c.ops.stat(name)
 }
+
+// ReadMemoryLimit reports the current memory.max (cgroup v2) or
+// memory.limit_in_bytes (cgroup v1) of the named cgroup in bytes.
+// Callers use it to validate live kernel state against their persisted
+// steady-state limit; it must not be treated as that steady-state source
+// because it may include a transient expansion left by a previous process.
+func (c *CgroupManager) ReadMemoryLimit(name string) (int64, error) {
+	stats, err := c.Stats(name)
+	if err != nil {
+		return 0, err
+	}
+	return int64(stats.MemoryLimitBytes), nil
+}

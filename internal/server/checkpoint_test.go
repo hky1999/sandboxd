@@ -25,6 +25,7 @@ import (
 	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
 	"github.com/inclusionAI/sandboxd/pkg/errord"
 	svc "github.com/inclusionAI/sandboxd/pkg/runtime"
+	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/codes"
@@ -118,6 +119,7 @@ func TestCheckpointForwardsRequest(t *testing.T) {
 	assert.Equal(t, svc.CheckpointConfig{
 		ID:           "sbox-checkpoint",
 		Directory:    directory,
+		CgroupPath:   "",
 		Compress:     true,
 		LeaveRunning: true,
 	}, handler.checkpoints[0])
@@ -289,6 +291,33 @@ func TestCheckpointInputDirectoryValidation(t *testing.T) {
 	got, err := validateCheckpointInputDirectory(directory)
 	require.NoError(t, err)
 	assert.Equal(t, directory, got)
+}
+
+func TestCheckpointGuestMemoryResources(t *testing.T) {
+	limit := int64(256 << 20)
+	swap := int64(512 << 20)
+	got := checkpointGuestMemoryResources(&specs.Spec{
+		Linux: &specs.Linux{
+			Resources: &specs.LinuxResources{
+				Memory: &specs.LinuxMemory{
+					Limit: &limit,
+					Swap:  &swap,
+				},
+			},
+		},
+	})
+	require.NotNil(t, got)
+	assert.Equal(t, limit, got.MemoryLimitInBytes)
+	assert.Equal(t, swap, got.MemorySwapLimitInBytes)
+
+	assert.Nil(t, checkpointGuestMemoryResources(nil))
+	assert.Nil(t, checkpointGuestMemoryResources(&specs.Spec{
+		Linux: &specs.Linux{
+			Resources: &specs.LinuxResources{
+				Memory: &specs.LinuxMemory{},
+			},
+		},
+	}))
 }
 
 func TestStartSandboxRuntimeDispatchesRestore(t *testing.T) {

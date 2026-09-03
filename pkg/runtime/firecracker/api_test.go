@@ -167,7 +167,12 @@ func TestFirecrackerSnapshotAPI(t *testing.T) {
 	if err := api.pause(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if err := api.createSnapshot(ctx, "/tmp/vmstate", "/tmp/memory"); err != nil {
+	if err := api.createSnapshot(
+		ctx,
+		"/tmp/vmstate",
+		"/tmp/memory",
+		firecrackerSnapshotTypeFull,
+	); err != nil {
 		t.Fatal(err)
 	}
 	if err := api.resume(ctx); err != nil {
@@ -194,7 +199,8 @@ func TestFirecrackerSnapshotAPI(t *testing.T) {
 	}
 	if calls[1].method != http.MethodPut ||
 		calls[1].path != "/snapshot/create" ||
-		calls[1].payload["snapshot_type"] != "Full" {
+		calls[1].payload["snapshot_type"] != "Full" ||
+		calls[1].payload["deferred_sync"] != true {
 		t.Fatalf("create snapshot call = %+v", calls[1])
 	}
 	if calls[2].method != http.MethodPatch ||

@@ -52,6 +52,7 @@ type Module struct {
 	ephemeralStorageCapacity  uint64
 	ephemeralStorageAvailable uint64
 	ephemeralStorageReady     bool
+	transientMemory           map[string]int64
 
 	lastRefresh atomic.Int64 // unix-nano of most recent successful refresh
 	listener    net.Listener
@@ -92,9 +93,10 @@ func NewModule(sockPath, provider string) (*Module, error) {
 	}
 
 	m := &Module{
-		nodeResource: nrm,
-		sockPath:     sockPath,
-		stopCh:       make(chan struct{}),
+		nodeResource:    nrm,
+		sockPath:        sockPath,
+		stopCh:          make(chan struct{}),
+		transientMemory: make(map[string]int64),
 	}
 
 	// OTLP metrics push is best-effort: a missing collector at startup must
@@ -173,7 +175,7 @@ func (m *Module) Start() error {
 		m.mu.RLock()
 		info := resourceInfo{
 			Cpu:      m.availCpu,
-			Mem:      m.availMem,
+			Mem:      availableAfterTransientReservations(m.availMem, m.transientMemory),
 			Xpu:      []xpumanager.Resource{},
 			Features: []string{},
 		}
@@ -250,7 +252,53 @@ func (m *Module) Healthy() bool {
 func (m *Module) Capacity() (int64, int64) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return m.availCpu * 1000, m.availMem
+	return m.availCpu * 1000, availableAfterTransientReservations(m.availMem, m.transientMemory)
+}
+
+// ReserveTransientMemory atomically removes short-lived runtime overhead from
+// the node capacity advertised to the scheduler. It fails when the refreshed
+// available capacity cannot cover the request. The returned release function
+// is idempotent so callers can use it on every terminal path.
+func (m *Module) ReserveTransientMemory(owner string, bytes int64) (func(), bool) {
+	if m == nil || owner == "" || bytes <= 0 {
+		return func() {}, false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.transientMemory == nil {
+		m.transientMemory = make(map[string]int64)
+	}
+	if _, exists := m.transientMemory[owner]; exists ||
+		bytes > availableAfterTransientReservations(m.availMem, m.transientMemory) {
+		return func() {}, false
+	}
+	m.transientMemory[owner] = bytes
+	return func() { m.ReleaseTransientMemory(owner) }, true
+}
+
+// ReleaseTransientMemory returns a short-lived reservation to advertised node
+// capacity. It is idempotent so both the operation and a later sandbox delete
+// can safely release the same owner.
+func (m *Module) ReleaseTransientMemory(owner string) {
+	if m == nil || owner == "" {
+		return
+	}
+	m.mu.Lock()
+	delete(m.transientMemory, owner)
+	m.mu.Unlock()
+}
+
+func availableAfterTransientReservations(available int64, reservations map[string]int64) int64 {
+	for _, reserved := range reservations {
+		if reserved <= 0 {
+			continue
+		}
+		if reserved >= available {
+			return 0
+		}
+		available -= reserved
+	}
+	return available
 }
 
 func (m *Module) serve(mux *http.ServeMux) {

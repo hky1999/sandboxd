@@ -27,6 +27,33 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+func TestIntegrationV2IgnoresLegacyConnectionMapABI(t *testing.T) {
+	require.NoError(t, ensureBPFFS())
+	require.NoError(t, rlimit.RemoveMemlock())
+	require.NoError(t, os.RemoveAll(pinRoot))
+	require.NoError(t, os.MkdirAll(pinRoot, 0700))
+	t.Cleanup(func() { _ = os.RemoveAll(pinRoot) })
+
+	legacy, err := ebpf.NewMap(&ebpf.MapSpec{
+		Name:       "CONNECTION_MAP",
+		Type:       ebpf.LRUHash,
+		KeySize:    uint32(binary.Size(connectionKey{})),
+		ValueSize:  uint32(binary.Size(uint64(0))),
+		MaxEntries: 131072,
+	})
+	require.NoError(t, err)
+	defer legacy.Close()
+	require.NoError(t, legacy.Pin(pinRoot+"/CONNECTION_MAP"))
+
+	manager, err := New(Config{
+		BridgeIP: net.ParseIP("10.88.0.1"), DisableProxy: true, DisableAttach: true,
+	})
+	require.NoError(t, err)
+	require.NoError(t, manager.Close())
+	_, err = os.Stat(pinRoot + "/CONNECTION_MAP")
+	require.ErrorIs(t, err, os.ErrNotExist)
+}
+
 func TestIntegrationDataplane(t *testing.T) {
 	require.NoError(t, ensureBPFFS())
 	require.NoError(t, rlimit.RemoveMemlock())
@@ -49,17 +76,18 @@ func TestIntegrationDataplane(t *testing.T) {
 	require.NoError(t, objects.Config.Update(&configKey, &configValue, ebpf.UpdateAny))
 
 	ifindex := uint32(1) // SCHED_CLS test-run uses the initial netns loopback.
-	policy := policyValue{
+	policy := policyV2Value{
 		Generation: 1, SandboxIP: ipv4Value(sandboxIP),
-		TrafficEnabled: 1, TrafficDefault: actionDeny,
+		TrafficEnabled: 1, IngressDefaultAction: actionDeny, EgressDefaultAction: actionDeny,
 	}
 	require.NoError(t, objects.Policies.Update(&ifindex, &policy, ebpf.UpdateAny))
-	allowProxy := ruleKey{
-		Generation: 1, IfIndex: ifindex, PeerIP: ipv4Value(proxyIP),
-		PeerPort: networkPort(8080), Direction: directionEgress, Protocol: 6,
+	policy.RuleCount = 1
+	policy.Rules[0] = policyV2Rule{
+		PeerIP: ipv4Value(proxyIP), PeerPrefix: 32, Priority: defaultRulePriority,
+		PeerPortFirst: 8080, PeerPortLast: 8080, Directions: directionEgress,
+		Protocol: 6, Action: actionAllow,
 	}
-	allow := actionAllow
-	require.NoError(t, objects.Rules.Update(&allowProxy, &allow, ebpf.UpdateAny))
+	require.NoError(t, objects.Policies.Update(&ifindex, &policy, ebpf.UpdateAny))
 
 	ret, _, err := objects.EgressProgram.Test(makeTCPPacket(sandboxIP, proxyIP, 32000, 8080))
 	require.NoError(t, err)
@@ -69,10 +97,12 @@ func TestIntegrationDataplane(t *testing.T) {
 	assert.Equal(t, uint32(2), ret)
 
 	// A broader deny wins over the exact allow.
-	denyProxy := allowProxy
-	denyProxy.PeerPort = 0
-	deny := actionDeny
-	require.NoError(t, objects.Rules.Update(&denyProxy, &deny, ebpf.UpdateAny))
+	policy.RuleCount = 2
+	policy.Rules[1] = policyV2Rule{
+		PeerIP: ipv4Value(proxyIP), PeerPrefix: 32, Priority: defaultRulePriority,
+		Directions: directionEgress, Protocol: 6, Action: actionDeny,
+	}
+	require.NoError(t, objects.Policies.Update(&ifindex, &policy, ebpf.UpdateAny))
 	ret, _, err = objects.EgressProgram.Test(makeTCPPacket(sandboxIP, proxyIP, 32000, 8080))
 	require.NoError(t, err)
 	assert.Equal(t, uint32(2), ret)
@@ -86,10 +116,82 @@ func TestIntegrationDataplane(t *testing.T) {
 	ret, _, err = objects.EgressProgram.Test(makeUDPPacket(sandboxIP, remoteIP, 32000, 53))
 	require.NoError(t, err)
 	assert.Equal(t, uint32(2), ret)
+	policy.UpdateBarrier = 1
+	require.NoError(t, objects.Policies.Update(&ifindex, &policy, ebpf.UpdateAny))
+	ret, _, err = objects.EgressProgram.Test(makeUDPPacket(sandboxIP, proxyIP, 32000, 53))
+	require.NoError(t, err)
+	assert.Equal(t, uint32(2), ret, "the derived-domain update barrier fails closed")
+	policy.UpdateBarrier = 0
+
+	// CIDR and port ranges honor explicit priority. A higher-priority allow
+	// beats a narrower deny; DENY wins after the priorities are tied.
+	policy.DNSEnabled = 0
+	policy.RuleCount = 2
+	policy.Rules[0] = policyV2Rule{
+		PeerIP: ipv4Value(net.ParseIP("192.0.2.0")), PeerPrefix: 24,
+		PeerPortFirst: 440, PeerPortLast: 450, Priority: 200,
+		Directions: directionEgress, Protocol: 6, Action: actionAllow,
+	}
+	policy.Rules[1] = policyV2Rule{
+		PeerIP: ipv4Value(remoteIP), PeerPrefix: 32,
+		PeerPortFirst: 443, PeerPortLast: 443, Priority: 100,
+		Directions: directionEgress, Protocol: 6, Action: actionDeny,
+	}
+	require.NoError(t, objects.Policies.Update(&ifindex, &policy, ebpf.UpdateAny))
+	ret, _, err = objects.EgressProgram.Test(makeTCPPacket(sandboxIP, remoteIP, 32000, 443))
+	require.NoError(t, err)
+	assert.Equal(t, uint32(0), ret)
+	policy.Rules[1].Priority = 200
+	require.NoError(t, objects.Policies.Update(&ifindex, &policy, ebpf.UpdateAny))
+	ret, _, err = objects.EgressProgram.Test(makeTCPPacket(sandboxIP, remoteIP, 32000, 443))
+	require.NoError(t, err)
+	assert.Equal(t, uint32(2), ret)
+
+	// DNS-derived grants expire in the dataplane even when userspace has not
+	// yet swept the persisted record.
+	policy.RuleCount = 0
+	require.NoError(t, objects.Policies.Update(&ifindex, &policy, ebpf.UpdateAny))
+	now, err := monotonicNanoseconds()
+	require.NoError(t, err)
+	domainKey := domainPolicyKey{Generation: policy.Generation, IfIndex: ifindex, PeerIP: ipv4Value(remoteIP)}
+	domainValue := domainPolicyValue{RuleCount: 1}
+	domainValue.Rules[0] = domainPolicyRule{
+		ExpiresAt: now + uint64(time.Second), Priority: 300,
+		PeerPortFirst: 443, PeerPortLast: 443, Protocol: 6, Action: actionAllow,
+	}
+	require.NoError(t, objects.DomainPolicies.Update(&domainKey, &domainValue, ebpf.UpdateAny))
+	ret, _, err = objects.EgressProgram.Test(makeTCPPacket(sandboxIP, remoteIP, 32000, 443))
+	require.NoError(t, err)
+	assert.Equal(t, uint32(0), ret)
+	domainValue.Rules[0].ExpiresAt = now - 1
+	require.NoError(t, objects.DomainPolicies.Update(&domainKey, &domainValue, ebpf.UpdateAny))
+	ret, _, err = objects.EgressProgram.Test(makeTCPPacket(sandboxIP, remoteIP, 32000, 443))
+	require.NoError(t, err)
+	assert.Equal(t, uint32(2), ret)
+
+	// A stateful connection created by a domain grant remains capped by that
+	// grant. Refreshing traffic cannot extend it past DNS expiry, including
+	// while userspace is unavailable to run the grant sweeper.
+	policy.Mode = policyModeStateful
+	policy.Generation++
+	require.NoError(t, objects.Policies.Update(&ifindex, &policy, ebpf.UpdateAny))
+	now, err = monotonicNanoseconds()
+	require.NoError(t, err)
+	domainKey.Generation = policy.Generation
+	domainValue.Rules[0].ExpiresAt = now + uint64(50*time.Millisecond)
+	require.NoError(t, objects.DomainPolicies.Update(&domainKey, &domainValue, ebpf.UpdateAny))
+	ret, _, err = objects.EgressProgram.Test(makeTCPPacket(sandboxIP, remoteIP, 32001, 443))
+	require.NoError(t, err)
+	assert.Equal(t, uint32(0), ret)
+	time.Sleep(75 * time.Millisecond)
+	ret, _, err = objects.EgressProgram.Test(makeTCPPacket(sandboxIP, remoteIP, 32001, 443))
+	require.NoError(t, err)
+	assert.Equal(t, uint32(2), ret)
 
 	// DNS-only policy must fail closed for IPv6 rather than allowing a direct
 	// query to an IPv6 resolver that bypasses sandbox0:53.
 	policy.TrafficEnabled = 0
+	policy.DNSEnabled = 1
 	require.NoError(t, objects.Policies.Update(&ifindex, &policy, ebpf.UpdateAny))
 	ret, _, err = objects.EgressProgram.Test(makeIPv6Packet(17))
 	require.NoError(t, err)
@@ -113,23 +215,23 @@ func TestIntegrationStatefulConnectionsAndFragments(t *testing.T) {
 	sandboxIP := net.ParseIP("10.88.0.2").To4()
 	remoteIP := net.ParseIP("192.0.2.10").To4()
 	ifindex := uint32(1)
-	policy := policyValue{
+	policy := policyV2Value{
 		Generation: 1, SandboxIP: ipv4Value(sandboxIP), TrafficEnabled: 1,
-		TrafficDefault: actionDeny, Mode: policyModeStateful,
+		IngressDefaultAction: actionDeny, EgressDefaultAction: actionDeny,
+		Mode: policyModeStateful,
+	}
+	policy.RuleCount = 2
+	policy.Rules[0] = policyV2Rule{
+		Priority: defaultRulePriority, Directions: directionIngress, Protocol: 6,
+		SandboxPortFirst: 50090, SandboxPortLast: 50090,
+		MatchFlags: ruleMatchPeerAny, Action: actionAllow,
+	}
+	policy.Rules[1] = policyV2Rule{
+		PeerIP: ipv4Value(remoteIP), PeerPrefix: 32, Priority: defaultRulePriority,
+		PeerPortFirst: 443, PeerPortLast: 443, Directions: directionEgress,
+		Protocol: 6, Action: actionAllow,
 	}
 	require.NoError(t, objects.Policies.Update(&ifindex, &policy, ebpf.UpdateAny))
-	allowPublishedPort := ruleKey{
-		Generation: 1, IfIndex: ifindex, Direction: directionIngress, Protocol: 6,
-		SandboxPort: networkPort(50090), MatchFlags: ruleMatchValid | ruleMatchPeerAny,
-	}
-	allow := actionAllow
-	require.NoError(t, objects.Rules.Update(&allowPublishedPort, &allow, ebpf.UpdateAny))
-	allowOutbound := ruleKey{
-		Generation: 1, IfIndex: ifindex, PeerIP: ipv4Value(remoteIP),
-		PeerPort: networkPort(443), Direction: directionEgress, Protocol: 6,
-		MatchFlags: ruleMatchValid,
-	}
-	require.NoError(t, objects.Rules.Update(&allowOutbound, &allow, ebpf.UpdateAny))
 
 	syn := makeTCPPacketWithFlags(remoteIP, sandboxIP, 32000, 50090, 0x02)
 	ret, _, err := objects.IngressProgram.Test(syn)
@@ -161,13 +263,13 @@ func TestIntegrationStatefulConnectionsAndFragments(t *testing.T) {
 	assert.Equal(t, uint32(2), ret, "a policy generation change invalidates old state")
 
 	policy.Generation = 3
-	require.NoError(t, objects.Policies.Update(&ifindex, &policy, ebpf.UpdateAny))
-	allowUDP := ruleKey{
-		Generation: 3, IfIndex: ifindex, PeerIP: ipv4Value(remoteIP),
-		PeerPort: networkPort(9000), Direction: directionEgress, Protocol: 17,
-		MatchFlags: ruleMatchValid,
+	policy.RuleCount = 1
+	policy.Rules[0] = policyV2Rule{
+		PeerIP: ipv4Value(remoteIP), PeerPrefix: 32, Priority: defaultRulePriority,
+		PeerPortFirst: 9000, PeerPortLast: 9000, Directions: directionEgress,
+		Protocol: 17, Action: actionAllow,
 	}
-	require.NoError(t, objects.Rules.Update(&allowUDP, &allow, ebpf.UpdateAny))
+	require.NoError(t, objects.Policies.Update(&ifindex, &policy, ebpf.UpdateAny))
 	first := makeUDPFragment(sandboxIP, remoteIP, 32000, 9000, 77, 0, true)
 	ret, _, err = objects.EgressProgram.Test(first)
 	require.NoError(t, err)
@@ -180,6 +282,320 @@ func TestIntegrationStatefulConnectionsAndFragments(t *testing.T) {
 	ret, _, err = objects.EgressProgram.Test(unknown)
 	require.NoError(t, err)
 	assert.Equal(t, uint32(2), ret, "an out-of-order fragment fails closed")
+}
+
+func TestIntegrationStagesV2PolicyBeforePartialAttach(t *testing.T) {
+	require.NoError(t, ensureBPFFS())
+	_ = os.RemoveAll(pinRoot)
+	veth := &netlink.Veth{
+		LinkAttrs: netlink.LinkAttrs{Name: "aclstage0"},
+		PeerName:  "aclstage1",
+	}
+	require.NoError(t, netlink.LinkAdd(veth))
+	t.Cleanup(func() {
+		if link, err := netlink.LinkByName("aclstage0"); err == nil {
+			_ = netlink.LinkDel(link)
+		}
+	})
+	host, err := netlink.LinkByName("aclstage0")
+	require.NoError(t, err)
+	require.NoError(t, netlink.LinkSetUp(host))
+
+	manager, err := New(Config{
+		BridgeIP: net.ParseIP("10.88.0.1"), DisableProxy: true,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = manager.Close() })
+
+	entry := persistedEntry{
+		IP:         "10.88.0.2",
+		HostVeth:   "aclstage0",
+		IfIndex:    host.Attrs().Index,
+		Generation: 1,
+		Policy: Policy{SchemaVersion: networkPolicySchemaV2, Traffic: &TrafficPolicy{
+			IngressDefaultAction: actionDeny,
+			EgressDefaultAction:  actionDeny,
+			Mode:                 policyModeStateful,
+		}},
+	}
+	// Force the second FilterReplace to fail after the egress program has
+	// attached. The partially attached v2 program must still find a staged
+	// policy rather than taking the unrestricted no-policy path.
+	require.NoError(t, manager.objects.IngressProgram.Close())
+	require.Error(t, manager.applyLocked(persistedEntry{}, entry))
+	var active policyV2Value
+	require.NoError(t, manager.objects.Policies.Lookup(uint32(entry.IfIndex), &active))
+	assert.Equal(t, actionDeny, active.EgressDefaultAction)
+
+	require.NoError(t, manager.removePolicyMapLocked(entry.IfIndex))
+	require.NoError(t, manager.detachLocked(entry))
+	require.NoError(t, manager.deleteDynamicStateLocked(entry.IfIndex, 0))
+}
+
+func TestIntegrationFailedV2StagingPreservesLegacyPolicy(t *testing.T) {
+	require.NoError(t, ensureBPFFS())
+	_ = os.RemoveAll(pinRoot)
+	manager, err := New(Config{
+		BridgeIP: net.ParseIP("10.88.0.1"), DisableProxy: true, DisableAttach: true,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = manager.Close() })
+
+	ifindex := uint32(4242)
+	legacy := policyValue{
+		Generation: 1, SandboxIP: ipv4Value(net.ParseIP("10.88.0.2")),
+		TrafficEnabled: 1, TrafficDefault: actionDeny,
+	}
+	require.NoError(t, manager.objects.LegacyPolicies.Update(&ifindex, &legacy, ebpf.UpdateAny))
+	require.NoError(t, manager.objects.DomainPolicies.Close())
+
+	now := time.Now()
+	next := persistedEntry{
+		IP: "10.88.0.2", IfIndex: int(ifindex), Generation: 1,
+		Policy: Policy{SchemaVersion: networkPolicySchemaV2, Traffic: &TrafficPolicy{
+			IngressDefaultAction: actionAllow,
+			EgressDefaultAction:  actionDeny,
+			Mode:                 policyModeStateful,
+			Rules: []TrafficRule{{
+				Action: actionAllow, Directions: []uint8{directionEgress},
+				Protocol: 6, PeerDomain: "example.com", Priority: defaultRulePriority,
+			}},
+		}},
+		DomainGrants: []persistedDomainGrant{{
+			Question: "example.com", IP: "192.0.2.10",
+			ExpiresAt: now.Add(time.Minute).UnixNano(), RuleIndex: 0,
+		}},
+	}
+	require.Error(t, manager.applyLocked(persistedEntry{}, next))
+
+	var activeV2 policyV2Value
+	err = manager.objects.Policies.Lookup(&ifindex, &activeV2)
+	require.ErrorIs(t, err, ebpf.ErrKeyNotExist)
+	var activeLegacy policyValue
+	require.NoError(t, manager.objects.LegacyPolicies.Lookup(&ifindex, &activeLegacy))
+	assert.Equal(t, actionDeny, activeLegacy.TrafficDefault)
+	require.NoError(t, manager.removeLegacyPolicyMapLocked(int(ifindex)))
+}
+
+func TestIntegrationStagesDomainDeniesBeforePolicyActivation(t *testing.T) {
+	require.NoError(t, ensureBPFFS())
+	_ = os.RemoveAll(pinRoot)
+	manager, err := New(Config{
+		BridgeIP: net.ParseIP("10.88.0.1"), DisableProxy: true, DisableAttach: true,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = manager.Close() })
+
+	ifindex := uint32(4343)
+	active := policyV2Value{
+		Generation: 1, SandboxIP: ipv4Value(net.ParseIP("10.88.0.2")),
+		TrafficEnabled: 1, IngressDefaultAction: actionDeny, EgressDefaultAction: actionDeny,
+	}
+	require.NoError(t, manager.objects.Policies.Update(&ifindex, &active, ebpf.UpdateAny))
+
+	// Make derived-state staging fail. The active policy map must remain on the
+	// old fail-closed generation; activating generation 2 first would expose a
+	// default-allow window for the domain DENY below.
+	require.NoError(t, manager.objects.DomainPolicies.Close())
+	now := time.Now()
+	next := persistedEntry{
+		IP: "10.88.0.2", IfIndex: int(ifindex), Generation: 2,
+		Policy: Policy{SchemaVersion: networkPolicySchemaV2, Traffic: &TrafficPolicy{
+			IngressDefaultAction: actionAllow,
+			EgressDefaultAction:  actionAllow,
+			Mode:                 policyModeStateful,
+			Rules: []TrafficRule{{
+				Action: actionDeny, Directions: []uint8{directionEgress},
+				Protocol: 6, PeerDomain: "blocked.example", Priority: defaultRulePriority,
+			}},
+		}},
+		DomainGrants: []persistedDomainGrant{{
+			Question: "blocked.example", IP: "192.0.2.20",
+			ExpiresAt: now.Add(time.Minute).UnixNano(), RuleIndex: 0,
+		}},
+	}
+	require.Error(t, manager.applyLocked(persistedEntry{Generation: 1}, next))
+
+	var retained policyV2Value
+	require.NoError(t, manager.objects.Policies.Lookup(&ifindex, &retained))
+	assert.Equal(t, uint64(1), retained.Generation)
+	assert.Equal(t, actionDeny, retained.EgressDefaultAction)
+	require.NoError(t, manager.removeV2PolicyMapLocked(int(ifindex)))
+}
+
+func TestIntegrationDomainUpdateFailureKeepsBarrier(t *testing.T) {
+	require.NoError(t, ensureBPFFS())
+	_ = os.RemoveAll(pinRoot)
+	manager, err := New(Config{
+		BridgeIP: net.ParseIP("10.88.0.1"), DisableProxy: true, DisableAttach: true,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = manager.Close() })
+
+	ifindex := uint32(4393)
+	active := policyV2Value{
+		Generation: 1, SandboxIP: ipv4Value(net.ParseIP("10.88.0.2")),
+		TrafficEnabled: 1, IngressDefaultAction: actionAllow, EgressDefaultAction: actionAllow,
+	}
+	require.NoError(t, manager.objects.Policies.Update(&ifindex, &active, ebpf.UpdateAny))
+	require.NoError(t, manager.objects.DomainPolicies.Close())
+	entry := persistedEntry{
+		IP: "10.88.0.2", IfIndex: int(ifindex), Generation: 1,
+		Policy: Policy{SchemaVersion: networkPolicySchemaV2, Traffic: &TrafficPolicy{
+			IngressDefaultAction: actionAllow,
+			EgressDefaultAction:  actionAllow,
+			Rules: []TrafficRule{{
+				Action: actionDeny, Directions: []uint8{directionEgress},
+				Protocol: 6, PeerDomain: "blocked.example", Priority: defaultRulePriority,
+			}},
+		}},
+		DomainGrants: []persistedDomainGrant{{
+			Question: "blocked.example", IP: "192.0.2.21",
+			ExpiresAt: time.Now().Add(time.Minute).UnixNano(), RuleIndex: 0,
+		}},
+	}
+	empty := entry
+	empty.DomainGrants = nil
+	require.Error(t, manager.applyDomainGrantsLocked(empty, entry))
+
+	var retained policyV2Value
+	require.NoError(t, manager.objects.Policies.Lookup(&ifindex, &retained))
+	assert.Equal(t, uint8(1), retained.UpdateBarrier)
+	assert.Equal(t, uint64(1), retained.Generation)
+	require.NoError(t, manager.removeV2PolicyMapLocked(int(ifindex)))
+}
+
+func TestIntegrationSuccessfulRecoveryClearsExistingDomainBarrier(t *testing.T) {
+	require.NoError(t, ensureBPFFS())
+	_ = os.RemoveAll(pinRoot)
+	manager, err := New(Config{
+		BridgeIP: net.ParseIP("10.88.0.1"), DisableProxy: true, DisableAttach: true,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = manager.Close() })
+
+	ifindex := uint32(4394)
+	active := policyV2Value{
+		Generation: 1, SandboxIP: ipv4Value(net.ParseIP("10.88.0.2")),
+		TrafficEnabled: 1, IngressDefaultAction: actionDeny, EgressDefaultAction: actionDeny,
+		UpdateBarrier: 1,
+	}
+	require.NoError(t, manager.objects.Policies.Update(&ifindex, &active, ebpf.UpdateAny))
+	entry := persistedEntry{
+		IP: "10.88.0.2", IfIndex: int(ifindex), Generation: 1,
+		Policy: Policy{SchemaVersion: networkPolicySchemaV2, Traffic: &TrafficPolicy{
+			IngressDefaultAction: actionDeny,
+			EgressDefaultAction:  actionDeny,
+		}},
+	}
+	require.NoError(t, manager.applyDomainGrantsLocked(entry, entry))
+
+	var recovered policyV2Value
+	require.NoError(t, manager.objects.Policies.Lookup(&ifindex, &recovered))
+	assert.Zero(t, recovered.UpdateBarrier)
+	assert.Equal(t, uint64(1), recovered.Generation)
+	require.NoError(t, manager.removeV2PolicyMapLocked(int(ifindex)))
+}
+
+func TestIntegrationExpiredDomainGrantDeletesDataplaneKey(t *testing.T) {
+	require.NoError(t, ensureBPFFS())
+	_ = os.RemoveAll(pinRoot)
+	manager, err := New(Config{
+		BridgeIP: net.ParseIP("10.88.0.1"), DisableProxy: true, DisableAttach: true,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = manager.Close() })
+
+	ifindex := uint32(4401)
+	const generation = uint64(3)
+	active := policyV2Value{
+		Generation: generation, SandboxIP: ipv4Value(net.ParseIP("10.88.0.2")),
+		TrafficEnabled: 1, IngressDefaultAction: actionDeny, EgressDefaultAction: actionDeny,
+	}
+	require.NoError(t, manager.objects.Policies.Update(&ifindex, &active, ebpf.UpdateAny))
+	previous := persistedEntry{
+		IP: "10.88.0.2", IfIndex: int(ifindex), Generation: generation,
+		Policy: Policy{SchemaVersion: networkPolicySchemaV2, Traffic: &TrafficPolicy{
+			IngressDefaultAction: actionDeny,
+			EgressDefaultAction:  actionDeny,
+			Rules: []TrafficRule{{
+				Action: actionAllow, Directions: []uint8{directionEgress},
+				Protocol: 6, PeerDomain: "service.example", Priority: defaultRulePriority,
+			}},
+		}},
+		DomainGrants: []persistedDomainGrant{{
+			Question: "service.example", IP: "192.0.2.40",
+			ExpiresAt: time.Now().Add(-time.Second).UnixNano(), RuleIndex: 0,
+		}},
+	}
+	key := domainPolicyKey{
+		Generation: generation, IfIndex: ifindex,
+		PeerIP: ipv4Value(net.ParseIP("192.0.2.40")),
+	}
+	stale := domainPolicyValue{RuleCount: 1}
+	stale.Rules[0] = domainPolicyRule{
+		ExpiresAt: 1, Priority: defaultRulePriority, Protocol: 6, Action: actionAllow,
+	}
+	require.NoError(t, manager.objects.DomainPolicies.Update(&key, &stale, ebpf.UpdateAny))
+
+	next := previous
+	next.DomainGrants = nil
+	require.NoError(t, manager.applyDomainGrantsLocked(previous, next))
+
+	var retained domainPolicyValue
+	err = manager.objects.DomainPolicies.Lookup(&key, &retained)
+	require.ErrorIs(t, err, ebpf.ErrKeyNotExist)
+	require.NoError(t, manager.removeV2PolicyMapLocked(int(ifindex)))
+}
+
+func TestIntegrationDomainGrantChangeDeletesPeerDynamicState(t *testing.T) {
+	require.NoError(t, ensureBPFFS())
+	_ = os.RemoveAll(pinRoot)
+	manager, err := New(Config{
+		BridgeIP: net.ParseIP("10.88.0.1"), DisableProxy: true, DisableAttach: true,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = manager.Close() })
+
+	const (
+		ifindex    = uint32(4444)
+		generation = uint64(5)
+	)
+	sandboxIP := ipv4Value(net.ParseIP("10.88.0.2"))
+	changedPeer := ipv4Value(net.ParseIP("192.0.2.30"))
+	otherPeer := ipv4Value(net.ParseIP("192.0.2.31"))
+	changedConnection := connectionKey{
+		Generation: generation, IfIndex: ifindex, PeerIP: changedPeer,
+		PeerPort: networkPort(443), SandboxPort: networkPort(32000), Protocol: 6,
+	}
+	otherConnection := changedConnection
+	otherConnection.PeerIP = otherPeer
+	connectionState := connectionValue{ExpiresAt: ^uint64(0)}
+	require.NoError(t, manager.objects.Connections.Update(&changedConnection, &connectionState, ebpf.UpdateAny))
+	require.NoError(t, manager.objects.Connections.Update(&otherConnection, &connectionState, ebpf.UpdateAny))
+
+	changedFragment := fragmentKey{
+		Generation: generation, IfIndex: ifindex, SourceIP: sandboxIP,
+		DestinationIP: changedPeer, Identification: 10, Protocol: 17,
+		Direction: directionEgress,
+	}
+	otherFragment := changedFragment
+	otherFragment.DestinationIP = otherPeer
+	fragmentState := ^uint64(0)
+	require.NoError(t, manager.objects.Fragments.Update(&changedFragment, &fragmentState, ebpf.UpdateAny))
+	require.NoError(t, manager.objects.Fragments.Update(&otherFragment, &fragmentState, ebpf.UpdateAny))
+
+	require.NoError(t, manager.deleteConnectionsForPeersLocked(
+		int(ifindex), generation, map[uint32]struct{}{changedPeer: {}},
+	))
+	var retainedConnection connectionValue
+	err = manager.objects.Connections.Lookup(&changedConnection, &retainedConnection)
+	require.ErrorIs(t, err, ebpf.ErrKeyNotExist)
+	require.NoError(t, manager.objects.Connections.Lookup(&otherConnection, &retainedConnection))
+	var retainedFragment uint64
+	err = manager.objects.Fragments.Lookup(&changedFragment, &retainedFragment)
+	require.ErrorIs(t, err, ebpf.ErrKeyNotExist)
+	require.NoError(t, manager.objects.Fragments.Lookup(&otherFragment, &retainedFragment))
 }
 
 func TestIntegrationManagerLifecycle(t *testing.T) {
@@ -229,6 +645,10 @@ func TestIntegrationManagerLifecycle(t *testing.T) {
 		},
 	}))
 	assertACLFilterCount(t, host, 2)
+	assert.Equal(t, uint64(2), manager.entries["sandbox-1"].Generation)
+	var restoredPolicy policyV2Value
+	require.NoError(t, manager.objects.Policies.Lookup(uint32(host.Attrs().Index), &restoredPolicy))
+	assert.Equal(t, uint64(2), restoredPolicy.Generation)
 
 	// A failed Start rollback keeps an orphan entry. Reusing the same link is
 	// allowed only after that orphan's kernel state has been cleaned and its
@@ -285,7 +705,7 @@ func TestIntegrationManagerLifecycle(t *testing.T) {
 	// An empty replacement returns the sandbox to the zero-overhead path.
 	require.NoError(t, manager.SetPolicy("sandbox-2", Policy{}))
 	assertACLFilterCount(t, host, 0)
-	var value policyValue
+	var value policyV2Value
 	err = manager.objects.Policies.Lookup(uint32(host.Attrs().Index), &value)
 	require.ErrorIs(t, err, ebpf.ErrKeyNotExist)
 	require.NoError(t, manager.Remove("sandbox-2"))
@@ -425,7 +845,7 @@ func TestIntegrationRestorePreservesOrphanWhenKernelCleanupFails(t *testing.T) {
 	// A closed rule map deterministically makes cleanup fail without relying on
 	// a particular netlink error. Restore must keep the orphan both in memory
 	// and in the store so a later startup can retry.
-	require.NoError(t, manager.objects.Rules.Close())
+	require.NoError(t, manager.objects.LegacyRules.Close())
 	require.Error(t, manager.Restore(map[string]Binding{}))
 
 	manager.mu.RLock()
@@ -505,6 +925,7 @@ func TestIntegrationDNSProxy(t *testing.T) {
 			}
 			return true
 		},
+		nil,
 	)
 	require.NoError(t, err)
 	defer proxy.close()

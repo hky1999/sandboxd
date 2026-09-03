@@ -74,3 +74,162 @@ func TestDNSErrorResponseUsesServerFailureForOverload(t *testing.T) {
 	assert.Equal(t, dnsmessage.RCodeServerFailure, header.RCode)
 	assert.Len(t, questions, 1)
 }
+
+func TestTrafficGrantNamesIgnoresParallelAAAAQueries(t *testing.T) {
+	nameA := testDNSName(t, "packages.example.")
+	nameAll := testDNSName(t, "registry.example.")
+	nameCNAME := testDNSName(t, "alias.example.")
+
+	assert.Equal(t, []string{"packages.example", "registry.example"}, trafficGrantNames([]dnsmessage.Question{
+		{Name: nameA, Type: dnsmessage.TypeAAAA, Class: dnsmessage.ClassINET},
+		{Name: nameA, Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET},
+		{Name: nameA, Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET},
+		{Name: nameAll, Type: dnsmessage.TypeALL, Class: dnsmessage.ClassINET},
+		{Name: nameCNAME, Type: dnsmessage.TypeCNAME, Class: dnsmessage.ClassINET},
+	}))
+}
+
+func TestValidateDNSResponseRejectsMismatchedTransactionAndQuestion(t *testing.T) {
+	question := dnsmessage.Question{
+		Name: testDNSName(t, "packages.example."), Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET,
+	}
+	requestHeader := dnsmessage.Header{ID: 42, OpCode: 0}
+	response := dnsmessage.Message{
+		Header:    dnsmessage.Header{ID: 42, Response: true, RCode: dnsmessage.RCodeSuccess},
+		Questions: []dnsmessage.Question{question},
+	}
+	payload, err := response.Pack()
+	require.NoError(t, err)
+	require.NoError(t, validateDNSResponse(payload, requestHeader, []dnsmessage.Question{question}))
+
+	response.Header.ID++
+	payload, err = response.Pack()
+	require.NoError(t, err)
+	require.ErrorContains(t, validateDNSResponse(payload, requestHeader, []dnsmessage.Question{question}), "header")
+
+	response.Header.ID = requestHeader.ID
+	response.Questions[0].Name = testDNSName(t, "other.example.")
+	payload, err = response.Pack()
+	require.NoError(t, err)
+	require.ErrorContains(t, validateDNSResponse(payload, requestHeader, []dnsmessage.Question{question}), "question 0")
+}
+
+func TestResolveDNSResponseFollowsCNAMEAndRejectsPoisonedAddresses(t *testing.T) {
+	question := testDNSName(t, "packages.example.")
+	canonical := testDNSName(t, "cdn.example.")
+	poison := testDNSName(t, "poison.example.")
+	message := dnsmessage.Message{
+		Header:    dnsmessage.Header{ID: 7, Response: true, RCode: dnsmessage.RCodeSuccess},
+		Questions: []dnsmessage.Question{{Name: question, Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET}},
+		Answers: []dnsmessage.Resource{
+			{
+				Header: dnsmessage.ResourceHeader{Name: question, Type: dnsmessage.TypeCNAME, Class: dnsmessage.ClassINET, TTL: 30},
+				Body:   &dnsmessage.CNAMEResource{CNAME: canonical},
+			},
+			{
+				Header: dnsmessage.ResourceHeader{Name: canonical, Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET, TTL: 300},
+				Body:   &dnsmessage.AResource{A: [4]byte{192, 0, 2, 10}},
+			},
+			{
+				Header: dnsmessage.ResourceHeader{Name: poison, Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET, TTL: 300},
+				Body:   &dnsmessage.AResource{A: [4]byte{203, 0, 113, 99}},
+			},
+		},
+	}
+	payload, err := message.Pack()
+	require.NoError(t, err)
+	rewritten, resolved, err := resolveDNSResponse(payload, []string{"packages.example."})
+	require.NoError(t, err)
+	assert.Equal(t, []resolvedAddress{{IP: [4]byte{192, 0, 2, 10}, TTL: 30}}, resolved["packages.example"])
+
+	var parsed dnsmessage.Message
+	require.NoError(t, parsed.Unpack(rewritten))
+	require.Len(t, parsed.Answers, 3)
+	assert.Equal(t, uint32(30), parsed.Answers[1].Header.TTL, "A TTL is bounded by the complete CNAME chain")
+}
+
+func TestResolveDNSResponseUsesTightestConvergingCNAMEPath(t *testing.T) {
+	question := testDNSName(t, "packages.example.")
+	longPath := testDNSName(t, "long.example.")
+	shortPath := testDNSName(t, "short.example.")
+	canonical := testDNSName(t, "cdn.example.")
+	message := dnsmessage.Message{
+		Header:    dnsmessage.Header{ID: 9, Response: true, RCode: dnsmessage.RCodeSuccess},
+		Questions: []dnsmessage.Question{{Name: question, Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET}},
+		Answers: []dnsmessage.Resource{
+			{
+				Header: dnsmessage.ResourceHeader{Name: question, Type: dnsmessage.TypeCNAME, Class: dnsmessage.ClassINET, TTL: 300},
+				Body:   &dnsmessage.CNAMEResource{CNAME: longPath},
+			},
+			{
+				Header: dnsmessage.ResourceHeader{Name: question, Type: dnsmessage.TypeCNAME, Class: dnsmessage.ClassINET, TTL: 10},
+				Body:   &dnsmessage.CNAMEResource{CNAME: shortPath},
+			},
+			{
+				Header: dnsmessage.ResourceHeader{Name: longPath, Type: dnsmessage.TypeCNAME, Class: dnsmessage.ClassINET, TTL: 300},
+				Body:   &dnsmessage.CNAMEResource{CNAME: canonical},
+			},
+			{
+				Header: dnsmessage.ResourceHeader{Name: shortPath, Type: dnsmessage.TypeCNAME, Class: dnsmessage.ClassINET, TTL: 10},
+				Body:   &dnsmessage.CNAMEResource{CNAME: canonical},
+			},
+			{
+				Header: dnsmessage.ResourceHeader{Name: canonical, Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET, TTL: 300},
+				Body:   &dnsmessage.AResource{A: [4]byte{192, 0, 2, 10}},
+			},
+		},
+	}
+	payload, err := message.Pack()
+	require.NoError(t, err)
+
+	_, resolved, err := resolveDNSResponse(payload, []string{"packages.example."})
+	require.NoError(t, err)
+	assert.Equal(t, []resolvedAddress{{IP: [4]byte{192, 0, 2, 10}, TTL: 10}}, resolved["packages.example"])
+}
+
+func TestResolveDNSResponseDoesNotGrantFromNegativeOrTruncatedAnswers(t *testing.T) {
+	name := testDNSName(t, "packages.example.")
+	for _, header := range []dnsmessage.Header{
+		{ID: 10, Response: true, RCode: dnsmessage.RCodeNameError},
+		{ID: 11, Response: true, RCode: dnsmessage.RCodeSuccess, Truncated: true},
+	} {
+		message := dnsmessage.Message{
+			Header:    header,
+			Questions: []dnsmessage.Question{{Name: name, Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET}},
+			Answers: []dnsmessage.Resource{{
+				Header: dnsmessage.ResourceHeader{Name: name, Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET, TTL: 300},
+				Body:   &dnsmessage.AResource{A: [4]byte{192, 0, 2, 10}},
+			}},
+		}
+		payload, err := message.Pack()
+		require.NoError(t, err)
+		_, resolved, err := resolveDNSResponse(payload, []string{"packages.example."})
+		require.NoError(t, err)
+		assert.Empty(t, resolved["packages.example"])
+	}
+}
+
+func TestResolveDNSResponseCapsReachableAddresses(t *testing.T) {
+	name := testDNSName(t, "many.example.")
+	message := dnsmessage.Message{
+		Header:    dnsmessage.Header{ID: 8, Response: true},
+		Questions: []dnsmessage.Question{{Name: name, Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET}},
+	}
+	for index := 0; index <= maxDNSAddresses; index++ {
+		message.Answers = append(message.Answers, dnsmessage.Resource{
+			Header: dnsmessage.ResourceHeader{Name: name, Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET, TTL: 60},
+			Body:   &dnsmessage.AResource{A: [4]byte{192, 0, 2, byte(index + 1)}},
+		})
+	}
+	payload, err := message.Pack()
+	require.NoError(t, err)
+	_, _, err = resolveDNSResponse(payload, []string{"many.example."})
+	require.ErrorContains(t, err, "maximum is 64")
+}
+
+func testDNSName(t *testing.T, value string) dnsmessage.Name {
+	t.Helper()
+	name, err := dnsmessage.NewName(value)
+	require.NoError(t, err)
+	return name
+}

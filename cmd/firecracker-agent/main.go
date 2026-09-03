@@ -27,11 +27,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	goruntime "runtime"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/inclusionAI/sandboxd/internal/firecrackerproto"
 	"github.com/vishvananda/netlink"
@@ -39,23 +41,96 @@ import (
 )
 
 const (
-	containerRoot    = "/container/root"
-	containerLower   = "/container/lower"
-	containerOverlay = "/container/overlay"
+	containerMountRoot = "/container/root"
+	containerLower     = "/container/lower"
+	containerOverlay   = "/container/overlay"
+	containerNative    = "/container/overlay/native"
+	sandboxInitMode    = "sandbox-init"
+	sandboxConfigFD    = 3
+	sandboxStatusFD    = 4
 )
+
+var containerRoot = containerMountRoot
+
+type rootSwitchOperations struct {
+	mount  func(string, string, string, uintptr, string) error
+	open   func(string, int, uint32) (int, error)
+	close  func(int) error
+	fchdir func(int) error
+	chroot func(string) error
+	chdir  func(string) error
+}
+
+var systemRootSwitchOperations = rootSwitchOperations{
+	mount:  unix.Mount,
+	open:   unix.Open,
+	close:  unix.Close,
+	fchdir: unix.Fchdir,
+	chroot: unix.Chroot,
+	chdir:  unix.Chdir,
+}
+
+type namespaceOperations struct {
+	unshare func(int) error
+	open    func(string, int, uint32) (int, error)
+	close   func(int) error
+	setns   func(int, int) error
+}
+
+var systemNamespaceOperations = namespaceOperations{
+	unshare: unix.Unshare,
+	open:    unix.Open,
+	close:   unix.Close,
+	setns:   unix.Setns,
+}
+
+type sandboxNamespace struct {
+	name string
+	flag int
+}
+
+var sandboxNamespaces = []sandboxNamespace{
+	{name: "ipc", flag: unix.CLONE_NEWIPC},
+	{name: "uts", flag: unix.CLONE_NEWUTS},
+	{name: "mnt", flag: unix.CLONE_NEWNS},
+	// Joining a PID namespace only affects children created afterward, so it
+	// must happen before exec.Cmd.Start forks the requested process.
+	{name: "pid", flag: unix.CLONE_NEWPID},
+}
+
+type checkpointHandoff struct {
+	fifoPath        string
+	environmentPath string
+	mu              sync.Mutex
+	reader          chan string
+	pendingRestore  bool
+	closed          bool
+	stop            chan struct{}
+	done            chan struct{}
+	stopOnce        sync.Once
+}
 
 type agentState struct {
 	mu         sync.RWMutex
 	configured bool
 	process    firecrackerproto.ProcessSpec
+	mainPID    int
 	mainDone   chan struct{}
 	mainExit   int
+	handoff    *checkpointHandoff
 }
 
 var state agentState
 
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+	if len(os.Args) == 2 && os.Args[1] == sandboxInitMode {
+		if err := runSandboxInit(); err != nil {
+			reportSandboxInitError(err)
+			log.Fatalf("start sandbox init: %v", err)
+		}
+		return
+	}
 	if os.Getpid() != 1 {
 		log.Printf("warning: firecracker-agent is PID %d, not PID 1", os.Getpid())
 	}
@@ -140,6 +215,28 @@ func handleConnection(connection *os.File) {
 			return
 		}
 		writeResponse(connection, reconfigureNetwork(request))
+	case firecrackerproto.MessageFlush:
+		// Checkpoint quiesce hook: sync() drains the writable layer (the
+		// guest's only persistent filesystem) before the host snapshots it.
+		// The reply doubles as the ack — the host proceeds on timeout anyway.
+		log.Printf("flushing guest filesystems for checkpoint")
+		syscall.Sync()
+		writeResponse(connection, nil)
+	case firecrackerproto.MessageShrink:
+		// Checkpoint shrink hook: sync, then drop the page caches.
+		log.Printf("shrinking guest caches for checkpoint")
+		syscall.Sync()
+		if err := os.WriteFile("/proc/sys/vm/drop_caches", []byte("3"), 0o200); err != nil {
+			log.Printf("drop_caches: %v", err)
+		}
+		writeResponse(connection, nil)
+	case firecrackerproto.MessageCheckpoint:
+		var request firecrackerproto.CheckpointRequest
+		if err := firecrackerproto.Decode(payload, &request); err != nil {
+			writeResponse(connection, err)
+			return
+		}
+		writeResponse(connection, releaseCheckpoint(request))
 	case firecrackerproto.MessageShutdown:
 		writeResponse(connection, nil)
 		go powerOff()
@@ -263,6 +360,15 @@ func configure(request firecrackerproto.ConfigureRequest) error {
 			return fmt.Errorf("create mount target %s: %w", mount.Target, err)
 		}
 	}
+	for _, mount := range request.NativeWritableMounts {
+		if _, err := ensureContainerDirectory(mount.Target); err != nil {
+			return fmt.Errorf(
+				"create native writable mount target %s: %w",
+				mount.Target,
+				err,
+			)
+		}
+	}
 	for _, file := range request.Files {
 		if err := injectFile(file); err != nil {
 			return err
@@ -273,6 +379,11 @@ func configure(request firecrackerproto.ConfigureRequest) error {
 	}
 	for _, mount := range request.Mounts {
 		if err := mountGuestFilesystem(mount); err != nil {
+			return err
+		}
+	}
+	for index, mount := range request.NativeWritableMounts {
+		if err := mountNativeWritable(index, mount); err != nil {
 			return err
 		}
 	}
@@ -287,30 +398,453 @@ func configure(request firecrackerproto.ConfigureRequest) error {
 			return fmt.Errorf("remount sandbox root read-only: %w", err)
 		}
 	}
-	if request.Hostname != "" {
-		if err := unix.Sethostname([]byte(request.Hostname)); err != nil {
-			return fmt.Errorf("set hostname: %w", err)
-		}
-	}
 	if err := configureNetwork(request.Network); err != nil {
 		return err
 	}
-	command, err := sandboxCommand(request.Process, nil)
+	handoff, err := prepareCheckpointHandoff(
+		containerRoot,
+		request.Process.Env,
+	)
 	if err != nil {
-		return err
+		return fmt.Errorf("prepare checkpoint handoff: %w", err)
 	}
-	command.Stdin = nil
-	command.Stdout = os.Stdout
-	command.Stderr = os.Stderr
-	if err := command.Start(); err != nil {
+	command, err := startSandboxProcess(request.Hostname, request.Process)
+	if err != nil {
+		handoff.close()
 		return fmt.Errorf("start sandbox process: %w", err)
 	}
 	state.process = request.Process
+	state.mainPID = command.Process.Pid
+	state.handoff = handoff
 	state.configured = true
 	state.mainDone = make(chan struct{})
 	go waitMainProcess(command, state.mainDone)
 	log.Printf("started sandbox process pid=%d command=%q", command.Process.Pid, request.Process.Args)
 	return nil
+}
+
+type sandboxInitRequest struct {
+	Executable string                       `json:"executable"`
+	Hostname   string                       `json:"hostname,omitempty"`
+	Process    firecrackerproto.ProcessSpec `json:"process"`
+}
+
+func startSandboxProcess(
+	hostname string,
+	process firecrackerproto.ProcessSpec,
+) (*exec.Cmd, error) {
+	if len(process.Args) == 0 {
+		return nil, errors.New("sandbox command is empty")
+	}
+	executable, err := resolveExecutable(process.Args[0], process.Env)
+	if err != nil {
+		return nil, err
+	}
+	configReader, configWriter, err := os.Pipe()
+	if err != nil {
+		return nil, fmt.Errorf("create sandbox init config pipe: %w", err)
+	}
+	defer configWriter.Close()
+	statusReader, statusWriter, err := os.Pipe()
+	if err != nil {
+		configReader.Close()
+		return nil, fmt.Errorf("create sandbox init status pipe: %w", err)
+	}
+	defer statusReader.Close()
+
+	command := sandboxInitCommand(configReader, statusWriter)
+	if err := command.Start(); err != nil {
+		configReader.Close()
+		statusWriter.Close()
+		return nil, err
+	}
+	configReader.Close()
+	statusWriter.Close()
+
+	request := sandboxInitRequest{
+		Executable: executable,
+		Hostname:   hostname,
+		Process:    process,
+	}
+	writeErr := firecrackerproto.WriteMessage(
+		configWriter,
+		firecrackerproto.MessageConfigure,
+		request,
+	)
+	closeErr := configWriter.Close()
+	status, statusErr := io.ReadAll(statusReader)
+	if writeErr != nil || closeErr != nil || statusErr != nil || len(status) != 0 {
+		_ = command.Process.Kill()
+		_ = command.Wait()
+		switch {
+		case writeErr != nil:
+			return nil, fmt.Errorf("send sandbox init config: %w", writeErr)
+		case closeErr != nil:
+			return nil, fmt.Errorf("close sandbox init config: %w", closeErr)
+		case statusErr != nil:
+			return nil, fmt.Errorf("read sandbox init status: %w", statusErr)
+		default:
+			return nil, errors.New(string(status))
+		}
+	}
+	return command, nil
+}
+
+func sandboxInitCommand(configReader, statusWriter *os.File) *exec.Cmd {
+	return &exec.Cmd{
+		Path:       "/init",
+		Args:       []string{"/init", sandboxInitMode},
+		Env:        []string{},
+		Dir:        "/",
+		Stdin:      nil,
+		Stdout:     os.Stdout,
+		Stderr:     os.Stderr,
+		ExtraFiles: []*os.File{configReader, statusWriter},
+		SysProcAttr: &syscall.SysProcAttr{
+			Cloneflags: unix.CLONE_NEWNS |
+				unix.CLONE_NEWPID |
+				unix.CLONE_NEWUTS |
+				unix.CLONE_NEWIPC,
+			Setpgid: true,
+		},
+	}
+}
+
+func runSandboxInit() error {
+	// Credential changes and exec apply to the calling thread. Keep the whole
+	// bootstrap sequence on one OS thread until exec replaces the Go process.
+	goruntime.LockOSThread()
+	if os.Getpid() != 1 {
+		return fmt.Errorf("sandbox init is PID %d, want PID 1", os.Getpid())
+	}
+	unix.CloseOnExec(sandboxStatusFD)
+	config := os.NewFile(sandboxConfigFD, "sandbox-init-config")
+	if config == nil {
+		return errors.New("sandbox init config fd is unavailable")
+	}
+	messageType, payload, err := firecrackerproto.ReadMessage(config)
+	config.Close()
+	if err != nil {
+		return fmt.Errorf("read sandbox init config: %w", err)
+	}
+	if messageType != firecrackerproto.MessageConfigure {
+		return fmt.Errorf("unexpected sandbox init config type %d", messageType)
+	}
+	var request sandboxInitRequest
+	if err := firecrackerproto.Decode(payload, &request); err != nil {
+		return err
+	}
+	if request.Executable == "" || len(request.Process.Args) == 0 {
+		return errors.New("sandbox init command is empty")
+	}
+	if request.Hostname != "" {
+		if err := unix.Sethostname([]byte(request.Hostname)); err != nil {
+			return fmt.Errorf("set sandbox hostname: %w", err)
+		}
+	}
+	if err := switchContainerRoot(containerRoot, systemRootSwitchOperations); err != nil {
+		return fmt.Errorf("switch to sandbox root: %w", err)
+	}
+	if err := remountSandboxProc(); err != nil {
+		return err
+	}
+	workingDirectory := request.Process.Cwd
+	if workingDirectory == "" {
+		workingDirectory = "/"
+	}
+	if err := unix.Chdir(workingDirectory); err != nil {
+		return fmt.Errorf("change sandbox directory to %s: %w", workingDirectory, err)
+	}
+	groups := make([]int, len(request.Process.AdditionalGIDs))
+	for index, group := range request.Process.AdditionalGIDs {
+		groups[index] = int(group)
+	}
+	if err := unix.Setgroups(groups); err != nil {
+		return fmt.Errorf("set sandbox supplementary groups: %w", err)
+	}
+	if err := unix.Setresgid(
+		int(request.Process.GID),
+		int(request.Process.GID),
+		int(request.Process.GID),
+	); err != nil {
+		return fmt.Errorf("set sandbox gid: %w", err)
+	}
+	if err := unix.Setresuid(
+		int(request.Process.UID),
+		int(request.Process.UID),
+		int(request.Process.UID),
+	); err != nil {
+		return fmt.Errorf("set sandbox uid: %w", err)
+	}
+	unix.Umask(0022)
+	return unix.Exec(
+		request.Executable,
+		append([]string(nil), request.Process.Args...),
+		append([]string(nil), request.Process.Env...),
+	)
+}
+
+func reportSandboxInitError(err error) {
+	status := os.NewFile(sandboxStatusFD, "sandbox-init-status")
+	if status == nil {
+		return
+	}
+	defer status.Close()
+	_, _ = io.WriteString(status, err.Error())
+}
+
+func remountSandboxProc() error {
+	if err := unix.Unmount("/proc", unix.MNT_DETACH); err != nil && !errors.Is(err, unix.EINVAL) {
+		return fmt.Errorf("unmount inherited procfs: %w", err)
+	}
+	if err := unix.Mount(
+		"proc",
+		"/proc",
+		"proc",
+		unix.MS_NOSUID|unix.MS_NOEXEC|unix.MS_NODEV,
+		"",
+	); err != nil {
+		return fmt.Errorf("mount sandbox procfs: %w", err)
+	}
+	return nil
+}
+
+func switchContainerRoot(root string, operations rootSwitchOperations) error {
+	if root == "" || root == "/" {
+		return fmt.Errorf("new root %q must identify a mounted child filesystem", root)
+	}
+	if err := operations.mount("", "/", "", unix.MS_REC|unix.MS_PRIVATE, ""); err != nil {
+		return fmt.Errorf("make root mount private: %w", err)
+	}
+	rootFD, err := operations.open(root, unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return fmt.Errorf("open new root %s: %w", root, err)
+	}
+	defer operations.close(rootFD)
+	if err := operations.mount(root, "/", "", unix.MS_MOVE, ""); err != nil {
+		return fmt.Errorf("move new root %s: %w", root, err)
+	}
+	if err := operations.fchdir(rootFD); err != nil {
+		return fmt.Errorf("enter new root %s: %w", root, err)
+	}
+	if err := operations.chroot("."); err != nil {
+		return fmt.Errorf("chroot to new root %s: %w", root, err)
+	}
+	if err := operations.chdir("/"); err != nil {
+		return fmt.Errorf("change directory to new root: %w", err)
+	}
+	return nil
+}
+
+func prepareCheckpointHandoff(
+	root string,
+	environment []string,
+) (*checkpointHandoff, error) {
+	fifoPath := filepath.Join(
+		root,
+		strings.TrimPrefix(firecrackerproto.CheckpointHandoffPath, "/"),
+	)
+	environmentPath := filepath.Join(
+		root,
+		strings.TrimPrefix(firecrackerproto.RestoreEnvPath, "/"),
+	)
+	if err := os.MkdirAll(filepath.Dir(fifoPath), 0755); err != nil {
+		return nil, err
+	}
+	if err := replaceCheckpointFIFO(fifoPath); err != nil {
+		return nil, err
+	}
+	if err := writeCheckpointEnvironment(environmentPath, environment); err != nil {
+		_ = os.Remove(fifoPath)
+		return nil, err
+	}
+	handoff := &checkpointHandoff{
+		fifoPath:        fifoPath,
+		environmentPath: environmentPath,
+		stop:            make(chan struct{}),
+		done:            make(chan struct{}),
+	}
+	go handoff.serve()
+	return handoff, nil
+}
+
+func replaceCheckpointFIFO(path string) error {
+	replacement := path + ".next"
+	if err := os.Remove(replacement); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if err := unix.Mkfifo(replacement, 0600); err != nil {
+		return err
+	}
+	if err := os.Rename(replacement, path); err != nil {
+		_ = os.Remove(replacement)
+		return err
+	}
+	return nil
+}
+
+func writeCheckpointEnvironment(path string, environment []string) error {
+	for _, entry := range environment {
+		if strings.IndexByte(entry, 0) >= 0 {
+			return errors.New("checkpoint environment contains a NUL byte")
+		}
+	}
+	content := []byte(strings.Join(environment, "\x00"))
+	if len(content) != 0 {
+		content = append(content, 0)
+	}
+	temporary := path + ".tmp"
+	if err := os.WriteFile(temporary, content, 0600); err != nil {
+		return err
+	}
+	if err := os.Rename(temporary, path); err != nil {
+		_ = os.Remove(temporary)
+		return err
+	}
+	return nil
+}
+
+func (handoff *checkpointHandoff) serve() {
+	defer close(handoff.done)
+	retry := time.NewTicker(10 * time.Millisecond)
+	defer retry.Stop()
+	lastOpenError := ""
+	for {
+		file, generation, err := handoff.openWriter()
+		if err != nil {
+			if message := err.Error(); message != lastOpenError {
+				log.Printf("open checkpoint handoff: %v", err)
+				lastOpenError = message
+			}
+			select {
+			case <-handoff.stop:
+				return
+			case <-retry.C:
+				continue
+			}
+		}
+		lastOpenError = ""
+		if file == nil {
+			select {
+			case <-handoff.stop:
+				return
+			case <-retry.C:
+				continue
+			}
+		}
+		select {
+		case outcome := <-generation:
+			// Publish the next FIFO inode before completing this generation.
+			// New readers cannot attach to the old inode while its current
+			// reader is consuming the outcome and waiting for EOF.
+			if err := replaceCheckpointFIFO(handoff.fifoPath); err != nil {
+				log.Printf("replace checkpoint handoff: %v", err)
+				_ = file.Close()
+				return
+			}
+			if _, err := io.WriteString(file, outcome+"\n"); err != nil {
+				log.Printf("write checkpoint handoff: %v", err)
+			}
+			if err := file.Close(); err != nil {
+				log.Printf("close checkpoint handoff: %v", err)
+			}
+		case <-handoff.stop:
+			handoff.clearReader(generation)
+			_ = file.Close()
+			return
+		}
+	}
+}
+
+func (handoff *checkpointHandoff) openWriter() (*os.File, chan string, error) {
+	handoff.mu.Lock()
+	defer handoff.mu.Unlock()
+	if handoff.closed {
+		return nil, nil, nil
+	}
+	fd, err := unix.Open(
+		handoff.fifoPath,
+		unix.O_WRONLY|unix.O_NONBLOCK|unix.O_CLOEXEC,
+		0,
+	)
+	if errors.Is(err, unix.ENXIO) || errors.Is(err, unix.EINTR) {
+		return nil, nil, nil
+	}
+	if errors.Is(err, unix.ENOENT) {
+		if err := replaceCheckpointFIFO(handoff.fifoPath); err != nil {
+			return nil, nil, fmt.Errorf("recreate checkpoint handoff: %w", err)
+		}
+		return nil, nil, nil
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	generation := make(chan string, 1)
+	if handoff.pendingRestore {
+		handoff.pendingRestore = false
+		generation <- "restore"
+	} else {
+		handoff.reader = generation
+	}
+	return os.NewFile(uintptr(fd), handoff.fifoPath), generation, nil
+}
+
+func (handoff *checkpointHandoff) clearReader(generation chan string) {
+	handoff.mu.Lock()
+	defer handoff.mu.Unlock()
+	if handoff.reader == generation {
+		handoff.reader = nil
+	}
+}
+
+func (handoff *checkpointHandoff) signal(outcome string) error {
+	handoff.mu.Lock()
+	defer handoff.mu.Unlock()
+	if handoff.closed {
+		log.Printf("drop checkpoint handoff outcome %q: handoff is closed", outcome)
+		return nil
+	}
+	if handoff.reader == nil {
+		if outcome == "restore" {
+			handoff.pendingRestore = true
+			log.Printf("defer checkpoint handoff outcome %q until a reader registers", outcome)
+			return nil
+		}
+		log.Printf("drop checkpoint handoff outcome %q: no reader registered", outcome)
+		return nil
+	}
+	generation := handoff.reader
+	handoff.reader = nil
+	generation <- outcome
+	return nil
+}
+
+func (handoff *checkpointHandoff) close() {
+	handoff.stopOnce.Do(func() {
+		handoff.mu.Lock()
+		handoff.closed = true
+		close(handoff.stop)
+		handoff.mu.Unlock()
+	})
+	<-handoff.done
+}
+
+func releaseCheckpoint(request firecrackerproto.CheckpointRequest) error {
+	if request.Outcome != "resume" && request.Outcome != "restore" && request.Outcome != "error" {
+		return fmt.Errorf("invalid checkpoint outcome %q", request.Outcome)
+	}
+	state.mu.RLock()
+	handoff := state.handoff
+	state.mu.RUnlock()
+	if handoff == nil {
+		return errors.New("checkpoint handoff is not configured")
+	}
+	if request.Outcome == "restore" {
+		if err := writeCheckpointEnvironment(handoff.environmentPath, request.Environment); err != nil {
+			return fmt.Errorf("write restored checkpoint environment: %w", err)
+		}
+	}
+	return handoff.signal(request.Outcome)
 }
 
 func mountRuntimeFilesystems() error {
@@ -370,6 +904,48 @@ func mountGuestFilesystem(mount firecrackerproto.MountSpec) error {
 			mount.FSType,
 		)
 	}
+}
+
+func mountNativeWritable(
+	index int,
+	mount firecrackerproto.NativeWritableMountSpec,
+) error {
+	return mountNativeWritableUnder(
+		containerNative,
+		containerRoot,
+		index,
+		mount,
+		unix.Mount,
+	)
+}
+
+func mountNativeWritableUnder(
+	sourceRoot,
+	root string,
+	index int,
+	mount firecrackerproto.NativeWritableMountSpec,
+	mountFn func(string, string, string, uintptr, string) error,
+) error {
+	if index < 0 {
+		return fmt.Errorf("native writable mount index %d is negative", index)
+	}
+	source := filepath.Join(sourceRoot, strconv.Itoa(index))
+	if err := os.MkdirAll(source, 0755); err != nil {
+		return fmt.Errorf("create native writable mount source %s: %w", source, err)
+	}
+	target, err := ensureContainerDirectoryUnder(root, mount.Target)
+	if err != nil {
+		return err
+	}
+	if err := mountFn(source, target, "", unix.MS_BIND, ""); err != nil {
+		return fmt.Errorf(
+			"bind native writable mount %s at %s: %w",
+			source,
+			mount.Target,
+			err,
+		)
+	}
+	return nil
 }
 
 func mountGuestEROFS(mount firecrackerproto.MountSpec) error {
@@ -702,6 +1278,61 @@ func powerOff() {
 	}
 }
 
+func startCommandInSandbox(mainPID int, command *exec.Cmd) error {
+	started := make(chan error, 1)
+	go func() {
+		// Namespace membership is per-thread. The goroutine deliberately never
+		// unlocks this thread: after Start returns, the goroutine exits and the Go
+		// runtime terminates the namespace-tainted OS thread.
+		goruntime.LockOSThread()
+		if err := joinSandboxNamespaces(
+			mainPID,
+			systemNamespaceOperations,
+		); err != nil {
+			started <- err
+			return
+		}
+		started <- command.Start()
+	}()
+	return <-started
+}
+
+func joinSandboxNamespaces(mainPID int, operations namespaceOperations) error {
+	if mainPID <= 0 {
+		return fmt.Errorf("invalid sandbox init PID %d", mainPID)
+	}
+	// setns(CLONE_NEWNS) rejects a caller that shares CLONE_FS state. The
+	// locked worker thread gets a private fs_struct before entering the mount
+	// namespace and is terminated instead of being returned to the Go runtime.
+	if err := operations.unshare(unix.CLONE_FS); err != nil {
+		return fmt.Errorf("unshare exec filesystem state: %w", err)
+	}
+	type namespaceFD struct {
+		sandboxNamespace
+		fd int
+	}
+	fds := make([]namespaceFD, 0, len(sandboxNamespaces))
+	defer func() {
+		for _, namespace := range fds {
+			_ = operations.close(namespace.fd)
+		}
+	}()
+	for _, namespace := range sandboxNamespaces {
+		path := fmt.Sprintf("/proc/%d/ns/%s", mainPID, namespace.name)
+		fd, err := operations.open(path, unix.O_RDONLY|unix.O_CLOEXEC, 0)
+		if err != nil {
+			return fmt.Errorf("open sandbox %s namespace: %w", namespace.name, err)
+		}
+		fds = append(fds, namespaceFD{sandboxNamespace: namespace, fd: fd})
+	}
+	for _, namespace := range fds {
+		if err := operations.setns(namespace.fd, namespace.flag); err != nil {
+			return fmt.Errorf("join sandbox %s namespace: %w", namespace.name, err)
+		}
+	}
+	return nil
+}
+
 func handleExec(connection *os.File, request firecrackerproto.ExecRequest, tty bool) {
 	state.mu.RLock()
 	if !state.configured {
@@ -710,6 +1341,7 @@ func handleExec(connection *os.File, request firecrackerproto.ExecRequest, tty b
 		return
 	}
 	base := state.process
+	mainPID := state.mainPID
 	done := state.mainDone
 	state.mu.RUnlock()
 	select {
@@ -724,19 +1356,19 @@ func handleExec(connection *os.File, request firecrackerproto.ExecRequest, tty b
 		writeResponse(connection, err)
 		return
 	}
-	command, err := sandboxCommand(process, &request)
+	command, err := sandboxCommand(process)
 	if err != nil {
 		writeResponse(connection, err)
 		return
 	}
 	if tty {
-		runTTYExec(connection, command, request)
+		runTTYExec(connection, command, request, mainPID)
 		return
 	}
-	runPipeExec(connection, command)
+	runPipeExec(connection, command, mainPID)
 }
 
-func runPipeExec(connection *os.File, command *exec.Cmd) {
+func runPipeExec(connection *os.File, command *exec.Cmd, mainPID int) {
 	stdin, err := command.StdinPipe()
 	if err != nil {
 		writeResponse(connection, err)
@@ -752,7 +1384,7 @@ func runPipeExec(connection *os.File, command *exec.Cmd) {
 		writeResponse(connection, err)
 		return
 	}
-	if err := command.Start(); err != nil {
+	if err := startCommandInSandbox(mainPID, command); err != nil {
 		writeResponse(connection, err)
 		return
 	}
@@ -797,7 +1429,12 @@ func runPipeExec(connection *os.File, command *exec.Cmd) {
 	writeMu.Unlock()
 }
 
-func runTTYExec(connection *os.File, command *exec.Cmd, request firecrackerproto.ExecRequest) {
+func runTTYExec(
+	connection *os.File,
+	command *exec.Cmd,
+	request firecrackerproto.ExecRequest,
+	mainPID int,
+) {
 	master, slave, err := openPTY(request.Rows, request.Cols)
 	if err != nil {
 		writeResponse(connection, err)
@@ -811,7 +1448,7 @@ func runTTYExec(connection *os.File, command *exec.Cmd, request firecrackerproto
 	command.SysProcAttr.Setpgid = false
 	command.SysProcAttr.Setctty = true
 	command.SysProcAttr.Ctty = 0
-	if err := command.Start(); err != nil {
+	if err := startCommandInSandbox(mainPID, command); err != nil {
 		slave.Close()
 		writeResponse(connection, err)
 		return
@@ -1053,10 +1690,7 @@ func resolveGroupIdentity(value string) (uint32, error) {
 	return 0, fmt.Errorf("unknown sandbox group %q", value)
 }
 
-func sandboxCommand(
-	process firecrackerproto.ProcessSpec,
-	request *firecrackerproto.ExecRequest,
-) (*exec.Cmd, error) {
+func sandboxCommand(process firecrackerproto.ProcessSpec) (*exec.Cmd, error) {
 	if len(process.Args) == 0 {
 		return nil, errors.New("sandbox command is empty")
 	}
@@ -1074,16 +1708,13 @@ func sandboxCommand(
 		command.Dir = "/"
 	}
 	command.SysProcAttr = &syscall.SysProcAttr{
-		Chroot:    containerRoot,
-		Setpgid:   true,
-		Pdeathsig: syscall.SIGKILL,
+		Setpgid: true,
 		Credential: &syscall.Credential{
 			Uid:    process.UID,
 			Gid:    process.GID,
 			Groups: append([]uint32(nil), process.AdditionalGIDs...),
 		},
 	}
-	_ = request
 	return command, nil
 }
 

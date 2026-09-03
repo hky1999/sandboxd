@@ -38,11 +38,33 @@ type CheckpointHandler interface {
 	Restore(context.Context, StartConfig) error
 }
 
+// CheckpointRestoreCapabilities describes the optional application-facing
+// handoff interface exposed inside a restored sandbox. Empty paths mean the
+// runtime supports transparent checkpoint/restore without application help.
+type CheckpointRestoreCapabilities struct {
+	CheckpointHandoffPath string
+	RestoreEnvPath        string
+}
+
+// CheckpointRestoreCapabilitiesProvider optionally describes the guest-facing
+// application handoff exposed by a CheckpointHandler.
+type CheckpointRestoreCapabilitiesProvider interface {
+	CheckpointRestoreCapabilities() CheckpointRestoreCapabilities
+}
+
 type CheckpointConfig struct {
-	ID           string
-	Directory    string
+	ID        string
+	Directory string
+	// CgroupPath is the runtime-owned source cgroup. It is internal runtime
+	// metadata rather than a public checkpoint option.
+	CgroupPath   string
 	Compress     bool
 	LeaveRunning bool
+	// SnapshotType requests a specific checkpoint flavor ("Full",
+	// "Incremental", or "SoftDirty" for Firecracker); empty leaves the
+	// runtime's automatic tier selection in charge. Runtimes without
+	// incremental checkpoints ignore it.
+	SnapshotType string
 }
 
 // HostResourcesProvider maps guest-visible resources to the host cgroup that
@@ -76,6 +98,7 @@ type StartConfig struct {
 	DisableCgroup           bool
 	SpecUpdates             *SpecUpdates
 	WritableLayerLimitBytes uint64
+	ExtraConfig             string
 	EnableKVM               bool
 	CheckpointDir           string
 }

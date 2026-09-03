@@ -46,6 +46,8 @@ REDIS_NETWORK="${CONTAINER}-network"
 REDIS_RESULT_KEY="sandboxd-e2e:${CONTAINER}:dnat"
 REDIS_FIXTURE_DIR=""
 REDIS_HOST=""
+SANDBOXD_HOME_FIXTURE_DIR=""
+DISABLED_HOME_FIXTURE_DIR=""
 
 log() {
     printf '[e2e-run] %s\n' "$*"
@@ -54,6 +56,25 @@ log() {
 fail() {
     printf '[e2e-run][error] %s\n' "$*" >&2
     exit 1
+}
+
+cleanup_disk_fixture() {
+    local dir="$1"
+
+    [ -n "${dir}" ] || return
+    [ -d "${dir}" ] || return
+
+    # The privileged E2E container writes root-owned runtime state into this
+    # host bind mount. A non-root CI runner cannot necessarily remove that
+    # state directly, so use the already-built E2E image for cleanup before
+    # removing the empty runner-owned directory on the host. Always take this
+    # path so root-run local tests exercise the same cleanup as CI.
+    "${DOCKER}" run --rm \
+        --entrypoint /bin/sh \
+        -v "${dir}:/cleanup:rw" \
+        "${IMAGE}" \
+        -c 'rm -rf /cleanup/* /cleanup/.[!.]* /cleanup/..?*'
+    rmdir -- "${dir}"
 }
 
 cleanup_container() {
@@ -72,9 +93,30 @@ cleanup_container() {
         rm -rf -- "${REDIS_FIXTURE_DIR}"
         REDIS_FIXTURE_DIR=""
     fi
+    if [ -n "${SANDBOXD_HOME_FIXTURE_DIR}" ]; then
+        cleanup_disk_fixture "${SANDBOXD_HOME_FIXTURE_DIR}"
+        SANDBOXD_HOME_FIXTURE_DIR=""
+    fi
+    if [ -n "${DISABLED_HOME_FIXTURE_DIR}" ]; then
+        cleanup_disk_fixture "${DISABLED_HOME_FIXTURE_DIR}"
+        DISABLED_HOME_FIXTURE_DIR=""
+    fi
     if [ "${E2E_SKIP_BUILD}" = "0" ] && [ "${E2E_RUNTIME}" = "kata" ]; then
         rm -rf -- "${ROOT_DIR}/output/kata"
     fi
+}
+
+prepare_sandboxd_home_fixture() {
+    local dir
+    local fs_type
+
+    dir="$(mktemp -d /var/tmp/sandboxd-e2e-home.XXXXXX)"
+    fs_type="$(stat -f -c %T "${dir}")"
+    if [ "${fs_type}" = "tmpfs" ]; then
+        rmdir "${dir}"
+        fail "/home/akernel fixture must be disk-backed, not tmpfs"
+    fi
+    printf '%s\n' "${dir}"
 }
 
 prepare_network_soak() {
@@ -324,6 +366,7 @@ fi
 
 cleanup_container
 prepare_network_soak
+SANDBOXD_HOME_FIXTURE_DIR="$(prepare_sandboxd_home_fixture)"
 
 container_network_args=(--net bridge)
 network_soak_args=(-e E2E_NETWORK_SOAK=0)
@@ -351,8 +394,10 @@ set +e
     -e "E2E_CPU_LIMIT_MODE=${E2E_CPU_LIMIT_MODE}" \
     -e "E2E_RUNTIME=${E2E_RUNTIME}" \
     -e "E2E_RUNSC_PLATFORM=${E2E_RUNSC_PLATFORM}" \
+    -e "E2E_FIRECRACKER_CHECKPOINT_MODE=${E2E_FIRECRACKER_CHECKPOINT_MODE:-}" \
+    -e "E2E_OCI_ROOTFS_IMAGE=${REDIS_IMAGE}" \
     "${network_soak_args[@]}" \
-    --tmpfs /home/akernel:rw,exec,size=2g \
+    -v "${SANDBOXD_HOME_FIXTURE_DIR}:/home/akernel:rw" \
     --tmpfs /e2e:rw,exec,size=512m \
     -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
     "${IMAGE}" &
@@ -385,6 +430,7 @@ if [ "${E2E_RUN_CGROUP_DISABLED}" = "0" ] ||
     exit 0
 fi
 
+DISABLED_HOME_FIXTURE_DIR="$(prepare_sandboxd_home_fixture)"
 log "running cgroup-disabled e2e container ${DISABLED_CONTAINER}"
 set +e
 "${DOCKER}" run \
@@ -396,7 +442,7 @@ set +e
     -e E2E_RUNTIME=runsc \
     -e "E2E_RUNSC_PLATFORM=${E2E_RUNSC_PLATFORM}" \
     -e E2E_CPU_LIMIT_MODE=shares \
-    --tmpfs /home/akernel:rw,exec,size=2g \
+    -v "${DISABLED_HOME_FIXTURE_DIR}:/home/akernel:rw" \
     --tmpfs /e2e:rw,exec,size=512m \
     -v /sys/fs/cgroup:/sys/fs/cgroup:ro \
     "${IMAGE}"

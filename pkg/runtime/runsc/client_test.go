@@ -274,3 +274,84 @@ func TestCheckpointCancellationTerminatesCommand(t *testing.T) {
 		t.Fatalf("checkpoint cancellation took %s", elapsed)
 	}
 }
+
+func TestOpenRestoreFilesSingleFile(t *testing.T) {
+	tempDir := t.TempDir()
+	imagePath := filepath.Join(tempDir, "checkpoint.img")
+	if err := os.WriteFile(imagePath, []byte("state"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	files, havePagesFile, err := openRestoreFiles(imagePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeFiles(files)
+	if havePagesFile {
+		t.Fatal("HavePagesFile = true, want false")
+	}
+	if len(files) != 1 || files[0].Name() != imagePath {
+		t.Fatalf("restore files = %v, want only %s", fileNames(files), imagePath)
+	}
+}
+
+func TestOpenRestoreFilesSplitPages(t *testing.T) {
+	tempDir := t.TempDir()
+	paths := []string{
+		filepath.Join(tempDir, "checkpoint.img"),
+		filepath.Join(tempDir, checkpointPagesMetadataName),
+		filepath.Join(tempDir, checkpointPagesName),
+	}
+	for _, path := range paths {
+		if err := os.WriteFile(path, []byte(filepath.Base(path)), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	files, havePagesFile, err := openRestoreFiles(paths[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeFiles(files)
+	if !havePagesFile {
+		t.Fatal("HavePagesFile = false, want true")
+	}
+	if got := fileNames(files); strings.Join(got, "\n") != strings.Join(paths, "\n") {
+		t.Fatalf("restore files = %v, want %v", got, paths)
+	}
+}
+
+func TestOpenRestoreFilesRejectsIncompletePages(t *testing.T) {
+	for _, presentName := range []string{
+		checkpointPagesMetadataName,
+		checkpointPagesName,
+	} {
+		t.Run(presentName, func(t *testing.T) {
+			tempDir := t.TempDir()
+			imagePath := filepath.Join(tempDir, "checkpoint.img")
+			if err := os.WriteFile(imagePath, []byte("state"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(tempDir, presentName), []byte("pages"), 0600); err != nil {
+				t.Fatal(err)
+			}
+
+			files, havePagesFile, err := openRestoreFiles(imagePath)
+			if err == nil || !strings.Contains(err.Error(), "incomplete checkpoint page files") {
+				closeFiles(files)
+				t.Fatalf("openRestoreFiles() error = %v, want incomplete page files", err)
+			}
+			if havePagesFile {
+				t.Fatal("HavePagesFile = true after incomplete checkpoint")
+			}
+		})
+	}
+}
+
+func fileNames(files []*os.File) []string {
+	names := make([]string, 0, len(files))
+	for _, file := range files {
+		names = append(names, file.Name())
+	}
+	return names
+}

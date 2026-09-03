@@ -26,6 +26,7 @@ RUN apt-get update && \
         erofs-utils \
         gzip \
         iproute2 \
+        ipset \
         iptables \
         iputils-ping \
         jq \

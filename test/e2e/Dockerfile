@@ -23,6 +23,7 @@ RUN apt-get update && \
         curl \
         erofs-utils \
         iproute2 \
+        ipset \
         iptables \
         iputils-ping \
         jq \

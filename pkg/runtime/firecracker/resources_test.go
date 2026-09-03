@@ -22,6 +22,9 @@ import (
 
 func TestFirecrackerHostResourcesAddsRuntimeMemoryOverhead(t *testing.T) {
 	const requested = int64(256 * 1024 * 1024)
+	if firecrackerHostMemoryOverheadBytes != 64*1024*1024 {
+		t.Fatalf("Firecracker host memory overhead = %d", firecrackerHostMemoryOverheadBytes)
+	}
 	original := &runtime.LinuxSandboxResources{
 		CpuQuota:               50000,
 		CpuPeriod:              100000,

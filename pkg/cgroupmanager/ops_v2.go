@@ -15,11 +15,13 @@
 package cgroupmanager
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/inclusionAI/sandboxd/config"
@@ -210,16 +212,19 @@ func (o *cgroupV2) kill(name string) error {
 	if err != nil {
 		return err
 	}
+	// Do not use cgroup.kill while supported kernels may lack Linux commit
+	// 8e3599202166 ("cgroup: fix spurious SIGKILL of CLONE_INTO_CGROUP
+	// children"). On affected kernels, cgroup.kill changes a persistent
+	// sequence number that can cause future processes cloned into this cached
+	// cgroup to be killed. Explicit signals avoid changing that sequence.
 	processes, err := group.Procs(true)
 	if err != nil {
 		return err
 	}
-	// cgroup.kill is sticky while tasks from the previous sandbox are still
-	// being reaped. Writing it for an already empty cgroup can therefore kill
-	// the first process cloned into a recycled cgroup.
-	if len(processes) > 0 {
-		if err := group.Kill(); err != nil {
-			return err
+	for _, pid := range processes {
+		if err := syscall.Kill(int(pid), syscall.SIGKILL); err != nil &&
+			!errors.Is(err, syscall.ESRCH) {
+			return fmt.Errorf("kill process %d in cgroup %s: %w", pid, name, err)
 		}
 	}
 

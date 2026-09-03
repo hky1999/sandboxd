@@ -83,9 +83,10 @@ Sandboxd owns TAP devices in the host network namespace whose names use its
 reuse those devices. Other software must not create TAP devices in this
 reserved namespace.
 
-An optional per-sandbox ACL uses native netfilter with the `iptables` backend
-and TC eBPF with the `bpfnat` backend. Both support stateful IPv4 rules,
-fragments, and managed DNS policies. See
+An optional per-sandbox ACL uses native netfilter and ipset with the `iptables`
+backend and TC eBPF with the `bpfnat` backend. Both support prioritized
+stateful IPv4 CIDR, domain, protocol, and port rules, fragments, and managed
+DNS policies. See
 [the network ACL guide](doc/network-acl.md) for its API, host requirements,
 limitations, and recovery behavior.
 
@@ -159,7 +160,8 @@ tools/               pinned protobuf code-generation image
 
 - Kata Containers and Firecracker require a usable `/dev/kvm`; nodes without
   KVM continue to support gVisor. Firecracker additionally requires a compatible
-  guest kernel/initrd, an EROFS root image, and the ext4 image tool.
+  guest kernel/initrd, an EROFS root image, and the ext4 image tool. Nodes that
+  enable OCI/Nydus rootfs materialization also require `mkfs.erofs`.
 - NVIDIA GPU sandboxes require runsc, a directory/lisafs-backed rootfs,
   `nvidia-container-cli`, accessible NVIDIA devices and userspace driver
   libraries, and a host driver supported by the pinned runsc nvproxy. Kata,

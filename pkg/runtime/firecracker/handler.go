@@ -48,8 +48,16 @@ const (
 	firecrackerVsock           = firecrackerproto.HostAgentSocketName
 	firecrackerAgentTimeout    = 15 * time.Second
 	firecrackerShutdownTimeout = 2 * time.Second
-	firecrackerMinMemoryMiB    = uint32(128)
-	firecrackerMaxVCPUs        = uint32(32)
+	// Guest flush budget before pausing for a checkpoint. Syncing a heavily
+	// dirty writable layer can exceed the default 1s agent round-trip, but
+	// the pause window must not grow unbounded on a stuck guest.
+	firecrackerFlushTimeout = 2 * time.Second
+	firecrackerMinMemoryMiB = uint32(128)
+	firecrackerMaxVCPUs     = uint32(32)
+	// checkpoint_mode values: the conservative default and the incremental
+	// chain. An unset value normalizes to full.
+	firecrackerCheckpointModeFull        = "full"
+	firecrackerCheckpointModeIncremental = "incremental"
 )
 
 var (
@@ -68,10 +76,33 @@ type firecrackerPersistedState struct {
 	VsockPath   string `json:"vsock_path"`
 	OverlayPath string `json:"overlay_path"`
 	CreatedAt   string `json:"created_at"`
-	Configured  bool   `json:"configured,omitempty"`
-	Exited      bool   `json:"exited,omitempty"`
-	ExitedAt    string `json:"exited_at,omitempty"`
-	ExitCode    int    `json:"exit_code,omitempty"`
+	// MemoryMiB is the guest memory size in MiB, recorded so incremental
+	// checkpoints can preallocate or clone a full-size base memory file.
+	MemoryMiB uint32 `json:"memory_mib,omitempty"`
+	// Vcpus is the guest vCPU count at Start time, recorded so checkpoints
+	// can stamp the compatibility tuple (the vmstate itself pins the count
+	// for a restore).
+	Vcpus uint32 `json:"vcpus,omitempty"`
+	// BaseMemoryPath points at the memory image the Firecracker dirty-page
+	// ledger currently tracks — the previous artifact's own memory file, or
+	// the file a restore loaded.
+	BaseMemoryPath string `json:"base_memory_path,omitempty"`
+	// BaseMemoryIncremental marks a base that came from a restore, which the
+	// Firecracker pagemap ledger (not the soft-dirty window) diffs against.
+	BaseMemoryIncremental bool `json:"base_memory_incremental,omitempty"`
+	// BaseMemoryLineageLost marks that the VMM dirty-page ledger may be
+	// armed against a base sandboxd no longer holds: a checkpoint failed
+	// after the VMM wrote and re-armed its window, or the daemon restarted
+	// and cannot tell which generation the surviving VMM tracks. While set,
+	// the next checkpoint must take a Full snapshot — Full ignores the
+	// ledger and writes the complete memory image, and the window re-opens
+	// only after that write, so patching later deltas onto the Full
+	// artifact is a safe superset.
+	BaseMemoryLineageLost bool   `json:"base_memory_lineage_lost,omitempty"`
+	Configured            bool   `json:"configured,omitempty"`
+	Exited                bool   `json:"exited,omitempty"`
+	ExitedAt              string `json:"exited_at,omitempty"`
+	ExitCode              int    `json:"exit_code,omitempty"`
 }
 
 type firecrackerInstance struct {
@@ -100,6 +131,52 @@ func (instance *firecrackerInstance) markConfigured() {
 	instance.mu.Lock()
 	instance.state.Configured = true
 	instance.mu.Unlock()
+}
+
+func (instance *firecrackerInstance) setMemoryMiB(size uint32) {
+	instance.mu.Lock()
+	instance.state.MemoryMiB = size
+	instance.mu.Unlock()
+}
+
+func (instance *firecrackerInstance) setVcpus(count uint32) {
+	instance.mu.Lock()
+	instance.state.Vcpus = count
+	instance.mu.Unlock()
+}
+
+func (instance *firecrackerInstance) setBaseMemory(path string, incremental bool) {
+	instance.mu.Lock()
+	instance.state.BaseMemoryPath = path
+	instance.state.BaseMemoryIncremental = incremental
+	instance.state.BaseMemoryLineageLost = false
+	instance.mu.Unlock()
+}
+
+// markBaseMemoryLineageLost drops the incremental lineage and records that
+// the VMM soft-dirty ledger may still be armed against the discarded base.
+// The next checkpoint must take a Full snapshot: with the ledger armed a
+// SoftDirty request writes only the window delta, which would silently lose
+// every page written before the discarded generation.
+func (instance *firecrackerInstance) markBaseMemoryLineageLost() {
+	instance.mu.Lock()
+	instance.state.BaseMemoryPath = ""
+	instance.state.BaseMemoryIncremental = false
+	instance.state.BaseMemoryLineageLost = true
+	instance.mu.Unlock()
+}
+
+// clearBaseMemory drops the incremental lineage without asserting anything
+// about the VMM ledger state; only callers that know the ledger is not armed
+// (a fresh sandbox that never checkpointed) may use it. Lineage-unsafe
+// callers must use markBaseMemoryLineageLost instead.
+func (instance *firecrackerInstance) clearBaseMemory() bool {
+	instance.mu.Lock()
+	changed := instance.state.BaseMemoryPath != ""
+	instance.state.BaseMemoryPath = ""
+	instance.state.BaseMemoryIncremental = false
+	instance.mu.Unlock()
+	return changed
 }
 
 func (instance *firecrackerInstance) finish(exit runtimecore.Exit) bool {
@@ -143,18 +220,76 @@ type Handler struct {
 	defaultMem   uint32
 	defaultDisk  uint64
 	ociLoader    runtimecore.OciLoader
+	// ociRootfsEnabled allows the server-side image preparation path to
+	// materialize an OCI rootfs directory as EROFS before Start is called.
+	ociRootfsEnabled bool
 
 	mu        sync.RWMutex
 	instances map[string]*firecrackerInstance
+
+	// compatMu guards the cached binary/kernel digests behind the
+	// compatibility tuple; hashing a vmlinux is a one-off per daemon.
+	compatMu      sync.Mutex
+	compatDigests *firecrackerCheckpointCompat
+
+	// digestCache memoizes verified checkpoint component digests so warm
+	// restores from a stable directory skip the re-hash.
+	digestCache checkpointDigestCache
+
+	// checkpointMode is the validated plugin.runtime.firecracker
+	// checkpoint_mode: full keeps upstream Full snapshots, incremental
+	// enables the three-tier chain.
+	checkpointMode string
+
+	// shrinkBeforeCheckpoint gates the pre-pause guest page-cache drop;
+	// see FirecrackerConfig.ShrinkBeforeCheckpoint for why it is off by
+	// default.
+	shrinkBeforeCheckpoint bool
+
+	// checkpointWriteback starts background writeback for completed memory
+	// artifacts so a later XFS reflink does not inherit the previous
+	// generation's buffered-I/O debt.
+	checkpointWriteback *checkpointWritebackScheduler
+}
+
+var _ runtimecore.Handler = &Handler{}
+var _ runtimecore.CheckpointHandler = &Handler{}
+var _ runtimecore.CheckpointRestoreCapabilitiesProvider = &Handler{}
+
+func (handler *Handler) CheckpointRestoreCapabilities() runtimecore.CheckpointRestoreCapabilities {
+	return runtimecore.CheckpointRestoreCapabilities{
+		CheckpointHandoffPath: firecrackerproto.CheckpointHandoffPath,
+		RestoreEnvPath:        firecrackerproto.RestoreEnvPath,
+	}
 }
 
 func (handler *Handler) ValidateStartRequest(
 	request *runtimeapi.StartRequest,
 ) error {
+	extraConfig, err := parseFirecrackerExtraConfig(request.GetExtraConfig())
+	if err != nil {
+		return err
+	}
+	mountTargets := make([]string, 0, len(request.GetMounts()))
+	for _, mount := range request.GetMounts() {
+		if mount != nil {
+			mountTargets = append(mountTargets, mount.GetTarget())
+		}
+	}
+	if err := validateFirecrackerNativeWritableMounts(
+		extraConfig.NativeWritableMounts,
+		mountTargets,
+	); err != nil {
+		return err
+	}
 	if rootfs := request.GetRootfs(); rootfs != nil &&
 		(rootfs.GetType() == runtimeapi.RootfsSrcType_IMAGE ||
 			rootfs.GetImageUrl() != "") {
-		return errors.New("Firecracker does not support OCI image rootfs")
+		if !handler.ociRootfsEnabled {
+			return errors.New(
+				"Firecracker does not support OCI image rootfs unless conversion is enabled",
+			)
+		}
 	}
 	for _, mount := range request.GetMounts() {
 		if mount == nil {
@@ -190,6 +325,9 @@ func NewHandler(
 	if err := validateFirecrackerKVM(firecrackerConfig.KVMDevice); err != nil {
 		return nil, err
 	}
+	if err := validateFirecrackerCheckpointMode(firecrackerConfig.CheckpointMode); err != nil {
+		return nil, err
+	}
 	if filepath.Clean(firecrackerConfig.KVMDevice) !=
 		filepath.Clean(config.DefaultKVMDevice) {
 		return nil, fmt.Errorf(
@@ -203,6 +341,18 @@ func NewHandler(
 	if _, err := exec.LookPath("mkfs.ext4"); err != nil {
 		return nil, fmt.Errorf("Firecracker requires mkfs.ext4: %w", err)
 	}
+	if firecrackerConfig.OCIRootfsEnabled {
+		mkfsEROFS := strings.TrimSpace(firecrackerConfig.MkfsEROFSPath)
+		if mkfsEROFS == "" {
+			mkfsEROFS = config.DefaultFirecrackerMkfsEROFS
+		}
+		if _, err := exec.LookPath(mkfsEROFS); err != nil {
+			return nil, fmt.Errorf(
+				"Firecracker OCI rootfs conversion requires mkfs.erofs: %w",
+				err,
+			)
+		}
+	}
 	sandboxRoot := filepath.Join(cfg.RootDir, "containers")
 	storageRoot := filepath.Join(cfg.RuntimeConfig.FilestoreDir, ".firecracker")
 	for path, mode := range map[string]os.FileMode{
@@ -215,19 +365,23 @@ func NewHandler(
 		}
 	}
 	handler := &Handler{
-		binary:       binary,
-		sandboxRoot:  sandboxRoot,
-		storageRoot:  storageRoot,
-		runtimeRoot:  firecrackerproto.HostRuntimeRoot,
-		kernelPath:   firecrackerConfig.KernelImagePath,
-		initrdPath:   firecrackerConfig.InitrdPath,
-		kernelArgs:   firecrackerConfig.KernelArgs,
-		kvmDevice:    firecrackerConfig.KVMDevice,
-		defaultVCPUs: firecrackerConfig.DefaultVCPUCount,
-		defaultMem:   firecrackerConfig.DefaultMemoryMiB,
-		defaultDisk:  firecrackerConfig.DefaultOverlaySizeBytes,
-		ociLoader:    loader,
-		instances:    make(map[string]*firecrackerInstance),
+		binary:                 binary,
+		sandboxRoot:            sandboxRoot,
+		storageRoot:            storageRoot,
+		runtimeRoot:            firecrackerproto.HostRuntimeRoot,
+		kernelPath:             firecrackerConfig.KernelImagePath,
+		initrdPath:             firecrackerConfig.InitrdPath,
+		kernelArgs:             firecrackerConfig.KernelArgs,
+		kvmDevice:              firecrackerConfig.KVMDevice,
+		defaultVCPUs:           firecrackerConfig.DefaultVCPUCount,
+		defaultMem:             firecrackerConfig.DefaultMemoryMiB,
+		shrinkBeforeCheckpoint: firecrackerConfig.ShrinkBeforeCheckpoint,
+		checkpointMode:         firecrackerConfig.CheckpointMode,
+		checkpointWriteback:    newCheckpointWritebackScheduler(),
+		defaultDisk:            firecrackerConfig.DefaultOverlaySizeBytes,
+		ociLoader:              loader,
+		ociRootfsEnabled:       firecrackerConfig.OCIRootfsEnabled,
+		instances:              make(map[string]*firecrackerInstance),
 	}
 	handler.recoverInstances()
 	return handler, nil
@@ -254,6 +408,24 @@ func applyFirecrackerDefaults(value *config.FirecrackerConfig) {
 	}
 	if value.DefaultOverlaySizeBytes == 0 {
 		value.DefaultOverlaySizeBytes = config.DefaultFirecrackerOverlayBytes
+	}
+	if value.CheckpointMode == "" {
+		value.CheckpointMode = firecrackerCheckpointModeFull
+	}
+}
+
+func validateFirecrackerCheckpointMode(mode string) error {
+	switch mode {
+	// "" is the unset value: applyFirecrackerDefaults normalizes it to
+	// full before validation runs, but accepting it here keeps the check
+	// order-independent for direct callers.
+	case "", firecrackerCheckpointModeFull, firecrackerCheckpointModeIncremental:
+		return nil
+	default:
+		return fmt.Errorf(
+			"invalid firecracker checkpoint_mode %q: want %q or %q",
+			mode, firecrackerCheckpointModeFull, firecrackerCheckpointModeIncremental,
+		)
 	}
 }
 
@@ -473,6 +645,8 @@ func (handler *Handler) Start(
 	if err != nil {
 		return err
 	}
+	instance.setMemoryMiB(memoryMiB)
+	instance.setVcpus(vcpus)
 	drives := []firecrackerDrive{
 		plan.rootDrive,
 		{
@@ -1014,6 +1188,23 @@ func (handler *Handler) recoverState(
 		}
 		return instance
 	}
+	// A daemon restart cannot know which generation the surviving VMM's
+	// dirty-page ledger is armed against: a checkpoint may have completed in
+	// the VMM (re-arming the window) without sandboxd persisting the new
+	// base. Never trust a pre-restart incremental lineage — drop the base on
+	// the recovered instance itself and force the next checkpoint to Full,
+	// which ignores the ledger and safely restarts the chain. Persist the
+	// reset so a second restart cannot resurrect the stale base. A sandbox
+	// that never checkpointed also pays one Full snapshot here; its ledger
+	// is disarmed, so that is only a completeness cost, never a correctness
+	// one.
+	instance.markBaseMemoryLineageLost()
+	if err := handler.persistInstance(instance); err != nil {
+		logrus.Warnf(
+			"firecracker: persist lineage reset for recovered sandbox %s: %v",
+			state.ID, err,
+		)
+	}
 	go handler.waitGuest(instance)
 	go handler.monitorRecovered(instance)
 	logrus.Infof("firecracker: recovered sandbox %s pid=%d", state.ID, state.PID)
@@ -1142,14 +1333,27 @@ func requestFirecrackerAgent(
 	messageType firecrackerproto.MessageType,
 	value any,
 ) error {
-	timeout := time.Second
+	return requestFirecrackerAgentWaiting(ctx, vsockPath, messageType, value, time.Second)
+}
+
+// requestFirecrackerAgentWaiting is requestFirecrackerAgent with a caller-set
+// cap on the dial timeout (used by the checkpoint flush, which may legitimately
+// wait out a slow guest sync).
+func requestFirecrackerAgentWaiting(
+	ctx context.Context,
+	vsockPath string,
+	messageType firecrackerproto.MessageType,
+	value any,
+	maxWait time.Duration,
+) error {
+	timeout := maxWait
 	if deadline, ok := ctx.Deadline(); ok {
 		timeout = time.Until(deadline)
 		if timeout <= 0 {
 			return ctx.Err()
 		}
-		if timeout > time.Second {
-			timeout = time.Second
+		if timeout > maxWait {
+			timeout = maxWait
 		}
 	}
 	connection, err := firecrackerproto.DialAgent(vsockPath, timeout)

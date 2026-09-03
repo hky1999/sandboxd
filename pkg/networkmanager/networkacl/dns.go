@@ -31,12 +31,14 @@ const (
 )
 
 type dnsAuthorizer func(net.IP, []string) bool
+type dnsObserver func(net.IP, []string, []string, []byte) ([]byte, error)
 
 type dnsProxy struct {
 	udp       *net.UDPConn
 	tcp       net.Listener
 	upstreams []string
 	authorize dnsAuthorizer
+	observe   dnsObserver
 	limiter   *dnsConcurrencyLimiter
 	stop      chan struct{}
 	wg        sync.WaitGroup
@@ -99,6 +101,7 @@ func newDNSProxy(
 	globalConcurrencyLimit int,
 	perSandboxConcurrencyLimit int,
 	authorize dnsAuthorizer,
+	observe dnsObserver,
 ) (*dnsProxy, error) {
 	upstreams, err := resolverUpstreams(resolverPath, bindIP)
 	if err != nil {
@@ -123,6 +126,7 @@ func newDNSProxy(
 		tcp:       tcp,
 		upstreams: upstreams,
 		authorize: authorize,
+		observe:   observe,
 		limiter:   limiter,
 		stop:      make(chan struct{}),
 	}
@@ -266,11 +270,235 @@ func (p *dnsProxy) handle(source net.IP, request []byte, network string) ([]byte
 	for _, upstream := range p.upstreams {
 		response, err := exchangeDNS(network, upstream, request)
 		if err == nil {
+			if err = validateDNSResponse(response, header, questions); err != nil {
+				lastErr = err
+				continue
+			}
+			if p.observe != nil {
+				grantNames := trafficGrantNames(questions)
+				if len(grantNames) == 0 {
+					return response, nil
+				}
+				observed, observeErr := p.observe(source, names, grantNames, response)
+				if observeErr != nil {
+					return dnsResponse(header, questions, dnsmessage.RCodeServerFailure)
+				}
+				return observed, nil
+			}
 			return response, nil
 		}
 		lastErr = err
 	}
 	return nil, fmt.Errorf("all DNS upstreams failed: %w", lastErr)
+}
+
+func validateDNSResponse(
+	payload []byte, requestHeader dnsmessage.Header, requestQuestions []dnsmessage.Question,
+) error {
+	var response dnsmessage.Message
+	if err := response.Unpack(payload); err != nil {
+		return fmt.Errorf("unpack DNS response: %w", err)
+	}
+	if !response.Header.Response || response.Header.ID != requestHeader.ID ||
+		response.Header.OpCode != requestHeader.OpCode {
+		return fmt.Errorf("DNS response does not match the request header")
+	}
+	if len(response.Questions) != len(requestQuestions) {
+		return fmt.Errorf("DNS response question count does not match the request")
+	}
+	for index, question := range requestQuestions {
+		candidate := response.Questions[index]
+		if canonicalDNSName(candidate.Name.String()) != canonicalDNSName(question.Name.String()) ||
+			candidate.Type != question.Type || candidate.Class != question.Class {
+			return fmt.Errorf("DNS response question %d does not match the request", index)
+		}
+	}
+	return nil
+}
+
+// trafficGrantNames returns only questions whose answers can replace IPv4
+// traffic grants. In particular, an ordinary resolver commonly sends A and
+// AAAA queries in parallel. Treating an empty AAAA response as a replacement
+// for the A response would immediately revoke a valid IPv4 grant.
+func trafficGrantNames(questions []dnsmessage.Question) []string {
+	names := make([]string, 0, len(questions))
+	seen := make(map[string]struct{}, len(questions))
+	for _, question := range questions {
+		if question.Type != dnsmessage.TypeA && question.Type != dnsmessage.TypeALL {
+			continue
+		}
+		name := canonicalDNSName(question.Name.String())
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		names = append(names, name)
+	}
+	return names
+}
+
+const (
+	minDomainGrantTTL = uint32(1)
+	maxDomainGrantTTL = uint32(3600)
+	maxDNSAddresses   = 64
+	maxCNAMEChain     = 32
+)
+
+type resolvedAddress struct {
+	IP  [4]byte
+	TTL uint32
+}
+
+type cnameTarget struct {
+	name string
+	ttl  uint32
+}
+
+type addressRecord struct {
+	ip  [4]byte
+	ttl uint32
+}
+
+func resolveDNSResponse(payload []byte, questions []string) ([]byte, map[string][]resolvedAddress, error) {
+	var message dnsmessage.Message
+	if err := message.Unpack(payload); err != nil {
+		return nil, nil, fmt.Errorf("unpack DNS response: %w", err)
+	}
+	if !message.Header.Response {
+		return nil, nil, fmt.Errorf("DNS payload is not a response")
+	}
+	cnames := make(map[string][]cnameTarget)
+	addresses := make(map[string][]addressRecord)
+	collect := func(resources []dnsmessage.Resource) {
+		for _, resource := range resources {
+			owner := canonicalDNSName(resource.Header.Name.String())
+			switch body := resource.Body.(type) {
+			case *dnsmessage.CNAMEResource:
+				cnames[owner] = append(cnames[owner], cnameTarget{
+					name: canonicalDNSName(body.CNAME.String()), ttl: clampDomainTTL(resource.Header.TTL),
+				})
+			case *dnsmessage.AResource:
+				addresses[owner] = append(addresses[owner], addressRecord{
+					ip: body.A, ttl: clampDomainTTL(resource.Header.TTL),
+				})
+			}
+		}
+	}
+	// Negative and truncated replies replace prior grants with an empty set.
+	// Their record sections are not a complete affirmative answer and must not
+	// be able to mint packet authorization.
+	if message.Header.RCode == dnsmessage.RCodeSuccess && !message.Header.Truncated {
+		collect(message.Answers)
+		collect(message.Additionals)
+	}
+
+	resolved := make(map[string][]resolvedAddress, len(questions))
+	effectiveA := make(map[string]uint32)
+	for _, question := range questions {
+		name := canonicalDNSName(question)
+		results, err := followCNAMEs(name, cnames, addresses)
+		if err != nil {
+			return nil, nil, err
+		}
+		if len(results) > maxDNSAddresses {
+			return nil, nil, fmt.Errorf("DNS response for %s has %d reachable A records; maximum is %d", name, len(results), maxDNSAddresses)
+		}
+		resolved[name] = results
+		for _, result := range results {
+			key := resultKey(result.IP)
+			if previous, ok := effectiveA[key]; !ok || result.TTL < previous {
+				effectiveA[key] = result.TTL
+			}
+		}
+	}
+	rewrite := func(resources []dnsmessage.Resource) {
+		for index := range resources {
+			resources[index].Header.TTL = clampDomainTTL(resources[index].Header.TTL)
+			if body, ok := resources[index].Body.(*dnsmessage.AResource); ok {
+				if ttl, found := effectiveA[resultKey(body.A)]; found && ttl < resources[index].Header.TTL {
+					resources[index].Header.TTL = ttl
+				}
+			}
+		}
+	}
+	rewrite(message.Answers)
+	rewrite(message.Authorities)
+	rewrite(message.Additionals)
+	rewritten, err := message.Pack()
+	if err != nil {
+		return nil, nil, fmt.Errorf("repack DNS response: %w", err)
+	}
+	return rewritten, resolved, nil
+}
+
+func followCNAMEs(
+	question string,
+	cnames map[string][]cnameTarget,
+	addresses map[string][]addressRecord,
+) ([]resolvedAddress, error) {
+	type pendingName struct {
+		name  string
+		ttl   uint32
+		depth int
+	}
+	pending := []pendingName{{name: question, ttl: maxDomainGrantTTL}}
+	// A malformed response can expose the same owner through multiple CNAME
+	// paths. Revisit it only when the new path has a tighter TTL so a path
+	// encountered first can never extend the derived authorization.
+	bestNameTTL := make(map[string]uint32)
+	results := make(map[[4]byte]uint32)
+	for len(pending) != 0 {
+		current := pending[0]
+		pending = pending[1:]
+		if current.depth > maxCNAMEChain {
+			return nil, fmt.Errorf("DNS CNAME chain for %s exceeds %d links", question, maxCNAMEChain)
+		}
+		if previous, seen := bestNameTTL[current.name]; seen && previous <= current.ttl {
+			continue
+		}
+		bestNameTTL[current.name] = current.ttl
+		for _, record := range addresses[current.name] {
+			ttl := minTTL(current.ttl, record.ttl)
+			if previous, ok := results[record.ip]; !ok || ttl < previous {
+				results[record.ip] = ttl
+			}
+		}
+		for _, target := range cnames[current.name] {
+			pending = append(pending, pendingName{
+				name: target.name, ttl: minTTL(current.ttl, target.ttl), depth: current.depth + 1,
+			})
+		}
+	}
+	out := make([]resolvedAddress, 0, len(results))
+	for ip, ttl := range results {
+		out = append(out, resolvedAddress{IP: ip, TTL: ttl})
+	}
+	return out, nil
+}
+
+func canonicalDNSName(name string) string {
+	return strings.ToLower(strings.TrimSuffix(strings.TrimSpace(name), "."))
+}
+
+func clampDomainTTL(ttl uint32) uint32 {
+	if ttl < minDomainGrantTTL {
+		return minDomainGrantTTL
+	}
+	if ttl > maxDomainGrantTTL {
+		return maxDomainGrantTTL
+	}
+	return ttl
+}
+
+func minTTL(left, right uint32) uint32 {
+	if left < right {
+		return left
+	}
+	return right
+}
+
+func resultKey(ip [4]byte) string {
+	return string(ip[:])
 }
 
 func parseDNSQuestions(payload []byte) (dnsmessage.Header, []dnsmessage.Question, []string, error) {

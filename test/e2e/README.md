@@ -25,13 +25,16 @@ The flow:
 8. verifies runsc in cgroup-disabled mode with `/sys/fs/cgroup` read-only;
 9. verifies runc's ephemeral netns/veth lifecycle and optional KVM injection;
 10. verifies Kata consumes the shared TAP cache without creating a private
-    `ktap` lifecycle; and
-11. verifies Firecracker's EROFS-only root and mount contract, private ext4
-    overlay, quota exhaustion, guest exec/TTY protocol, direct service access,
-    local DNAT, network ACL and managed DNS replacement, crash recovery,
-    stale-policy removal, exit-code recovery when the daemon is unavailable,
-    and reuse of the same TAP without policy leakage.
-12. runs concurrent Redis SET/GET traffic from every runtime to a sibling
+    `ktap` lifecycle;
+11. checkpoints the same runsc or Firecracker sandbox ten consecutive times,
+    verifies it keeps running, and restores the tenth artifact;
+12. verifies Firecracker's EROFS root and mount contract, OCI-to-EROFS rootfs
+    conversion, private ext4 overlay, native writable ext4 mounts (including
+    checkpoint/restore), quota exhaustion, guest exec/TTY protocol, direct
+    service access, local DNAT, network ACL and managed DNS replacement, crash
+    recovery, stale-policy removal, exit-code recovery when the daemon is
+    unavailable, and reuse of the same TAP without policy leakage; and
+13. runs concurrent Redis SET/GET traffic from every runtime to a sibling
     Redis container through SNAT and from that container to the sandbox's
     published port through DNAT. The test verifies the translated source
     address and the DNAT packet counter instead of treating connectivity alone
@@ -151,9 +154,11 @@ wrapper.
 The test detects cgroup mode from `/sys/fs/cgroup/cgroup.controllers`.
 There is no sandboxd cgroup-version switch. The separate disabled-mode
 container does not use the host cgroup namespace and bind-mounts the hierarchy
-read-only. Test containers keep sandboxd state and rootfs work trees on tmpfs,
-so a runsc private overlay does not nest its upper directory inside Docker's
-storage driver.
+read-only. Each test container bind-mounts a dedicated host disk directory at
+`/home/akernel` for sandboxd state, rootfs work trees, and checkpoint
+artifacts. This avoids both tmpfs-only checkpoint behavior and nested private
+overlays in Docker's writable layer. The harness rejects a tmpfs-backed source
+and verifies the mount again inside the container.
 
 GitHub Actions builds the project-owned E2E binaries once and uploads them as
 a short-lived artifact. Five dependent matrix jobs then build targeted images

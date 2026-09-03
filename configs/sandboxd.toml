@@ -94,6 +94,15 @@ runsc = ""
 #default_vcpu_count = 1
 #default_memory_mib = 512
 #default_overlay_size_bytes = 10737418240
+# Checkpoint algorithm: "full" (default) keeps the conservative upstream
+# behavior where every generation is a Full snapshot; "incremental" enables
+# the three-tier incremental chain and requires a fork VMM that supports it.
+#checkpoint_mode = "full"
+# Opt-in support for materializing an OCI or Nydus image-manager rootfs mount
+# as an immutable EROFS file before starting a Firecracker VM. The generated
+# file follows the source image cache lifecycle.
+#oci_rootfs_enabled = false
+#mkfs_erofs_path = "/usr/bin/mkfs.erofs"
 
 [plugin.runtime.runtime_binary]
 runsc = "/usr/local/bin/runsc"

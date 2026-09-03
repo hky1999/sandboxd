@@ -43,6 +43,10 @@ var StartCmd = cli.Command{
 			Name:  "rootfs",
 			Usage: "local rootfs path",
 		},
+		cli.StringFlag{
+			Name:  "image-url",
+			Usage: "OCI image reference used as the rootfs",
+		},
 		cli.BoolFlag{
 			Name:  "rootfs-readonly",
 			Usage: "mark rootfs readonly in the Start request",
@@ -50,6 +54,10 @@ var StartCmd = cli.Command{
 		cli.BoolFlag{
 			Name:  "enable-kvm",
 			Usage: "expose the configured KVM device in a runc sandbox",
+		},
+		cli.StringFlag{
+			Name:  "extra-config",
+			Usage: "runtime-specific configuration as a JSON object",
 		},
 		cli.StringFlag{
 			Name:  "cwd",
@@ -98,8 +106,13 @@ var StartCmd = cli.Command{
 		},
 	},
 	Action: func(context *cli.Context) error {
-		if context.String("rootfs") == "" {
-			return fmt.Errorf("--rootfs is required")
+		rootfs, err := startRootfs(
+			context.String("rootfs"),
+			context.String("image-url"),
+			context.Bool("rootfs-readonly"),
+		)
+		if err != nil {
+			return err
 		}
 		requestedID := context.String("sandbox-id")
 		if requestedID != "" && !config.IsValidSandboxID(requestedID) {
@@ -130,7 +143,10 @@ var StartCmd = cli.Command{
 		if err != nil {
 			return err
 		}
-		extraConfig, err := startExtraConfig(context.Bool("enable-kvm"))
+		extraConfig, err := startExtraConfig(
+			context.String("extra-config"),
+			context.Bool("enable-kvm"),
+		)
 		if err != nil {
 			return err
 		}
@@ -150,15 +166,9 @@ var StartCmd = cli.Command{
 		defer client.Close()
 
 		resp, err := client.StartSandbox(&runtime.StartRequest{
-			SandboxID: requestedID,
-			Runtime:   context.String("runtime"),
-			Rootfs: &runtime.RootfsConfig{
-				Readonly: context.Bool("rootfs-readonly"),
-				Type:     runtime.RootfsSrcType_LOCAL,
-				Source: &runtime.RootfsConfig_Path{
-					Path: context.String("rootfs"),
-				},
-			},
+			SandboxID:               requestedID,
+			Runtime:                 context.String("runtime"),
+			Rootfs:                  rootfs,
 			Command:                 command,
 			Cwd:                     context.String("cwd"),
 			Envs:                    envs,
@@ -188,13 +198,41 @@ var StartCmd = cli.Command{
 	},
 }
 
-func startExtraConfig(enableKVM bool) (string, error) {
-	if !enableKVM {
+func startRootfs(localPath, imageURL string, readonly bool) (*runtime.RootfsConfig, error) {
+	if localPath == "" && imageURL == "" {
+		return nil, fmt.Errorf("exactly one of --rootfs or --image-url is required")
+	}
+	if localPath != "" && imageURL != "" {
+		return nil, fmt.Errorf("--rootfs and --image-url are mutually exclusive")
+	}
+	rootfs := &runtime.RootfsConfig{Readonly: readonly}
+	if imageURL != "" {
+		rootfs.Type = runtime.RootfsSrcType_IMAGE
+		rootfs.Source = &runtime.RootfsConfig_ImageUrl{ImageUrl: imageURL}
+		return rootfs, nil
+	}
+	rootfs.Type = runtime.RootfsSrcType_LOCAL
+	rootfs.Source = &runtime.RootfsConfig_Path{Path: localPath}
+	return rootfs, nil
+}
+
+func startExtraConfig(raw string, enableKVM bool) (string, error) {
+	if strings.TrimSpace(raw) == "" && !enableKVM {
 		return "", nil
 	}
-	data, err := json.Marshal(struct {
-		EnableKVM bool `json:"enableKVM"`
-	}{EnableKVM: true})
+	config := make(map[string]json.RawMessage)
+	if strings.TrimSpace(raw) != "" {
+		if err := json.Unmarshal([]byte(raw), &config); err != nil {
+			return "", fmt.Errorf("decode --extra-config: %w", err)
+		}
+		if config == nil {
+			return "", fmt.Errorf("--extra-config must be a JSON object")
+		}
+	}
+	if enableKVM {
+		config["enableKVM"] = json.RawMessage("true")
+	}
+	data, err := json.Marshal(config)
 	if err != nil {
 		return "", err
 	}

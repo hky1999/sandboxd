@@ -123,13 +123,19 @@ func (api *firecrackerAPI) resume(ctx context.Context) error {
 func (api *firecrackerAPI) createSnapshot(
 	ctx context.Context,
 	statePath,
-	memoryPath string,
+	memoryPath,
+	snapshotType string,
 ) error {
-	return api.put(ctx, "/snapshot/create", map[string]any{
-		"snapshot_type": "Full",
+	body := map[string]any{
+		"snapshot_type": snapshotType,
 		"snapshot_path": statePath,
 		"mem_file_path": memoryPath,
-	})
+		"deferred_sync": true,
+	}
+	// Checkpoint artifacts deliberately remain in the host page cache. The
+	// caller accepts that success does not imply immediate power-loss
+	// durability; avoiding a forced writeback keeps the pause path short.
+	return api.put(ctx, "/snapshot/create", body)
 }
 
 func (api *firecrackerAPI) loadSnapshot(

@@ -30,6 +30,12 @@ When changing bpfnat behavior, extend the regular unit tests for pure parsing
 and policy logic and add or update the tagged integration tests for
 kernel-visible behavior and relevant boundary cases.
 
+# Markdown and GitHub Text Formatting
+
+Do not hard-wrap prose in Markdown documentation, GitHub pull request bodies, release descriptions, issue comments, or pull request review comments. Keep each paragraph and list item on a single logical line and let the renderer handle visual wrapping. Preserve line breaks that carry Markdown meaning, such as paragraph boundaries, lists, tables, blockquotes, and code blocks.
+
+Git commit message bodies are the exception and should remain wrapped at approximately 72 characters as required by the repository commit rules.
+
 # Runtime Artifact Pins
 
 `third_party/runtime-versions.env` is the single source of truth for runtime
@@ -80,11 +86,13 @@ stays synchronized with the implementation.
 # Firecracker Storage Contract
 
 The Firecracker adapter accepts only local or image-provider-backed regular
-EROFS files for its root filesystem and filesystem image mounts. Do not add
-OCI or Nydus directory conversion, runtime-specific image caching, or shared
-artifact reference counting to sandboxd or its image manager. Produce EROFS
-before sandbox creation and let the existing image provider own distribution,
-lazy loading, and deduplication.
+EROFS files for its root filesystem and filesystem image mounts. An operator
+may opt into OCI/Nydus rootfs materialization with
+`plugin.runtime.firecracker.oci_rootfs_enabled`. Keep derived EROFS files
+content-addressed and inside storage owned by the source image manager: OCI
+artifacts follow final-chain GC, while Nydus artifacts follow daemon/bootstrap
+GC. Do not create an independent tag-keyed cache or artifact reference count.
+OCI image mounts remain unsupported by Firecracker.
 
 Per-sandbox Firecracker storage is limited to the private ext4 writable layer
 and runtime state. Bounded read-only regular-file injection is a separate

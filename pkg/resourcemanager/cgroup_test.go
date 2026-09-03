@@ -129,6 +129,26 @@ func TestCgroupV2UnlimitedFallsBackToCPUSetAndHostMemory(t *testing.T) {
 	assert.Equal(t, 10*gib, memory)
 }
 
+func TestCgroupV2RootWithoutLimitFilesFallsBackToHostCapacity(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "cgroup")
+	require.NoError(t, os.MkdirAll(root, 0755))
+	writeFixture(t, filepath.Join(root, "cpu-online"), "0-7\n")
+	writeFixture(t, filepath.Join(root, "meminfo"), "MemTotal:       10485760 kB\n")
+
+	mgr := &cgroupResourceManager{
+		mode:      cgroups.Unified,
+		cpu:       cgroupHierarchy{mountpoint: root, current: root},
+		memory:    cgroupHierarchy{mountpoint: root, current: root},
+		cpuset:    cgroupHierarchy{mountpoint: root, current: root},
+		meminfo:   filepath.Join(root, "meminfo"),
+		cpuOnline: filepath.Join(root, "cpu-online"),
+	}
+	cpu, memory, err := mgr.GetAvailableResource()
+	require.NoError(t, err)
+	assert.Equal(t, int64(8000), cpu)
+	assert.Equal(t, 10*gib, memory)
+}
+
 func TestCgroupV1Capacity(t *testing.T) {
 	testRoot := t.TempDir()
 	cpuRoot := filepath.Join(testRoot, "cpu")

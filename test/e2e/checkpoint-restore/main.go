@@ -41,14 +41,18 @@ type options struct {
 	timeout                  time.Duration
 	checkpointTimeoutSeconds uint
 	memoryMB                 float64
+	cpu                      int
 	storageMB                uint64
+	extraConfig              string
 	compress                 bool
 	leaveRunning             bool
+	snapshotType             string
+	workloadCmd              string
 }
 
 func main() {
 	var value options
-	flag.StringVar(&value.action, "action", "", "start, checkpoint, or restore")
+	flag.StringVar(&value.action, "action", "", "start, checkpoint, restore, or delete")
 	flag.StringVar(&value.socket, "socket", "", "sandboxd Unix socket")
 	flag.StringVar(&value.runtime, "runtime", "runsc", "runtime handler")
 	flag.StringVar(&value.rootfs, "rootfs", "", "local rootfs path")
@@ -64,9 +68,16 @@ func main() {
 		"sandboxd checkpoint timeout in seconds",
 	)
 	flag.Float64Var(&value.memoryMB, "memory-mb", 128, "sandbox memory in MiB")
+	flag.IntVar(&value.cpu, "cpu", 500, "CPU quota (milli-CPU)")
 	flag.Uint64Var(&value.storageMB, "storage-mb", 64, "writable layer in MiB")
+	flag.StringVar(&value.extraConfig, "extra-config", "",
+		"runtime-specific configuration as a JSON object")
 	flag.BoolVar(&value.compress, "compress", true, "compress checkpoint artifacts")
 	flag.BoolVar(&value.leaveRunning, "leave-running", true, "leave source running")
+	flag.StringVar(&value.snapshotType, "snapshot-type", "",
+		"checkpoint flavor: empty (auto), Full, Incremental, or SoftDirty")
+	flag.StringVar(&value.workloadCmd, "workload-cmd", "",
+		"override the built-in start workload command (template warmup hooks)")
 	flag.Parse()
 
 	if err := run(value); err != nil {
@@ -76,8 +87,8 @@ func main() {
 }
 
 func run(value options) error {
-	if value.socket == "" || value.requestFile == "" {
-		return errors.New("--socket and --request-file are required")
+	if value.socket == "" {
+		return errors.New("--socket is required")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), value.timeout)
 	defer cancel()
@@ -103,8 +114,10 @@ func run(value options) error {
 		return checkpoint(ctx, client, value)
 	case "restore":
 		return restore(ctx, client, value)
+	case "delete":
+		return deleteSandbox(ctx, client, value)
 	default:
-		return errors.New("--action must be start, checkpoint, or restore")
+		return errors.New("--action must be start, checkpoint, restore, or delete")
 	}
 }
 
@@ -115,6 +128,9 @@ func start(
 ) error {
 	if value.rootfs == "" || value.sandboxID == "" {
 		return errors.New("--rootfs and --sandbox-id are required for start")
+	}
+	if value.requestFile == "" {
+		return errors.New("--request-file is required for start")
 	}
 	if value.storageMB > ^uint64(0)/(1024*1024) {
 		return errors.New("--storage-mb overflows bytes")
@@ -131,21 +147,18 @@ func start(
 		Command: []string{
 			"/bin/sh",
 			"-c",
-			"if [ -e /var/checkpoint-started ]; then " +
-				"echo restarted > /var/checkpoint-restarted; fi; " +
-				"echo started > /var/checkpoint-started; " +
-				"counter=0; while :; do counter=$((counter + 1)); " +
-				"echo \"$counter\" > /var/checkpoint-counter; sleep 0.1; done",
+			workloadCommand(value.workloadCmd),
 		},
 		Cwd:     "/",
 		Network: "sandbox",
 		Stdout:  "/var/log/sandboxd/checkpoint-workload.stdout",
 		Stderr:  "/var/log/sandboxd/checkpoint-runtime.stderr",
 		Resources: map[string]float64{
-			"CPU":    500,
+			"CPU":    float64(value.cpu),
 			"Memory": value.memoryMB,
 		},
 		WritableLayerLimitBytes: value.storageMB * 1024 * 1024,
+		ExtraConfig:             value.extraConfig,
 	}
 	data, err := protojson.MarshalOptions{
 		Indent:          "  ",
@@ -169,6 +182,26 @@ func start(
 	return nil
 }
 
+// workloadCommand returns the guest workload for a start: an explicit hook
+// overrides the built-in regression workload. Hook authors keep full control
+// but must keep the sandbox alive — end with an idle loop.
+func workloadCommand(hook string) string {
+	if hook != "" {
+		return hook
+	}
+	return "if [ -e /var/checkpoint-started ]; then " +
+		"echo restarted > /var/checkpoint-restarted; fi; " +
+		"echo started > /var/checkpoint-started; " +
+		// The anonymous 100MiB blob gives the dirty-page ledgers a
+		// substantial first window; the fsyncs land the marker files
+		// on the writable layer, where a sealed artifact can read
+		// them back with debugfs (the guest page cache is otherwise
+		// still unflushed at snapshot pause time).
+		"dd if=/dev/zero of=/tmp/blob bs=1M count=100 conv=fsync 2>/dev/null; sync; " +
+		"counter=0; while :; do counter=$((counter + 1)); " +
+		"echo \"$counter\" > /var/checkpoint-counter; sync; sleep 0.1; done"
+}
+
 func checkpoint(
 	ctx context.Context,
 	client runtime.SandboxServiceClient,
@@ -186,6 +219,7 @@ func checkpoint(
 		TimeoutSeconds: uint32(value.checkpointTimeoutSeconds),
 		Compress:       value.compress,
 		LeaveRunning:   value.leaveRunning,
+		SnapshotType:   value.snapshotType,
 	})
 	if err != nil {
 		return fmt.Errorf("checkpoint: %w", err)
@@ -200,6 +234,9 @@ func restore(
 ) error {
 	if value.targetID == "" || value.checkpointDir == "" {
 		return errors.New("--target-id and --checkpoint-dir are required for restore")
+	}
+	if value.requestFile == "" {
+		return errors.New("--request-file is required for restore")
 	}
 	data, err := os.ReadFile(value.requestFile)
 	if err != nil {
@@ -221,5 +258,24 @@ func restore(
 		return fmt.Errorf("restore response = %+v", response)
 	}
 	fmt.Println(response.ID)
+	return nil
+}
+
+// deleteSandbox releases a sandbox through the normal Delete RPC, cleaning
+// its runtime state and writable layer — the acceptance counterpart to
+// checkpoint/restore (previously only reachable through the sbox CLI).
+func deleteSandbox(
+	ctx context.Context,
+	client runtime.SandboxServiceClient,
+	value options,
+) error {
+	if value.sandboxID == "" {
+		return errors.New("--sandbox-id is required for delete")
+	}
+	if _, err := client.Delete(ctx, &runtime.DeleteRequest{
+		ID: value.sandboxID,
+	}); err != nil {
+		return fmt.Errorf("delete: %w", err)
+	}
 	return nil
 }
