@@ -248,6 +248,14 @@ func (s *faultServer) resolve(addr uint64) error {
 			buf = buf[:copyLen] // trim fetched chunk to page size
 		}
 		dst := r.BaseHostVirtAddr + (off - r.Offset)
+		if os.Getenv("UFFD_TRACE") != "" {
+			head := 8
+			if len(buf) < head {
+				head = len(buf)
+			}
+			log.Printf("TRACE copy addr=%#x fileOff=%#x off=%#x dst=%#x len=%d head=%x",
+				addr, fileOff, off, dst, len(buf), buf[:head])
+		}
 		arg := uffdioCopyArg{
 			Dst:  dst,
 			Src:  uint64(uintptr(unsafe.Pointer(&buf[0]))),
@@ -385,6 +393,12 @@ func main() {
 	}
 	log.Printf("handler ready: %d regions, chunk=%dKiB, workers=%d",
 		len(regions), *chunkKB, *workers)
+	if os.Getenv("UFFD_TRACE") != "" {
+		for i, r := range regions {
+			log.Printf("TRACE region[%d] base=%#x size=%#x offset=%#x", i,
+				r.BaseHostVirtAddr, r.Size, r.Offset)
+		}
+	}
 
 	faults := make(chan uint64, 4096)
 	var wg sync.WaitGroup
