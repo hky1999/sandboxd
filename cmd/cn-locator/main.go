@@ -30,6 +30,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -39,15 +40,19 @@ import (
 func main() {
 	nodes := flag.String("nodes", "", "comma-separated node catalog addresses (http://host:port)")
 	checkpointDir := flag.String("checkpoint-dir", "", "local path to the checkpoint directory")
+	templateID := flag.String("template-id", "", "content-addressed template id to derive from")
+	templateCompat := flag.String("template-compat", "",
+		"local template directory to read the compat tuple from (default: the manifest next to -template-root)")
+	templateRoot := flag.String("template-root", "", "local template root holding <id>/manifest.json for -template-id")
 	origin := flag.String("origin", "", "origin node ID (placement prefers it when registered)")
 	pin := flag.Bool("pin", false, "forbid cross-node placement even when a compatible peer exists")
 	timeout := flag.Duration("timeout", 10*time.Second, "overall deadline")
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "usage: cn-locator -nodes http://n1:18090,http://n2:18090 -checkpoint-dir DIR [-origin ID] [-pin]\n")
+		fmt.Fprintf(os.Stderr, "usage: cn-locator -nodes http://n1:18090,http://n2:18090 (-checkpoint-dir DIR [-origin ID] [-pin] | -template-id ID [-template-compat DIR])\n")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
-	if *nodes == "" || *checkpointDir == "" {
+	if *nodes == "" || (*checkpointDir == "" && *templateID == "") || (*checkpointDir != "" && *templateID != "") {
 		flag.Usage()
 		os.Exit(2)
 	}
@@ -65,23 +70,52 @@ func main() {
 		os.Exit(2)
 	}
 
-	compat, err := checkpointlocator.ReadCheckpointCompat(*checkpointDir)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		os.Exit(2)
-	}
+	var compat *checkpointlocator.CheckpointCompat
+	var err error
 	id := strings.TrimRight(strings.ReplaceAll(*checkpointDir, "\\", "/"), "/")
 	if idx := strings.LastIndexByte(id, '/'); idx >= 0 {
 		id = id[idx+1:]
 	}
 
-	placement, err := checkpointlocator.Decide(checkpointlocator.Input{
-		CheckpointID: id,
-		Compat:       compat,
-		OriginNodeID: *origin,
-		PinToOrigin:  *pin,
-		Nodes:        records,
-	})
+	var placement checkpointlocator.Placement
+	if *templateID != "" {
+		dir := *templateCompat
+		if dir == "" {
+			dir = filepath.Join(*templateRoot, *templateID)
+		}
+		compat, err = checkpointlocator.ReadCheckpointCompat(dir)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(2)
+		}
+		holders := make([]checkpointlocator.NodeHolder, 0, len(records))
+		for _, record := range records {
+			ids, ferr := checkpointlocator.FetchTemplates(ctx, record.Address)
+			if ferr != nil {
+				fmt.Fprintf(os.Stderr, "warning: %v\n", ferr)
+				ids = nil
+			}
+			holders = append(holders, checkpointlocator.NodeHolder{Record: record, Holds: ids})
+		}
+		placement, err = checkpointlocator.DecideTemplate(checkpointlocator.TemplateInput{
+			TemplateID: *templateID,
+			Compat:     compat,
+			Nodes:      holders,
+		})
+	} else {
+		compat, err = checkpointlocator.ReadCheckpointCompat(*checkpointDir)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(2)
+		}
+		placement, err = checkpointlocator.Decide(checkpointlocator.Input{
+			CheckpointID: id,
+			Compat:       compat,
+			OriginNodeID: *origin,
+			PinToOrigin:  *pin,
+			Nodes:        records,
+		})
+	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)

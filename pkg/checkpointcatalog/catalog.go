@@ -51,6 +51,9 @@ type Config struct {
 	// Node is the node record served at /api/v1/node. Nil disables the
 	// endpoint; the wiring fills it from the runtime configuration.
 	Node *checkpointlocator.NodeRecord
+	// TemplateRoots are template-manufacture roots (templates.json plus
+	// content-addressed directories) inventoried at /api/v1/templates.
+	TemplateRoots []string
 }
 
 // Compat is the software-stack tuple a checkpoint pins. A cross-node

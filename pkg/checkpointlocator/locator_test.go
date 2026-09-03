@@ -211,3 +211,36 @@ func TestFetchAndReadCompat(t *testing.T) {
 		t.Fatalf("no-tuple read = %+v, %v", compat, err)
 	}
 }
+
+func TestDecideTemplateHolderAndMatrix(t *testing.T) {
+	goodFace := face()
+	badFace := face(func(f *RuntimeFace) { f.Kernel = "other" })
+	holders := []NodeHolder{
+		{Record: NodeRecord{ID: "node-a", Runtimes: []RuntimeFace{badFace}}, Holds: []string{"tpl-1"}},
+		{Record: NodeRecord{ID: "node-b", Runtimes: []RuntimeFace{goodFace}}, Holds: []string{"tpl-2"}},
+		{Record: NodeRecord{ID: "node-c", Runtimes: []RuntimeFace{goodFace}}, Holds: []string{"tpl-1"}},
+	}
+
+	got, err := DecideTemplate(TemplateInput{
+		TemplateID: "tpl-1",
+		Compat:     &CheckpointCompat{Kernel: "kernel-digest"},
+		Nodes:      holders,
+	})
+	if err != nil {
+		t.Fatalf("decide: %v", err)
+	}
+	// node-a holds it but is incompatible; node-b is compatible but does not
+	// hold it; node-c wins.
+	if got.NodeID != "node-c" {
+		t.Fatalf("placement = %+v", got)
+	}
+
+	_, err = DecideTemplate(TemplateInput{
+		TemplateID: "tpl-missing",
+		Compat:     &CheckpointCompat{},
+		Nodes:      holders,
+	})
+	if err == nil || !strings.Contains(err.Error(), "no compatible holder") {
+		t.Fatalf("missing template not fail-closed: %v", err)
+	}
+}
