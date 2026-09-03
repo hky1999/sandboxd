@@ -80,6 +80,12 @@ type pageSource struct {
 
 	inflightMu sync.Mutex
 	inflight   map[uint64]*sync.WaitGroup // chunk index -> waiters' group
+	// fetched records the chunks whose cache bytes are fully written. A
+	// sparse hole inside the cache reads back as a full-length run of
+	// zeros once the file has been extended past it by ANY other chunk's
+	// write, so length cannot distinguish "written" from "hole": only the
+	// bitmap can. Guarded by inflightMu.
+	fetched map[uint64]struct{}
 }
 
 func (s *faultServer) resolveChunk(fileOff uint64) ([]byte, error) {
@@ -103,16 +109,21 @@ func (s *faultServer) resolveChunk(fileOff uint64) ([]byte, error) {
 		}
 		return buf[subOff:]
 	}
-	if buf, ok := s.readCache(cacheOff, true); ok {
-		if out := sliceAt(buf); out != nil {
-			return out, nil
+	src := s.source
+	// A chunk is readable only once its fetch completed (bitmap). Reading
+	// before that can return a hole: another worker's write to a higher
+	// chunk extends the sparse file, and ReadAt then returns a full-length
+	// zero buffer for this chunk's unwritten extent — indistinguishable
+	// from real data by length alone.
+	src.inflightMu.Lock()
+	_, ready := src.fetched[chunkIdx]
+	src.inflightMu.Unlock()
+	if !ready {
+		if err := s.fetchChunk(chunkIdx); err != nil {
+			return nil, err
 		}
-		return nil, fmt.Errorf("offset %d beyond cached chunk %d", fileOff, chunkIdx)
 	}
-	if err := s.fetchChunk(chunkIdx); err != nil {
-		return nil, err
-	}
-	buf, ok := s.readCache(cacheOff, false)
+	buf, ok := s.readCache(cacheOff)
 	if !ok {
 		return nil, fmt.Errorf("chunk %d missing from cache after fetch", chunkIdx)
 	}
@@ -122,24 +133,18 @@ func (s *faultServer) resolveChunk(fileOff uint64) ([]byte, error) {
 	return nil, fmt.Errorf("offset %d beyond fetched chunk %d", fileOff, chunkIdx)
 }
 
-// readCache reads the chunk at cacheOff back from the sparse cache. With
-// full=true a hit requires the COMPLETE chunk: the bulk download writes a
-// chunk through several WriteAt calls, so a racing read observes a partial
-// chunk, and serving that slice injects truncated (effectively zero) pages
-// into the guest — the VM stalls a few pages into boot. A partial chunk is
-// therefore a miss, and the miss path waits on the inflight fetch instead
-// of racing the writer. After fetchChunk returns, a short read is the true
-// artifact tail and is served as-is (full=false).
-func (s *faultServer) readCache(cacheOff uint64, full bool) ([]byte, bool) {
+// readCache reads the chunk at cacheOff back from the sparse cache. The
+// caller must have established (via the fetched bitmap) that the chunk's
+// bytes are fully written: a sparse hole reads back as a full-length run
+// of zeros once the file has been extended past it, so this function
+// deliberately does not try to validate completeness by length.
+func (s *faultServer) readCache(cacheOff uint64) ([]byte, bool) {
 	buf := make([]byte, s.source.chunk)
 	n, err := s.source.cache.ReadAt(buf, int64(cacheOff))
 	if err != nil && !errors.Is(err, io.EOF) {
 		return nil, false
 	}
 	if n == 0 {
-		return nil, false
-	}
-	if full && uint64(n) < s.source.chunk {
 		return nil, false
 	}
 	return buf[:n], true
@@ -212,6 +217,11 @@ func (s *faultServer) fetchChunk(chunkIdx uint64) error {
 				// readers see zeros instead of retrying forever.
 				_, _ = src.cache.WriteAt(make([]byte, 1), int64(start))
 			}
+			// Publish the chunk before the deferred inflight cleanup wakes
+			// any waiter: from here on ReadAt cannot observe a hole for it.
+			src.inflightMu.Lock()
+			src.fetched[chunkIdx] = struct{}{}
+			src.inflightMu.Unlock()
 			return nil
 		}()
 		if err == nil {
@@ -382,7 +392,11 @@ func main() {
 	// treats partially written chunks as misses so faults never race the
 	// writer (see readCache).
 	chunk := uint64(*chunkKB) << 10
-	source := &pageSource{chunk: chunk, inflight: make(map[uint64]*sync.WaitGroup)}
+	source := &pageSource{
+		chunk:    chunk,
+		inflight: make(map[uint64]*sync.WaitGroup),
+		fetched:  make(map[uint64]struct{}),
+	}
 	if *remoteURL != "" {
 		cacheFile, err := os.OpenFile(*cachePath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o600)
 		if err != nil {
