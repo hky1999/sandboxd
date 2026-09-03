@@ -117,6 +117,27 @@ func TestListTemplatesLiveView(t *testing.T) {
 	if len(entries) != 1 || entries[0].ID != id || entries[0].MemoryMiB != 256 {
 		t.Fatalf("entries = %+v", entries)
 	}
+
+	// The registry's dir is written from the manufacturing node and may be
+	// absolute there but missing here; the entry must resolve through this
+	// node's root-relative path instead of being skipped.
+	foreign := filepath.Join(t.TempDir(), "elsewhere", id)
+	raw := map[string]any{"templates": []any{map[string]any{
+		"id": id, "name": "warm", "dir": foreign,
+		"created_at": "x", "snapshot_type": "full", "memory_size": 1 << 20,
+		"compat": map[string]any{}, "digests": map[string]string{},
+	}}}
+	encoded, _ := json.Marshal(raw)
+	if err := os.WriteFile(filepath.Join(root, registryName), encoded, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	entries, err = ListTemplates(context.Background(), Config{TemplateRoots: []string{root}})
+	if err != nil {
+		t.Fatalf("list foreign-dir: %v", err)
+	}
+	if len(entries) != 1 || entries[0].ID != id || entries[0].Dir != filepath.Join(root, id) {
+		t.Fatalf("foreign-dir entry = %+v", entries)
+	}
 	if entries[0].Compat == nil || entries[0].Compat.Firecracker != "fc" {
 		t.Fatalf("compat not projected: %+v", entries[0].Compat)
 	}
