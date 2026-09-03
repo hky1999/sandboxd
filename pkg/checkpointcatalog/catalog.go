@@ -32,6 +32,7 @@ import (
 	"time"
 
 	"github.com/inclusionAI/sandboxd/pkg/checkpointlocator"
+	"github.com/inclusionAI/sandboxd/pkg/checkpointpublish"
 )
 
 // manifestName matches the Firecracker v2 layout; its presence is the
@@ -79,6 +80,11 @@ type Entry struct {
 	BaseMemory   string            `json:"base_memory,omitempty"`
 	Compat       *Compat           `json:"compat,omitempty"`
 	Digests      map[string]string `json:"digests,omitempty"`
+	// PublishState reports the chunk-distribution state machine for this
+	// artifact: "" (never published, local-only), "publishing",
+	// "published", or "publish_failed". Only "published" unlocks cross-node
+	// placement in the locator.
+	PublishState string `json:"publish_state,omitempty"`
 }
 
 // manifest mirrors the Firecracker v2 manifest fields the catalog projects.
@@ -157,6 +163,9 @@ func List(ctx context.Context, cfg Config) ([]Entry, error) {
 				Digests:      m.Digests,
 			}
 			entry.Compat = m.Compat
+			if pub, perr := checkpointpublish.Status(dir); perr == nil && pub != nil {
+				entry.PublishState = pub.State
+			}
 			entries = append(entries, entry)
 		}
 	}

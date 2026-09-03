@@ -123,6 +123,13 @@ type Input struct {
 	// PinToOrigin forbids cross-node placement (for example, the sandbox has
 	// host-local mounts). With the origin unavailable the request fails.
 	PinToOrigin bool
+	// RequirePublished locks cross-node placement behind the chunk
+	// distribution state machine: a peer can only serve the artifact's
+	// memory once its chunks are published to the shared store. The origin
+	// is exempt — it holds the local artifact. PublishState is the
+	// artifact's persisted state ("" counts as never published).
+	RequirePublished bool
+	PublishState     string
 	// Nodes is the registry snapshot to place against.
 	Nodes []NodeRecord
 }
@@ -165,6 +172,12 @@ func Decide(in Input) (Placement, error) {
 		return Placement{}, fmt.Errorf(
 			"checkpoint %s is pinned to origin %q, which is not registered",
 			in.CheckpointID, in.OriginNodeID)
+	}
+
+	if in.RequirePublished && in.PublishState != "published" {
+		return Placement{}, fmt.Errorf(
+			"checkpoint %s is not published (state %q); cross-node restore is locked",
+			in.CheckpointID, publishStateLabel(in.PublishState))
 	}
 
 	ids := make([]string, 0, len(byID))
@@ -258,4 +271,11 @@ func DecideTemplate(in TemplateInput) (Placement, error) {
 	}
 	return Placement{}, fmt.Errorf(
 		"template %s has no compatible holder (%v)", in.TemplateID, whyNot)
+}
+
+func publishStateLabel(state string) string {
+	if state == "" {
+		return "never published"
+	}
+	return state
 }
