@@ -533,6 +533,20 @@ func digestMemoryWithChunkScan(ctx context.Context, memoryPath string) (string, 
 		wg.Wait()
 		close(results)
 	}()
+	// Drain results concurrently with the reads: with both channels
+	// bounded, a reader that only drains after its loop deadlocks once the
+	// workers fill the results backlog and stop pulling jobs.
+	digestsByIndex := make(map[int]string)
+	var dmu sync.Mutex
+	collectDone := make(chan struct{})
+	go func() {
+		defer close(collectDone)
+		for res := range results {
+			dmu.Lock()
+			digestsByIndex[res.index] = res.digest
+			dmu.Unlock()
+		}
+	}()
 
 	scan := &checkpointchunks.Manifest{
 		Version:    1,
@@ -567,15 +581,13 @@ func digestMemoryWithChunkScan(ctx context.Context, memoryPath string) (string, 
 	}
 	close(jobs)
 
-	digests := make([]string, len(scan.Entries))
-	for res := range results {
-		digests[res.index] = res.digest
-	}
+	<-collectDone
 	for i := range scan.Entries {
-		if digests[i] == "" {
+		digest, ok := digestsByIndex[i]
+		if !ok {
 			return "", fmt.Errorf("memory chunk %d was not hashed", i)
 		}
-		scan.Entries[i].Digest = digests[i]
+		scan.Entries[i].Digest = digest
 	}
 	scan.ChunkCount = len(scan.Entries)
 	scan.FileDigest = hex.EncodeToString(fileHash.Sum(nil))

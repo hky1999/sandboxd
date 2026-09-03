@@ -430,6 +430,40 @@ func TestFinalizeCheckpointV2DigestPolicy(t *testing.T) {
 	}
 }
 
+func TestFinalizeMemoryChunkScanScalesPastChannelBuffers(t *testing.T) {
+	// 64MiB = 256 chunks, far beyond the worker-pool channel buffers; the
+	// collector must drain concurrently with the reads or finalize
+	// deadlocks (first seen at 4GiB in the field).
+	if testing.Short() {
+		t.Skip("64MiB hash")
+	}
+	dir := t.TempDir()
+	files := sealArtifactFixture(t, dir)
+	data := make([]byte, 64<<20)
+	for i := range data {
+		data[i] = byte(i * 7)
+	}
+	if err := os.WriteFile(files.Memory, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		manifest := &firecrackerCheckpointManifest{
+			SnapshotType: firecrackerSnapshotTypeFull,
+			MemorySize:   int64(len(data)),
+		}
+		done <- finalizeFirecrackerCheckpointV2(context.Background(), files, manifest, true)
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("finalize: %v", err)
+		}
+	case <-time.After(60 * time.Second):
+		t.Fatal("finalize deadlocked on chunk scan")
+	}
+}
+
 func TestFinalizeMemoryDigestMatchesPlainHashAndScansChunks(t *testing.T) {
 	dir := t.TempDir()
 	files := sealArtifactFixture(t, dir)
