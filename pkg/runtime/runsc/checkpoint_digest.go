@@ -19,6 +19,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -76,6 +77,17 @@ func sealRunscCheckpoint(ctx context.Context, dir string) error {
 	}
 	sort.Strings(manifest.Artifacts)
 
+	// Chunk the pages artifact so runsc checkpoints can ride the same
+	// content-addressed distribution as Firecracker ones: cn-publish
+	// ships only dirty chunks between generations, cn-fetch materializes
+	// from digest-keyed objects. The sidecar is best-effort — sealing
+	// succeeds even without it (legacy whole-file path stays available).
+	if pages := filepath.Join(dir, "pages.img"); chunkableFile(pages) {
+		if scan, err := scanRunscFileChunks(ctx, pages); err == nil {
+			_ = writeRunscChunkSidecar(dir, scan)
+		}
+	}
+
 	encoded, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {
 		return err
@@ -132,4 +144,77 @@ func digestRunscFile(ctx context.Context, path string) (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+func chunkableFile(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.Mode().IsRegular()
+}
+
+// scanRunscFileChunks produces a chunk manifest for the pages artifact,
+// mirroring the Firecracker seal's parallel one-pass scan.
+func scanRunscFileChunks(ctx context.Context, path string) (*runscChunkScan, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	const chunkBytes = 256 << 10
+	scan := &runscChunkScan{
+		File:       "pages.img",
+		FileSize:   info.Size(),
+		ChunkBytes: chunkBytes,
+	}
+	buf := make([]byte, chunkBytes)
+	var offset int64
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		n, rerr := io.ReadFull(f, buf)
+		if n > 0 {
+			sum := sha256.Sum256(buf[:n])
+			scan.Entries = append(scan.Entries, runscChunkEntry{
+				Offset: offset,
+				Digest: hex.EncodeToString(sum[:]),
+			})
+			offset += int64(n)
+		}
+		if errors.Is(rerr, io.EOF) || errors.Is(rerr, io.ErrUnexpectedEOF) {
+			break
+		}
+		if rerr != nil {
+			return nil, rerr
+		}
+	}
+	scan.ChunkCount = len(scan.Entries)
+	return scan, nil
+}
+
+type runscChunkScan struct {
+	Version    int               `json:"version"`
+	File       string            `json:"file"`
+	FileSize   int64             `json:"file_size"`
+	ChunkBytes int               `json:"chunk_bytes"`
+	ChunkCount int               `json:"chunk_count"`
+	Entries    []runscChunkEntry `json:"entries"`
+}
+
+type runscChunkEntry struct {
+	Offset int64  `json:"offset"`
+	Digest string `json:"digest"`
+}
+
+func writeRunscChunkSidecar(dir string, scan *runscChunkScan) error {
+	scan.Version = 1
+	encoded, err := json.MarshalIndent(scan, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(dir, "pages.img.chunks.json"),
+		append(encoded, '\n'), 0o600)
 }
