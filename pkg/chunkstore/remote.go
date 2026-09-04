@@ -42,6 +42,9 @@ type Remote struct {
 	client  *http.Client
 }
 
+// String names the endpoint in publish states and logs.
+func (r *Remote) String() string { return r.baseURL }
+
 // maxRemotePutBytes bounds Remote.Put: chunks are 256KiB-1MiB; anything
 // larger must use PutKey with streaming (artifact files do).
 const maxRemotePutBytes = 8 << 20
