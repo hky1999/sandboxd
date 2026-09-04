@@ -15,7 +15,10 @@
 package checkpointpublish
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -202,6 +205,73 @@ func mustMemoryBytes(t *testing.T, dir string) []byte {
 		t.Fatal(err)
 	}
 	return raw
+}
+
+func TestOverlayChunkedRoundtrip(t *testing.T) {
+	source := fixtureCheckpoint(t)
+	writeFullArtifact(t, source)
+	// A fresh overlay sidecar makes the writable layer ship chunk-by-chunk.
+	if _, err := checkpointchunks.Compute(context.Background(), source, checkpointchunks.DefaultChunkBytes); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeOverlaySidecar(t, source); err != nil {
+		t.Fatal(err)
+	}
+
+	storeRoot := filepath.Join(filepath.Dir(source), "oc-store")
+	local, err := chunkstore.NewLocal(storeRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := filepath.Base(source)
+	if _, err := Run(context.Background(), source, id, local, storeRoot); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	blind := filepath.Join(filepath.Dir(source), "oc-blind")
+	var keyed chunkstore.Keyed = local
+	if err := Materialize(context.Background(), blind, id, keyed); err != nil {
+		t.Fatalf("materialize: %v", err)
+	}
+	// Reassembled overlay must be byte-identical to the source's.
+	src, err := os.ReadFile(filepath.Join(source, "overlay.ext4"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(filepath.Join(blind, "overlay.ext4"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(src, got) {
+		t.Fatalf("reassembled overlay diverged: %d vs %d bytes", len(src), len(got))
+	}
+}
+
+func writeOverlaySidecar(t *testing.T, dir string) error {
+	t.Helper()
+	overlay, err := os.ReadFile(filepath.Join(dir, "overlay.ext4"))
+	if err != nil {
+		return err
+	}
+	const chunkBytes = checkpointchunks.DefaultChunkBytes
+	scan := &checkpointchunks.Manifest{
+		Version: 1, File: "overlay.ext4", FileSize: int64(len(overlay)),
+		ChunkBytes: chunkBytes, FileDigestMode: checkpointchunks.FileDigestChunks,
+	}
+	for off := 0; off < len(overlay); off += chunkBytes {
+		end := off + chunkBytes
+		if end > len(overlay) {
+			end = len(overlay)
+		}
+		sum := sha256.Sum256(overlay[off:end])
+		scan.Entries = append(scan.Entries, checkpointchunks.Chunk{
+			Offset: int64(off), Digest: hex.EncodeToString(sum[:]),
+		})
+	}
+	scan.ChunkCount = len(scan.Entries)
+	scan.FileDigest = checkpointchunks.RootDigest(scan.Entries)
+	return checkpointchunks.WriteNamed(dir,
+		checkpointchunks.SidecarName("overlay.ext4"), scan)
 }
 
 func TestRunFailureIsPersistedAndRetryable(t *testing.T) {

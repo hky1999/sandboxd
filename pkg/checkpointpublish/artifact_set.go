@@ -15,10 +15,12 @@
 package checkpointpublish
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -45,14 +47,68 @@ const MaterializedMarker = ".materialized"
 // ArtifactIndex is the per-checkpoint manifest of everything except the
 // memory bytes.
 type ArtifactIndex struct {
-	CheckpointID string            `json:"checkpoint_id"`
-	MemoryRoot   string            `json:"memory_root"`
-	ChunkCount   int               `json:"chunk_count"`
-	Files        map[string]string `json:"files"` // file name -> sha256
+	CheckpointID string `json:"checkpoint_id"`
+	MemoryRoot   string `json:"memory_root"`
+	ChunkCount   int    `json:"chunk_count"`
+	// OverlayChunks marks that the writable layer ships as digest-keyed
+	// chunk objects (overlay-chunks/<digest>) rather than one file object;
+	// materialization reassembles it from the overlay sidecar.
+	OverlayChunks bool              `json:"overlay_chunks,omitempty"`
+	Files         map[string]string `json:"files"` // file name -> sha256
 }
 
 func ArtifactKey(id, name string) string {
 	return ArtifactNamespace + "/" + id + "/" + name
+}
+
+// OverlaySidecarName is the chunk sidecar for the writable layer.
+const OverlaySidecarName = "overlay.ext4.chunks.json"
+
+// publishOverlayChunks ships the writable layer chunk-by-chunk when its
+// sidecar exists (chunks-digest deployments): incremental generations put
+// only their dirty chunks, and materialization reassembles by digest.
+// Returns true when the chunked path was taken.
+func publishOverlayChunks(
+	ctx context.Context,
+	checkpointDir, id string,
+	store chunkstore.Keyed,
+) (bool, error) {
+	scan, err := checkpointchunks.LoadNamed(checkpointDir, OverlaySidecarName)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil // legacy artifact: whole-file overlay object
+		}
+		return false, err
+	}
+	overlay, err := os.Open(filepath.Join(checkpointDir, scan.File))
+	if err != nil {
+		return false, err
+	}
+	defer overlay.Close()
+	for _, entry := range scan.Entries {
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+		if ok, err := store.HasKey(ctx, ArtifactKey(id, "overlay-chunks/"+entry.Digest)); err != nil {
+			return false, err
+		} else if ok {
+			continue
+		}
+		want := scan.ChunkBytes
+		if tail := int(scan.FileSize - entry.Offset); tail < want {
+			want = tail
+		}
+		block := make([]byte, want)
+		if _, err := overlay.ReadAt(block, entry.Offset); err != nil &&
+			!errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+			return false, fmt.Errorf("read overlay chunk at %d: %w", entry.Offset, err)
+		}
+		if err := store.PutKey(ctx, ArtifactKey(id, "overlay-chunks/"+entry.Digest),
+			bytes.NewReader(block)); err != nil {
+			return false, fmt.Errorf("put overlay chunk at %d: %w", entry.Offset, err)
+		}
+	}
+	return true, nil
 }
 
 // publishArtifactSet uploads vmstate, overlay, manifest, chunk sidecar and
@@ -80,7 +136,20 @@ func publishArtifactSet(
 		ChunkCount:   chunks.ChunkCount,
 		Files:        make(map[string]string, 4),
 	}
-	for _, name := range []string{"manifest.json", checkpointchunks.ManifestName, "vmstate", "overlay.ext4"} {
+	overlayChunked, ocErr := publishOverlayChunks(ctx, checkpointDir, id, store)
+	if ocErr != nil {
+		return ocErr
+	}
+	index.OverlayChunks = overlayChunked
+	files := []string{"manifest.json", checkpointchunks.ManifestName, "vmstate"}
+	if overlayChunked {
+		// The sidecar replaces the whole-file object for the writable
+		// layer; it is small and digest-verified per chunk.
+		files = append(files, OverlaySidecarName)
+	} else {
+		files = append(files, "overlay.ext4")
+	}
+	for _, name := range files {
 		path := filepath.Join(checkpointDir, name)
 		if _, err := os.Stat(path); os.IsNotExist(err) {
 			return fmt.Errorf("artifact set file %s missing", name)
@@ -138,7 +207,13 @@ func Materialize(ctx context.Context, targetDir, id string, store chunkstore.Key
 	if err := os.MkdirAll(targetDir, 0o700); err != nil {
 		return err
 	}
-	for _, name := range []string{"manifest.json", checkpointchunks.ManifestName, "vmstate", "overlay.ext4"} {
+	files := []string{"manifest.json", checkpointchunks.ManifestName, "vmstate"}
+	if index.OverlayChunks {
+		files = append(files, OverlaySidecarName)
+	} else {
+		files = append(files, "overlay.ext4")
+	}
+	for _, name := range files {
 		want, recorded := index.Files[name]
 		if !recorded {
 			return fmt.Errorf("index has no entry for %s", name)
@@ -156,6 +231,12 @@ func Materialize(ctx context.Context, targetDir, id string, store chunkstore.Key
 			return err
 		}
 	}
+	if index.OverlayChunks {
+		if err := materializeOverlayChunks(ctx, targetDir, id, store, index); err != nil {
+			return err
+		}
+	}
+
 	// Sparse memory placeholder of the manifest's recorded size; the uffd
 	// handler serves real bytes by digest from the chunk store.
 	var manifest struct {
@@ -176,6 +257,44 @@ func Materialize(ctx context.Context, targetDir, id string, store chunkstore.Key
 		}
 	}
 	return os.WriteFile(filepath.Join(targetDir, MaterializedMarker), []byte(id+"\n"), 0o600)
+}
+
+// materializeOverlayChunks reassembles the writable layer from digest-keyed
+// chunk objects, verifying every chunk against the sidecar before it lands.
+func materializeOverlayChunks(
+	ctx context.Context,
+	targetDir, id string,
+	store chunkstore.Keyed,
+	index ArtifactIndex,
+) error {
+	scan, err := checkpointchunks.LoadNamed(targetDir, OverlaySidecarName)
+	if err != nil {
+		return fmt.Errorf("load overlay sidecar: %w", err)
+	}
+	overlay, err := os.OpenFile(filepath.Join(targetDir, "overlay.ext4"),
+		os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	defer overlay.Close()
+	for i, entry := range scan.Entries {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		body, err := fetchKey(ctx, store, ArtifactKey(id, "overlay-chunks/"+entry.Digest))
+		if err != nil {
+			return fmt.Errorf("fetch overlay chunk %d: %w", i, err)
+		}
+		sum := sha256.Sum256(body)
+		if hex.EncodeToString(sum[:]) != entry.Digest {
+			return fmt.Errorf("overlay chunk %d digest mismatch: sidecar %s fetched %s",
+				i, entry.Digest, hex.EncodeToString(sum[:]))
+		}
+		if _, err := overlay.WriteAt(body, entry.Offset); err != nil {
+			return err
+		}
+	}
+	return overlay.Truncate(scan.FileSize)
 }
 
 func fetchKey(ctx context.Context, store chunkstore.Keyed, key string) ([]byte, error) {
