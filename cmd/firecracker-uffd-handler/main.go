@@ -25,6 +25,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 	"unsafe"
@@ -269,16 +270,34 @@ func (s *faultServer) fetchChunkFromStore(chunkIdx uint64) error {
 	}
 	length := end - start
 
-	objectPath := filepath.Join(src.chunkStore, entry.Digest[:2], entry.Digest)
-	f, err := os.Open(objectPath)
-	if err != nil {
-		return fmt.Errorf("open store chunk %s: %w", entry.Digest, err)
+	// The chunk store is either a local directory tree or an HTTP object
+	// endpoint (S3 REST anonymous subset); both speak the same <aa>/<digest>
+	// key layout and both are verified by the digest below.
+	var body io.Reader
+	if strings.HasPrefix(src.chunkStore, "http://") || strings.HasPrefix(src.chunkStore, "https://") {
+		resp, err := http.Get(strings.TrimRight(src.chunkStore, "/") +
+			"/" + entry.Digest[:2] + "/" + entry.Digest)
+		if err != nil {
+			return fmt.Errorf("fetch store chunk %s: %w", entry.Digest, err)
+		}
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			return fmt.Errorf("fetch store chunk %s: status %d", entry.Digest, resp.StatusCode)
+		}
+		defer resp.Body.Close()
+		body = io.LimitReader(resp.Body, int64(length))
+	} else {
+		objectPath := filepath.Join(src.chunkStore, entry.Digest[:2], entry.Digest)
+		f, err := os.Open(objectPath)
+		if err != nil {
+			return fmt.Errorf("open store chunk %s: %w", entry.Digest, err)
+		}
+		defer f.Close()
+		body = io.LimitReader(f, int64(length))
 	}
-	defer f.Close()
 
 	hash := sha256.New()
-	written, err := io.Copy(newOffsetWriter(src.cache, int64(start)), io.TeeReader(
-		io.LimitReader(f, int64(length)), hash))
+	written, err := io.Copy(newOffsetWriter(src.cache, int64(start)), io.TeeReader(body, hash))
 	if err != nil {
 		return fmt.Errorf("cache chunk %d from store: %w", chunkIdx, err)
 	}

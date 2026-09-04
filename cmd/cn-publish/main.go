@@ -72,7 +72,7 @@ func main() {
 		return
 	}
 
-	store, err := chunkstore.NewLocal(*storePath)
+	store, err := chunkstore.Open(*storePath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(2)
@@ -88,7 +88,8 @@ func main() {
 		fmt.Fprintln(os.Stderr, string(encoded))
 		os.Exit(1)
 	}
-	fmt.Printf("published %s: %d/%d chunks (%d put, %d skipped) in %s\n",
+	fmt.Printf("published %s: %d/%d chunks (%d put, %d skipped), artifact_set=%v in %s\n",
 		id, result.State.ChunksPut, result.State.ChunksTotal,
-		result.ChunksPut, result.ChunksSkip, time.Since(start).Round(time.Millisecond))
+		result.ChunksPut, result.ChunksSkip, result.State.ArtifactSet,
+		time.Since(start).Round(time.Millisecond))
 }
