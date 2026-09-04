@@ -153,6 +153,16 @@ func Write(dir string, manifest *Manifest) error {
 	return os.WriteFile(filepath.Join(dir, ManifestName), append(encoded, '\n'), 0o600)
 }
 
+// WriteNamed stores the manifest under an explicit sidecar file name,
+// used for secondary scans (the overlay's overlay.ext4.chunks.json).
+func WriteNamed(dir, name string, manifest *Manifest) error {
+	encoded, err := json.MarshalIndent(manifest, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(dir, name), append(encoded, '\n'), 0o600)
+}
+
 // Load reads the sidecar manifest from a checkpoint directory. A checkpoint
 // without one predates chunked distribution.
 func Load(dir string) (*Manifest, error) {
