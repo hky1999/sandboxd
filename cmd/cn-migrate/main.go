@@ -123,12 +123,25 @@ func main() {
 	// 4. Place: federate node records, decide with the source excluded.
 	nodeRecords, fetchErrs := checkpointlocator.FetchAll(context.Background(), strings.Split(*nodes, ","))
 	_ = fetchErrs
-	// The compat tuple comes from the source node's catalog — the
-	// orchestrator stays filesystem-free.
-	sourceAddr := firstAddress(*nodes)
-	compat, err := checkpointlocator.FetchCheckpointCompat(context.Background(), sourceAddr, dirBase(report.Checkpoint))
-	if err != nil {
-		fail("place", err.Error())
+	// The compat tuple comes from a catalog that lists the checkpoint —
+	// normally the source node's; try every address since the orchestrator
+	// stays filesystem-free either way.
+	var compat *checkpointlocator.CheckpointCompat
+	var compatErr error
+	for _, addr := range strings.Split(*nodes, ",") {
+		addr = strings.TrimSpace(addr)
+		if addr == "" {
+			continue
+		}
+		var c *checkpointlocator.CheckpointCompat
+		c, compatErr = checkpointlocator.FetchCheckpointCompat(context.Background(), addr, dirBase(report.Checkpoint))
+		if compatErr == nil {
+			compat = c
+			break
+		}
+	}
+	if compatErr != nil {
+		fail("place", compatErr.Error())
 	}
 	placement, err := checkpointlocator.Decide(checkpointlocator.Input{
 		CheckpointID:     dirBase(report.Checkpoint),
@@ -245,13 +258,4 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n] + "…"
-}
-
-func firstAddress(list string) string {
-	for _, addr := range strings.Split(list, ",") {
-		if trimmed := strings.TrimSpace(addr); trimmed != "" {
-			return trimmed
-		}
-	}
-	return ""
 }
