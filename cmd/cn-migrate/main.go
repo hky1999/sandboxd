@@ -76,7 +76,9 @@ func main() {
 		report.Steps = append(report.Steps, stepLog{Step: step, Detail: detail, Failed: true})
 		finish(report, *jsonOut, false)
 	}
-	run := func(node, step string, args ...string) string {
+	// run executes one node command; success is the exit status, not the
+	// output — several CLIs print nothing on success.
+	run := func(node, step string, args ...string) (string, bool) {
 		started := time.Now()
 		tpl := strings.ReplaceAll(*execTpl, "{node}", node)
 		full := append(strings.Fields(tpl), args...)
@@ -84,28 +86,31 @@ func main() {
 		defer cancel()
 		cmd := exec.CommandContext(ctx, full[0], full[1:]...)
 		out, err := cmd.CombinedOutput()
+		trimmed := strings.TrimSpace(string(out))
 		report.Steps = append(report.Steps, stepLog{
-			Step: step, Detail: strings.TrimSpace(string(out)), TookMs: time.Since(started).Milliseconds(), Failed: err != nil,
+			Step: step, Detail: trimmed, TookMs: time.Since(started).Milliseconds(), Failed: err != nil,
 		})
-		if err != nil {
-			return ""
-		}
-		return strings.TrimSpace(string(out))
+		return trimmed, err == nil
 	}
 
 	// 1. Confirm the sandbox is running on the source.
-	if listing := run(*source, "list", *bin+"/sbox", "--address", "/run/sandboxd/sandboxd.sock", "list"); listing == "" {
+	if _, ok := run(*source, "list", *bin+"/sbox", "--address", "/run/sandboxd/sandboxd.sock", "list"); !ok {
 		fail("list", "source listing failed")
 	}
 	if !containsField(report.lastDetail(), *sandbox) {
 		fail("list", fmt.Sprintf("sandbox %s not found on source %s", *sandbox, *source))
 	}
 
+	// A previous failed attempt may have left its checkpoint directory
+	// behind; sandboxd refuses non-empty directories, so clear it for an
+	// idempotent retry.
+	run(*source, "clean-dir", "rm", "-rf", report.Checkpoint)
+
 	// 2. Checkpoint it (stop semantics: leave_running=false).
-	if run(*source, "checkpoint", *bin+"/checkpoint-restore",
+	if _, ok := run(*source, "checkpoint", *bin+"/checkpoint-restore",
 		"--action", "checkpoint", "--socket", "/run/sandboxd/sandboxd.sock",
 		"--request-file", *ckReq, "--sandbox-id", *sandbox,
-		"--checkpoint-dir", report.Checkpoint, "--compress=false") == "" {
+		"--checkpoint-dir", report.Checkpoint, "--compress=false"); !ok {
 		fail("checkpoint", "checkpoint failed (see steps)")
 	}
 
@@ -157,14 +162,14 @@ func main() {
 	report.Target = placement.NodeID
 
 	// 5. Materialize + restore on the target.
-	if run(placement.NodeID, "materialize", *bin+"/cn-fetch",
-		"-into", report.Checkpoint, "-id", dirBase(report.Checkpoint), "-store", *storeSpec) == "" {
+	if _, ok := run(placement.NodeID, "materialize", *bin+"/cn-fetch",
+		"-into", report.Checkpoint, "-id", dirBase(report.Checkpoint), "-store", *storeSpec); !ok {
 		fail("materialize", "cn-fetch failed on target")
 	}
-	if run(placement.NodeID, "restore", *bin+"/checkpoint-restore",
+	if _, ok := run(placement.NodeID, "restore", *bin+"/checkpoint-restore",
 		"--action", "restore", "--socket", "/run/sandboxd/sandboxd.sock",
 		"--target-id", *sandbox, "--request-file", *ckReq,
-		"--checkpoint-dir", report.Checkpoint) == "" {
+		"--checkpoint-dir", report.Checkpoint); !ok {
 		fail("restore", "restore failed on target (source preserved)")
 	}
 
@@ -172,8 +177,8 @@ func main() {
 	verified := false
 	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
-		if out := run(placement.NodeID, "verify", *bin+"/sbox",
-			"--address", "/run/sandboxd/sandboxd.sock", "list"); out != "" &&
+		if _, ok := run(placement.NodeID, "verify", *bin+"/sbox",
+			"--address", "/run/sandboxd/sandboxd.sock", "list"); ok &&
 			containsField(report.lastDetail(), *sandbox) {
 			verified = true
 			break
