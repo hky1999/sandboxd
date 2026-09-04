@@ -49,6 +49,8 @@ func main() {
 	pin := flag.Bool("pin", false, "forbid cross-node placement even when a compatible peer exists")
 	requirePublished := flag.Bool("require-published", false,
 		"lock cross-node placement behind the chunk publish state machine (origin exempt)")
+	noRequirePublished := flag.Bool("no-require-published", false,
+		"explicitly disable the published gate even for chunk-manifest checkpoints (shared-volume test topologies)")
 	timeout := flag.Duration("timeout", 10*time.Second, "overall deadline")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "usage: cn-locator -nodes http://n1:18090,http://n2:18090 (-checkpoint-dir DIR [-origin ID] [-pin] | -template-id ID [-template-compat DIR])\n")
@@ -116,7 +118,19 @@ func main() {
 			os.Exit(2)
 		}
 		publishState := ""
-		if *requirePublished {
+		// The gate defaults ON for artifacts shaped for object-store
+		// distribution (they carry a chunks.json sidecar): a node with no
+		// visibility into the source directory has no byte source for
+		// unpublished memory. Shared-volume test topologies opt out with
+		// -no-require-published.
+		gateOn := *requirePublished
+		if !gateOn && !*noRequirePublished {
+			if _, err := os.Stat(filepath.Join(*checkpointDir,
+				"chunks.json")); err == nil {
+				gateOn = true
+			}
+		}
+		if gateOn {
 			state, perr := checkpointpublish.Status(*checkpointDir)
 			if perr != nil {
 				fmt.Fprintf(os.Stderr, "error: %v\n", perr)
@@ -131,7 +145,7 @@ func main() {
 			Compat:           compat,
 			OriginNodeID:     *origin,
 			PinToOrigin:      *pin,
-			RequirePublished: *requirePublished,
+			RequirePublished: gateOn,
 			PublishState:     publishState,
 			Nodes:            records,
 		})
