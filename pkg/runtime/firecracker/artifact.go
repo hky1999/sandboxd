@@ -707,6 +707,7 @@ func digestMemoryWithChunkScan(ctx context.Context, memoryPath, digestMode strin
 		ChunkBytes: chunkBytes,
 	}
 	fileHash := sha256.New()
+	zeroDigests := make(map[int]string)
 	buf := make([]byte, chunkBytes)
 	var offset int64
 	for {
@@ -722,10 +723,19 @@ func digestMemoryWithChunkScan(ctx context.Context, memoryPath, digestMode strin
 				// core's sha256 throughput and starve the workers.
 				fileHash.Write(buf[:n])
 			}
-			block := make([]byte, n)
-			copy(block, buf[:n])
 			scan.Entries = append(scan.Entries, checkpointchunks.Chunk{Offset: offset})
-			jobs <- chunkJob{index: len(scan.Entries) - 1, block: block}
+			// O-4: all-zero chunks have a content-independent digest for a
+			// given length — substitute it without hashing. A freshly booted
+			// 4GiB guest is ~70% zero pages; skipping them removes the
+			// dominant hashing cost from the seal's critical path. The
+			// sequential file hash is unaffected (it still sees the bytes).
+			if isAllZero(buf[:n]) {
+				zeroDigests[len(scan.Entries)-1] = zeroChunkDigest(n)
+			} else {
+				block := make([]byte, n)
+				copy(block, buf[:n])
+				jobs <- chunkJob{index: len(scan.Entries) - 1, block: block}
+			}
 			offset += int64(n)
 		}
 		if errors.Is(rerr, io.EOF) || errors.Is(rerr, io.ErrUnexpectedEOF) {
@@ -740,6 +750,10 @@ func digestMemoryWithChunkScan(ctx context.Context, memoryPath, digestMode strin
 
 	<-collectDone
 	for i := range scan.Entries {
+		if zd, isZero := zeroDigests[i]; isZero {
+			scan.Entries[i].Digest = zd
+			continue
+		}
 		digest, ok := digestsByIndex[i]
 		if !ok {
 			return "", fmt.Errorf("memory chunk %d was not hashed", i)
@@ -891,4 +905,28 @@ func (cache *checkpointDigestCache) verifyFirecrackerCheckpointMemoryChunks(
 			expected, root)
 	}
 	return nil
+}
+
+// zeroChunkDigestCache memoizes the SHA-256 of an all-zero buffer per
+// length (full chunks share one entry; the file tail gets its own).
+var zeroChunkDigestCache sync.Map
+
+func zeroChunkDigest(n int) string {
+	if d, ok := zeroChunkDigestCache.Load(n); ok {
+		return d.(string)
+	}
+	sum := sha256.Sum256(make([]byte, n))
+	d := hex.EncodeToString(sum[:])
+	zeroChunkDigestCache.Store(n, d)
+	return d
+}
+
+// isAllZero reports whether every byte is zero (O-4 fast path).
+func isAllZero(buf []byte) bool {
+	for _, b := range buf {
+		if b != 0 {
+			return false
+		}
+	}
+	return true
 }
