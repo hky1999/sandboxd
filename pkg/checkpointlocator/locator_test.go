@@ -293,6 +293,39 @@ func TestDecidePublishedGate(t *testing.T) {
 	}
 }
 
+func TestDecideExcludesNodes(t *testing.T) {
+	nodes := []NodeRecord{
+		{ID: "draining", Runtimes: []RuntimeFace{face()}},
+		{ID: "peer", Runtimes: []RuntimeFace{face()}},
+	}
+	// The origin is registered but excluded (draining): placement must fall
+	// through to the peer instead of returning the retiring node.
+	got, err := Decide(Input{
+		CheckpointID: "C1",
+		Compat:       &CheckpointCompat{},
+		OriginNodeID: "draining",
+		ExcludeNodes: []string{"draining"},
+		Nodes:        nodes,
+	})
+	if err != nil {
+		t.Fatalf("decide: %v", err)
+	}
+	if got.NodeID != "peer" || !got.CrossNode {
+		t.Fatalf("excluded origin still placed: %+v", got)
+	}
+
+	// Excluding every node fails closed.
+	if _, err := Decide(Input{
+		CheckpointID: "C1",
+		Compat:       &CheckpointCompat{},
+		OriginNodeID: "draining",
+		ExcludeNodes: []string{"draining", "peer"},
+		Nodes:        nodes,
+	}); err == nil {
+		t.Fatal("fully excluded registry still placed")
+	}
+}
+
 func TestDecideTemplateHolderAndMatrix(t *testing.T) {
 	goodFace := face()
 	badFace := face(func(f *RuntimeFace) { f.Kernel = "other" })
