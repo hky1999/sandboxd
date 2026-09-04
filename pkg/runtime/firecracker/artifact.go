@@ -213,6 +213,21 @@ func finalizeFirecrackerCheckpointV2(
 	// copy-on-write and Firecracker's own writes. Manifests from before
 	// this knob carry no memory digest and restore keeps skipping it.
 	manifest.Digests = make(map[string]string, 2)
+	// B4-4 scan side: in chunks-digest deployments the seal also produces
+	// the overlay's chunk manifest (same pipeline, same sidecar format) so
+	// the publish path can ship the writable layer chunk-by-chunk instead
+	// of as one object. The overlay itself stays undigested (policy
+	// unchanged); this only records how its bytes chunk.
+	if manifest.MemoryDigestMode == checkpointchunks.FileDigestChunks {
+		if scan, serr := scanFileChunks(ctx, files.Overlay, firecrackerCheckpointOverlayName); serr == nil {
+			if werr := checkpointchunks.WriteNamed(filepath.Dir(files.Overlay),
+				firecrackerCheckpointOverlayName+"."+checkpointchunks.ManifestName, scan); werr != nil {
+				return werr
+			}
+		} else {
+			return fmt.Errorf("scan overlay chunks: %w", serr)
+		}
+	}
 	for _, component := range firecrackerCheckpointComponents(files) {
 		if component.name == firecrackerCheckpointOverlayName ||
 			(component.name == firecrackerCheckpointMemoryName && !digestMemory) {
@@ -537,6 +552,98 @@ func firecrackerCheckpointComponents(
 // digest is byte-for-byte what a plain sequential sha256 yields, so
 // verification and pre-existing manifests are unaffected; the sidecar is
 // what lets cn-publish skip re-reading the artifact.
+// scanFileChunks chunks any artifact file in one sequential pass with a
+// parallel worker pool, without computing a whole-file digest (the overlay
+// is deliberately not digested; its chunks only describe how bytes group).
+func scanFileChunks(ctx context.Context, path, name string) (*checkpointchunks.Manifest, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	workers := runtime.GOMAXPROCS(0)
+	if workers > 8 {
+		workers = 8
+	}
+	type chunkJob struct {
+		index int
+		block []byte
+	}
+	type chunkRes struct {
+		index  int
+		digest string
+	}
+	jobs := make(chan chunkJob, workers*2)
+	results := make(chan chunkRes, workers*2)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for job := range jobs {
+				sum := sha256.Sum256(job.block)
+				results <- chunkRes{index: job.index, digest: hex.EncodeToString(sum[:])}
+			}
+		}()
+	}
+	go func() { wg.Wait(); close(results) }()
+	byIndex := make(map[int]string)
+	var collect sync.WaitGroup
+	collect.Add(1)
+	go func() {
+		defer collect.Done()
+		for res := range results {
+			byIndex[res.index] = res.digest
+		}
+	}()
+
+	scan := &checkpointchunks.Manifest{
+		Version:    1,
+		File:       name,
+		FileSize:   info.Size(),
+		ChunkBytes: checkpointchunks.DefaultChunkBytes,
+	}
+	buf := make([]byte, checkpointchunks.DefaultChunkBytes)
+	var offset int64
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		n, rerr := io.ReadFull(f, buf)
+		if n > 0 {
+			block := make([]byte, n)
+			copy(block, buf[:n])
+			scan.Entries = append(scan.Entries, checkpointchunks.Chunk{Offset: offset})
+			jobs <- chunkJob{index: len(scan.Entries) - 1, block: block}
+			offset += int64(n)
+		}
+		if errors.Is(rerr, io.EOF) || errors.Is(rerr, io.ErrUnexpectedEOF) {
+			break
+		}
+		if rerr != nil {
+			close(jobs)
+			return nil, rerr
+		}
+	}
+	close(jobs)
+	collect.Wait()
+	for i := range scan.Entries {
+		digest, ok := byIndex[i]
+		if !ok {
+			return nil, fmt.Errorf("file %s chunk %d was not hashed", name, i)
+		}
+		scan.Entries[i].Digest = digest
+	}
+	scan.ChunkCount = len(scan.Entries)
+	scan.FileDigestMode = checkpointchunks.FileDigestChunks
+	scan.FileDigest = checkpointchunks.RootDigest(scan.Entries)
+	return scan, nil
+}
+
 func digestMemoryWithChunkScan(ctx context.Context, memoryPath, digestMode string) (string, error) {
 	f, err := os.Open(memoryPath)
 	if err != nil {
