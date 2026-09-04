@@ -142,6 +142,25 @@ func (r *Remote) PutKey(ctx context.Context, key string, body io.Reader) error {
 			return err
 		}
 		body = bytes.NewReader(buf)
+	} else {
+		// Seekables still need an explicit length or Go sends chunked
+		// encoding, which S3 answers with 411.
+		if end, err := body.(io.Seeker).Seek(0, io.SeekEnd); err == nil {
+			if _, err := body.(io.Seeker).Seek(0, io.SeekStart); err == nil {
+				if req2, err2 := http.NewRequestWithContext(ctx, http.MethodPut, url, body); err2 == nil {
+					req2.ContentLength = end
+					resp2, err3 := r.client.Do(req2)
+					if err3 != nil {
+						return err3
+					}
+					defer resp2.Body.Close()
+					if resp2.StatusCode != http.StatusOK {
+						return fmt.Errorf("PUT %s: status %d", url, resp2.StatusCode)
+					}
+					return nil
+				}
+			}
+		}
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, body)
 	if err != nil {
