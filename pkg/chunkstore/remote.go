@@ -127,6 +127,22 @@ func (r *Remote) Has(ctx context.Context, digest string) (bool, error) {
 
 func (r *Remote) PutKey(ctx context.Context, key string, body io.Reader) error {
 	url := r.baseURL + "/" + strings.TrimLeft(key, "/")
+	// The S3 REST API rejects PUTs without a Content-Length (MinIO answers
+	// 411); Go only sets it for known-length bodies, so spool anything else
+	// through a buffer. Artifact files are KBs-to-overlay-sized; genuinely
+	// huge objects want multipart, which this subset deliberately omits.
+	if f, ok := body.(*os.File); ok {
+		if info, err := f.Stat(); err == nil {
+			body = io.NewSectionReader(f, 0, info.Size())
+		}
+	}
+	if _, ok := body.(io.Seeker); !ok {
+		buf, err := io.ReadAll(body)
+		if err != nil {
+			return err
+		}
+		body = bytes.NewReader(buf)
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, body)
 	if err != nil {
 		return err
