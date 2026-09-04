@@ -143,3 +143,39 @@ func FetchTemplates(ctx context.Context, address string) ([]string, error) {
 	}
 	return ids, nil
 }
+
+// FetchCheckpointCompat reads one checkpoint's compatibility tuple from a
+// node's catalog — the orchestrator's filesystem-free path: placement
+// never needs artifact directory access, only the catalog's projection.
+func FetchCheckpointCompat(ctx context.Context, address, checkpointID string) (*CheckpointCompat, error) {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	url := strings.TrimRight(address, "/") + "/api/v1/checkpoints"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("fetch checkpoints %s: %w", address, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("fetch checkpoints %s: status %d", address, resp.StatusCode)
+	}
+	var listed struct {
+		Checkpoints []struct {
+			ID     string            `json:"id"`
+			Compat *CheckpointCompat `json:"compat"`
+		} `json:"checkpoints"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&listed); err != nil {
+		return nil, fmt.Errorf("decode checkpoints %s: %w", address, err)
+	}
+	for _, entry := range listed.Checkpoints {
+		if entry.ID == checkpointID {
+			return entry.Compat, nil
+		}
+	}
+	return nil, fmt.Errorf("checkpoint %q not in catalog at %s", checkpointID, address)
+}
