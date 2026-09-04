@@ -123,7 +123,10 @@ func main() {
 	// 4. Place: federate node records, decide with the source excluded.
 	nodeRecords, fetchErrs := checkpointlocator.FetchAll(context.Background(), strings.Split(*nodes, ","))
 	_ = fetchErrs
-	compat, err := checkpointlocator.ReadCheckpointCompat(report.Checkpoint)
+	// The compat tuple comes from the source node's catalog — the
+	// orchestrator stays filesystem-free.
+	sourceAddr := firstAddress(*nodes)
+	compat, err := checkpointlocator.FetchCheckpointCompat(context.Background(), sourceAddr, dirBase(report.Checkpoint))
 	if err != nil {
 		fail("place", err.Error())
 	}
@@ -242,4 +245,13 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n] + "…"
+}
+
+func firstAddress(list string) string {
+	for _, addr := range strings.Split(list, ",") {
+		if trimmed := strings.TrimSpace(addr); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
 }
