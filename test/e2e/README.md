@@ -28,12 +28,7 @@ The flow:
     `ktap` lifecycle;
 11. checkpoints the same runsc or Firecracker sandbox ten consecutive times,
     verifies it keeps running, and restores the tenth artifact;
-12. verifies Firecracker's EROFS root and mount contract, OCI-to-EROFS rootfs
-    conversion, private ext4 overlay, native writable ext4 mounts (including
-    checkpoint/restore), quota exhaustion, guest exec/TTY protocol, direct
-    service access, local DNAT, network ACL and managed DNS replacement, crash
-    recovery, stale-policy removal, exit-code recovery when the daemon is
-    unavailable, and reuse of the same TAP without policy leakage; and
+12. verifies Firecracker's EROFS and virtio-fs root and mount contracts, OCI/Nydus directory rootfs, private ext4 overlay, native writable ext4 mounts (including checkpoint/restore), quota exhaustion, guest exec/TTY protocol, direct service access, local DNAT, network ACL and managed DNS replacement, crash recovery, stale-policy removal, exit-code recovery when the daemon is unavailable, and reuse of the same TAP without policy leakage; and
 13. runs concurrent Redis SET/GET traffic from every runtime to a sibling
     Redis container through SNAT and from that container to the sandbox's
     published port through DNAT. The test verifies the translated source
@@ -119,26 +114,42 @@ FIRECRACKER_INITRD=/opt/firecracker/initrd.img \
 make e2e
 ```
 
+Validate an unpublished migration-capable Firecracker and virtiofsd together
+without changing `third_party/runtime-versions.env`:
+
+```bash
+TMPDIR=/xfs/build-tmp make firecracker-initrd
+
+E2E_RUNTIME=firecracker \
+E2E_FIRECRACKER_VIRTIOFS=1 \
+E2E_HOME_FIXTURE_PARENT=/xfs/test-tmp \
+E2E_KEEP_HOME_FIXTURE=1 \
+RUN_UNIT_TESTS=0 \
+FIRECRACKER_BINARY=/path/to/candidate/firecracker \
+FIRECRACKER_KERNEL=/path/to/candidate/vmlinux \
+FIRECRACKER_INITRD="${PWD}/output/initrd.img" \
+FIRECRACKER_VIRTIOFSD=/path/to/virtiofsd \
+make e2e
+```
+
+The virtio-fs mode uses a directory rootfs and a read-only directory mount in
+the main lifecycle and checkpoint/restore paths. It also checks the
+`virtiofs.state` sidecar and compatibility digest. Point
+`E2E_HOME_FIXTURE_PARENT` at XFS to exercise reflinked checkpoint memory and
+filestore data there. The keep flag retains that fixture and prints its exact
+path; the default remains automatic cleanup.
+
 `KATA_ROOT` must contain the runtime-rs shim, Dragonball configuration,
 guest kernel, and guest image at their upstream archive paths. The sandbox
 logger is built with sandboxd. The Firecracker kernel must provide the facilities listed in
 [the runtime guide](../../doc/runtime.md), and the initrd must contain the
 matching `firecracker-agent` as `/init`.
 
-Set `RUN_UNIT_TESTS=0` to skip unit tests while rerunning a privileged
-scenario. Set `E2E_STRESS_ROUNDS` to a positive number and
-`E2E_STRESS_CONCURRENCY` to 1 through 8 to run concurrent lifecycle rounds.
-Targeted runtime cases enable the Redis network soak by default. Set
-`E2E_NETWORK_SOAK=1` with one selected `E2E_RUNTIME` to enable it for a
-direct `make e2e` invocation. The harness uses a digest-pinned Redis image;
-`E2E_REDIS_IMAGE` can point at a preloaded equivalent when Docker Hub is not
-reachable.
-`E2E_RUNTIME=all` means runsc plus runc; Kata and Firecracker stay explicit
-for targeted images. `E2E_SKIP_BUILD=1` reuses
-`SANDBOXD_E2E_IMAGE`, and `E2E_RUN_CGROUP_DISABLED=0` suppresses the second
-runsc cgroup-disabled container. These controls are used by the runtime-case
-wrapper.
+Set `RUN_UNIT_TESTS=0` to skip unit tests while rerunning a privileged scenario. Set `E2E_STRESS_ROUNDS` to a positive number and `E2E_STRESS_CONCURRENCY` to 1 through 32 to run concurrent lifecycle rounds. Targeted runtime cases enable the Redis network soak by default. Set `E2E_NETWORK_SOAK=1` with one selected `E2E_RUNTIME` to enable it for a direct `make e2e` invocation. The harness uses a digest-pinned Redis image; `E2E_REDIS_IMAGE` can point at a preloaded equivalent when Docker Hub is not reachable.
+`E2E_RUNTIME=all` means runsc plus runc; Kata and Firecracker stay explicit for targeted images. `E2E_SKIP_BUILD=1` reuses `SANDBOXD_E2E_IMAGE`, and `E2E_RUN_CGROUP_DISABLED=0` suppresses the second runsc cgroup-disabled container. These controls are used by the runtime-case wrapper.
 `E2E_RUNC_ONLY=1` remains a deprecated alias for `E2E_RUNTIME=runc`.
+
+For a Firecracker virtio-fs storage soak, set `E2E_STRESS_ROOTFS_HOST` to a host directory that contains executable `/bin/sh`, `/stress-data/large.bin`, `/stress-data/small.master`, and a populated `/stress-data/small` directory. The harness mounts it read-only into the E2E container, continuously verifies and scans it from every concurrent guest, and keeps each guest's writes in its private layer. `E2E_STRESS_CHECKPOINT=1` checkpoints and restores one guest in every round while the remaining guests continue their read workload. The host directory can be a distill-fs Nydus FUSE mount to exercise the complete Nydus-to-virtio-fs data path. Set `E2E_STRESS_ONLY=1` to skip the ordinary runtime cases when iterating on a soak; it requires Firecracker virtio-fs and at least one stress round.
 
 ## Host requirements
 

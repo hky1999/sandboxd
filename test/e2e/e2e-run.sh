@@ -29,6 +29,7 @@ EROFS_MOUNT_ROOT="${E2E_EROFS_MOUNT_ROOT:-/e2e/erofs-mount-root}"
 EROFS_MOUNT_IMAGE="${E2E_EROFS_MOUNT_IMAGE:-/e2e/data.erofs}"
 FIRECRACKER_KERNEL="${E2E_FIRECRACKER_KERNEL:-/opt/firecracker/vmlinux}"
 FIRECRACKER_CHECKPOINT_MODE="${E2E_FIRECRACKER_CHECKPOINT_MODE:-}"
+FIRECRACKER_VIRTIOFS="${E2E_FIRECRACKER_VIRTIOFS:-0}"
 FIRECRACKER_INITRD="${E2E_FIRECRACKER_INITRD:-/opt/firecracker/initrd.img}"
 OCI_ROOTFS_IMAGE="${E2E_OCI_ROOTFS_IMAGE:-docker.io/library/redis:7-alpine}"
 FIRECRACKER_OVERLAY_BYTES="${E2E_FIRECRACKER_OVERLAY_BYTES:-134217728}"
@@ -52,6 +53,9 @@ REDIS_RESULT_KEY="${E2E_REDIS_RESULT_KEY:-}"
 REDIS_BENCHMARK_REQUESTS="${E2E_REDIS_BENCHMARK_REQUESTS:-20000}"
 STRESS_ROUNDS="${E2E_STRESS_ROUNDS:-0}"
 STRESS_CONCURRENCY="${E2E_STRESS_CONCURRENCY:-8}"
+STRESS_ROOTFS="${E2E_STRESS_ROOTFS:-}"
+STRESS_CHECKPOINT="${E2E_STRESS_CHECKPOINT:-0}"
+STRESS_ONLY="${E2E_STRESS_ONLY:-0}"
 DISABLE_CGROUP="${E2E_DISABLE_CGROUP:-0}"
 CPU_LIMIT_MODE="${E2E_CPU_LIMIT_MODE:-quota}"
 E2E_RUNTIME="${E2E_RUNTIME:-all}"
@@ -187,9 +191,16 @@ preflight() {
     assert_sandboxd_home_is_disk_backed
     [ "$(id -u)" = "0" ] || fail "e2e container must run as root"
     [[ "${STRESS_ROUNDS}" =~ ^[0-9]+$ ]] || fail "E2E_STRESS_ROUNDS must be a non-negative integer"
-    [[ "${STRESS_CONCURRENCY}" =~ ^[1-8]$ ]] || fail "E2E_STRESS_CONCURRENCY must be between 1 and 8"
+    [[ "${STRESS_CONCURRENCY}" =~ ^([1-9]|[12][0-9]|3[0-2])$ ]] ||
+        fail "E2E_STRESS_CONCURRENCY must be between 1 and 32"
+    [[ "${STRESS_CHECKPOINT}" =~ ^[01]$ ]] ||
+        fail "E2E_STRESS_CHECKPOINT must be 0 or 1"
+    [[ "${STRESS_ONLY}" =~ ^[01]$ ]] ||
+        fail "E2E_STRESS_ONLY must be 0 or 1"
     [[ "${DISABLE_CGROUP}" =~ ^[01]$ ]] || fail "E2E_DISABLE_CGROUP must be 0 or 1"
     [[ "${NETWORK_SOAK}" =~ ^[01]$ ]] || fail "E2E_NETWORK_SOAK must be 0 or 1"
+    [[ "${FIRECRACKER_VIRTIOFS}" =~ ^[01]$ ]] ||
+        fail "E2E_FIRECRACKER_VIRTIOFS must be 0 or 1"
     [[ "${REDIS_BENCHMARK_REQUESTS}" =~ ^[1-9][0-9]*$ ]] || fail "E2E_REDIS_BENCHMARK_REQUESTS must be positive"
     [[ "${CPU_LIMIT_MODE}" =~ ^(shares|quota)$ ]] || fail "E2E_CPU_LIMIT_MODE must be shares or quota"
     case "${E2E_RUNTIME}" in
@@ -215,6 +226,36 @@ preflight() {
     fi
     if [ "${E2E_RUNTIME}" = "firecracker" ] && [ "${DISABLE_CGROUP}" = "1" ]; then
         fail "Firecracker e2e requires sandbox-managed cgroups"
+    fi
+    if [ "${FIRECRACKER_VIRTIOFS}" = "1" ] &&
+        [ "${E2E_RUNTIME}" != "firecracker" ]; then
+        fail "E2E_FIRECRACKER_VIRTIOFS requires E2E_RUNTIME=firecracker"
+    fi
+    if [ -n "${STRESS_ROOTFS}" ]; then
+        [ "${E2E_RUNTIME}" = "firecracker" ] &&
+            [ "${FIRECRACKER_VIRTIOFS}" = "1" ] ||
+            fail "E2E_STRESS_ROOTFS requires Firecracker virtio-fs"
+        [ -x "${STRESS_ROOTFS}/bin/sh" ] ||
+            fail "E2E_STRESS_ROOTFS lacks executable /bin/sh"
+        [ -f "${STRESS_ROOTFS}/stress-data/large.bin" ] ||
+            fail "E2E_STRESS_ROOTFS lacks /stress-data/large.bin"
+        [ -f "${STRESS_ROOTFS}/stress-data/small.master" ] ||
+            fail "E2E_STRESS_ROOTFS lacks /stress-data/small.master"
+        [ -d "${STRESS_ROOTFS}/stress-data/small" ] ||
+            fail "E2E_STRESS_ROOTFS lacks /stress-data/small"
+    fi
+    if [ "${STRESS_CHECKPOINT}" = "1" ] && {
+        [ "${E2E_RUNTIME}" != "firecracker" ] ||
+            [ "${FIRECRACKER_VIRTIOFS}" != "1" ];
+    }; then
+        fail "E2E_STRESS_CHECKPOINT requires Firecracker virtio-fs"
+    fi
+    if [ "${STRESS_ONLY}" = "1" ] && {
+        [ "${E2E_RUNTIME}" != "firecracker" ] ||
+            [ "${FIRECRACKER_VIRTIOFS}" != "1" ] ||
+            [ "${STRESS_ROUNDS}" = "0" ];
+    }; then
+        fail "E2E_STRESS_ONLY requires Firecracker virtio-fs stress rounds"
     fi
     if [ "${NETWORK_SOAK}" = "1" ]; then
         [ "${E2E_RUNTIME}" != "all" ] ||
@@ -256,6 +297,10 @@ preflight() {
         firecracker)
             command -v firecracker >/dev/null 2>&1 || fail "missing command: firecracker"
             command -v mkfs.ext4 >/dev/null 2>&1 || fail "missing command: mkfs.ext4"
+            if [ "${FIRECRACKER_VIRTIOFS}" = "1" ]; then
+                command -v virtiofsd >/dev/null 2>&1 ||
+                    fail "missing command: virtiofsd"
+            fi
             [ -c /dev/kvm ] || fail "Firecracker e2e requires /dev/kvm"
             [ -f "${FIRECRACKER_KERNEL}" ] || fail "missing Firecracker kernel"
             [ -f "${FIRECRACKER_INITRD}" ] || fail "missing Firecracker initrd"
@@ -357,6 +402,18 @@ EOF
 
     local runtime_binaries
     local node_resource_config=""
+    local max_instance_num=8
+    local interface_cache_size=1
+    if [ "${STRESS_CONCURRENCY}" -gt "${max_instance_num}" ]; then
+        max_instance_num="${STRESS_CONCURRENCY}"
+    fi
+    if [ "${STRESS_ROUNDS}" -gt 0 ]; then
+        # Keep the full stress working set reusable. The interface manager trims
+        # idle entries every 30 seconds; a cache of one can otherwise destroy
+        # endpoints between back-to-back rounds and make allocation fail before
+        # the storage path is exercised.
+        interface_cache_size="${STRESS_CONCURRENCY}"
+    fi
     case "${E2E_RUNTIME}" in
         all)
             runtime_binaries=$'runsc = "/usr/local/bin/runsc"\nrunc = "/usr/local/bin/runc"'
@@ -383,6 +440,10 @@ EOF
         e2e_fc_checkpoint_mode_cfg="$(printf 'checkpoint_mode = "%s"' \
             "${FIRECRACKER_CHECKPOINT_MODE}")"
     fi
+    local e2e_fc_virtiofs_cfg=""
+    if [ "${FIRECRACKER_VIRTIOFS}" = "1" ]; then
+        e2e_fc_virtiofs_cfg=$'virtiofs_enabled = true\nvirtiofsd_path = "/usr/local/bin/virtiofsd"'
+    fi
     cat > "${CONFIG_FILE}" <<EOF
 rootDir = "${SANDBOXD_ROOT}"
 storeDir = "${SANDBOXD_STORE}"
@@ -397,9 +458,9 @@ enable_network_acl = true
 disable_cgroup = ${disable_cgroup}
 cpu_limit_mode = "${CPU_LIMIT_MODE}"
 cgroup_cache_size = 1
-interface_cache_size = 1
+interface_cache_size = ${interface_cache_size}
 cgroup_root_name = "/${CGROUP_ROOT}"
-max_instance_num = 8
+max_instance_num = ${max_instance_num}
 pids_max = 64
 
 ${node_resource_config}
@@ -435,8 +496,7 @@ kvm_device = "/dev/kvm"
 default_vcpu_count = 1
 default_memory_mib = 256
 default_overlay_size_bytes = ${FIRECRACKER_OVERLAY_BYTES}
-oci_rootfs_enabled = true
-mkfs_erofs_path = "/usr/bin/mkfs.erofs"
+${e2e_fc_virtiofs_cfg}
 ${e2e_fc_checkpoint_mode_cfg}
 
 [plugin.runtime.basic_spec]
@@ -732,17 +792,23 @@ run_checkpoint_restore_check() {
     local request_file="/tmp/${suffix}-checkpoint-request.json"
     local checkpoint_parent="${SANDBOXD_HOME}/e2e-checkpoints"
     local checkpoint_root="${checkpoint_parent}/${suffix}"
-    local checkpoint_dir=""
-    local checkpoint_count=10
-    local memory_mb=128
-    local extra_config_args=()
-    if [ "${runtime}" = "firecracker" ]; then
-        memory_mb=256
-        extra_config_args=(
-            --extra-config
-            '{"nativeWritableMounts":[{"target":"/var/lib/native-checkpoint"}]}'
-        )
-    fi
+	local checkpoint_dir=""
+	local checkpoint_count=10
+	local memory_mb=128
+	local extra_config_args=()
+	local checkpoint_mount_args=()
+	if [ "${runtime}" = "firecracker" ]; then
+		memory_mb=256
+		extra_config_args=(
+			--extra-config
+			'{"nativeWritableMounts":[{"target":"/var/lib/native-checkpoint"}]}'
+		)
+		if [ "${FIRECRACKER_VIRTIOFS}" = "1" ]; then
+			checkpoint_mount_args=(
+				--mount "${HOST_MOUNT}:/mnt/host:bind:ro"
+			)
+		fi
+	fi
 
     log "testing ${suffix} ${checkpoint_count} consecutive checkpoints and restoring the last"
     mkdir -p "${checkpoint_parent}"
@@ -755,12 +821,26 @@ run_checkpoint_restore_check() {
         --runtime "${runtime}" \
         --rootfs "${rootfs}" \
         --sandbox-id "${source_id}" \
-        --request-file "${request_file}" \
-        --memory-mb "${memory_mb}" \
-        --storage-mb 64 \
-        "${extra_config_args[@]}")"
+		--request-file "${request_file}" \
+		--memory-mb "${memory_mb}" \
+		--storage-mb 64 \
+		"${extra_config_args[@]}" \
+		"${checkpoint_mount_args[@]}")"
     assert_eq "${SANDBOX_ID}" "${source_id}" "${suffix} checkpoint source ID"
     wait_for_state "${SANDBOX_ID}" "SANDBOX_STATE_RUNNING" 300
+    if [ "${runtime}" = "firecracker" ] &&
+        [ "${FIRECRACKER_VIRTIOFS}" = "1" ]; then
+        local mounted
+        mounted="$(sbox_cmd exec "${SANDBOX_ID}" /bin/cat /mnt/host/input.txt)"
+        assert_eq "${mounted}" "host-mount-ok" \
+            "${suffix} checkpoint source virtio-fs mount"
+        if sbox_cmd exec "${SANDBOX_ID}" /bin/sh -c \
+            'echo unexpected > /mnt/host/checkpoint-write' \
+            >/tmp/firecracker-checkpoint-mount-write.log 2>&1; then
+            cat /tmp/firecracker-checkpoint-mount-write.log >&2
+            fail "${suffix} checkpoint source virtio-fs mount was writable"
+        fi
+    fi
     sbox_cmd exec "${SANDBOX_ID}" /bin/sh -c \
         'echo checkpoint-state-ok > /var/checkpoint-persist'
     if [ "${runtime}" = "firecracker" ]; then
@@ -827,6 +907,18 @@ run_checkpoint_restore_check() {
                 assert_snapshot_type "${checkpoint_dir}" "Full" \
                     "${suffix} baseline checkpoint ${checkpoint_index}"
             fi
+            if [ "${FIRECRACKER_VIRTIOFS}" = "1" ]; then
+                [ -s "${checkpoint_dir}/virtiofs.state" ] ||
+                    fail "${suffix} checkpoint ${checkpoint_index} lacks virtiofs.state"
+                jq -e '
+                    .virtio_fs == true and
+                    (.digests["virtiofs.state"] |
+                        test("^[0-9a-f]{64}$")) and
+                    (.compat.virtiofsd |
+                        test("^[0-9a-f]{64}$"))
+                ' "${checkpoint_dir}/manifest.json" >/dev/null ||
+                    fail "${suffix} checkpoint ${checkpoint_index} lacks virtio-fs metadata"
+            fi
         fi
 
         source_after=""
@@ -869,6 +961,20 @@ run_checkpoint_restore_check() {
     local persisted
     persisted="$(sbox_cmd exec "${SANDBOX_ID}" /bin/cat /var/checkpoint-persist)"
     assert_eq "${persisted}" "checkpoint-state-ok" "${suffix} restored writable state"
+    if [ "${runtime}" = "firecracker" ] &&
+        [ "${FIRECRACKER_VIRTIOFS}" = "1" ]; then
+        local restored_mount
+        restored_mount="$(sbox_cmd exec "${SANDBOX_ID}" \
+            /bin/cat /mnt/host/input.txt)"
+        assert_eq "${restored_mount}" "host-mount-ok" \
+            "${suffix} restored virtio-fs mount"
+        if sbox_cmd exec "${SANDBOX_ID}" /bin/sh -c \
+            'echo unexpected > /mnt/host/restored-write' \
+            >/tmp/firecracker-restored-mount-write.log 2>&1; then
+            cat /tmp/firecracker-restored-mount-write.log >&2
+            fail "${suffix} restored virtio-fs mount was writable"
+        fi
+    fi
     if [ "${runtime}" = "firecracker" ]; then
         local restored_init
         restored_init="$(sbox_cmd exec "${SANDBOX_ID}" /bin/sh -c \
@@ -1054,7 +1160,8 @@ run_firecracker_post_restore_chain() {
 run_network_soak() {
     local runtime="${1}"
     local rootfs="${REDIS_ROOTFS}"
-    if [ "${runtime}" = "firecracker" ]; then
+    if [ "${runtime}" = "firecracker" ] &&
+        [ "${FIRECRACKER_VIRTIOFS}" != "1" ]; then
         rootfs="${REDIS_EROFS_ROOTFS}"
     fi
 
@@ -1263,6 +1370,24 @@ wait_for_cgroup_count() {
     fail "cgroup child count did not reach ${expected}; last count: ${count}"
 }
 
+assert_virtiofsd_cgroups() {
+    local comm_path
+    local cgroup_path
+    local pid
+    local count=0
+    for comm_path in /proc/[0-9]*/comm; do
+        [ "$(cat "${comm_path}" 2>/dev/null || true)" = "virtiofsd" ] || continue
+        cgroup_path="${comm_path%/comm}/cgroup"
+        pid="${comm_path%/comm}"
+        pid="${pid##*/}"
+        grep -Eq "^[^:]*:[^:]*:/${CGROUP_ROOT}/" "${cgroup_path}" ||
+            fail "virtiofsd pid ${pid} escaped ${CGROUP_ROOT} cgroups"
+        count=$((count + 1))
+    done
+    [ "${count}" -ge "${STRESS_CONCURRENCY}" ] ||
+        fail "found only ${count} virtiofsd processes for ${STRESS_CONCURRENCY} sandboxes"
+}
+
 wait_for_process_exit() {
     local pid="$1"
     local description="$2"
@@ -1368,10 +1493,32 @@ run_stress_checks() {
         return
     fi
 
+    local memory_mb=128
+    local cpu_millicores=100
+    if [ "${runtime}" = "firecracker" ]; then
+        memory_mb=256
+    fi
+    local marker=""
+    local workload="/bin/sleep 300"
+    if [ -n "${STRESS_ROOTFS}" ]; then
+        rootfs="${STRESS_ROOTFS}"
+        cpu_millicores=1000
+        local large_sha
+        local small_sha
+        local small_count
+        large_sha="$(sha256sum "${rootfs}/stress-data/large.bin" | awk '{print $1}')"
+        small_sha="$(sha256sum "${rootfs}/stress-data/small.master" | awk '{print $1}')"
+        small_count="$(find "${rootfs}/stress-data/small" -type f | wc -l)"
+        marker="${large_sha}:${small_sha}:${small_count}"
+        workload='while :; do large="$(sha256sum /stress-data/large.bin)"; large="${large%% *}"; small="$(sha256sum /stress-data/small.master)"; small="${small%% *}"; find /stress-data/small -type f -exec cat {} + >/dev/null; count="$(find /stress-data/small -type f | wc -l)"; printf "%s:%s:%s\n" "$large" "$small" "$count" > /var/virtiofs-stress; done'
+    fi
+
     log "running ${STRESS_ROUNDS} ${runtime} stress rounds at concurrency ${STRESS_CONCURRENCY}"
     local round
     local slot
     local id
+    local request_file
+    local checkpoint_dir
     local -a pids
     for round in $(seq 1 "${STRESS_ROUNDS}"); do
         STRESS_IDS=()
@@ -1379,19 +1526,40 @@ run_stress_checks() {
         for slot in $(seq 1 "${STRESS_CONCURRENCY}"); do
             id="sbox-e2e-stress-${round}-${slot}"
             STRESS_IDS+=("${id}")
-            sbox_cmd start \
-                --quiet \
-                --runtime "${runtime}" \
-                --sandbox-id "${id}" \
-                --rootfs "${rootfs}" \
-                --cpu-millicores 100 \
-                --memory-mb 128 \
-                /bin/sleep 300 >"/tmp/${id}.start.log" 2>&1 &
+            if [ "${STRESS_CHECKPOINT}" = "1" ] && [ "${slot}" = "1" ]; then
+                request_file="${SANDBOXD_HOME}/stress-${round}.request.json"
+                checkpoint-restore \
+                    --action start \
+                    --socket "${SOCKET}" \
+                    --runtime "${runtime}" \
+                    --rootfs "${rootfs}" \
+                    --sandbox-id "${id}" \
+                    --request-file "${request_file}" \
+                    --cpu "${cpu_millicores}" \
+                    --memory-mb "${memory_mb}" \
+                    --storage-mb 64 \
+                    --workload-cmd "${workload}" \
+                    >"/tmp/${id}.start.log" 2>&1 &
+            else
+                sbox_cmd start \
+                    --quiet \
+                    --runtime "${runtime}" \
+                    --sandbox-id "${id}" \
+                    --rootfs "${rootfs}" \
+                    --cpu-millicores "${cpu_millicores}" \
+                    --memory-mb "${memory_mb}" \
+                    /bin/sh -c "${workload}" \
+                    >"/tmp/${id}.start.log" 2>&1 &
+            fi
             pids+=("$!")
         done
         for slot in "${!pids[@]}"; do
             if ! wait "${pids[$slot]}"; then
                 cat "/tmp/${STRESS_IDS[$slot]}.start.log" >&2
+                if [ -f "${LOG_FILE}" ]; then
+                    log "sandboxd log at failed stress start"
+                    tail -300 "${LOG_FILE}" >&2
+                fi
                 fail "stress start failed for ${STRESS_IDS[$slot]}"
             fi
         done
@@ -1399,6 +1567,62 @@ run_stress_checks() {
             wait_for_state "${id}" "SANDBOX_STATE_RUNNING"
         done
         wait_for_cgroup_count "${STRESS_CONCURRENCY}"
+        if [ "${runtime}" = "firecracker" ] && [ "${FIRECRACKER_VIRTIOFS}" = "1" ]; then
+            assert_virtiofsd_cgroups
+        fi
+
+        if [ -n "${marker}" ]; then
+            for id in "${STRESS_IDS[@]}"; do
+                local got=""
+                local attempt
+                for attempt in $(seq 1 1200); do
+                    got="$(sbox_cmd exec "${id}" /bin/cat \
+                        /var/virtiofs-stress 2>/dev/null || true)"
+                    [ "${got}" = "${marker}" ] && break
+                    sleep 0.1
+                done
+                [ "${got}" = "${marker}" ] ||
+                    fail "stress read verification failed for ${id}: ${got@Q}"
+            done
+        fi
+
+        if [ "${STRESS_CHECKPOINT}" = "1" ]; then
+            local source_id="${STRESS_IDS[0]}"
+            local restored_id="${source_id}-restored"
+            checkpoint_dir="${SANDBOXD_HOME}/stress-${round}.checkpoint"
+            checkpoint-restore \
+                --action checkpoint \
+                --socket "${SOCKET}" \
+                --sandbox-id "${source_id}" \
+                --checkpoint-dir "${checkpoint_dir}" \
+                --checkpoint-timeout-seconds 180 \
+                --compress=true \
+                --leave-running=true
+            [ -s "${checkpoint_dir}/virtiofs.state" ] ||
+                fail "stress checkpoint lacks virtiofs.state"
+            sbox_cmd delete "${source_id}"
+            if ! checkpoint-restore \
+                --action restore \
+                --timeout 60s \
+                --socket "${SOCKET}" \
+                --target-id "${restored_id}" \
+                --request-file "${request_file}" \
+                --checkpoint-dir "${checkpoint_dir}" >/dev/null; then
+                if [ -f "${LOG_FILE}" ]; then
+                    log "sandboxd log at failed stress restore"
+                    tail -300 "${LOG_FILE}" >&2
+                fi
+                fail "stress restore failed for ${restored_id}"
+            fi
+            STRESS_IDS[0]="${restored_id}"
+            wait_for_state "${restored_id}" "SANDBOX_STATE_RUNNING" 300
+            if [ -n "${marker}" ]; then
+                wait_for_exec_output "${restored_id}" "${marker}" \
+                    /bin/cat /var/virtiofs-stress
+            fi
+            wait_for_cgroup_count "${STRESS_CONCURRENCY}"
+            assert_virtiofsd_cgroups
+        fi
 
         pids=()
         for id in "${STRESS_IDS[@]}"; do
@@ -1412,6 +1636,10 @@ run_stress_checks() {
             fi
         done
         wait_for_cgroup_count 1
+        if [ "${STRESS_CHECKPOINT}" = "1" ]; then
+            rm -rf -- "${checkpoint_dir}"
+            rm -f -- "${request_file}"
+        fi
         STRESS_IDS=()
     done
     log "stress checks passed"
@@ -1633,7 +1861,15 @@ run_kata_checks() {
 }
 
 run_firecracker_checks() {
-    log "testing Firecracker EROFS root, writable layer, exec, and network"
+    local rootfs="${EROFS_ROOTFS}"
+    local host_mount="${HOST_MOUNT}/input.txt:/mnt/host/input.txt:bind:ro"
+    local root_description="EROFS"
+    if [ "${FIRECRACKER_VIRTIOFS}" = "1" ]; then
+        rootfs="${ROOTFS}"
+        host_mount="${HOST_MOUNT}:/mnt/host:bind:ro"
+        root_description="virtio-fs directory"
+    fi
+    log "testing Firecracker ${root_description} root, writable layer, exec, and network"
     local main_stdout="/tmp/firecracker-main.stdout"
     local main_stderr="/tmp/firecracker-main.stderr"
     rm -f "${main_stdout}" "${main_stderr}" /tmp/firecracker-exec.stderr
@@ -1642,10 +1878,10 @@ run_firecracker_checks() {
         --quiet \
         --runtime firecracker \
         --sandbox-id sbox-e2e-firecracker \
-        --rootfs "${EROFS_ROOTFS}" \
+        --rootfs "${rootfs}" \
         --cwd / \
         --env E2E_MARKER=firecracker-env-ok \
-        --mount "${HOST_MOUNT}/input.txt:/mnt/host/input.txt:bind:ro" \
+        --mount "${host_mount}" \
         --mount "${EROFS_MOUNT_IMAGE}:/mnt/erofs:erofs:ro" \
         --mount "tmpfs:/mnt/ram:tmpfs:rw,nosuid,nodev,noexec,size=1m,mode=0755" \
         --extra-config \
@@ -1697,6 +1933,16 @@ run_firecracker_checks() {
         fail "Firecracker read-only injected file was writable"
     fi
     assert_eq "$(cat "${HOST_MOUNT}/input.txt")" "host-mount-ok" "Firecracker host file unchanged"
+    if [ "${FIRECRACKER_VIRTIOFS}" = "1" ]; then
+        if sbox_cmd exec "${SANDBOX_ID}" /bin/sh -c \
+            'echo changed > /mnt/host/new-file' \
+            >/tmp/firecracker-directory-write.log 2>&1; then
+            cat /tmp/firecracker-directory-write.log >&2
+            fail "Firecracker read-only directory mount accepted a new file"
+        fi
+        [ ! -e "${HOST_MOUNT}/new-file" ] ||
+            fail "Firecracker directory mount write escaped to the host"
+    fi
 
     got="$(sbox_cmd exec "${SANDBOX_ID}" /bin/cat /mnt/erofs/input.txt)"
     assert_eq "${got}" "erofs-mount-ok" "Firecracker EROFS mount"
@@ -1760,60 +2006,64 @@ run_firecracker_checks() {
         fail "recycled Firecracker TAP ${cached_tap} remained administratively up"
     fi
 
-    log "testing Firecracker rejects directory rootfs and mounts"
-    local rejected_id
-    if rejected_id="$(sbox_cmd start \
-        --quiet \
-        --runtime firecracker \
-        --sandbox-id sbox-e2e-firecracker-directory-root \
-        --rootfs "${ROOTFS}" \
-        --cpu-millicores 100 \
-        --memory-mb 256 \
-        /bin/true 2>/tmp/firecracker-directory-root.log)"; then
-        sbox_cmd delete "${rejected_id}" || true
-        fail "Firecracker accepted a directory rootfs"
-    fi
-    if rejected_id="$(sbox_cmd start \
-        --quiet \
-        --runtime firecracker \
-        --sandbox-id sbox-e2e-firecracker-directory-mount \
-        --rootfs "${EROFS_ROOTFS}" \
-        --mount "${EROFS_MOUNT_ROOT}:/mnt/dir:bind:ro" \
-        --cpu-millicores 100 \
-        --memory-mb 256 \
-        /bin/true 2>/tmp/firecracker-directory-mount.log)"; then
-        sbox_cmd delete "${rejected_id}" || true
-        fail "Firecracker accepted a directory mount"
+    if [ "${FIRECRACKER_VIRTIOFS}" != "1" ]; then
+        log "testing Firecracker rejects directory rootfs and mounts"
+        local rejected_id
+        if rejected_id="$(sbox_cmd start \
+            --quiet \
+            --runtime firecracker \
+            --sandbox-id sbox-e2e-firecracker-directory-root \
+            --rootfs "${ROOTFS}" \
+            --cpu-millicores 100 \
+            --memory-mb 256 \
+            /bin/true 2>/tmp/firecracker-directory-root.log)"; then
+            sbox_cmd delete "${rejected_id}" || true
+            fail "Firecracker accepted a directory rootfs"
+        fi
+        if rejected_id="$(sbox_cmd start \
+            --quiet \
+            --runtime firecracker \
+            --sandbox-id sbox-e2e-firecracker-directory-mount \
+            --rootfs "${EROFS_ROOTFS}" \
+            --mount "${EROFS_MOUNT_ROOT}:/mnt/dir:bind:ro" \
+            --cpu-millicores 100 \
+            --memory-mb 256 \
+            /bin/true 2>/tmp/firecracker-directory-mount.log)"; then
+            sbox_cmd delete "${rejected_id}" || true
+            fail "Firecracker accepted a directory mount"
+        fi
     fi
 
-    log "testing Firecracker OCI rootfs conversion"
-    local oci_root_id="sbox-e2e-firecracker-oci-root"
-    SANDBOX_ID="$(sbox_cmd start \
-        --quiet \
-        --runtime firecracker \
-        --sandbox-id "${oci_root_id}" \
-        --image-url "${OCI_ROOTFS_IMAGE}" \
-        --cpu-millicores 100 \
-        --memory-mb 256 \
-        /bin/sh -c 'echo firecracker-oci-ready > /var/oci-rootfs; sleep 300')"
-    wait_for_state "${SANDBOX_ID}" "SANDBOX_STATE_RUNNING"
-    wait_for_exec_output "${SANDBOX_ID}" "firecracker-oci-ready" \
-        /bin/cat /var/oci-rootfs
-    local redis_version
-    redis_version="$(sbox_cmd exec "${SANDBOX_ID}" redis-server --version)"
-    [[ "${redis_version}" == *"Redis server v="* ]] || \
-        fail "Firecracker OCI rootfs did not preserve image content: ${redis_version@Q}"
-    sbox_cmd delete "${SANDBOX_ID}"
-    SANDBOX_ID=""
+    if [ "${FIRECRACKER_VIRTIOFS}" = "1" ]; then
+        log "testing Firecracker OCI/Nydus directory rootfs through virtio-fs"
+        local oci_root_id="sbox-e2e-firecracker-oci-root"
+        SANDBOX_ID="$(sbox_cmd start \
+            --quiet \
+            --runtime firecracker \
+            --sandbox-id "${oci_root_id}" \
+            --image-url "${OCI_ROOTFS_IMAGE}" \
+            --cpu-millicores 100 \
+            --memory-mb 256 \
+            /bin/sh -c 'echo firecracker-oci-ready > /var/oci-rootfs; sleep 300')"
+        wait_for_state "${SANDBOX_ID}" "SANDBOX_STATE_RUNNING"
+        wait_for_exec_output "${SANDBOX_ID}" "firecracker-oci-ready" \
+            /bin/cat /var/oci-rootfs
+        local redis_version
+        redis_version="$(sbox_cmd exec "${SANDBOX_ID}" redis-server --version)"
+        [[ "${redis_version}" == *"Redis server v="* ]] || \
+            fail "Firecracker OCI/Nydus rootfs did not preserve image content: ${redis_version@Q}"
+        sbox_cmd delete "${SANDBOX_ID}"
+        SANDBOX_ID=""
+    fi
 
     local cached_taps_before
     cached_taps_before="$(list_cached_taps)"
-    log "testing Firecracker read-only EROFS root"
+    log "testing Firecracker read-only ${root_description} root"
     SANDBOX_ID="$(sbox_cmd start \
         --quiet \
         --runtime firecracker \
         --sandbox-id sbox-e2e-firecracker-readonly \
-        --rootfs "${EROFS_ROOTFS}" \
+        --rootfs "${rootfs}" \
         --rootfs-readonly \
         --mount "${EROFS_MOUNT_IMAGE}:/mnt/erofs-readonly:erofs:ro" \
         --cpu-millicores 100 \
@@ -1859,7 +2109,7 @@ run_firecracker_checks() {
         --quiet \
         --runtime firecracker \
         --sandbox-id sbox-e2e-firecracker-exit \
-        --rootfs "${EROFS_ROOTFS}" \
+        --rootfs "${rootfs}" \
         --cpu-millicores 100 \
         --memory-mb 256 \
         /bin/sh -c 'sleep 2; exit 23')"
@@ -1882,11 +2132,11 @@ run_firecracker_checks() {
     sbox_cmd delete "${SANDBOX_ID}"
     SANDBOX_ID=""
 
-    run_dnat_check firecracker "Firecracker" "${EROFS_ROOTFS}" 256
+    run_dnat_check firecracker "Firecracker" "${rootfs}" 256
 
-    run_checkpoint_restore_check firecracker "${EROFS_ROOTFS}"
-    run_storage_quota_check firecracker "${EROFS_ROOTFS}"
-    run_stress_checks firecracker "${EROFS_ROOTFS}"
+    run_checkpoint_restore_check firecracker "${rootfs}"
+    run_storage_quota_check firecracker "${rootfs}"
+    run_stress_checks firecracker "${rootfs}"
 }
 
 run_runsc_checks() {
@@ -2063,6 +2313,11 @@ run_e2e() {
     prepare_rootfs
     start_sandboxd
     start_gateway_httpd
+    if [ "${STRESS_ONLY}" = "1" ]; then
+        run_stress_checks firecracker "${STRESS_ROOTFS:-${ROOTFS}}"
+        log "e2e stress passed"
+        return
+    fi
     if [ "${DISABLE_CGROUP}" = "1" ]; then
         run_cgroup_disabled_checks
     else

@@ -9,10 +9,10 @@ binaries, boot artifacts, and host prerequisites pass validation.
 | Capability | runsc | runc | Kata Containers | Firecracker |
 | --- | --- | --- | --- | --- |
 | Kernel boundary | gVisor user-space kernel | Host Linux kernel | Dedicated guest kernel in a lightweight VM | Dedicated guest kernel in a microVM |
-| Host requirements | Tested runsc binary; `/dev/kvm` when the KVM platform is selected | runc and runc-shim; writable cgroups, overlayfs, EROFS, and loop devices | Kata runtime and configuration with usable `/dev/kvm` | Firecracker, compatible kernel and initrd, `/dev/kvm`, `mkfs.ext4`, and optionally `mkfs.erofs` |
+| Host requirements | Tested runsc binary; `/dev/kvm` when the KVM platform is selected | runc and runc-shim; writable cgroups, overlayfs, EROFS, and loop devices | Kata runtime and configuration with usable `/dev/kvm` | Firecracker, compatible kernel and initrd, `/dev/kvm`, `mkfs.ext4`, and virtiofsd when directory sharing is enabled |
 | Network lifecycle | Reusable TAP from the interface pool | New netns and veth per sandbox, deleted on release | Reusable TAP from the interface pool | Reusable TAP from the interface pool |
-| Root filesystem | Directory or EROFS | Directory or EROFS with a host overlay | Directory or EROFS passed into the VM | Immutable EROFS drive or opt-in OCI/Nydus materialization, plus a private ext4 overlay |
-| Read-only mounts | Bind, EROFS, and runtime-supported OCI mounts | Bind, EROFS, and OCI mounts | Bind, EROFS, and runtime-supported OCI mounts | EROFS drives and bounded regular-file injection |
+| Root filesystem | Directory or EROFS | Directory or EROFS with a host overlay | Directory or EROFS passed into the VM | Immutable EROFS drive or opt-in virtio-fs directory, plus a private ext4 overlay |
+| Read-only mounts | Bind, EROFS, and runtime-supported OCI mounts | Bind, EROFS, and OCI mounts | Bind, EROFS, and runtime-supported OCI mounts | EROFS drives, virtio-fs directories, and bounded regular-file injection |
 | Exec, interactive TTY, wait, stats, and recovery | Supported | Supported | Supported | Supported |
 | Network ACL and managed DNS | Supported | Not supported | Supported | Supported |
 | Published-port DNAT | Supported | Supported | Supported | Supported |
@@ -44,9 +44,11 @@ uses `plugin.runtime.firecracker` and requires
 `plugin.runtime.filestore_dir`. An unavailable optional adapter is omitted
 while the other runtimes remain usable.
 
-Firecracker uses the stock VMM API and expects KVM at `/dev/kvm`. Its kernel
-must include virtio block, virtio net, vsock, EROFS, ext4, overlayfs, devtmpfs,
-and the cgroup controllers needed by the guest. The initrd must contain the
+Firecracker expects KVM at `/dev/kvm`. Its kernel must include virtio block,
+virtio net, vsock, EROFS, ext4, overlayfs, devtmpfs, and the cgroup controllers
+needed by the guest. The optional virtio-fs path additionally requires
+`CONFIG_FUSE_FS=y` and `CONFIG_VIRTIO_FS=y`; DAX stays disabled because the VMM
+does not expose a shared-memory window. The initrd must contain the
 matching sandboxd `firecracker-agent` as `/init`. Default artifact paths are
 `/opt/firecracker/vmlinux` and `/opt/firecracker/initrd.img`; the sample
 configuration shows all overrides. The default VM size is one vCPU and
@@ -73,27 +75,19 @@ network ACLs.
 
 ## Firecracker storage model
 
-Firecracker accepts only a regular file containing an EROFS superblock as its
-root filesystem. The file may be local or exposed by an image provider such as
-distill-fs, so object-storage range reads and lazy caching remain outside the
-runtime adapter.
+By default Firecracker accepts a regular file containing an EROFS superblock as
+its root filesystem. The file may be local or exposed by an image provider
+such as distill-fs, so object-storage range reads and lazy caching remain
+outside the runtime adapter.
 
-Set `oci_rootfs_enabled = true` under `plugin.runtime.firecracker` to accept an
-OCI image reference as the rootfs. sandboxd first mounts the image through its
-existing OCI/Nydus image manager, then runs `mkfs.erofs --quiet
--Enoinline_data` over the merged read-only directory. `mkfs_erofs_path`
-selects the executable and defaults to `mkfs.erofs`. Conversion is eager and
-therefore reads the complete image before the VM starts.
+Set `virtiofs_enabled = true` to use directory-backed root filesystems and explicitly read-only host-directory mounts, including OCI/Nydus rootfs directories resolved by the image manager. OCI image mounts remain unsupported. sandboxd creates one private staging tmpfs per sandbox, recursively bind-mounts each source below fixed relative paths, and starts one upstream virtiofsd selected by `virtiofsd_path` (default `/usr/local/bin/virtiofsd`). The daemon is always started with `--readonly`, namespace sandboxing, submount announcements disabled, inode file handles disabled, and `find-paths` migration mode. Disabling submount announcements makes the staging bind mounts ordinary virtio-fs directories in the guest, so they can serve as an overlayfs lower layer. The staging binds are also remounted read-only. The image manager keeps owning and garbage-collecting the source; Firecracker creates no independent image cache. OCI and Nydus rootfs directories require this mode and are never eagerly converted to EROFS.
 
-The generated file does not use a separate tag-keyed cache. A regular OCI
-image is keyed by its final chain ID and stored beside that chain, so the
-existing chain TTL and disk-pressure GC remove it. A Nydus image is keyed by
-the bootstrap digest and stored in the daemon directory, so daemon GC owns it.
-This follows the same content-addressed ownership principle as the
-[containerd EROFS snapshotter](https://github.com/containerd/containerd/blob/main/docs/snapshotters/erofs.md)
-while retaining sandboxd's current image lifecycle. Creation uses a temporary
-file and an atomic rename; sandboxd does not fsync the read-only derived
-artifact. Firecracker OCI image mounts remain unsupported.
+This mode requires the AKernel Firecracker build with the MMIO virtio-fs
+frontend and vhost-user migration support, plus virtiofsd 1.14 or newer. The
+frontend requires `MQ`, `REPLY_ACK`, `LOG_SHMFD`, `DEVICE_STATE`, and
+`VHOST_F_LOG_ALL`; startup fails rather than silently disabling checkpoint
+correctness when a backend lacks them. DAX and writable host sharing are not
+supported. The sandbox's private ext4 overlay remains the only writable layer.
 
 Every sandbox gets a sparse ext4 image under `filestore_dir/.firecracker` and
 uses it as the overlay upper and work filesystem. For a read-only root, the
@@ -127,11 +121,13 @@ requested.
 EROFS and `rofs` mounts must also name regular EROFS image files and are
 attached as read-only drives. Read-only regular files are injected into the
 guest, limited to 1 MiB per file and 4 MiB in total; this narrow path supports
-managed files such as `resolv.conf` and does not provide directory sharing. At
-most 24 drives, including root and overlay, may be attached. Directory roots
-that were not explicitly materialized, directory binds, writable binds, host
-device-provider OCI updates, NVIDIA devices, and nested KVM are rejected
-instead of being silently weakened.
+managed files such as `resolv.conf`. With virtio-fs disabled, directory roots
+that were not explicitly materialized and directory binds are rejected. With
+virtio-fs enabled, directory roots and explicitly read-only directory binds use
+the single shared filesystem instead of block drives. At most 24 block drives,
+including an EROFS root and the overlay, may be attached. Writable binds, host
+device-provider OCI updates, NVIDIA devices, and nested KVM are always
+rejected instead of being silently weakened.
 Private tmpfs mounts are supported with a bounded set of standard security,
 ownership, mode, inode, and size options.
 
