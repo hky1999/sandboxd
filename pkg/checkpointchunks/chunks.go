@@ -163,6 +163,31 @@ func WriteNamed(dir, name string, manifest *Manifest) error {
 	return os.WriteFile(filepath.Join(dir, name), append(encoded, '\n'), 0o600)
 }
 
+// LoadNamed reads a sidecar under an explicit file name (the overlay's
+// overlay.ext4.chunks.json).
+func LoadNamed(dir, name string) (*Manifest, error) {
+	raw, err := os.ReadFile(filepath.Join(dir, name))
+	if err != nil {
+		return nil, err
+	}
+	var manifest Manifest
+	if err := json.Unmarshal(raw, &manifest); err != nil {
+		return nil, fmt.Errorf("decode chunk manifest: %w", err)
+	}
+	if manifest.Version != 1 {
+		return nil, fmt.Errorf("unsupported chunk manifest version %d", manifest.Version)
+	}
+	for i, entry := range manifest.Entries {
+		if !digestPattern.MatchString(entry.Digest) {
+			return nil, fmt.Errorf("chunk manifest entry %d has invalid digest %q", i, entry.Digest)
+		}
+	}
+	return &manifest, nil
+}
+
+// SidecarName is the chunk sidecar file name for an artifact file.
+func SidecarName(file string) string { return file + "." + ManifestName }
+
 // Load reads the sidecar manifest from a checkpoint directory. A checkpoint
 // without one predates chunked distribution.
 func Load(dir string) (*Manifest, error) {
