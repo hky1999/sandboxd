@@ -29,7 +29,6 @@ import (
 
 	"github.com/inclusionAI/sandboxd/pkg/checkpointlocator"
 	"github.com/inclusionAI/sandboxd/pkg/checkpointpublish"
-	"github.com/inclusionAI/sandboxd/pkg/chunkstore"
 )
 
 type stepLog struct {
@@ -114,15 +113,11 @@ func main() {
 		fail("checkpoint", "checkpoint failed (see steps)")
 	}
 
-	// 3. Publish (source-side; idempotent).
-	store, err := chunkstore.Open(*storeSpec)
-	if err != nil {
-		fail("publish", err.Error())
-	}
-	pubCtx, pubCancel := context.WithTimeout(context.Background(), *wait)
-	defer pubCancel()
-	if _, err := checkpointpublish.Run(pubCtx, report.Checkpoint, dirBase(report.Checkpoint), store, *storeSpec); err != nil {
-		fail("publish", err.Error())
+	// 3. Publish on the source node (paths are node-local; the executor
+	// runs cn-publish where the checkpoint landed, idempotent either way).
+	if _, ok := run(*source, "publish", *bin+"/cn-publish",
+		"-checkpoint-dir", report.Checkpoint, "-store", *storeSpec); !ok {
+		fail("publish", "cn-publish failed on source")
 	}
 
 	// 4. Place: federate node records, decide with the source excluded.
