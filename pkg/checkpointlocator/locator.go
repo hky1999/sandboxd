@@ -123,6 +123,11 @@ type Input struct {
 	// PinToOrigin forbids cross-node placement (for example, the sandbox has
 	// host-local mounts). With the origin unavailable the request fails.
 	PinToOrigin bool
+	// ExcludeNodes removes nodes from consideration entirely — most
+	// importantly the origin: draining a node must never place the restore
+	// back on the node being retired, which plain origin preference would
+	// do the moment it is still registered.
+	ExcludeNodes []string
 	// RequirePublished locks cross-node placement behind the chunk
 	// distribution state machine: a peer can only serve the artifact's
 	// memory once its chunks are published to the shared store. The origin
@@ -145,8 +150,15 @@ type Placement struct {
 // Decide runs the placement tree: origin first; otherwise the earliest
 // compatible candidate in stable node order; never a silent degradation.
 func Decide(in Input) (Placement, error) {
+	excluded := make(map[string]struct{}, len(in.ExcludeNodes))
+	for _, id := range in.ExcludeNodes {
+		excluded[id] = struct{}{}
+	}
 	byID := make(map[string]NodeRecord, len(in.Nodes))
 	for _, n := range in.Nodes {
+		if _, gone := excluded[n.ID]; gone {
+			continue
+		}
 		byID[n.ID] = n
 	}
 
