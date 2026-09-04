@@ -160,11 +160,13 @@ func publishArtifactSet(
 		}
 		index.Files[name] = digest
 
-		if ok, err := store.HasKey(ctx, ArtifactKey(id, name)); err != nil {
-			return err
-		} else if ok {
-			continue // immutable content, already hosted
-		}
+		// Artifact-set files are named by checkpoint ID, not by content
+		// digest: re-publishing the same ID after the local directory
+		// was recreated (bench reruns, ID reuse) produces a different
+		// manifest under the same key. The immutability skip is only
+		// sound for digest-keyed objects, so these files always upload.
+		// The one large file (overlay) ships as digest-keyed chunks
+		// where the key IS the content hash and the skip stays correct.
 		f, err := os.Open(path)
 		if err != nil {
 			return err
