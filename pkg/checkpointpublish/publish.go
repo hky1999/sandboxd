@@ -34,6 +34,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
+	"sync"
 	"time"
 
 	"github.com/inclusionAI/sandboxd/pkg/checkpointchunks"
@@ -155,35 +157,79 @@ func Run(ctx context.Context, checkpointDir, id string, store chunkstore.Store, 
 	}
 	defer memory.Close()
 
-	buf := make([]byte, manifest.ChunkBytes)
-	put, skipped := 0, 0
+	// O-1: parallel chunk upload. Sequential PUTs bound the publish wall
+	// clock by per-request latency (~25ms/object, 54s for 2,200 chunks at
+	// 4GiB); overlapping round trips with a worker pool compresses the
+	// same bytes into the bandwidth-bound floor.
+	workers := runtime.GOMAXPROCS(0)
+	if workers > 8 {
+		workers = 8
+	}
+	type uploadJob struct {
+		chunk checkpointchunks.Chunk
+	}
+	upload := make(chan uploadJob, workers*2)
+	var uploadErr error
+	var uploadErrOnce sync.Once
+	failUpload := func(cause error) {
+		uploadErrOnce.Do(func() { uploadErr = cause })
+	}
+	var wg sync.WaitGroup
+	var progress int64
+	var progressMu sync.Mutex
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			buf := make([]byte, manifest.ChunkBytes)
+			for job := range upload {
+				if uploadErr != nil {
+					continue // drain
+				}
+				if _, err := memory.ReadAt(buf, job.chunk.Offset); err != nil &&
+					!errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+					failUpload(fmt.Errorf("read chunk at %d: %w", job.chunk.Offset, err))
+					continue
+				}
+				end := int(manifest.FileSize - job.chunk.Offset)
+				if end > manifest.ChunkBytes {
+					end = manifest.ChunkBytes
+				}
+				if err := store.Put(ctx, job.chunk.Digest, &byteReader{b: buf[:end]}); err != nil {
+					failUpload(fmt.Errorf("put chunk at %d: %w", job.chunk.Offset, err))
+					continue
+				}
+				progressMu.Lock()
+				progress++
+				state.ChunksPut = int(progress)
+				progressMu.Unlock()
+			}
+		}()
+	}
+	skipped := 0
 	for _, chunk := range manifest.Entries {
+		if uploadErr != nil {
+			break
+		}
 		if err := ctx.Err(); err != nil {
-			return failState(state, err)
+			uploadErr = err
+			break
 		}
 		if ok, err := store.Has(ctx, chunk.Digest); err != nil {
-			return failState(state, err)
+			uploadErr = err
+			break
 		} else if ok {
 			skipped++
 			continue
 		}
-		if _, err := memory.ReadAt(buf, chunk.Offset); err != nil &&
-			!errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
-			return failState(state, fmt.Errorf("read chunk at %d: %w", chunk.Offset, err))
-		}
-		end := int(manifest.FileSize - chunk.Offset)
-		if end > manifest.ChunkBytes {
-			end = manifest.ChunkBytes
-		}
-		if err := store.Put(ctx, chunk.Digest, &byteReader{b: buf[:end]}); err != nil {
-			return failState(state, fmt.Errorf("put chunk at %d: %w", chunk.Offset, err))
-		}
-		put++
-		state.ChunksPut = put + skipped
-		if err := writeState(state); err != nil {
-			return result, err
-		}
+		upload <- uploadJob{chunk: chunk}
 	}
+	close(upload)
+	wg.Wait()
+	if uploadErr != nil {
+		return failState(state, uploadErr)
+	}
+	put := int(progress)
 
 	// Artifact set: everything a blind node needs to materialize the
 	// checkpoint except the memory bytes themselves.
