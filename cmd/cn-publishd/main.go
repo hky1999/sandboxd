@@ -29,10 +29,13 @@ import (
 	"github.com/inclusionAI/sandboxd/pkg/chunkstore"
 )
 
-// roundOutcome is the machine-readable summary of one scan round.
+// roundOutcome is the machine-readable summary of one scan round — the
+// dirty-set gauge (Pending) is the Prometheus-able signal: it must trend
+// to zero shortly after checkpoints and spike only when the store is down.
 type roundOutcome struct {
 	StartedAt time.Time         `json:"started_at"`
 	Duration  string            `json:"duration"`
+	Pending   int               `json:"pending"`
 	Published []string          `json:"published"`
 	Skipped   int               `json:"skipped"`
 	Failed    map[string]string `json:"failed,omitempty"`
@@ -160,6 +163,7 @@ func scanAndPublish(roots string, store chunkstore.Store, timeout time.Duration)
 	}
 	// Newest first: the most recent generation is the most likely restore
 	// target, so it earns cross-node eligibility first.
+	outcome.Pending = len(pending)
 	sort.Slice(pending, func(i, j int) bool { return pending[i].created.After(pending[j].created) })
 
 	for _, artifact := range pending {

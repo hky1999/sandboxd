@@ -31,6 +31,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 )
 
 // ManifestName is the sidecar file written next to the memory artifact.
@@ -79,6 +80,20 @@ func RootDigest(entries []Chunk) string {
 		h.Write([]byte(entries[i].Digest))
 	}
 	return hex.EncodeToString(h.Sum(nil))
+}
+
+// ChunkBytesFromEnv returns the chunk size for standalone tools,
+// overridable with CHUNK_BYTES for object-store backends where 1MiB
+// objects halve the request count (the seal-side size stays fixed at
+// DefaultChunkBytes so manifests never disagree with their artifacts).
+func ChunkBytesFromEnv() int {
+	if v := os.Getenv("CHUNK_BYTES"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err == nil && n >= 4096 && n <= 4<<20 {
+			return n
+		}
+	}
+	return DefaultChunkBytes
 }
 
 // Compute chunks the checkpoint's memory file and writes the sidecar
