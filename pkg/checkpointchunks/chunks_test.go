@@ -16,8 +16,10 @@ package checkpointchunks
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -58,5 +60,44 @@ func TestComputeAndVerify(t *testing.T) {
 	}
 	if err := Verify(context.Background(), dir); err == nil {
 		t.Fatal("mutated artifact verified")
+	}
+}
+
+func TestLoadRejectsMalformedDigests(t *testing.T) {
+	dir := t.TempDir()
+	// F2: digests are object keys; empty or non-hex values must fail Load
+	// rather than panic on slicing or path-traverse the store.
+	for name, digest := range map[string]string{
+		"empty":       "",
+		"not-hex":     "zz" + strings.Repeat("a", 62),
+		"wrong-case":  strings.ToUpper(strings.Repeat("a", 64)),
+		"too-short":   "abcd",
+		"path-escape": strings.Repeat("a", 60) + "../../",
+	} {
+		manifest := map[string]any{
+			"version": 1, "file": "memory", "file_size": 1,
+			"chunk_bytes": 256, "chunk_count": 1,
+			"entries": []map[string]any{{"offset": 0, "digest": digest}},
+		}
+		raw, _ := json.Marshal(manifest)
+		if err := os.WriteFile(filepath.Join(dir, ManifestName), raw, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Load(dir); err == nil {
+			t.Fatalf("%s digest accepted by Load", name)
+		}
+	}
+	// A well-formed digest still loads.
+	manifest := map[string]any{
+		"version": 1, "file": "memory", "file_size": 1,
+		"chunk_bytes": 256, "chunk_count": 1,
+		"entries": []map[string]any{{"offset": 0, "digest": strings.Repeat("a", 64)}},
+	}
+	raw, _ := json.Marshal(manifest)
+	if err := os.WriteFile(filepath.Join(dir, ManifestName), raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(dir); err != nil {
+		t.Fatalf("valid manifest rejected: %v", err)
 	}
 }
