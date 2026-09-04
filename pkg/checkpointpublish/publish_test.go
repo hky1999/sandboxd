@@ -16,13 +16,16 @@ package checkpointpublish
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 
+	"github.com/inclusionAI/sandboxd/pkg/checkpointchunks"
 	"github.com/inclusionAI/sandboxd/pkg/chunkstore"
 )
 
@@ -95,6 +98,110 @@ func (f *failingStore) Get(ctx context.Context, digest string) (io.ReadCloser, e
 }
 func (f *failingStore) Has(ctx context.Context, digest string) (bool, error) {
 	return f.inner.Has(ctx, digest)
+}
+func (f *failingStore) PutKey(ctx context.Context, key string, r io.Reader) error {
+	if f.fail {
+		return errors.New("store unavailable")
+	}
+	return f.inner.PutKey(ctx, key, r)
+}
+func (f *failingStore) GetKey(ctx context.Context, key string) (io.ReadCloser, error) {
+	return f.inner.GetKey(ctx, key)
+}
+func (f *failingStore) HasKey(ctx context.Context, key string) (bool, error) {
+	return f.inner.HasKey(ctx, key)
+}
+
+func TestPublishMaterializeRoundtrip(t *testing.T) {
+	source := fixtureCheckpoint(t)
+	// Complete artifact shape: manifest + chunk sidecar + vmstate + overlay.
+	writeFullArtifact(t, source)
+
+	storeRoot := filepath.Join(filepath.Dir(source), "roundtrip-store")
+	local, err := chunkstore.NewLocal(storeRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var store chunkstore.Store = local
+	_ = store
+	id := filepath.Base(source)
+	result, err := Run(context.Background(), source, id, store, storeRoot)
+	if err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	if !result.State.ArtifactSet {
+		t.Fatal("artifact set not published")
+	}
+
+	// Materialize into a directory that never saw the source.
+	blind := filepath.Join(filepath.Dir(source), "blind-copy")
+	var keyed chunkstore.Keyed = local
+	if err := Materialize(context.Background(), blind, id, keyed); err != nil {
+		t.Fatalf("materialize: %v", err)
+	}
+	for _, name := range []string{"manifest.json", "chunks.json", "vmstate", "overlay.ext4", MaterializedMarker} {
+		if _, err := os.Stat(filepath.Join(blind, name)); err != nil {
+			t.Fatalf("materialized %s missing: %v", name, err)
+		}
+	}
+	// Memory is a sparse placeholder of the manifest size, not a copy.
+	var manifest struct {
+		MemorySize int64 `json:"memory_size"`
+	}
+	raw, _ := os.ReadFile(filepath.Join(blind, "manifest.json"))
+	_ = json.Unmarshal(raw, &manifest)
+	info, err := os.Stat(filepath.Join(blind, "memory"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() != manifest.MemorySize {
+		t.Fatalf("placeholder size %d, want %d", info.Size(), manifest.MemorySize)
+	}
+	if sys, ok := info.Sys().(*syscall.Stat_t); ok && sys.Blocks > 8 {
+		t.Fatalf("placeholder allocated %d blocks; want sparse", sys.Blocks)
+	}
+
+	// A tampered INDEX digest must fail materialization of a second copy.
+	tamperKey := ArtifactKey(id, "vmstate")
+	_ = local.PutKey(context.Background(), tamperKey, strings.NewReader("tampered"))
+	second := filepath.Join(filepath.Dir(source), "blind-copy-2")
+	if err := Materialize(context.Background(), second, id, keyed); err == nil {
+		t.Fatal("tampered artifact set materialized")
+	} else if !strings.Contains(err.Error(), "digest mismatch") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func writeFullArtifact(t *testing.T, dir string) {
+	t.Helper()
+	manifest := map[string]any{
+		"version": 2, "snapshot_type": "SoftDirty",
+		"memory_size": len(mustMemoryBytes(t, dir)),
+	}
+	raw, _ := json.MarshalIndent(manifest, "", "  ")
+	if err := os.WriteFile(filepath.Join(dir, "manifest.json"), raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for name, content := range map[string]string{
+		"vmstate":      "vmstate-bytes",
+		"overlay.ext4": "overlay-bytes",
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := checkpointchunks.Compute(context.Background(), dir, checkpointchunks.DefaultChunkBytes); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func mustMemoryBytes(t *testing.T, dir string) []byte {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(dir, "memory"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
 }
 
 func TestRunFailureIsPersistedAndRetryable(t *testing.T) {

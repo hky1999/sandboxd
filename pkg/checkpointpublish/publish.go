@@ -55,15 +55,21 @@ const StateDirName = ".publish"
 
 // State is the persisted publish record for one checkpoint.
 type State struct {
-	CheckpointID string    `json:"checkpoint_id"`
-	Dir          string    `json:"dir"`
-	State        string    `json:"state"`
-	Store        string    `json:"store,omitempty"`
-	ChunksTotal  int       `json:"chunks_total"`
-	ChunksPut    int       `json:"chunks_put"`
-	StartedAt    time.Time `json:"started_at,omitempty"`
-	PublishedAt  time.Time `json:"published_at,omitempty"`
-	LastError    string    `json:"last_error,omitempty"`
+	CheckpointID string `json:"checkpoint_id"`
+	Dir          string `json:"dir"`
+	State        string `json:"state"`
+	Store        string `json:"store,omitempty"`
+	ChunksTotal  int    `json:"chunks_total"`
+	ChunksPut    int    `json:"chunks_put"`
+	// ArtifactSet records whether the non-memory files (manifest, chunks
+	// sidecar, vmstate, overlay) are uploaded under the artifact namespace —
+	// what a node with no visibility into the source directory needs to
+	// materialize a restorable copy (memory itself is served by digest from
+	// the chunk objects).
+	ArtifactSet bool      `json:"artifact_set"`
+	StartedAt   time.Time `json:"started_at,omitempty"`
+	PublishedAt time.Time `json:"published_at,omitempty"`
+	LastError   string    `json:"last_error,omitempty"`
 }
 
 // StatePath returns the state file location for a checkpoint directory.
@@ -177,6 +183,16 @@ func Run(ctx context.Context, checkpointDir, id string, store chunkstore.Store, 
 		if err := writeState(state); err != nil {
 			return result, err
 		}
+	}
+
+	// Artifact set: everything a blind node needs to materialize the
+	// checkpoint except the memory bytes themselves.
+	if keyed, ok := store.(chunkstore.Keyed); ok {
+		if err := publishArtifactSet(ctx, checkpointDir, id, keyed, &state); err != nil {
+			return failState(state, err)
+		}
+	} else {
+		return failState(state, errors.New("store backend cannot host artifact sets"))
 	}
 
 	state.State = StatePublished

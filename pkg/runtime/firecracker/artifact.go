@@ -34,6 +34,9 @@ import (
 const (
 	firecrackerCheckpointManifestName = "manifest.json"
 	firecrackerCheckpointVersion2     = 2
+	// materializedMarkerName matches checkpointpublish.MaterializedMarker
+	// without importing it (runtime package stays store-agnostic).
+	materializedMarkerName = ".materialized"
 )
 
 // Snapshot types recorded in a v2 manifest; the strings match the Firecracker
@@ -421,7 +424,28 @@ func (cache *checkpointDigestCache) verifyFirecrackerCheckpointDigests(
 ) error {
 	cache.mu.Lock()
 	defer cache.mu.Unlock()
-	if artifact.Manifest.MemoryDigestMode == checkpointchunks.FileDigestChunks {
+	// A materialized artifact (cn-fetch from the chunk store) carries a
+	// sparse memory placeholder: its integrity is guaranteed per chunk by
+	// the uffd handler at serve time (fetch-verify-copy), so re-hashing
+	// the placeholder here would be both wrong and wasteful.
+	materialized := false
+	if marker, err := os.Lstat(filepath.Join(
+		filepath.Dir(artifact.Files.Memory), materializedMarkerName)); err == nil &&
+		marker.Mode().IsRegular() {
+		materialized = true
+	}
+	if materialized {
+		expected := artifact.Manifest.Digests[firecrackerCheckpointMemoryName]
+		if expected != "" && artifact.Manifest.MemoryDigestMode != checkpointchunks.FileDigestChunks {
+			// sha256-mode manifests have no chunk-by-chunk serve-time
+			// verification path in the handler (it trusts digests only in
+			// chunk mode); refuse rather than serve unverified memory.
+			return fmt.Errorf(
+				"materialized checkpoint %s uses sha256 memory digest mode; chunk mode is required for store-served memory",
+				artifact.Files.Memory)
+		}
+	}
+	if !materialized && artifact.Manifest.MemoryDigestMode == checkpointchunks.FileDigestChunks {
 		// Chunks mode: the recorded digest is the chunk root; verify the
 		// sidecar chunk-by-chunk in parallel instead of one serial
 		// whole-file pass, then compare the root.
@@ -433,6 +457,9 @@ func (cache *checkpointDigestCache) verifyFirecrackerCheckpointDigests(
 		expected, recorded := artifact.Manifest.Digests[component.name]
 		if !recorded || expected == "" {
 			continue
+		}
+		if component.name == firecrackerCheckpointMemoryName && materialized {
+			continue // sparse placeholder; verified per chunk at serve time
 		}
 		if component.name == firecrackerCheckpointMemoryName &&
 			artifact.Manifest.MemoryDigestMode == checkpointchunks.FileDigestChunks {
