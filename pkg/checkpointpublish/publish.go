@@ -36,6 +36,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/inclusionAI/sandboxd/pkg/checkpointchunks"
@@ -171,6 +172,7 @@ func Run(ctx context.Context, checkpointDir, id string, store chunkstore.Store, 
 	upload := make(chan uploadJob, workers*2)
 	var uploadErr error
 	var uploadErrOnce sync.Once
+	var skippedCount int64
 	failUpload := func(cause error) {
 		uploadErrOnce.Do(func() { uploadErr = cause })
 	}
@@ -185,6 +187,13 @@ func Run(ctx context.Context, checkpointDir, id string, store chunkstore.Store, 
 			for job := range upload {
 				if uploadErr != nil {
 					continue // drain
+				}
+				if ok, err := store.Has(ctx, job.chunk.Digest); err != nil {
+					failUpload(fmt.Errorf("has chunk %s: %w", job.chunk.Digest[:12], err))
+					continue
+				} else if ok {
+					atomic.AddInt64(&skippedCount, 1)
+					continue
 				}
 				if _, err := memory.ReadAt(buf, job.chunk.Offset); err != nil &&
 					!errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
@@ -206,6 +215,10 @@ func Run(ctx context.Context, checkpointDir, id string, store chunkstore.Store, 
 			}
 		}()
 	}
+	// O-1b: parallel Has pre-check. Feeding the sequential loop from the
+	// main goroutine bounded the publish at HEAD latency x total chunks
+	// (16-50s for 16,384 entries); workers now do Has+Put together.
+	put := 0
 	skipped := 0
 	for _, chunk := range manifest.Entries {
 		if uploadErr != nil {
@@ -215,13 +228,6 @@ func Run(ctx context.Context, checkpointDir, id string, store chunkstore.Store, 
 			uploadErr = err
 			break
 		}
-		if ok, err := store.Has(ctx, chunk.Digest); err != nil {
-			uploadErr = err
-			break
-		} else if ok {
-			skipped++
-			continue
-		}
 		upload <- uploadJob{chunk: chunk}
 	}
 	close(upload)
@@ -229,7 +235,8 @@ func Run(ctx context.Context, checkpointDir, id string, store chunkstore.Store, 
 	if uploadErr != nil {
 		return failState(state, uploadErr)
 	}
-	put := int(progress)
+	put = int(progress)
+	skipped = int(atomic.LoadInt64(&skippedCount))
 
 	// Artifact set: everything a blind node needs to materialize the
 	// checkpoint except the memory bytes themselves.
