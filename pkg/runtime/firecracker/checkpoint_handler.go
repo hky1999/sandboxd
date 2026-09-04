@@ -990,6 +990,17 @@ func (handler *Handler) launchUffdHandler(sandboxID, sockPath, backingPath, stat
 		// its chunk manifest next to it and falls back to it when none.
 		args = append(args, "-backing", backingPath,
 			"-chunk-store", handler.uffdChunkStore, "-cache", cachePath)
+		// An object-store endpoint gains a persistent local chunk cache in
+		// the configured cache directory: warm restores on this node stop
+		// touching the network entirely.
+		if strings.HasPrefix(handler.uffdChunkStore, "http://") ||
+			strings.HasPrefix(handler.uffdChunkStore, "https://") {
+			local := filepath.Join(filepath.Dir(cachePath), "chunk-store")
+			if err := os.MkdirAll(local, 0o755); err != nil {
+				return fmt.Errorf("create local chunk cache: %w", err)
+			}
+			args = append(args, "-chunk-local", local)
+		}
 	} else {
 		args = append(args, "-backing", backingPath)
 	}

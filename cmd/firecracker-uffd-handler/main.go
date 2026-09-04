@@ -89,6 +89,10 @@ type pageSource struct {
 	// backing-file or HTTP-range source.
 	chunkManifest *checkpointchunks.Manifest
 	chunkStore    string
+	// chunkLocal is a persistent content-addressed cache directory fronting
+	// an http chunk-store: hits never touch the network; misses are verified
+	// and persisted here for the next sandbox on this node.
+	chunkLocal string
 
 	inflightMu sync.Mutex
 	inflight   map[uint64]*sync.WaitGroup // chunk index -> waiters' group
@@ -272,32 +276,73 @@ func (s *faultServer) fetchChunkFromStore(chunkIdx uint64) error {
 
 	// The chunk store is either a local directory tree or an HTTP object
 	// endpoint (S3 REST anonymous subset); both speak the same <aa>/<digest>
-	// key layout and both are verified by the digest below.
+	// key layout and both are verified by the digest below. An http store
+	// fronted by -chunk-local consults the persistent local cache first:
+	// hits never touch the network, misses stream once and land in both the
+	// per-sandbox sparse cache and the persistent local cache.
 	var body io.Reader
-	if strings.HasPrefix(src.chunkStore, "http://") || strings.HasPrefix(src.chunkStore, "https://") {
-		resp, err := http.Get(strings.TrimRight(src.chunkStore, "/") +
-			"/" + entry.Digest[:2] + "/" + entry.Digest)
-		if err != nil {
-			return fmt.Errorf("fetch store chunk %s: %w", entry.Digest, err)
+	httpSource := strings.HasPrefix(src.chunkStore, "http://") || strings.HasPrefix(src.chunkStore, "https://")
+	if httpSource && src.chunkLocal != "" {
+		if localPath := filepath.Join(src.chunkLocal, entry.Digest[:2], entry.Digest); fileExists(localPath) {
+			f, err := os.Open(localPath)
+			if err != nil {
+				return fmt.Errorf("open local chunk %s: %w", entry.Digest, err)
+			}
+			defer f.Close()
+			log.Printf("DEBUG local-hit chunk=%d digest=%s", chunkIdx, entry.Digest[:12])
+			body = io.LimitReader(f, int64(length))
+			httpSource = false // served locally; skip the persist step
 		}
-		if resp.StatusCode != http.StatusOK {
-			resp.Body.Close()
-			return fmt.Errorf("fetch store chunk %s: status %d", entry.Digest, resp.StatusCode)
+	}
+	if body == nil {
+		if strings.HasPrefix(src.chunkStore, "http://") || strings.HasPrefix(src.chunkStore, "https://") {
+			resp, err := http.Get(strings.TrimRight(src.chunkStore, "/") +
+				"/" + entry.Digest[:2] + "/" + entry.Digest)
+			if err != nil {
+				return fmt.Errorf("fetch store chunk %s: %w", entry.Digest, err)
+			}
+			if resp.StatusCode != http.StatusOK {
+				resp.Body.Close()
+				return fmt.Errorf("fetch store chunk %s: status %d", entry.Digest, resp.StatusCode)
+			}
+			defer resp.Body.Close()
+			body = io.LimitReader(resp.Body, int64(length))
+		} else {
+			objectPath := filepath.Join(src.chunkStore, entry.Digest[:2], entry.Digest)
+			f, err := os.Open(objectPath)
+			if err != nil {
+				return fmt.Errorf("open store chunk %s: %w", entry.Digest, err)
+			}
+			defer f.Close()
+			body = io.LimitReader(f, int64(length))
+			httpSource = false // a directory store needs no local persist
 		}
-		defer resp.Body.Close()
-		body = io.LimitReader(resp.Body, int64(length))
-	} else {
-		objectPath := filepath.Join(src.chunkStore, entry.Digest[:2], entry.Digest)
-		f, err := os.Open(objectPath)
-		if err != nil {
-			return fmt.Errorf("open store chunk %s: %w", entry.Digest, err)
-		}
-		defer f.Close()
-		body = io.LimitReader(f, int64(length))
 	}
 
 	hash := sha256.New()
-	written, err := io.Copy(newOffsetWriter(src.cache, int64(start)), io.TeeReader(body, hash))
+	var persist *os.File
+	var persistPath string
+	if httpSource && src.chunkLocal != "" {
+		// Persist this fetch for the next sandbox on the node. The temp
+		// file is renamed in only after the digest verifies, so the local
+		// cache never holds a partial or corrupt object.
+		persistPath = filepath.Join(src.chunkLocal, entry.Digest[:2], entry.Digest)
+		if err := os.MkdirAll(filepath.Dir(persistPath), 0o755); err != nil {
+			return err
+		}
+		tmp, err := os.CreateTemp(filepath.Dir(persistPath), ".put-*")
+		if err != nil {
+			return err
+		}
+		defer tmp.Close()
+		defer os.Remove(tmp.Name()) // no-op after successful rename
+		persist = tmp
+	}
+	sink := io.Writer(newOffsetWriter(src.cache, int64(start)))
+	if persist != nil {
+		sink = io.MultiWriter(sink, persist)
+	}
+	written, err := io.Copy(sink, io.TeeReader(body, hash))
 	if err != nil {
 		return fmt.Errorf("cache chunk %d from store: %w", chunkIdx, err)
 	}
@@ -307,8 +352,29 @@ func (s *faultServer) fetchChunkFromStore(chunkIdx uint64) error {
 	if got := hex.EncodeToString(hash.Sum(nil)); got != entry.Digest {
 		return fmt.Errorf("store chunk %s digest mismatch: hashed %s", entry.Digest, got)
 	}
+	if persist != nil {
+		if err := persist.Sync(); err != nil {
+			return err
+		}
+		if err := os.Rename(persist.Name(), persistPath); err != nil {
+			return err
+		}
+		persist = nil
+	}
+	// Publish the fetched bitmap exactly like the remote path does: the
+	// bitmap is the only discriminator against sparse-hole reads, and
+	// without it every fault on this chunk re-fetches, re-hashes, and
+	// re-writes (F1).
+	src.inflightMu.Lock()
+	src.fetched[chunkIdx] = struct{}{}
+	src.inflightMu.Unlock()
 	log.Printf("DEBUG store chunk=%d digest=%s bytes=%d", chunkIdx, entry.Digest[:12], length)
 	return nil
+}
+
+func fileExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.Mode().IsRegular()
 }
 
 // offsetWriter adapts io.Copy onto an *os.File section.
@@ -458,7 +524,9 @@ func main() {
 	remoteURL := flag.String("remote", "", "HTTP(S) URL of the artifact memory file (remote mode)")
 	cachePath := flag.String("cache", "", "sparse local cache file (remote mode)")
 	chunkStorePath := flag.String("chunk-store", "",
-		"content-addressed chunk store directory; a chunks.json next to the backing file switches fetches to per-chunk digest lookups")
+		"content-addressed chunk store directory or http(s) object endpoint; a chunks.json next to the backing file switches fetches to per-chunk digest lookups")
+	chunkLocalDir := flag.String("chunk-local", "",
+		"local content-addressed cache directory fronting an http chunk-store: hits never touch the network, misses are verified and persisted here")
 	chunkKB := flag.Uint("chunk-kb", 4, "bytes copied per fault, in KiB")
 	workers := flag.Int("workers", 8, "concurrent UFFDIO_COPY workers")
 	prefetch := flag.Int("prefetch", 4, "background chunk prefetch concurrency (0 = disabled)")
@@ -510,6 +578,7 @@ func main() {
 			source.cachePath = *cachePath
 			source.chunkManifest = manifest
 			source.chunkStore = *chunkStorePath
+			source.chunkLocal = *chunkLocalDir
 			if uint64(manifest.ChunkBytes) != chunk {
 				log.Printf("chunk size %dKiB from manifest overrides flag (%dKiB)",
 					manifest.ChunkBytes>>10, chunk>>10)

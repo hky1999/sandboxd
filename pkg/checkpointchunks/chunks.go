@@ -30,6 +30,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 )
 
 // ManifestName is the sidecar file written next to the memory artifact.
@@ -166,8 +167,21 @@ func Load(dir string) (*Manifest, error) {
 	if manifest.Version != 1 {
 		return nil, fmt.Errorf("unsupported chunk manifest version %d", manifest.Version)
 	}
+	// Digests are used as object keys (sliced and path-joined) by every
+	// consumer: an empty or non-hex value would panic the slice at best and
+	// path-traverse the store at worst. The write side already rejects
+	// these; loading must be equally defensive (F2).
+	for i, entry := range manifest.Entries {
+		if !digestPattern.MatchString(entry.Digest) {
+			return nil, fmt.Errorf("chunk manifest entry %d has invalid digest %q", i, entry.Digest)
+		}
+	}
 	return &manifest, nil
 }
+
+// digestPattern is the strict shape of a sha256 hex digest, shared by the
+// chunk store's object-key validation.
+var digestPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
 // Verify re-hashes the memory file chunk by chunk against the manifest.
 // It proves the sidecar still describes the artifact on disk.
