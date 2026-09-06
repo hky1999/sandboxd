@@ -26,6 +26,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -550,10 +551,11 @@ func (w *offsetWriter) Write(p []byte) (int, error) {
 }
 
 type faultServer struct {
-	regions []regionMapping
-	chunk   uint64
-	uffdFd  int
-	source  *pageSource
+	regions   []regionMapping
+	chunk     uint64
+	copyBytes uint64 // opt-in forward population; zero keeps the 4KiB default
+	uffdFd    int
+	source    *pageSource
 
 	mu     sync.Mutex
 	served uint64
@@ -565,12 +567,23 @@ func (s *faultServer) resolve(addr uint64) error {
 			continue
 		}
 		fileOff := addr - r.BaseHostVirtAddr + r.Offset
-		// UFFDIO_COPY must use page granularity (4KiB): larger copies stall
-		// the KVM vCPU (256KiB copies freeze the guest after ~6 pages).
-		// The fetch/cache chunk size (s.chunk) is independent and larger
-		// for bulk transfer efficiency.
-		const copyLen = 4096
-		off := fileOff &^ (copyLen - 1)
+		// Start at the faulting page, never at the chunk's earlier boundary:
+		// an already-present prefix would return EEXIST without resolving
+		// this fault. Forward population stops at the source chunk/region.
+		const pageBytes = uint64(4096)
+		off := fileOff &^ (pageBytes - 1)
+		copyLen := pageBytes
+		chunk := s.source.chunk
+		if chunk == 0 {
+			chunk = s.chunk
+		}
+		if s.copyBytes > pageBytes && chunk >= pageBytes {
+			copyLen = min(s.copyBytes, chunk-off%chunk, r.Size-(addr-r.BaseHostVirtAddr))
+			copyLen &^= pageBytes - 1
+			if copyLen < pageBytes {
+				copyLen = pageBytes
+			}
+		}
 		buf, err := s.resolveChunk(off, copyLen)
 		if err != nil {
 			return err
@@ -579,7 +592,7 @@ func (s *faultServer) resolve(addr uint64) error {
 			buf = make([]byte, copyLen) // past EOF: zero fill
 		}
 		if uint64(len(buf)) > copyLen {
-			buf = buf[:copyLen] // trim fetched chunk to page size
+			buf = buf[:copyLen] // trim to the requested forward span
 		}
 		dst := r.BaseHostVirtAddr + (off - r.Offset)
 		if os.Getenv("UFFD_TRACE") != "" {
@@ -601,6 +614,7 @@ func (s *faultServer) resolve(addr uint64) error {
 				unix.SYS_IOCTL, uintptr(s.uffdFd),
 				uintptr(uffdioCopyNr), uintptr(unsafe.Pointer(&arg)),
 			)
+			runtime.KeepAlive(buf) // ioctl holds only the numeric source address
 			if errno == 0 {
 				break
 			}
@@ -609,6 +623,13 @@ func (s *faultServer) resolve(addr uint64) error {
 				return nil
 			}
 			if errno == unix.EAGAIN {
+				// A partial COPY may stop at a later resident page. The
+				// kernel has populated and woken the copied prefix; the
+				// faulting first page is done. Do not retry from a chunk
+				// boundary or claim that the unfilled suffix is resident.
+				if arg.Copy >= int64(pageBytes) {
+					break
+				}
 				continue
 			}
 			if errno == unix.ENOSPC || errno == unix.EFAULT {
@@ -720,12 +741,16 @@ func main() {
 		"content-addressed chunk store directory or http(s) object endpoint; a chunks.json next to the backing file switches fetches to per-chunk digest lookups")
 	chunkLocalDir := flag.String("chunk-local", "",
 		"local content-addressed cache directory fronting an http chunk-store: hits never touch the network, misses are verified and persisted here")
-	chunkKB := flag.Uint("chunk-kb", 4, "bytes copied per fault, in KiB")
+	chunkKB := flag.Uint("chunk-kb", 4, "remote fetch/cache chunk size in KiB (manifest may override)")
 	workers := flag.Int("workers", 8, "concurrent UFFDIO_COPY workers")
+	copyKB := flag.Int("copy-kb", 4, "forward UFFD population span in KiB (4..256, multiple of 4; experimental above 4)")
 	prefetch := flag.Int("prefetch", 4, "background chunk prefetch concurrency (0 = disabled)")
 	prefetchBudgetMB := flag.Int("prefetch-budget-mb", 0, "cap background prefetch to this many MiB (0 = walk the whole artifact)")
 	persistWorkers := flag.Int("persist-workers", persistenceWorkers, "background persistent cache IO workers (1-64)")
 	flag.Parse()
+	if *copyKB < 4 || *copyKB > 256 || *copyKB%4 != 0 {
+		log.Fatal("-copy-kb must be a multiple of 4 between 4 and 256")
+	}
 	if *persistWorkers < 1 || *persistWorkers > 64 {
 		log.Fatal("-persist-workers must be between 1 and 64")
 	}
@@ -836,10 +861,11 @@ func main() {
 	}
 	defer vmmConn.Close()
 	s := &faultServer{
-		regions: regions,
-		chunk:   chunk,
-		uffdFd:  fd,
-		source:  source,
+		regions:   regions,
+		copyBytes: uint64(*copyKB) << 10,
+		chunk:     chunk,
+		uffdFd:    fd,
+		source:    source,
 	}
 	log.Printf("handler ready: %d regions, chunk=%dKiB, workers=%d",
 		len(regions), *chunkKB, *workers)
