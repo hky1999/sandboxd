@@ -47,6 +47,17 @@ import (
 
 const packPayloadBudget = 16 << 20
 
+// PackTimings reports wall-clock phases and summed worker times in nanoseconds.
+// BuildTotal and UploadTotal overlap across workers: neither is CPU time.
+type PackTimings struct {
+	Prepare     time.Duration `json:"prepare_ns"`
+	Classify    time.Duration `json:"classify_ns"`
+	PackWall    time.Duration `json:"pack_wall_ns"`
+	BuildTotal  time.Duration `json:"build_total_ns"`
+	UploadTotal time.Duration `json:"upload_total_ns"`
+	Artifacts   time.Duration `json:"artifacts_ns"`
+}
+
 func validPackedID(id string) bool {
 	return id != "" && id != "." && id != ".." && !strings.ContainsAny(id, "/\\?#%")
 }
@@ -94,7 +105,7 @@ func packedMemoryClosure(m *checkpointchunks.Manifest, raw []byte) error {
 	if err := checkpointchunks.ValidateTransport(m); err != nil {
 		return err
 	}
-	if m.File != "memory" || m.FileDigestMode != checkpointchunks.FileDigestChunks || checkpointchunks.RootDigest(m.Entries) != m.FileDigest {
+	if m.File != "memory" || m.FileSize <= 0 || m.FileDigestMode != checkpointchunks.FileDigestChunks || checkpointchunks.RootDigest(m.Entries) != m.FileDigest {
 		return fmt.Errorf("packed publication requires sealed memory in chunks digest mode")
 	}
 	var fc struct {
@@ -166,6 +177,9 @@ func loadPackBaseline(ctx context.Context, store chunkstore.Keyed, id string) (*
 }
 
 func runPacked(ctx context.Context, dir, id string, store chunkstore.Store, m *checkpointchunks.Manifest, state State, result Result, opts Options) (Result, error) {
+	phaseStart := time.Now()
+	timings := &PackTimings{}
+	result.PackTimings = timings
 	fail := func(err error) (Result, error) { return failState(state, err) }
 	keyed, ok := store.(chunkstore.Keyed)
 	if !ok {
@@ -214,6 +228,8 @@ func runPacked(ctx context.Context, dir, id string, store chunkstore.Store, m *c
 			return fail(fmt.Errorf("load pack baseline: %w", err))
 		}
 	}
+	timings.Prepare = time.Since(phaseStart)
+	phaseStart = time.Now()
 	unique := []checkpointchunks.Chunk{}
 	seen := map[string]bool{}
 	for _, c := range m.Entries {
@@ -287,6 +303,8 @@ func runPacked(ctx context.Context, dir, id string, store chunkstore.Store, m *c
 	if err != nil {
 		return fail(err)
 	}
+	timings.Classify = time.Since(phaseStart)
+	phaseStart = time.Now()
 	type packJob struct {
 		chunks []checkpointchunks.Chunk
 		size   int
@@ -310,6 +328,7 @@ func runPacked(ctx context.Context, dir, id string, store chunkstore.Store, m *c
 	}
 	result.Workers = min(result.Workers, packPayloadBudget/opts.PackBytes)
 	err = parallelPackWork(ctx, len(jobs), result.Workers, func(ctx context.Context, i int) error {
+		buildStart := time.Now()
 		job := jobs[i]
 		buf := make([]byte, job.size)
 		offset := 0
@@ -328,6 +347,8 @@ func runPacked(ctx context.Context, dir, id string, store chunkstore.Store, m *c
 		sum := sha256.Sum256(buf)
 		digest := hex.EncodeToString(sum[:])
 		key := checkpointchunks.PackKey(digest)
+		buildTime := time.Since(buildStart)
+		uploadStart := time.Now()
 		present, err := keyed.HasKey(ctx, key)
 		if err != nil {
 			return err
@@ -337,8 +358,11 @@ func runPacked(ctx context.Context, dir, id string, store chunkstore.Store, m *c
 				return err
 			}
 		}
+		uploadTime := time.Since(uploadStart)
 		mu.Lock()
 		defer mu.Unlock()
+		timings.BuildTotal += buildTime
+		timings.UploadTotal += uploadTime
 		if present {
 			result.PacksSkip++
 			result.ChunksSkip += len(job.chunks)
@@ -357,12 +381,15 @@ func runPacked(ctx context.Context, dir, id string, store chunkstore.Store, m *c
 	if err != nil {
 		return fail(err)
 	}
+	timings.PackWall = time.Since(phaseStart)
+	phaseStart = time.Now()
 	if err := checkpointchunks.ValidateTransport(&transport); err != nil {
 		return fail(err)
 	}
 	if err := publishArtifactSetWithTransport(ctx, dir, id, keyed, &state, &transport); err != nil {
 		return fail(err)
 	}
+	timings.Artifacts = time.Since(phaseStart)
 	state.State = StatePublished
 	state.PublishedAt = time.Now().UTC()
 	state.ChunksPut = result.ChunksPut + result.ChunksSkip

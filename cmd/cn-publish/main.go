@@ -34,6 +34,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime/pprof"
 	"time"
 
 	"github.com/inclusionAI/sandboxd/pkg/checkpointpublish"
@@ -43,6 +44,7 @@ import (
 func main() {
 	checkpointDir := flag.String("checkpoint-dir", "", "checkpoint directory to publish")
 	storePath := flag.String("store", "", "chunk store path (directory backend)")
+	cpuProfile := flag.String("cpu-profile", "", "write an optional CPU profile to a new file (diagnostic runs only)")
 	status := flag.Bool("status", false, "print the persisted publish state and exit")
 	packMiB := flag.Int("pack-mib", 0, "pack memory into 1-8MiB objects (0 disables; candidate 4)")
 	baseID := flag.String("base-id", "", "verified published baseline in the same store for pack reuse")
@@ -95,8 +97,24 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
 
+	stopProfile := func() {}
+	if *cpuProfile != "" {
+		file, err := os.OpenFile(*cpuProfile, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "CPU profile: %v\n", err)
+			os.Exit(2)
+		}
+		if err := pprof.StartCPUProfile(file); err != nil {
+			file.Close()
+			fmt.Fprintf(os.Stderr, "CPU profile: %v\n", err)
+			os.Exit(2)
+		}
+		stopProfile = func() { pprof.StopCPUProfile(); file.Close() }
+	}
 	start := time.Now()
 	result, err := checkpointpublish.RunWithOptions(ctx, *checkpointDir, id, store, *storePath, checkpointpublish.Options{Workers: *workers, PackBytes: *packMiB << 20, BaseID: *baseID})
+	elapsed := time.Since(start)
+	stopProfile()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "publish failed (state persisted, retry resumes): %v\n", err)
 		encoded, _ := json.MarshalIndent(result.State, "", "  ")
@@ -106,8 +124,12 @@ func main() {
 	if *packMiB > 0 {
 		fmt.Printf("packs: %d uploaded, %d reused\n", result.PacksPut, result.PacksSkip)
 	}
-	fmt.Printf("published %s: %d/%d chunks (%d put, %d skipped), artifact_set=%v workers=%d in %s\n",
-		id, result.State.ChunksPut, result.State.ChunksTotal,
+	if result.PackTimings != nil {
+		encoded, _ := json.Marshal(result.PackTimings)
+		fmt.Printf("pack_timings=%s\n", encoded)
+	}
+	fmt.Printf("published %s: %d logical chunks, %d unique (%d written, %d reused), artifact_set=%v workers=%d in %s\n",
+		id, result.State.ChunksTotal, result.State.ChunksPut,
 		result.ChunksPut, result.ChunksSkip, result.State.ArtifactSet, result.Workers,
-		time.Since(start).Round(time.Millisecond))
+		elapsed.Round(time.Millisecond))
 }
