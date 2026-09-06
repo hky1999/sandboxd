@@ -566,3 +566,7 @@ For chunk-manifest restores, a chunk whose recorded digest equals the SHA-256 of
 ### Repeated nonzero memory chunks
 
 Within one UFFD restore, nonzero references with the same digest and exact length share a download and verification. Once the first cache extent is verified, later positions copy its immutable bytes into their own logical offsets and only then become readable. Failed downloads never publish a reusable extent. The handler retains only offsets and in-flight notifications, not a permanent in-memory payload copy; the persistent digest cache is populated by the first successful download. Zero chunks and HTTP Range sources keep their existing paths.
+
+### Bounded persistent chunk cache writes
+
+UFFD persistent cache writes use four background workers. Pending work retains only a digest and its verified sandbox-cache extent, with at most one task per unique digest and a metadata queue bounded by the manifest entry count. Each worker reads one chunk when it starts writing, so pending fsync operations no longer retain all downloaded payloads or create a goroutine per chunk. Normal queueing does not block faults or discard warm-cache work. VMM shutdown stops submissions and drops unstarted rebuildable cache tasks; at most four writes already in progress remain, and fault handling does not wait for them. Persistence still uses temporary files, fsync and atomic rename.
