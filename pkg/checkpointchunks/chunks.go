@@ -317,6 +317,18 @@ func verifyContents(ctx context.Context, reader io.Reader, manifest *Manifest) e
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		length := expectedChunkLen(manifest, i)
+		if manifest.FileDigestMode == FileDigestChunks && chunk.Digest == ZeroChunkDigest(int(length)) {
+			if holes, ok := reader.(interface{ skipZeroHole(int64) (bool, error) }); ok {
+				skipped, err := holes.skipZeroHole(length)
+				if err != nil {
+					return err
+				}
+				if skipped {
+					continue
+				}
+			}
+		}
 		n, err := io.ReadFull(reader, buf)
 		if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
 			return err
