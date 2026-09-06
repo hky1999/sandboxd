@@ -139,6 +139,8 @@ func writeState(state State) error {
 
 // Result summarizes one Run.
 type Result struct {
+	PacksPut   int   `json:"packs_put,omitempty"`
+	PacksSkip  int   `json:"packs_skip,omitempty"`
 	Workers    int   `json:"workers"` // actual memory upload concurrency
 	State      State `json:"state"`
 	ChunksPut  int   `json:"chunks_put"`  // objects written this run
@@ -156,13 +158,23 @@ func Run(ctx context.Context, checkpointDir, id string, store chunkstore.Store, 
 
 // Options bounds memory upload concurrency independently of host CPU count.
 // Zero Workers preserves Run's default (at most eight GOMAXPROCS workers).
-type Options struct{ Workers int }
+type Options struct {
+	Workers   int
+	PackBytes int    // zero keeps version-1 single-chunk publication
+	BaseID    string // optional verified published baseline in the same store
+}
 
 // RunWithOptions is Run with an explicit memory-upload concurrency bound.
 // Overlay publication retains its own bounded worker pool.
 func RunWithOptions(ctx context.Context, checkpointDir, id string, store chunkstore.Store, storeName string, opts Options) (Result, error) {
 	if opts.Workers < 0 || opts.Workers > 64 {
 		return Result{}, fmt.Errorf("publish workers must be between 0 and 64, got %d", opts.Workers)
+	}
+	if opts.PackBytes < 0 || opts.PackBytes > checkpointchunks.MaxPackBytes || (opts.PackBytes > 0 && opts.PackBytes < 4096) {
+		return Result{}, fmt.Errorf("pack bytes must be zero or between 4096 and %d", checkpointchunks.MaxPackBytes)
+	}
+	if opts.BaseID != "" && (opts.PackBytes == 0 || !validPackedID(opts.BaseID) || opts.BaseID == id) {
+		return Result{}, fmt.Errorf("pack base ID must be a distinct checkpoint ID with packing enabled")
 	}
 	workers := opts.Workers
 	if workers == 0 {
@@ -197,6 +209,9 @@ func RunWithOptions(ctx context.Context, checkpointDir, id string, store chunkst
 		}
 	}
 	state.ChunksTotal = manifest.ChunkCount
+	if opts.PackBytes > 0 {
+		return runPacked(ctx, checkpointDir, id, store, manifest, state, result, opts)
+	}
 
 	if err := writeState(state); err != nil {
 		return result, err
