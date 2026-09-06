@@ -262,12 +262,15 @@ func listHasRunningSandbox(listOutput, sandboxID string) bool {
 }
 
 // sandboxListState returns the STATUS column of the row whose ID column
-// equals sandboxID exactly, or "" when absent.
+// equals sandboxID exactly, or "" when absent. The listing is rendered by
+// text/tabwriter, whose output pads columns with spaces (the tabs become
+// alignment padding), so rows are split on whitespace: IDs and states
+// contain none.
 func sandboxListState(listOutput, sandboxID string) string {
 	for _, line := range strings.Split(listOutput, "\n") {
-		cols := strings.Split(line, "\t")
-		if len(cols) >= 2 && strings.TrimSpace(cols[0]) == sandboxID {
-			return strings.TrimSpace(cols[1])
+		fields := strings.Fields(line)
+		if len(fields) >= 2 && fields[0] == sandboxID {
+			return fields[1]
 		}
 	}
 	return ""
