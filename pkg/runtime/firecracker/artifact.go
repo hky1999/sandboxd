@@ -925,13 +925,7 @@ func (cache *checkpointDigestCache) verifyFirecrackerCheckpointMemoryChunks(
 var zeroChunkDigestCache sync.Map
 
 func zeroChunkDigest(n int) string {
-	if d, ok := zeroChunkDigestCache.Load(n); ok {
-		return d.(string)
-	}
-	sum := sha256.Sum256(make([]byte, n))
-	d := hex.EncodeToString(sum[:])
-	zeroChunkDigestCache.Store(n, d)
-	return d
+	return checkpointchunks.ZeroChunkDigest(n)
 }
 
 // isAllZero reports whether every byte is zero (O-4 fast path).

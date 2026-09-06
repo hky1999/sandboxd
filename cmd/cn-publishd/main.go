@@ -54,6 +54,7 @@ func main() {
 	once := flag.Bool("once", false, "run a single round and exit")
 	jsonOut := flag.Bool("json", false, "machine-readable round summaries")
 	timeout := flag.Duration("timeout", 10*time.Minute, "per-publish deadline")
+	stale := flag.Duration("stale", 10*time.Minute, "publishing state older than this is a crash leftover and is re-queued")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "usage: cn-publishd -roots DIR[,DIR...] -store SPEC [-interval 30s] [-once] [-json]\n")
 		flag.PrintDefaults()
@@ -70,7 +71,7 @@ func main() {
 	}
 
 	for {
-		outcome := scanAndPublish(*roots, store, *timeout)
+		outcome := scanAndPublish(*roots, store, *timeout, *stale)
 		if *jsonOut {
 			encoded, _ := json.Marshal(outcome)
 			fmt.Println(string(encoded))
@@ -92,10 +93,13 @@ func main() {
 }
 
 // scanAndPublish walks the roots, collects sealed-but-unpublished
-// artifacts newest first, and publishes each. Already-published and
-// in-flight (publishing) artifacts are skipped: publishing is not
-// interrupted, only not restarted.
-func scanAndPublish(roots string, store chunkstore.Store, timeout time.Duration) roundOutcome {
+// artifacts newest first, and publishes each. Already-published artifacts
+// are skipped. A "publishing" record whose recorded start is older than
+// staleAfter is a crash leftover (no live owner holds it) and is
+// re-queued — publishing is idempotent, so the rerun only puts objects
+// the store still lacks. Young publishing records may belong to a
+// concurrent publisher and are left untouched.
+func scanAndPublish(roots string, store chunkstore.Store, timeout, staleAfter time.Duration) roundOutcome {
 	outcome := roundOutcome{
 		StartedAt: time.Now().UTC(),
 		Failed:    map[string]string{},
@@ -125,8 +129,20 @@ func scanAndPublish(roots string, store chunkstore.Store, timeout time.Duration)
 				continue // never published: candidate
 			}
 			switch state.State {
-			case checkpointpublish.StatePublished, checkpointpublish.StatePublishing:
+			case checkpointpublish.StatePublished:
 				outcome.Skipped++
+			case checkpointpublish.StatePublishing:
+				// Crash-leftover lease: a state string alone does not mean
+				// anyone still owns the publish — a daemon death between
+				// writing "publishing" and any outcome would otherwise
+				// strand the artifact forever.
+				if time.Since(state.StartedAt) > staleAfter {
+					pending = append(pending, pendingArtifact{
+						dir: dir, id: entry.Name(), created: state.StartedAt,
+					})
+				} else {
+					outcome.Skipped++
+				}
 			case checkpointpublish.StatePublishFailed:
 				pending = append(pending, pendingArtifact{
 					dir: dir, id: entry.Name(), created: state.StartedAt,

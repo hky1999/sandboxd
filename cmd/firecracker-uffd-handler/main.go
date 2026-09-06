@@ -27,6 +27,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 	"unsafe"
 
@@ -104,11 +105,16 @@ type pageSource struct {
 	fetched map[uint64]struct{}
 }
 
-func (s *faultServer) resolveChunk(fileOff uint64) ([]byte, error) {
+// resolveChunk returns the bytes for [fileOff, fileOff+want) clamped to the
+// artifact end. The page fault path calls it with want = 4KiB: on an
+// already-fetched chunk only those bytes are read back from the cache, not
+// the whole 256KiB chunk (P4 — a full-chunk read per 4KiB fault amplifies
+// user-space reads up to 64x while the guest walks sequential pages).
+func (s *faultServer) resolveChunk(fileOff, want uint64) ([]byte, error) {
 	if s.source.file != nil {
-		buf := make([]byte, s.source.chunk)
+		buf := make([]byte, want)
 		n, err := s.source.file.ReadAt(buf, int64(fileOff))
-		if err != nil && !errors.Is(err, io.EOF) {
+		if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
 			return nil, err
 		}
 		return buf[:n], nil
@@ -119,12 +125,6 @@ func (s *faultServer) resolveChunk(fileOff uint64) ([]byte, error) {
 	chunkIdx := fileOff / s.source.chunk
 	cacheOff := chunkIdx * s.source.chunk
 	subOff := fileOff - cacheOff // offset within the chunk
-	sliceAt := func(buf []byte) []byte {
-		if subOff >= uint64(len(buf)) {
-			return nil
-		}
-		return buf[subOff:]
-	}
 	src := s.source
 	// A chunk is readable only once its fetch completed (bitmap). Reading
 	// before that can return a hole: another worker's write to a higher
@@ -139,31 +139,34 @@ func (s *faultServer) resolveChunk(fileOff uint64) ([]byte, error) {
 			return nil, err
 		}
 	}
-	buf, ok := s.readCache(cacheOff)
+	// Page-granular read of exactly the requested span (clamped to the
+	// chunk's end; the tail chunk may be short).
+	span := src.chunk - subOff
+	if want < span {
+		span = want
+	}
+	buf, ok := s.readCache(cacheOff+subOff, span)
 	if !ok {
 		return nil, fmt.Errorf("chunk %d missing from cache after fetch", chunkIdx)
 	}
-	if out := sliceAt(buf); out != nil {
-		return out, nil
-	}
-	return nil, fmt.Errorf("offset %d beyond fetched chunk %d", fileOff, chunkIdx)
+	return buf, nil
 }
 
-// readCache reads the chunk at cacheOff back from the sparse cache. The
-// caller must have established (via the fetched bitmap) that the chunk's
-// bytes are fully written: a sparse hole reads back as a full-length run
-// of zeros once the file has been extended past it, so this function
-// deliberately does not try to validate completeness by length.
-func (s *faultServer) readCache(cacheOff uint64) ([]byte, bool) {
-	buf := make([]byte, s.source.chunk)
-	n, err := s.source.cache.ReadAt(buf, int64(cacheOff))
-	if err != nil && !errors.Is(err, io.EOF) {
+// readCache reads n bytes back from the sparse cache at the given absolute
+// offset. The caller must have established (via the fetched bitmap) that the
+// enclosing chunk's bytes are fully written: a sparse hole reads back as a
+// full-length run of zeros once the file has been extended past it, so this
+// function deliberately does not try to validate completeness by length.
+func (s *faultServer) readCache(off, n uint64) ([]byte, bool) {
+	buf := make([]byte, n)
+	read, err := s.source.cache.ReadAt(buf, int64(off))
+	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
 		return nil, false
 	}
-	if n == 0 {
+	if read == 0 {
 		return nil, false
 	}
-	return buf[:n], true
+	return buf[:read], true
 }
 
 // fetchChunk pulls one chunk from the remote source, collapsing concurrent
@@ -279,8 +282,11 @@ func (s *faultServer) fetchChunkFromStore(chunkIdx uint64) error {
 	// key layout and both are verified by the digest below. An http store
 	// fronted by -chunk-local consults the persistent local cache first:
 	// hits never touch the network, misses stream once and land in both the
-	// per-sandbox sparse cache and the persistent local cache.
+	// per-sandbox sparse cache and the persistent local cache. A persistent
+	// copy that fails verification is evicted so the retry refetches from
+	// the store instead of poisoning every attempt.
 	var body io.Reader
+	localHitPath := ""
 	httpSource := strings.HasPrefix(src.chunkStore, "http://") || strings.HasPrefix(src.chunkStore, "https://")
 	if httpSource && src.chunkLocal != "" {
 		if localPath := filepath.Join(src.chunkLocal, entry.Digest[:2], entry.Digest); fileExists(localPath) {
@@ -291,12 +297,13 @@ func (s *faultServer) fetchChunkFromStore(chunkIdx uint64) error {
 			defer f.Close()
 			log.Printf("DEBUG local-hit chunk=%d digest=%s", chunkIdx, entry.Digest[:12])
 			body = io.LimitReader(f, int64(length))
+			localHitPath = localPath
 			httpSource = false // served locally; skip the persist step
 		}
 	}
 	if body == nil {
 		if strings.HasPrefix(src.chunkStore, "http://") || strings.HasPrefix(src.chunkStore, "https://") {
-			resp, err := http.Get(strings.TrimRight(src.chunkStore, "/") +
+			resp, err := storeHTTPClient.Get(strings.TrimRight(src.chunkStore, "/") +
 				"/" + entry.Digest[:2] + "/" + entry.Digest)
 			if err != nil {
 				return fmt.Errorf("fetch store chunk %s: %w", entry.Digest, err)
@@ -334,8 +341,6 @@ func (s *faultServer) fetchChunkFromStore(chunkIdx uint64) error {
 		if err != nil {
 			return err
 		}
-		defer tmp.Close()
-		defer os.Remove(tmp.Name()) // no-op after successful rename
 		persist = tmp
 	}
 	sink := io.Writer(newOffsetWriter(src.cache, int64(start)))
@@ -344,22 +349,53 @@ func (s *faultServer) fetchChunkFromStore(chunkIdx uint64) error {
 	}
 	written, err := io.Copy(sink, io.TeeReader(body, hash))
 	if err != nil {
+		if persist != nil {
+			persist.Close()
+			os.Remove(persist.Name())
+		}
 		return fmt.Errorf("cache chunk %d from store: %w", chunkIdx, err)
 	}
 	if uint64(written) != length {
+		if persist != nil {
+			persist.Close()
+			os.Remove(persist.Name())
+		}
 		return fmt.Errorf("store chunk %s short: %d bytes, want %d", entry.Digest, written, length)
 	}
 	if got := hex.EncodeToString(hash.Sum(nil)); got != entry.Digest {
+		if persist != nil {
+			persist.Close()
+			os.Remove(persist.Name())
+		}
+		if localHitPath != "" {
+			// Evict the poisoned persistent copy; fetchChunk's retry then
+			// refetches from the store instead of hitting the same bad
+			// bytes again.
+			os.Remove(localHitPath)
+			return fmt.Errorf("persistent chunk %s failed verification (hashed %s); evicted, retrying from store",
+				entry.Digest, got)
+		}
 		return fmt.Errorf("store chunk %s digest mismatch: hashed %s", entry.Digest, got)
 	}
 	if persist != nil {
-		if err := persist.Sync(); err != nil {
-			return err
-		}
-		if err := os.Rename(persist.Name(), persistPath); err != nil {
-			return err
-		}
-		persist = nil
+		// The bytes are already in the per-sandbox cache and verified, so
+		// the fault can be served now; the persistent copy is rebuildable
+		// state, and its fsync+rename moves off the fault's critical path
+		// (P4: a per-chunk fsync blocked every faulting vCPU on cache
+		// persistence the store can always redo).
+		pending := persist
+		go func() {
+			defer pending.Close()
+			if err := pending.Sync(); err != nil {
+				os.Remove(pending.Name())
+				log.Printf("persist chunk %s: sync: %v (cache copy remains valid)", entry.Digest[:12], err)
+				return
+			}
+			if err := os.Rename(pending.Name(), persistPath); err != nil {
+				os.Remove(pending.Name())
+				log.Printf("persist chunk %s: rename: %v (cache copy remains valid)", entry.Digest[:12], err)
+			}
+		}()
 	}
 	// Publish the fetched bitmap exactly like the remote path does: the
 	// bitmap is the only discriminator against sparse-hole reads, and
@@ -413,7 +449,7 @@ func (s *faultServer) resolve(addr uint64) error {
 		// for bulk transfer efficiency.
 		const copyLen = 4096
 		off := fileOff &^ (copyLen - 1)
-		buf, err := s.resolveChunk(off)
+		buf, err := s.resolveChunk(off, copyLen)
 		if err != nil {
 			return err
 		}
@@ -517,6 +553,33 @@ func recvHandshake(l net.Listener) ([]regionMapping, int, *net.UnixConn, error) 
 	return nil, -1, nil, errors.New("handshake carried no file descriptor")
 }
 
+// fileFullyAllocated reports whether path is a regular file whose allocated
+// blocks cover its size — i.e. it has no holes. A blind-materialized memory
+// file starts sparse (real bytes in the chunk store); a Firecracker-written
+// image is fully allocated. When the stat cannot be narrowed to a Unix
+// inode, assume allocated.
+func fileFullyAllocated(path string) bool {
+	info, err := os.Stat(path)
+	if err != nil || !info.Mode().IsRegular() || info.Size() == 0 {
+		return false
+	}
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return true
+	}
+	return uint64(st.Blocks)*512 >= uint64(info.Size())
+}
+
+// storeHTTPClient is the shared client for chunk-store fetches. A bounded
+// timeout keeps a wedged store from occupying fault workers indefinitely
+// (the default client has none).
+var storeHTTPClient = &http.Client{
+	Timeout: 60 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConnsPerHost: 16,
+	},
+}
+
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	sockPath := flag.String("sock", "", "unix socket path Firecracker will connect to")
@@ -565,11 +628,30 @@ func main() {
 		}}
 		// Cache writes go through fetchChunk which serializes via inflight.
 	} else if *chunkStorePath != "" {
-		// Chunk mode: serve from a content-addressed store when the
-		// artifact carries a chunk manifest; without one, degrade to the
-		// plain backing-file path below (full mode, backward compatible).
+		// Chunk mode picks the source by artifact shape, not by manifest
+		// presence alone:
+		//
+		//   - complete local image  -> serve the backing file directly; the
+		//     chunk store is a distribution channel, not a dependency, and a
+		//     store outage must not block restoring artifacts this node
+		//     already holds in full (fail-open to local).
+		//   - sparse placeholder    -> real bytes live in the store; serve
+		//     chunks (persistent cache first, remote on miss).
+		//   - broken manifest + complete image -> serve the bytes we have.
+		//   - broken manifest + sparse placeholder -> refuse: serving the
+		//     backing would feed zeros for every unfetched chunk, which is
+		//     silent memory corruption rather than a failure.
+		backingComplete := fileFullyAllocated(*backingPath)
 		manifest, err := checkpointchunks.Load(filepath.Dir(*backingPath))
-		if err == nil {
+		switch {
+		case err == nil && backingComplete:
+			file, ferr := os.Open(*backingPath)
+			if ferr != nil {
+				log.Fatalf("open backing file: %v", ferr)
+			}
+			source.file = file
+			log.Printf("complete local memory image; serving backing file directly (chunk store not on the critical path)")
+		case err == nil:
 			cacheFile, cerr := os.OpenFile(*cachePath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o600)
 			if cerr != nil {
 				log.Fatalf("open cache file %s: %v", *cachePath, cerr)
@@ -585,13 +667,16 @@ func main() {
 				source.chunk = uint64(manifest.ChunkBytes)
 			}
 			log.Printf("chunk source: %d chunks from store %s", manifest.ChunkCount, *chunkStorePath)
-		} else {
-			log.Printf("no usable chunk manifest next to %s (%v); falling back to the backing file", *backingPath, err)
+		case backingComplete:
+			log.Printf("no usable chunk manifest next to %s (%v); backing image is complete, serving it", *backingPath, err)
 			file, ferr := os.Open(*backingPath)
 			if ferr != nil {
 				log.Fatalf("open backing file: %v", ferr)
 			}
 			source.file = file
+		default:
+			log.Fatalf("chunk manifest unusable (%v) and backing %s is a sparse placeholder; refusing to serve zeros — repair the manifest or re-materialize the artifact",
+				err, *backingPath)
 		}
 	} else {
 		file, err := os.Open(*backingPath)
@@ -647,30 +732,59 @@ func main() {
 
 	// Background bulk download: sequentially fetchChunk every chunk. This
 	// runs concurrently with fault serving — the inflight dedup in
-	// fetchChunk ensures a chunk is fetched at most once, and the writes
-	// are serialized by the sequential iteration (one fetchChunk at a time
-	// in this goroutine). Fault-serving workers may also call fetchChunk
-	// for the same chunk concurrently, which the inflight WaitGroup handles.
-	if *prefetch > 0 && source.remote != "" && os.Getenv("UFFD_NO_BULK") == "" {
+	// Background prefetch warms the whole artifact with a bounded worker
+	// pool; -prefetch is the concurrency, and it now covers the S3 chunk
+	// path too (the old remote-only gate silently disabled prefetch for
+	// exactly the deployments that needed it). fetchChunk's inflight
+	// tracking makes concurrent prefetch with fault serving safe: each
+	// chunk moves at most once, faults wait on the same WaitGroup.
+	if *prefetch > 0 && (source.remote != "" || source.chunkStore != "") &&
+		os.Getenv("UFFD_NO_BULK") == "" {
 		go func() {
 			totalChunks := uint64(0)
 			for _, r := range regions {
 				totalChunks += (r.Size + chunk - 1) / chunk
 			}
+			workers := *prefetch
+			if workers > 16 {
+				workers = 16
+			}
+			if workers > int(totalChunks) {
+				workers = int(totalChunks)
+			}
+			queue := make(chan uint64)
+			var pwg sync.WaitGroup
+			for w := 0; w < workers; w++ {
+				pwg.Add(1)
+				go func() {
+					defer pwg.Done()
+					for idx := range queue {
+						select {
+						case <-stop:
+							return
+						default:
+						}
+						if err := s.fetchChunk(idx); err != nil {
+							log.Printf("prefetch chunk %d: %v", idx, err)
+							return
+						}
+					}
+				}()
+			}
 			startT := time.Now()
 			for idx := uint64(0); idx < totalChunks; idx++ {
 				select {
 				case <-stop:
+					close(queue)
+					pwg.Wait()
 					return
-				default:
-				}
-				if err := s.fetchChunk(idx); err != nil {
-					log.Printf("prefetch chunk %d: %v", idx, err)
-					return
+				case queue <- idx:
 				}
 			}
-			log.Printf("prefetch: %d chunks in %.2fs",
-				totalChunks, time.Since(startT).Seconds())
+			close(queue)
+			pwg.Wait()
+			log.Printf("prefetch: %d chunks in %.2fs (concurrency %d)",
+				totalChunks, time.Since(startT).Seconds(), workers)
 		}()
 	}
 

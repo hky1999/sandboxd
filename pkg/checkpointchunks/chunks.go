@@ -32,6 +32,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strconv"
+	"sync"
 )
 
 // ManifestName is the sidecar file written next to the memory artifact.
@@ -197,6 +198,9 @@ func LoadNamed(dir, name string) (*Manifest, error) {
 			return nil, fmt.Errorf("chunk manifest entry %d has invalid digest %q", i, entry.Digest)
 		}
 	}
+	if err := validateManifest(&manifest); err != nil {
+		return nil, err
+	}
 	return &manifest, nil
 }
 
@@ -226,12 +230,66 @@ func Load(dir string) (*Manifest, error) {
 			return nil, fmt.Errorf("chunk manifest entry %d has invalid digest %q", i, entry.Digest)
 		}
 	}
+	if err := validateManifest(&manifest); err != nil {
+		return nil, err
+	}
 	return &manifest, nil
+}
+
+// validateManifest enforces the structural invariants every consumer
+// indexes on: positive chunk size, entries matching the declared count,
+// offsets laid out as i*ChunkBytes, and a FileSize consistent with the
+// final (possibly short) chunk. A manifest failing any of these would
+// otherwise divide by zero, read out of bounds, or silently describe a
+// different file (C6).
+func validateManifest(manifest *Manifest) error {
+	if manifest.ChunkBytes <= 0 {
+		return fmt.Errorf("chunk manifest has non-positive chunk_bytes %d", manifest.ChunkBytes)
+	}
+	if manifest.ChunkCount != len(manifest.Entries) {
+		return fmt.Errorf("chunk manifest declares %d chunks but carries %d entries",
+			manifest.ChunkCount, len(manifest.Entries))
+	}
+	if manifest.File == "" {
+		return fmt.Errorf("chunk manifest has an empty file name")
+	}
+	for i := range manifest.Entries {
+		if want := int64(i) * int64(manifest.ChunkBytes); manifest.Entries[i].Offset != want {
+			return fmt.Errorf("chunk manifest entry %d offset %d breaks the %d-byte grid (want %d)",
+				i, manifest.Entries[i].Offset, manifest.ChunkBytes, want)
+		}
+	}
+	if n := len(manifest.Entries); n > 0 {
+		last := manifest.Entries[n-1].Offset
+		if manifest.FileSize <= last || manifest.FileSize > last+int64(manifest.ChunkBytes) {
+			return fmt.Errorf("chunk manifest file_size %d inconsistent with %d entries of %d bytes (tail must be in (%d, %d])",
+				manifest.FileSize, n, manifest.ChunkBytes, last, last+int64(manifest.ChunkBytes))
+		}
+	} else if manifest.FileSize != 0 {
+		return fmt.Errorf("chunk manifest with no entries must have file_size 0, got %d", manifest.FileSize)
+	}
+	return nil
 }
 
 // digestPattern is the strict shape of a sha256 hex digest, shared by the
 // chunk store's object-key validation.
 var digestPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
+
+// zeroChunkDigestCache memoizes sha256(n zero bytes) per length.
+var zeroChunkDigestCache sync.Map
+
+// ZeroChunkDigest returns the sha256 of n zero bytes. An all-zero chunk of
+// a known length has a constant digest, so publishers and materializers can
+// recognize (and synthesize or skip) zero chunks without hashing them.
+func ZeroChunkDigest(n int) string {
+	if d, ok := zeroChunkDigestCache.Load(n); ok {
+		return d.(string)
+	}
+	sum := sha256.Sum256(make([]byte, n))
+	d := hex.EncodeToString(sum[:])
+	zeroChunkDigestCache.Store(n, d)
+	return d
+}
 
 // Verify re-hashes the memory file chunk by chunk against the manifest.
 // It proves the sidecar still describes the artifact on disk.

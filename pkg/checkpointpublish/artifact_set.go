@@ -25,6 +25,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 
 	"github.com/inclusionAI/sandboxd/pkg/checkpointchunks"
 	"github.com/inclusionAI/sandboxd/pkg/chunkstore"
@@ -64,10 +66,30 @@ func ArtifactKey(id, name string) string {
 // OverlaySidecarName is the chunk sidecar for the writable layer.
 const OverlaySidecarName = "overlay.ext4.chunks.json"
 
+// OverlayChunkKey is the store key for one overlay chunk. Overlay chunks
+// live in a global content-addressed namespace — the key carries no
+// checkpoint ID — so a digest held once serves every generation and node:
+// unchanged blocks between generations are single Has hits instead of
+// re-uploads (the cross-generation dedup the per-ID namespace could not
+// express).
+func OverlayChunkKey(digest string) string {
+	return "overlay-chunks/" + digest[:2] + "/" + digest
+}
+
+// legacyOverlayChunkKey is the pre-global namespace (artifacts/<id>/...).
+// Materialization still probes it so checkpoints published before the
+// switch remain restorable.
+func legacyOverlayChunkKey(id, digest string) string {
+	return ArtifactKey(id, "overlay-chunks/"+digest)
+}
+
+// overlayWorkers bounds overlay publish/materialize concurrency.
+const overlayWorkers = 8
+
 // publishOverlayChunks ships the writable layer chunk-by-chunk when its
-// sidecar exists (chunks-digest deployments): incremental generations put
-// only their dirty chunks, and materialization reassembles by digest.
-// Returns true when the chunked path was taken.
+// sidecar exists (chunks-digest deployments): chunks are keyed by content
+// in a global namespace, deduplicated within the run, and uploaded by a
+// bounded worker pool. Returns true when the chunked path was taken.
 func publishOverlayChunks(
 	ctx context.Context,
 	checkpointDir, id string,
@@ -85,28 +107,84 @@ func publishOverlayChunks(
 		return false, err
 	}
 	defer overlay.Close()
+	// P1: one job per unique digest — repeated blocks (zeros above all)
+	// are served by whichever representative runs first.
+	seen := make(map[string]struct{}, len(scan.Entries))
+	type job struct {
+		offset int64
+		length int
+		digest string
+	}
+	jobs := make([]job, 0, len(scan.Entries))
 	for _, entry := range scan.Entries {
-		if err := ctx.Err(); err != nil {
-			return false, err
-		}
-		if ok, err := store.HasKey(ctx, ArtifactKey(id, "overlay-chunks/"+entry.Digest)); err != nil {
-			return false, err
-		} else if ok {
+		if _, dup := seen[entry.Digest]; dup {
 			continue
 		}
+		seen[entry.Digest] = struct{}{}
 		want := scan.ChunkBytes
 		if tail := int(scan.FileSize - entry.Offset); tail < want {
 			want = tail
 		}
-		block := make([]byte, want)
-		if _, err := overlay.ReadAt(block, entry.Offset); err != nil &&
-			!errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
-			return false, fmt.Errorf("read overlay chunk at %d: %w", entry.Offset, err)
+		jobs = append(jobs, job{offset: entry.Offset, length: want, digest: entry.Digest})
+	}
+	var errMu sync.Mutex
+	firstErr := error(nil)
+	failed := atomic.Bool{}
+	failJob := func(cause error) {
+		errMu.Lock()
+		if firstErr == nil {
+			firstErr = cause
 		}
-		if err := store.PutKey(ctx, ArtifactKey(id, "overlay-chunks/"+entry.Digest),
-			bytes.NewReader(block)); err != nil {
-			return false, fmt.Errorf("put overlay chunk at %d: %w", entry.Offset, err)
+		errMu.Unlock()
+		failed.Store(true)
+	}
+	queue := make(chan job)
+	var wg sync.WaitGroup
+	for w := 0; w < overlayWorkers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := range queue {
+				if failed.Load() {
+					continue // drain
+				}
+				key := OverlayChunkKey(j.digest)
+				if ok, err := store.HasKey(ctx, key); err != nil {
+					failJob(fmt.Errorf("has overlay chunk %s: %w", j.digest[:12], err))
+					continue
+				} else if ok {
+					continue
+				}
+				block := make([]byte, j.length)
+				if _, err := overlay.ReadAt(block, j.offset); err != nil &&
+					!errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+					failJob(fmt.Errorf("read overlay chunk at %d: %w", j.offset, err))
+					continue
+				}
+				if err := store.PutKey(ctx, key, bytes.NewReader(block)); err != nil {
+					failJob(fmt.Errorf("put overlay chunk at %d: %w", j.offset, err))
+					continue
+				}
+			}
+		}()
+	}
+	for _, j := range jobs {
+		if failed.Load() {
+			break
 		}
+		if err := ctx.Err(); err != nil {
+			failJob(err)
+			break
+		}
+		queue <- j
+	}
+	close(queue)
+	wg.Wait()
+	if failed.Load() {
+		errMu.Lock()
+		cause := firstErr
+		errMu.Unlock()
+		return false, cause
 	}
 	return true, nil
 }
@@ -190,10 +268,16 @@ func publishArtifactSet(
 }
 
 // Materialize rebuilds a restorable checkpoint directory from the store on a
-// node that never saw the source: every file is fetched by key and verified
-// against the INDEX digest before landing; the memory file is created as a
-// sparse placeholder of the recorded size with the marker written last so a
-// partial materialization is never mistaken for a complete one.
+// node that never saw the source. Every file is fetched by key and verified
+// against the INDEX digest, and the INDEX's memory root is cross-checked
+// against the chunk sidecar so the sidecar provably belongs to this
+// checkpoint (not merely to itself). The whole rebuild lands in a staging
+// directory and is committed by a single rename: a crash leaves either
+// nothing or a complete artifact, never a half-materialized directory the
+// catalog could mistake for sealed (the manifest also lands inside staging,
+// before the commit). A non-empty target directory is refused rather than
+// overwritten — an in-use generation must never be mutated under a live
+// restorer.
 func Materialize(ctx context.Context, targetDir, id string, store chunkstore.Keyed) error {
 	indexRaw, err := fetchKey(ctx, store, ArtifactKey(id, IndexName))
 	if err != nil {
@@ -206,9 +290,26 @@ func Materialize(ctx context.Context, targetDir, id string, store chunkstore.Key
 	if index.CheckpointID != id {
 		return fmt.Errorf("index is for %q, requested %q", index.CheckpointID, id)
 	}
-	if err := os.MkdirAll(targetDir, 0o700); err != nil {
+	// Refuse to clobber a live target before doing any work.
+	if entries, err := os.ReadDir(targetDir); err == nil && len(entries) > 0 {
+		return fmt.Errorf("target %s is not empty; refusing to overwrite an in-use generation", targetDir)
+	}
+	parent := filepath.Dir(targetDir)
+	if err := os.MkdirAll(parent, 0o700); err != nil {
 		return err
 	}
+	staging, err := os.MkdirTemp(parent, "."+filepath.Base(targetDir)+".staging-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(staging)
+	commit := func() error {
+		if err := os.Rename(staging, targetDir); err != nil {
+			return err
+		}
+		return nil
+	}
+
 	files := []string{"manifest.json", checkpointchunks.ManifestName, "vmstate"}
 	if index.OverlayChunks {
 		files = append(files, OverlaySidecarName)
@@ -229,12 +330,28 @@ func Materialize(ctx context.Context, targetDir, id string, store chunkstore.Key
 			return fmt.Errorf("artifact %s digest mismatch: index %s fetched %s",
 				name, want, hex.EncodeToString(got[:]))
 		}
-		if err := os.WriteFile(filepath.Join(targetDir, name), body, 0o600); err != nil {
+		if err := os.WriteFile(filepath.Join(staging, name), body, 0o600); err != nil {
 			return err
 		}
 	}
+	// Closure check: the memory root advertised by the INDEX must be the
+	// root the sidecar actually derives, otherwise the sidecar describes a
+	// different file than the checkpoint claims to own.
+	if index.OverlayChunks || index.MemoryRoot != "" {
+		if sidecar, err := checkpointchunks.Load(staging); err == nil {
+			switch sidecar.FileDigestMode {
+			case checkpointchunks.FileDigestChunks, "":
+				if root := checkpointchunks.RootDigest(sidecar.Entries); root != index.MemoryRoot {
+					return fmt.Errorf("index memory root %s does not match sidecar root %s",
+						index.MemoryRoot, root)
+				}
+			}
+		} else {
+			return fmt.Errorf("verify sidecar against index: %w", err)
+		}
+	}
 	if index.OverlayChunks {
-		if err := materializeOverlayChunks(ctx, targetDir, id, store, index); err != nil {
+		if err := materializeOverlayChunks(ctx, staging, id, store); err != nil {
 			return err
 		}
 	}
@@ -244,10 +361,10 @@ func Materialize(ctx context.Context, targetDir, id string, store chunkstore.Key
 	var manifest struct {
 		MemorySize int64 `json:"memory_size"`
 	}
-	if raw, err := os.ReadFile(filepath.Join(targetDir, "manifest.json")); err == nil {
+	if raw, err := os.ReadFile(filepath.Join(staging, "manifest.json")); err == nil {
 		if err := json.Unmarshal(raw, &manifest); err == nil && manifest.MemorySize > 0 {
 			placeholder, err := os.OpenFile(
-				filepath.Join(targetDir, "memory"), os.O_CREATE|os.O_WRONLY, 0o600)
+				filepath.Join(staging, "memory"), os.O_CREATE|os.O_WRONLY, 0o600)
 			if err != nil {
 				return err
 			}
@@ -258,16 +375,21 @@ func Materialize(ctx context.Context, targetDir, id string, store chunkstore.Key
 			placeholder.Close()
 		}
 	}
-	return os.WriteFile(filepath.Join(targetDir, MaterializedMarker), []byte(id+"\n"), 0o600)
+	if err := os.WriteFile(filepath.Join(staging, MaterializedMarker), []byte(id+"\n"), 0o600); err != nil {
+		return err
+	}
+	return commit()
 }
 
 // materializeOverlayChunks reassembles the writable layer from digest-keyed
-// chunk objects, verifying every chunk against the sidecar before it lands.
+// chunk objects: unique digests only, all-zero chunks synthesized as sparse
+// holes (no GET, no write), bounded-concurrency GETs with per-run digest
+// reuse, and legacy per-ID keys probed as fallback so checkpoints published
+// before the global namespace remain restorable.
 func materializeOverlayChunks(
 	ctx context.Context,
 	targetDir, id string,
 	store chunkstore.Keyed,
-	index ArtifactIndex,
 ) error {
 	scan, err := checkpointchunks.LoadNamed(targetDir, OverlaySidecarName)
 	if err != nil {
@@ -279,20 +401,121 @@ func materializeOverlayChunks(
 		return err
 	}
 	defer overlay.Close()
-	for i, entry := range scan.Entries {
-		if err := ctx.Err(); err != nil {
-			return err
+	// Zero-chunk bypass: an all-zero chunk's digest is a constant per
+	// length, and an unwritten region of the fresh file already reads as
+	// zeros — skip both the GET and the write, keeping the layer sparse.
+	zeroFull := checkpointchunks.ZeroChunkDigest(scan.ChunkBytes)
+	zeroTail := ""
+	if tail := scan.FileSize - int64(len(scan.Entries)-1)*int64(scan.ChunkBytes); tail > 0 && tail < int64(scan.ChunkBytes) {
+		zeroTail = checkpointchunks.ZeroChunkDigest(int(tail))
+	}
+	// Unique-digest jobs with a shared body cache: repeated blocks are
+	// fetched once and written to every offset that references them.
+	seen := make(map[string][][]byte, len(scan.Entries))
+	var order []string
+	for _, entry := range scan.Entries {
+		if entry.Digest == zeroFull || (zeroTail != "" && entry.Digest == zeroTail) {
+			continue // sparse hole
 		}
-		body, err := fetchKey(ctx, store, ArtifactKey(id, "overlay-chunks/"+entry.Digest))
+		if _, dup := seen[entry.Digest]; dup {
+			continue
+		}
+		seen[entry.Digest] = nil
+		order = append(order, entry.Digest)
+	}
+	var bodyMu sync.Mutex
+	var errMu sync.Mutex
+	firstErr := error(nil)
+	failed := atomic.Bool{}
+	failJob := func(cause error) {
+		errMu.Lock()
+		if firstErr == nil {
+			firstErr = cause
+		}
+		errMu.Unlock()
+		failed.Store(true)
+	}
+	fetchBody := func(digest string) ([]byte, bool) {
+		bodyMu.Lock()
+		cached, ok := seen[digest]
+		bodyMu.Unlock()
+		if ok && cached != nil {
+			return cached[0], true
+		}
+		rc, err := store.GetKey(ctx, OverlayChunkKey(digest))
 		if err != nil {
-			return fmt.Errorf("fetch overlay chunk %d: %w", i, err)
+			// Legacy namespace fallback for artifacts published before
+			// the global one.
+			rc2, err2 := store.GetKey(ctx, legacyOverlayChunkKey(id, digest))
+			if err2 != nil {
+				failJob(fmt.Errorf("fetch overlay chunk %s: %v (legacy: %v)", digest[:12], err, err2))
+				return nil, false
+			}
+			rc = rc2
+		}
+		body, err := io.ReadAll(rc)
+		rc.Close()
+		if err != nil {
+			failJob(fmt.Errorf("read overlay chunk %s: %w", digest[:12], err))
+			return nil, false
 		}
 		sum := sha256.Sum256(body)
-		if hex.EncodeToString(sum[:]) != entry.Digest {
-			return fmt.Errorf("overlay chunk %d digest mismatch: sidecar %s fetched %s",
-				i, entry.Digest, hex.EncodeToString(sum[:]))
+		if hex.EncodeToString(sum[:]) != digest {
+			failJob(fmt.Errorf("overlay chunk digest mismatch: sidecar %s fetched %s",
+				digest, hex.EncodeToString(sum[:])))
+			return nil, false
 		}
-		if _, err := overlay.WriteAt(body, entry.Offset); err != nil {
+		bodyMu.Lock()
+		seen[digest] = [][]byte{body}
+		bodyMu.Unlock()
+		return body, true
+	}
+	queue := make(chan string)
+	var wg sync.WaitGroup
+	for w := 0; w < overlayWorkers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for digest := range queue {
+				if failed.Load() {
+					continue // drain
+				}
+				fetchBody(digest)
+			}
+		}()
+	}
+	for _, digest := range order {
+		if failed.Load() {
+			break
+		}
+		if err := ctx.Err(); err != nil {
+			failJob(err)
+			break
+		}
+		queue <- digest
+	}
+	close(queue)
+	wg.Wait()
+	if failed.Load() {
+		errMu.Lock()
+		cause := firstErr
+		errMu.Unlock()
+		return cause
+	}
+	// Writes are issued from one goroutine after all bodies are verified:
+	// WriteAt ordering does not matter, but this keeps the failure mode a
+	// clean all-or-nothing through staging + rename.
+	for _, entry := range scan.Entries {
+		if entry.Digest == zeroFull || (zeroTail != "" && entry.Digest == zeroTail) {
+			continue
+		}
+		bodyMu.Lock()
+		cached := seen[entry.Digest]
+		bodyMu.Unlock()
+		if len(cached) == 0 {
+			return fmt.Errorf("internal: verified body for %s vanished", entry.Digest[:12])
+		}
+		if _, err := overlay.WriteAt(cached[0], entry.Offset); err != nil {
 			return err
 		}
 	}

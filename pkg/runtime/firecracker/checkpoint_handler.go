@@ -591,10 +591,28 @@ func digestFirecrackerStackFile(path string) (string, error) {
 
 // firecrackerBaseMemoryUsable reports whether the recorded base can still be
 // patched by an incremental snapshot of a guest with the given memory size.
+// A sparse file never qualifies: incremental tiers clone the base and write
+// only the delta, so any hole (pages a blind materialization never fetched)
+// would survive as zeros in every later generation.
 func firecrackerBaseMemoryUsable(path string, memorySize int64) bool {
 	info, err := os.Lstat(path)
 	return err == nil && info.Mode().IsRegular() &&
-		info.Mode()&os.ModeSymlink == 0 && info.Size() == memorySize
+		info.Mode()&os.ModeSymlink == 0 && info.Size() == memorySize &&
+		!firecrackerMemoryHasHoles(info)
+}
+
+// firecrackerMemoryHasHoles reports whether the file has fewer blocks
+// allocated than its size, i.e. sparse regions. A blind-materialized memory
+// file starts as a sparse placeholder whose real bytes live in the chunk
+// store; until every page has been faulted in or materialized it is not a
+// complete image. When the stat cannot be narrowed to a Unix inode (non-Linux
+// builds), report no holes and keep the previous size-only behavior.
+func firecrackerMemoryHasHoles(info os.FileInfo) bool {
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return false
+	}
+	return uint64(st.Blocks)*512 < uint64(info.Size())
 }
 
 // discardUnsealedFirecrackerCheckpoint removes the components of a checkpoint
@@ -632,6 +650,14 @@ func adoptCheckpointMemory(
 		)
 		// The base sandboxd recorded cannot be patched anymore; whether the
 		// VMM ledger is armed is unknown, so force the safe Full path.
+		instance.markBaseMemoryLineageLost()
+		return
+	}
+	if firecrackerMemoryHasHoles(info) {
+		logrus.Warnf(
+			"firecracker: checkpoint base %s is a sparse placeholder (blind materialization with unfetched chunks); adopting it would lose every unfaulted page in later incremental generations — forcing Full until the image is complete",
+			memoryPath,
+		)
 		instance.markBaseMemoryLineageLost()
 		return
 	}
