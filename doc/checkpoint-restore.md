@@ -562,3 +562,7 @@ For chunk-manifest restores, a chunk whose recorded digest equals the SHA-256 of
 ### Publisher memory-upload concurrency
 
 `cn-publish -workers N` selects 1–64 concurrent memory chunk jobs; `0` preserves the existing default of at most eight GOMAXPROCS workers. Library callers can use `checkpointpublish.RunWithOptions` with `Options.Workers`; `Run` keeps its defaults. Invalid values fail before touching publish state. Each worker processes one unique digest at a time, so this bounds worker buffers and concurrent HEAD/PUT requests; overlay workers remain independently capped at eight and run in their existing artifact phase. The selected memory worker count is included in the result and CLI output. Higher concurrency should be chosen using backend measurements, not assumed to improve throughput.
+
+### Repeated nonzero memory chunks
+
+Within one UFFD restore, nonzero references with the same digest and exact length share a download and verification. Once the first cache extent is verified, later positions copy its immutable bytes into their own logical offsets and only then become readable. Failed downloads never publish a reusable extent. The handler retains only offsets and in-flight notifications, not a permanent in-memory payload copy; the persistent digest cache is populated by the first successful download. Zero chunks and HTTP Range sources keep their existing paths.
