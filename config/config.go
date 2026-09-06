@@ -226,6 +226,9 @@ type FirecrackerConfig struct {
 	UffdCacheDir string `toml:"uffd_cache_dir" json:"uffdCacheDir,omitempty"`
 	// UffdChunkKB is the fetch/copy granularity of the uffd handler.
 	UffdChunkKB uint `toml:"uffd_chunk_kb" json:"uffdChunkKB,omitempty"`
+	// UffdPersistWorkers overrides the handler's persistent-cache IO budget.
+	// Zero inherits the handler default; explicit values must be 1-64.
+	UffdPersistWorkers int `toml:"uffd_persist_workers" json:"uffdPersistWorkers,omitempty"`
 
 	// DigestMemory seals a sha256 of the memory artifact into the
 	// checkpoint manifest so restores reject corrupted artifacts up front
