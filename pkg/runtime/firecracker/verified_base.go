@@ -89,3 +89,15 @@ func prepareCheckpointWithProof(ctx context.Context, dir, base string, size int6
 		return cloneVerifiedBackingNoSync(ctx, proof.proof, destination)
 	})
 }
+
+// updateSealedCheckpointLineage runs only after artifact sealing succeeds.
+// A stop-and-copy source has no next incremental consumer. Invalidate its
+// previous window before attempting to stop, so even a failed stop cannot
+// reuse the old base after the VMM has advanced its dirty ledger.
+func updateSealedCheckpointLineage(ctx context.Context, instance *firecrackerInstance, path string, manifest *firecrackerCheckpointManifest, leaveRunning bool) {
+	if !leaveRunning {
+		instance.markBaseMemoryLineageLost()
+		return
+	}
+	adoptSealedCheckpointMemory(ctx, instance, path, manifest)
+}
