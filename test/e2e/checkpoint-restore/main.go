@@ -48,6 +48,8 @@ type options struct {
 	compress                 bool
 	leaveRunning             bool
 	snapshotType             string
+	stdout                   string
+	stderr                   string
 	workloadCmd              string
 	mounts                   stringList
 }
@@ -68,6 +70,8 @@ func main() {
 	flag.StringVar(&value.action, "action", "", "start, checkpoint, restore, or delete")
 	flag.StringVar(&value.socket, "socket", "", "sandboxd Unix socket")
 	flag.StringVar(&value.runtime, "runtime", "runsc", "runtime handler")
+	flag.StringVar(&value.stdout, "stdout", "/var/log/sandboxd/checkpoint-workload.stdout", "sandbox console output path")
+	flag.StringVar(&value.stderr, "stderr", "/var/log/sandboxd/checkpoint-runtime.stderr", "sandbox runtime error log path")
 	flag.StringVar(&value.rootfs, "rootfs", "", "local rootfs path")
 	flag.StringVar(&value.sandboxID, "sandbox-id", "", "source sandbox ID")
 	flag.StringVar(&value.targetID, "target-id", "", "restored sandbox ID")
