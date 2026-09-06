@@ -19,6 +19,8 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
+	"sync"
 	"testing"
 
 	"golang.org/x/sys/unix"
@@ -249,6 +251,9 @@ func (c *markDuringReadContext) Err() error {
 	return c.Context.Err()
 }
 func TestBackingProofRejectsMarkerCreatedDuringScan(t *testing.T) {
+	// This original injection targets the serial verifier's Err checks.
+	old := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(old)
 	dir, m := backingFixture(t, FileDigestChunks)
 	ctx := &markDuringReadContext{Context: context.Background(), mark: func() {
 		if err := os.WriteFile(filepath.Join(dir, ".materialized"), nil, 0600); err != nil {
@@ -333,5 +338,37 @@ func TestZeroVerificationChecksWholeChunkAndTail(t *testing.T) {
 		if Verify(context.Background(), dir) == nil {
 			t.Fatalf("zero verification missed corrupt byte at %d", off)
 		}
+	}
+}
+
+// WithCancel subscribes to the parent only when parallel content verification
+// starts, after the proof's initial marker/identity checks. Inject there rather
+// than counting Err calls made by a child context.
+type markDuringParallelContext struct {
+	context.Context
+	once sync.Once
+	mark func()
+}
+
+func (c *markDuringParallelContext) Done() <-chan struct{} {
+	c.once.Do(c.mark)
+	return c.Context.Done()
+}
+func TestBackingProofRejectsMarkerCreatedDuringParallelScan(t *testing.T) {
+	old := runtime.GOMAXPROCS(4)
+	defer runtime.GOMAXPROCS(old)
+	dir, m := backingFixture(t, FileDigestChunks)
+	triggered := false
+	ctx := &markDuringParallelContext{Context: context.Background(), mark: func() {
+		triggered = true
+		if err := os.WriteFile(filepath.Join(dir, ".materialized"), nil, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}}
+	if p, err := VerifyMemoryBacking(ctx, dir, m.FileDigest, m.FileDigestMode); err == nil {
+		t.Fatalf("accepted marker created during parallel scan: %+v", p)
+	}
+	if !triggered {
+		t.Fatal("marker injection did not run")
 	}
 }
