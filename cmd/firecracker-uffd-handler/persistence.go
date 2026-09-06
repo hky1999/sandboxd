@@ -22,7 +22,7 @@ import (
 	"sync"
 )
 
-const persistenceWorkers = 4
+const persistenceWorkers = 16
 
 // A pending job holds metadata only. Verified cache bytes are immutable for
 // the handler lifetime, so buffering payloads while waiting for fsync is wasted.
