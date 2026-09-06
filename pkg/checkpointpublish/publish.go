@@ -160,7 +160,12 @@ func Run(ctx context.Context, checkpointDir, id string, store chunkstore.Store, 
 	}
 	if previous, err := Status(checkpointDir); err == nil && previous != nil {
 		state.ChunksTotal, state.ChunksPut = previous.ChunksTotal, previous.ChunksPut
-		state.StartedAt = previous.StartedAt
+		// Stamp THIS attempt's own start: cn-publishd's stale-lease requeue
+		// judges liveness by StartedAt, and an inherited first-generation
+		// timestamp would let a retry in flight be re-claimed as a crash
+		// leftover (F8). A full owner lease is still future work; this
+		// closes the practical gap.
+		state.StartedAt = time.Now().UTC()
 	}
 
 	manifest, err := checkpointchunks.Load(checkpointDir)

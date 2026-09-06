@@ -115,7 +115,10 @@ func scanAndPublish(roots string, store chunkstore.Store, timeout, staleAfter ti
 			continue
 		}
 		for _, entry := range entries {
-			if !entry.IsDir() || entry.Name() == checkpointpublish.StateDirName {
+			if !entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
+				// Dot-prefixed directories are system namespaces (publish
+				// state, materialization staging), never publish targets
+				// (F4).
 				continue
 			}
 			dir := filepath.Join(root, entry.Name())
@@ -159,7 +162,10 @@ func scanAndPublish(roots string, store chunkstore.Store, timeout, staleAfter ti
 			continue
 		}
 		for _, entry := range entries {
-			if !entry.IsDir() || entry.Name() == checkpointpublish.StateDirName {
+			if !entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
+				// Dot-prefixed directories are system namespaces (publish
+				// state, materialization staging), never publish targets
+				// (F4).
 				continue
 			}
 			dir := filepath.Join(root, entry.Name())

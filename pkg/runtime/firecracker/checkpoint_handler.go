@@ -653,9 +653,14 @@ func adoptCheckpointMemory(
 		instance.markBaseMemoryLineageLost()
 		return
 	}
-	if firecrackerMemoryHasHoles(info) {
+	// F3: the .materialized marker is the explicit remote-placeholder
+	// representation and forbids incremental lineage even when allocation
+	// looks complete (fallocate/preallocation can fake blocks>=size);
+	// holes are the secondary signal for unmarked files.
+	if _, markerErr := os.Stat(filepath.Join(filepath.Dir(memoryPath), ".materialized")); markerErr == nil ||
+		firecrackerMemoryHasHoles(info) {
 		logrus.Warnf(
-			"firecracker: checkpoint base %s is a sparse placeholder (blind materialization with unfetched chunks); adopting it would lose every unfaulted page in later incremental generations — forcing Full until the image is complete",
+			"firecracker: checkpoint base %s is a materialized placeholder (unfetched chunks live in the store); adopting it would lose every unfaulted page in later incremental generations — forcing Full until the image is complete",
 			memoryPath,
 		)
 		instance.markBaseMemoryLineageLost()
