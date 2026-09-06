@@ -385,3 +385,61 @@ func TestPublishInvalidConcurrencyDoesNotTouchState(t *testing.T) {
 		}
 	}
 }
+
+func TestMaterializeOverlayExactLengths(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		bodies    [][]byte
+		fileSize  int64
+		wantError bool
+	}{
+		{"short", [][]byte{{1, 2, 3}}, 4, true},
+		{"long", [][]byte{{1, 2, 3, 4, 5}}, 4, true},
+		{"short-zero-in-full-slot", [][]byte{{0, 0, 0}, {1, 2, 3}}, 7, true},
+		{"full-zero-in-tail-slot", [][]byte{{1, 2, 3, 4}, {0, 0, 0, 0}}, 7, true},
+		{"digest-used-at-two-lengths", [][]byte{{1, 2, 3, 4}, {1, 2, 3, 4}}, 7, true},
+		{"valid-repeated-and-tail", [][]byte{{1, 2, 3, 4}, {1, 2, 3, 4}, {5, 6, 7}}, 11, false},
+		{"valid-zero-and-tail", [][]byte{{0, 0, 0, 0}, {0, 0, 0}}, 7, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			store, err := chunkstore.NewLocal(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			scan := &checkpointchunks.Manifest{Version: 1, File: "overlay.ext4", FileSize: tc.fileSize, ChunkBytes: 4, FileDigestMode: checkpointchunks.FileDigestChunks}
+			var expected []byte
+			for i, body := range tc.bodies {
+				sum := sha256.Sum256(body)
+				digest := hex.EncodeToString(sum[:])
+				scan.Entries = append(scan.Entries, checkpointchunks.Chunk{Offset: int64(i * 4), Digest: digest})
+				if err := store.PutKey(context.Background(), OverlayChunkKey(digest), bytes.NewReader(body)); err != nil {
+					t.Fatal(err)
+				}
+				expected = append(expected, body...)
+			}
+			scan.ChunkCount = len(scan.Entries)
+			scan.FileDigest = checkpointchunks.RootDigest(scan.Entries)
+			if err := checkpointchunks.WriteNamed(dir, OverlaySidecarName, scan); err != nil {
+				t.Fatal(err)
+			}
+			err = materializeOverlayChunks(context.Background(), dir, "test", store)
+			if tc.wantError {
+				if err == nil || !strings.Contains(err.Error(), "length") {
+					t.Fatalf("want length rejection, got %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := os.ReadFile(filepath.Join(dir, "overlay.ext4"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(got, expected) {
+				t.Fatalf("content mismatch: got %x want %x", got, expected)
+			}
+		})
+	}
+}

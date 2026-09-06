@@ -485,7 +485,7 @@ The writable layer ships the same way when its sidecar
 content-addressed namespace (`overlay-chunks/<aa>/<sha256>`, no checkpoint
 id in the key), so unchanged overlay blocks are shared across generations
 and nodes. Materialization recognizes the all-zero chunk digests by length
-and synthesizes those blocks as sparse holes — no GET, no write.
+and synthesizes those blocks as sparse holes — no GET, no write. Each reference must match the exact object length, including the final short chunk; a digest cannot be reused for different reference lengths. Materialization rejects both short and oversized objects before writing them, and the zero shortcut applies only to the digest of that reference’s exact length.
 
 `Materialize` (cn-fetch) rebuilds a restorable directory on a node that
 never saw the source. Every file is digest-verified against the INDEX, the
