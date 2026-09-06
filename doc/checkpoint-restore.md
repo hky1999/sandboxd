@@ -550,3 +550,7 @@ fresh immutable checkpoint id per attempt, verifies the target by parsing
 the listing for the exact id in the RUNNING state, rolls the source back
 from its local checkpoint directory if any post-checkpoint step fails, and
 treats a failed source deletion as a hard failure rather than success.
+
+### Sparse overlay chunk sealing
+
+Sealing an immutable local overlay preserves the SHA-256 of every logical chunk and its existing root digest. Complete chunks proven to be holes by `SEEK_DATA`/`SEEK_HOLE` reuse the zero digest without reading; chunks overlapping data extents are read and verified normally. Allocated all-zero chunks reuse the same digest after reading. Unsupported extent queries fall back to reads; physical allocation size is never used as proof of artifact completeness. This optimization does not authorize a remote memory placeholder as a local incremental base. Overlay and memory sealing durations are logged separately.
