@@ -22,8 +22,11 @@ package main
 // copy (short or corrupt) is evicted so retries refetch from the store.
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -205,5 +208,59 @@ func TestShortLocalCacheEvicted(t *testing.T) {
 	// The retry loop inside fetchChunk should have recovered from the store.
 	if err := f.srv.fetchChunk(0); err != nil {
 		t.Fatalf("retry after eviction: %v", err)
+	}
+}
+
+// A shared all-zero digest is a complete specification of its bytes. Concurrent
+// faults/prefetch must not download it or write a full-sized zero cache file.
+func TestZeroChunksNeedNoStoreOrCache(t *testing.T) {
+	f := newFixture(t, make([]byte, 8195), true)
+	src := f.srv.source
+	src.chunk = 4096
+	src.chunkManifest.ChunkBytes = 4096
+	src.chunkManifest.ChunkCount = 3
+	src.chunkManifest.Entries = []checkpointchunks.Chunk{
+		{Offset: 0, Digest: checkpointchunks.ZeroChunkDigest(4096)},
+		{Offset: 4096, Digest: checkpointchunks.ZeroChunkDigest(4096)},
+		{Offset: 8192, Digest: checkpointchunks.ZeroChunkDigest(3)},
+	}
+	// Even a corrupt authoritative object cannot change digest-derived zeroes.
+	f.body.Store(bytes.Repeat([]byte{0xff}, 8195))
+	var wg sync.WaitGroup
+	for n := 0; n < 24; n++ {
+		wg.Add(1)
+		go func(index uint64) {
+			defer wg.Done()
+			if err := f.srv.fetchChunk(index); err != nil {
+				t.Error(err)
+				return
+			}
+			got, err := f.srv.resolveChunk(index*4096, 4096)
+			want := 4096
+			if index == 2 {
+				want = 3
+			}
+			if err != nil || len(got) != want || !bytes.Equal(got, make([]byte, want)) {
+				t.Errorf("chunk %d: len=%d err=%v", index, len(got), err)
+			}
+		}(uint64(n % 3))
+	}
+	wg.Wait()
+	if f.gets.Load() != 0 {
+		t.Fatalf("GET=%d for known zero chunks", f.gets.Load())
+	}
+	info, err := src.cache.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() != 0 {
+		t.Fatalf("zero cache grew to %d bytes", info.Size())
+	}
+	got, err := f.srv.resolveChunk(8193, 4096)
+	if err != nil || len(got) != 2 {
+		t.Fatalf("tail offset: %x, %v", got, err)
+	}
+	if _, err := f.srv.resolveChunk(8195, 4096); !errors.Is(err, io.EOF) {
+		t.Fatalf("past tail: %v", err)
 	}
 }
