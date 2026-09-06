@@ -21,12 +21,15 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/inclusionAI/sandboxd/pkg/checkpointchunks"
 	"github.com/inclusionAI/sandboxd/pkg/chunkstore"
@@ -298,5 +301,87 @@ func TestRunFailureIsPersistedAndRetryable(t *testing.T) {
 	result, err := Run(context.Background(), dir, filepath.Base(dir), store, "test-store")
 	if err != nil || result.State.State != StatePublished {
 		t.Fatalf("retry = %+v, %v", result, err)
+	}
+}
+
+type uploadGateStore struct {
+	chunkstore.Store
+	chunkstore.Keyed
+	entered chan struct{}
+	release chan struct{}
+	active  atomic.Int64
+	peak    atomic.Int64
+}
+
+func (s *uploadGateStore) Has(ctx context.Context, digest string) (bool, error) {
+	active := s.active.Add(1)
+	defer s.active.Add(-1)
+	for old := s.peak.Load(); active > old; old = s.peak.Load() {
+		if s.peak.CompareAndSwap(old, active) {
+			break
+		}
+	}
+	s.entered <- struct{}{}
+	select {
+	case <-s.release:
+	case <-ctx.Done():
+		return false, ctx.Err()
+	}
+	return s.Store.Has(ctx, digest)
+}
+
+func TestPublishExplicitConcurrencyBound(t *testing.T) {
+	for _, workers := range []int{1, 3, 16} {
+		t.Run(fmt.Sprint(workers), func(t *testing.T) {
+			dir := t.TempDir()
+			data := make([]byte, 20*checkpointchunks.DefaultChunkBytes)
+			for i := range data {
+				data[i] = byte(i/checkpointchunks.DefaultChunkBytes + 1)
+			}
+			if err := os.WriteFile(filepath.Join(dir, "memory"), data, 0600); err != nil {
+				t.Fatal(err)
+			}
+			local, err := chunkstore.NewLocal(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			store := &uploadGateStore{Store: local, Keyed: local, entered: make(chan struct{}, 20), release: make(chan struct{})}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			done := make(chan error, 1)
+			go func() {
+				result, err := RunWithOptions(ctx, dir, "gate", store, "test", Options{Workers: workers})
+				if err == nil && (result.Workers != workers || result.ChunksPut != 20) {
+					err = fmt.Errorf("unexpected result: %+v", result)
+				}
+				done <- err
+			}()
+			for i := 0; i < workers; i++ {
+				select {
+				case <-store.entered:
+				case <-ctx.Done():
+					t.Fatal("did not reach configured concurrency")
+				}
+			}
+			close(store.release)
+			if err := <-done; err != nil {
+				t.Fatal(err)
+			}
+			if peak := store.peak.Load(); peak != int64(workers) {
+				t.Fatalf("peak=%d, want %d", peak, workers)
+			}
+		})
+	}
+}
+
+func TestPublishInvalidConcurrencyDoesNotTouchState(t *testing.T) {
+	for _, workers := range []int{-1, 65} {
+		dir := filepath.Join(t.TempDir(), "absent")
+		if _, err := RunWithOptions(context.Background(), dir, "bad", nil, "test", Options{Workers: workers}); err == nil {
+			t.Fatal("invalid concurrency accepted")
+		}
+		if _, err := os.Stat(filepath.Dir(StatePath(dir))); !os.IsNotExist(err) {
+			t.Fatalf("state directory touched: %v", err)
+		}
 	}
 }

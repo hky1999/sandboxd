@@ -139,6 +139,7 @@ func writeState(state State) error {
 
 // Result summarizes one Run.
 type Result struct {
+	Workers    int   `json:"workers"` // actual memory upload concurrency
 	State      State `json:"state"`
 	ChunksPut  int   `json:"chunks_put"`  // objects written this run
 	ChunksSkip int   `json:"chunks_skip"` // objects already in the store
@@ -150,7 +151,24 @@ type Result struct {
 // interrupted run resumes and re-puts only what is missing. The memory file
 // is opened once and seeked per chunk.
 func Run(ctx context.Context, checkpointDir, id string, store chunkstore.Store, storeName string) (Result, error) {
-	result := Result{}
+	return RunWithOptions(ctx, checkpointDir, id, store, storeName, Options{})
+}
+
+// Options bounds memory upload concurrency independently of host CPU count.
+// Zero Workers preserves Run's default (at most eight GOMAXPROCS workers).
+type Options struct{ Workers int }
+
+// RunWithOptions is Run with an explicit memory-upload concurrency bound.
+// Overlay publication retains its own bounded worker pool.
+func RunWithOptions(ctx context.Context, checkpointDir, id string, store chunkstore.Store, storeName string, opts Options) (Result, error) {
+	if opts.Workers < 0 || opts.Workers > 64 {
+		return Result{}, fmt.Errorf("publish workers must be between 0 and 64, got %d", opts.Workers)
+	}
+	workers := opts.Workers
+	if workers == 0 {
+		workers = min(runtime.GOMAXPROCS(0), 8)
+	}
+	result := Result{Workers: workers}
 	state := State{
 		CheckpointID: id,
 		Dir:          checkpointDir,
@@ -194,10 +212,6 @@ func Run(ctx context.Context, checkpointDir, id string, store chunkstore.Store, 
 	// clock by per-request latency (~25ms/object, 54s for 2,200 chunks at
 	// 4GiB); overlapping round trips with a worker pool compresses the
 	// same bytes into the bandwidth-bound floor.
-	workers := runtime.GOMAXPROCS(0)
-	if workers > 8 {
-		workers = 8
-	}
 	// Error slot: every read and write goes through errMu; failedFlag is
 	// the lock-free fast path workers check per job. (A sync.Once around
 	// the first writer does not guard concurrent readers — the race the
