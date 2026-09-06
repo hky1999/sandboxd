@@ -25,6 +25,7 @@ import (
 	"os"
 	"path"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -49,6 +50,23 @@ func (r *Remote) String() string { return r.baseURL }
 // larger must use PutKey with streaming (artifact files do).
 const maxRemotePutBytes = 8 << 20
 
+// All Remote instances share a bounded idle pool, including per-fault packed
+// readers. Clone the standard transport rather than changing process globals.
+// Applications that installed a custom RoundTripper retain that behavior.
+var remoteTransport = sync.OnceValue(func() http.RoundTripper {
+	return pooledRemoteTransport(http.DefaultTransport)
+})
+
+func pooledRemoteTransport(base http.RoundTripper) http.RoundTripper {
+	if transport, ok := base.(*http.Transport); ok {
+		clone := transport.Clone()
+		clone.MaxIdleConnsPerHost = 64
+		clone.MaxIdleConns = 128
+		return clone
+	}
+	return base
+}
+
 // Open resolves a store specification to a backend: an http(s):// URL names
 // the object backend (bucket endpoint root), anything else is a local
 // directory tree.
@@ -56,7 +74,7 @@ func Open(spec string) (Store, error) {
 	if strings.HasPrefix(spec, "http://") || strings.HasPrefix(spec, "https://") {
 		return &Remote{
 			baseURL: strings.TrimRight(spec, "/"),
-			client:  &http.Client{Timeout: 120 * time.Second},
+			client:  &http.Client{Transport: remoteTransport(), Timeout: 120 * time.Second},
 		}, nil
 	}
 	return NewLocal(spec)

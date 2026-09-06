@@ -602,3 +602,7 @@ Range readers verify the exact response range, length, and each chunk SHA before
 ### Single-chunk upload buffering
 
 Standalone remote chunk uploads retain the 8MiB size bound and verify a private stable copy against the claimed digest before issuing PUT. Standard in-memory readers are copied into a buffer sized to their remaining bytes, preserving the current offset and avoiding repeated growth. Arbitrary readers retain bounded streaming reads; custom length hints are not trusted. The publisher uses a standard bytes reader over its worker buffer and waits for Put to finish before reusing that buffer. This changes neither the object format nor the digest-before-upload contract.
+
+### Remote object HTTP connection reuse
+
+Remote object-store instances share a package-owned HTTP transport. On first use, the standard process default transport is cloned with at most 64 idle connections per host and 128 idle connections overall; proxy, TLS, HTTP/2, idle expiration and other inherited transport behavior are preserved. The process default is not mutated. A custom nonstandard RoundTripper installed before first use is retained without pool tuning. Clients retain their 120-second timeout. Idle retention is not an active-request concurrency limit; publisher and prefetch worker limits still apply. Legacy UFFD HTTP clients with their separate 16-idle-connection configuration are unchanged by this adjustment.
