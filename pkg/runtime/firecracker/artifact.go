@@ -29,6 +29,8 @@ import (
 	"time"
 
 	"github.com/inclusionAI/sandboxd/pkg/checkpointchunks"
+	"github.com/sirupsen/logrus"
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -218,6 +220,7 @@ func finalizeFirecrackerCheckpointV2(
 	// of as one object. The overlay itself stays undigested (policy
 	// unchanged); this only records how its bytes chunk.
 	if manifest.MemoryDigestMode == checkpointchunks.FileDigestChunks {
+		started := time.Now()
 		if scan, serr := scanFileChunks(ctx, files.Overlay, firecrackerCheckpointOverlayName); serr == nil {
 			if werr := checkpointchunks.WriteNamed(filepath.Dir(files.Overlay),
 				firecrackerCheckpointOverlayName+"."+checkpointchunks.ManifestName, scan); werr != nil {
@@ -226,6 +229,7 @@ func finalizeFirecrackerCheckpointV2(
 		} else {
 			return fmt.Errorf("scan overlay chunks: %w", serr)
 		}
+		logrus.Infof("firecracker: seal overlay dir=%s elapsed=%dms", filepath.Dir(files.Overlay), time.Since(started).Milliseconds())
 	}
 	for _, component := range firecrackerCheckpointComponents(files) {
 		if component.name == firecrackerCheckpointOverlayName ||
@@ -239,10 +243,12 @@ func finalizeFirecrackerCheckpointV2(
 			// root, fully parallel — while a worker pool digests 256KiB
 			// chunks and the chunks.json sidecar is written from the same
 			// pass. Publishing no longer re-reads the artifact either way.
+			started := time.Now()
 			fileDigest, derr := digestMemoryWithChunkScan(ctx, files.Memory, manifest.MemoryDigestMode)
 			if derr != nil {
 				return derr
 			}
+			logrus.Infof("firecracker: seal memory dir=%s elapsed=%dms", filepath.Dir(files.Memory), time.Since(started).Milliseconds())
 			manifest.Digests[component.name] = fileDigest
 			continue
 		}
@@ -565,9 +571,54 @@ func firecrackerCheckpointComponents(
 // digest is byte-for-byte what a plain sequential sha256 yields, so
 // verification and pre-existing manifests are unaffected; the sidecar is
 // what lets cn-publish skip re-reading the artifact.
-// scanFileChunks chunks any artifact file in one sequential pass with a
-// parallel worker pool, without computing a whole-file digest (the overlay
-// is deliberately not digested; its chunks only describe how bytes group).
+// chunkExtentReader skips only ranges the filesystem proves are holes. The
+// sealed artifact must remain immutable throughout the scan. Allocation size
+// is never used to infer content; unsupported extent queries fall back to reads.
+type chunkExtentReader struct {
+	f                  *os.File
+	dataStart, dataEnd int64
+	unsupported        bool
+}
+
+func (r *chunkExtentReader) hasData(offset, end int64) (bool, error) {
+	if r.unsupported {
+		return true, nil
+	}
+	if end <= r.dataStart {
+		return false, nil
+	}
+	if offset < r.dataEnd {
+		return true, nil
+	}
+	start, err := unix.Seek(int(r.f.Fd()), offset, unix.SEEK_DATA)
+	if errors.Is(err, unix.ENXIO) {
+		r.dataStart = int64(^uint64(0) >> 1)
+		return false, nil
+	}
+	if errors.Is(err, unix.EINVAL) || errors.Is(err, unix.ENOTSUP) || errors.Is(err, unix.ENOSYS) {
+		r.unsupported = true
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	hole, err := unix.Seek(int(r.f.Fd()), start, unix.SEEK_HOLE)
+	if errors.Is(err, unix.EINVAL) || errors.Is(err, unix.ENOTSUP) || errors.Is(err, unix.ENOSYS) {
+		r.unsupported = true
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if start < offset || hole <= start {
+		return false, fmt.Errorf("invalid extent [%d,%d) at %d", start, hole, offset)
+	}
+	r.dataStart, r.dataEnd = start, hole
+	return start < end, nil
+}
+
+// scanFileChunks preserves byte-for-byte chunk digests while avoiding reads of
+// complete hole chunks and redundant hashing/copying of allocated zero chunks.
 func scanFileChunks(ctx context.Context, path, name string) (*checkpointchunks.Manifest, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -578,6 +629,11 @@ func scanFileChunks(ctx context.Context, path, name string) (*checkpointchunks.M
 	if err != nil {
 		return nil, err
 	}
+	const chunkBytes = checkpointchunks.DefaultChunkBytes
+	scan := &checkpointchunks.Manifest{Version: 1, File: name, FileSize: info.Size(), ChunkBytes: chunkBytes}
+	for offset := int64(0); offset < info.Size(); offset += chunkBytes {
+		scan.Entries = append(scan.Entries, checkpointchunks.Chunk{Offset: offset})
+	}
 	workers := runtime.GOMAXPROCS(0)
 	if workers > 8 {
 		workers = 8
@@ -586,12 +642,7 @@ func scanFileChunks(ctx context.Context, path, name string) (*checkpointchunks.M
 		index int
 		block []byte
 	}
-	type chunkRes struct {
-		index  int
-		digest string
-	}
 	jobs := make(chan chunkJob, workers*2)
-	results := make(chan chunkRes, workers*2)
 	var wg sync.WaitGroup
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
@@ -599,58 +650,45 @@ func scanFileChunks(ctx context.Context, path, name string) (*checkpointchunks.M
 			defer wg.Done()
 			for job := range jobs {
 				sum := sha256.Sum256(job.block)
-				results <- chunkRes{index: job.index, digest: hex.EncodeToString(sum[:])}
+				scan.Entries[job.index].Digest = hex.EncodeToString(sum[:])
 			}
 		}()
 	}
-	go func() { wg.Wait(); close(results) }()
-	byIndex := make(map[int]string)
-	var collect sync.WaitGroup
-	collect.Add(1)
-	go func() {
-		defer collect.Done()
-		for res := range results {
-			byIndex[res.index] = res.digest
-		}
-	}()
-
-	scan := &checkpointchunks.Manifest{
-		Version:    1,
-		File:       name,
-		FileSize:   info.Size(),
-		ChunkBytes: checkpointchunks.DefaultChunkBytes,
-	}
-	buf := make([]byte, checkpointchunks.DefaultChunkBytes)
-	var offset int64
-	for {
+	// All exits join workers before closing the file or releasing scan state.
+	var finishOnce sync.Once
+	finish := func() { finishOnce.Do(func() { close(jobs); wg.Wait() }) }
+	defer finish()
+	extents := chunkExtentReader{f: f}
+	buf := make([]byte, chunkBytes)
+	for i := range scan.Entries {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		n, rerr := io.ReadFull(f, buf)
-		if n > 0 {
-			block := make([]byte, n)
-			copy(block, buf[:n])
-			scan.Entries = append(scan.Entries, checkpointchunks.Chunk{Offset: offset})
-			jobs <- chunkJob{index: len(scan.Entries) - 1, block: block}
-			offset += int64(n)
+		offset := scan.Entries[i].Offset
+		length := min(int64(chunkBytes), info.Size()-offset)
+		hasData, err := extents.hasData(offset, offset+length)
+		if err != nil {
+			return nil, fmt.Errorf("query %s extents: %w", name, err)
 		}
-		if errors.Is(rerr, io.EOF) || errors.Is(rerr, io.ErrUnexpectedEOF) {
-			break
+		if !hasData {
+			scan.Entries[i].Digest = zeroChunkDigest(int(length))
+			continue
 		}
-		if rerr != nil {
-			close(jobs)
-			return nil, rerr
+		if _, err := f.ReadAt(buf[:length], offset); err != nil {
+			return nil, err
+		}
+		if isAllZero(buf[:length]) {
+			scan.Entries[i].Digest = zeroChunkDigest(int(length))
+			continue
+		}
+		block := append([]byte(nil), buf[:length]...)
+		select {
+		case jobs <- chunkJob{index: i, block: block}:
+		case <-ctx.Done():
+			return nil, ctx.Err()
 		}
 	}
-	close(jobs)
-	collect.Wait()
-	for i := range scan.Entries {
-		digest, ok := byIndex[i]
-		if !ok {
-			return nil, fmt.Errorf("file %s chunk %d was not hashed", name, i)
-		}
-		scan.Entries[i].Digest = digest
-	}
+	finish()
 	scan.ChunkCount = len(scan.Entries)
 	scan.FileDigestMode = checkpointchunks.FileDigestChunks
 	scan.FileDigest = checkpointchunks.RootDigest(scan.Entries)
