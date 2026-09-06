@@ -39,6 +39,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/inclusionAI/sandboxd/pkg/checkpointchunks"
@@ -46,6 +47,7 @@ import (
 )
 
 const packPayloadBudget = 16 << 20
+const maxPackPayloadBudget = 64 << 20
 
 // PackTimings reports wall-clock phases and summed worker times in nanoseconds.
 // BuildTotal and UploadTotal overlap across workers: neither is CPU time.
@@ -342,10 +344,23 @@ func runPacked(ctx context.Context, dir, id string, store chunkstore.Store, m *c
 	if current.size > 0 {
 		jobs = append(jobs, current)
 	}
-	result.Workers = min(result.Workers, packPayloadBudget/opts.PackBytes)
+	budget := opts.PackPayloadBytes
+	if budget == 0 {
+		budget = packPayloadBudget
+	}
+	result.PackPayloadBudget = budget
+	result.Workers = min(result.Workers, budget/opts.PackBytes)
+	var activePayload, peakPayload atomic.Int64
 	err = parallelPackWork(ctx, len(jobs), result.Workers, func(ctx context.Context, i int) error {
 		buildStart := time.Now()
 		job := jobs[i]
+		active := activePayload.Add(int64(job.size))
+		for peak := peakPayload.Load(); active > peak; peak = peakPayload.Load() {
+			if peakPayload.CompareAndSwap(peak, active) {
+				break
+			}
+		}
+		defer activePayload.Add(-int64(job.size))
 		buf := make([]byte, job.size)
 		offset := 0
 		var parts []checkpointchunks.PackPart
@@ -416,6 +431,7 @@ func runPacked(ctx context.Context, dir, id string, store chunkstore.Store, m *c
 	if err != nil {
 		return fail(err)
 	}
+	result.PackPayloadPeak = peakPayload.Load()
 	timings.PackWall = time.Since(phaseStart)
 	phaseStart = time.Now()
 	if err := checkpointchunks.ValidateTransport(&transport); err != nil {
