@@ -47,6 +47,7 @@ func main() {
 	packIdentity := flag.String("pack-identity", "", "pack identity: empty for legacy SHA256, chunks-v1 for versioned chunk root (requires -pack-mib)")
 	cpuProfile := flag.String("cpu-profile", "", "write an optional CPU profile to a new file (diagnostic runs only)")
 	status := flag.Bool("status", false, "print the persisted publish state and exit")
+	packPayloadMiB := flag.Int("pack-payload-mib", 0, "active pack payload budget (0 = 16MiB; up to 64MiB, requires packing)")
 	packMiB := flag.Int("pack-mib", 0, "pack memory into 1-8MiB objects (0 disables; candidate 4)")
 	baseID := flag.String("base-id", "", "verified published baseline in the same store for pack reuse")
 	workers := flag.Int("workers", 0, "memory upload concurrency (1-64; 0 = at most 8 GOMAXPROCS workers)")
@@ -58,6 +59,10 @@ func main() {
 	flag.Parse()
 	if *packMiB < 0 || *packMiB > 8 {
 		fmt.Fprintln(os.Stderr, "error: -pack-mib must be between 0 and 8")
+		os.Exit(2)
+	}
+	if *packPayloadMiB < 0 || *packPayloadMiB > 64 || (*packPayloadMiB != 0 && (*packMiB == 0 || *packPayloadMiB < *packMiB)) {
+		fmt.Fprintln(os.Stderr, "error: -pack-payload-mib requires packing and must fit a pack, up to 64MiB")
 		os.Exit(2)
 	}
 	if *baseID != "" && *packMiB == 0 {
@@ -113,7 +118,7 @@ func main() {
 		stopProfile = func() { pprof.StopCPUProfile(); file.Close() }
 	}
 	start := time.Now()
-	result, err := checkpointpublish.RunWithOptions(ctx, *checkpointDir, id, store, *storePath, checkpointpublish.Options{PackIdentity: *packIdentity, Workers: *workers, PackBytes: *packMiB << 20, BaseID: *baseID})
+	result, err := checkpointpublish.RunWithOptions(ctx, *checkpointDir, id, store, *storePath, checkpointpublish.Options{PackPayloadBytes: *packPayloadMiB << 20, PackIdentity: *packIdentity, Workers: *workers, PackBytes: *packMiB << 20, BaseID: *baseID})
 	elapsed := time.Since(start)
 	stopProfile()
 	if err != nil {
@@ -124,6 +129,7 @@ func main() {
 	}
 	if *packMiB > 0 {
 		fmt.Printf("packs: %d uploaded, %d reused\n", result.PacksPut, result.PacksSkip)
+		fmt.Printf("pack_payload budget=%d peak=%d\n", result.PackPayloadBudget, result.PackPayloadPeak)
 	}
 	if result.PackTimings != nil {
 		encoded, _ := json.Marshal(result.PackTimings)

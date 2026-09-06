@@ -140,13 +140,15 @@ func writeState(state State) error {
 
 // Result summarizes one Run.
 type Result struct {
-	PackTimings *PackTimings `json:"pack_timings,omitempty"`
-	PacksPut    int          `json:"packs_put,omitempty"`
-	PacksSkip   int          `json:"packs_skip,omitempty"`
-	Workers     int          `json:"workers"` // actual memory upload concurrency
-	State       State        `json:"state"`
-	ChunksPut   int          `json:"chunks_put"`  // unique chunks written this run
-	ChunksSkip  int          `json:"chunks_skip"` // unique chunks reused or synthesized
+	PackPayloadBudget int          `json:"pack_payload_budget,omitempty"`
+	PackPayloadPeak   int64        `json:"pack_payload_peak,omitempty"`
+	PackTimings       *PackTimings `json:"pack_timings,omitempty"`
+	PacksPut          int          `json:"packs_put,omitempty"`
+	PacksSkip         int          `json:"packs_skip,omitempty"`
+	Workers           int          `json:"workers"` // actual memory upload concurrency
+	State             State        `json:"state"`
+	ChunksPut         int          `json:"chunks_put"`  // unique chunks written this run
+	ChunksSkip        int          `json:"chunks_skip"` // unique chunks reused or synthesized
 }
 
 // Run publishes the checkpoint's memory chunks: it computes (or reuses) the
@@ -161,10 +163,11 @@ func Run(ctx context.Context, checkpointDir, id string, store chunkstore.Store, 
 // Options bounds memory upload concurrency independently of host CPU count.
 // Zero Workers preserves Run's default (at most eight GOMAXPROCS workers).
 type Options struct {
-	PackIdentity string // empty = legacy whole-pack SHA256; chunks-v1 = versioned chunk root
-	Workers      int
-	PackBytes    int    // zero keeps version-1 single-chunk publication
-	BaseID       string // optional verified published baseline in the same store
+	PackPayloadBytes int    // zero keeps the 16MiB active pack payload budget
+	PackIdentity     string // empty = legacy whole-pack SHA256; chunks-v1 = versioned chunk root
+	Workers          int
+	PackBytes        int    // zero keeps version-1 single-chunk publication
+	BaseID           string // optional verified published baseline in the same store
 }
 
 // RunWithOptions is Run with an explicit memory-upload concurrency bound.
@@ -178,6 +181,9 @@ func RunWithOptions(ctx context.Context, checkpointDir, id string, store chunkst
 	}
 	if opts.PackBytes < 0 || opts.PackBytes > checkpointchunks.MaxPackBytes || (opts.PackBytes > 0 && opts.PackBytes < 4096) {
 		return Result{}, fmt.Errorf("pack bytes must be zero or between 4096 and %d", checkpointchunks.MaxPackBytes)
+	}
+	if opts.PackPayloadBytes != 0 && (opts.PackBytes == 0 || opts.PackPayloadBytes < opts.PackBytes || opts.PackPayloadBytes > maxPackPayloadBudget) {
+		return Result{}, fmt.Errorf("pack payload budget requires packing and must be between pack size and %d", maxPackPayloadBudget)
 	}
 	if opts.BaseID != "" && (opts.PackBytes == 0 || !validPackedID(opts.BaseID) || opts.BaseID == id) {
 		return Result{}, fmt.Errorf("pack base ID must be a distinct checkpoint ID with packing enabled")

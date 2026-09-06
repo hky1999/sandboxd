@@ -21,6 +21,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -302,6 +303,7 @@ func packMixedCASZeroAndTail(t *testing.T, identity string) {
 }
 
 type packBudgetStore struct {
+	wantActive int
 	*chunkstore.Local
 	mu                                   sync.Mutex
 	activeBytes, peakBytes, active, peak int
@@ -311,7 +313,7 @@ type packBudgetStore struct {
 }
 
 func (s *packBudgetStore) PutKey(ctx context.Context, key string, r io.Reader) error {
-	if !strings.HasPrefix(key, "memory-packs/") {
+	if !strings.HasPrefix(key, "memory-packs/") && !strings.HasPrefix(key, "memory-chunk-packs-v1/") {
 		return s.Local.PutKey(ctx, key, r)
 	}
 	n := r.(*bytes.Reader).Len()
@@ -320,7 +322,11 @@ func (s *packBudgetStore) PutKey(ctx context.Context, key string, r io.Reader) e
 	s.active++
 	s.peakBytes = max(s.peakBytes, s.activeBytes)
 	s.peak = max(s.peak, s.active)
-	if s.active == 4 {
+	want := s.wantActive
+	if want == 0 {
+		want = 4
+	}
+	if s.active == want {
 		s.once.Do(func() { close(s.started) })
 	}
 	s.mu.Unlock()
@@ -412,5 +418,83 @@ func TestRootPackRejectsChangedPayload(t *testing.T) {
 	}
 	if ok, err := local.HasKey(ctx, ArtifactKey("bad", IndexName)); err != nil || ok {
 		t.Fatalf("INDEX exists=%v err=%v", ok, err)
+	}
+}
+
+func TestExplicitPackPayloadBudgets(t *testing.T) {
+	data := append(packData(69, 1<<20), bytes.Repeat([]byte{211}, 123)...)
+	source := packSource(t, data, 1<<20)
+	for _, tc := range []struct {
+		budget, workers int
+		cancel          bool
+	}{{16, 64, false}, {32, 64, false}, {64, 64, false}, {64, 2, false}, {64, 64, true}} {
+		t.Run(fmt.Sprintf("%d/%d/cancel=%v", tc.budget, tc.workers, tc.cancel), func(t *testing.T) {
+			local, _ := chunkstore.NewLocal(t.TempDir())
+			want := min(tc.workers, tc.budget/4)
+			store := &packBudgetStore{Local: local, wantActive: want, started: make(chan struct{}), release: make(chan struct{})}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			var result Result
+			var runErr error
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				result, runErr = RunWithOptions(ctx, source, "explicit", store, "local", Options{Workers: tc.workers, PackBytes: 4 << 20, PackPayloadBytes: tc.budget << 20, PackIdentity: checkpointchunks.PackIdentityChunks})
+			}()
+			select {
+			case <-store.started:
+			case <-time.After(10 * time.Second):
+				cancel()
+				<-done
+				t.Fatal("budget did not permit expected concurrency")
+			}
+			if tc.cancel {
+				cancel()
+			} else {
+				close(store.release)
+			}
+			select {
+			case <-done:
+			case <-time.After(10 * time.Second):
+				t.Fatal("workers did not converge")
+			}
+			store.mu.Lock()
+			active, activeBytes, peak, peakBytes := store.active, store.activeBytes, store.peak, store.peakBytes
+			store.mu.Unlock()
+			if active != 0 || activeBytes != 0 || peak != want || peakBytes > tc.budget<<20 {
+				t.Fatalf("active %d/%d peak %d/%d", active, activeBytes, peak, peakBytes)
+			}
+			if tc.cancel {
+				if runErr == nil {
+					t.Fatal("cancel ignored")
+				}
+				if exists, _ := local.HasKey(context.Background(), ArtifactKey("explicit", IndexName)); exists {
+					t.Fatal("cancelled INDEX published")
+				}
+				return
+			}
+			if runErr != nil {
+				t.Fatal(runErr)
+			}
+			if result.Workers != want || result.PackPayloadBudget != tc.budget<<20 || result.PackPayloadPeak > int64(tc.budget<<20) || result.PackPayloadPeak < int64(peakBytes) {
+				t.Fatalf("incorrect measured budget: %+v", result)
+			}
+			assertPackedBytes(t, local, "explicit", data)
+		})
+	}
+}
+func TestInvalidPackPayloadHasNoSideEffects(t *testing.T) {
+	for _, opts := range []Options{{PackPayloadBytes: 1}, {PackBytes: 4096, PackPayloadBytes: -1}, {PackBytes: 8192, PackPayloadBytes: 4096}, {PackBytes: 4096, PackPayloadBytes: (64 << 20) + 1}} {
+		dir := t.TempDir()
+		localRoot := t.TempDir()
+		store, _ := chunkstore.NewLocal(localRoot)
+		if _, err := RunWithOptions(context.Background(), dir, "invalid", store, "local", opts); err == nil {
+			t.Fatal("invalid budget accepted")
+		}
+		files, _ := os.ReadDir(dir)
+		objects, _ := os.ReadDir(localRoot)
+		if len(files) != 0 || len(objects) != 0 {
+			t.Fatal("invalid options changed state/store")
+		}
 	}
 }
