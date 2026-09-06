@@ -554,3 +554,7 @@ treats a failed source deletion as a hard failure rather than success.
 ### Sparse overlay chunk sealing
 
 Sealing an immutable local overlay preserves the SHA-256 of every logical chunk and its existing root digest. Complete chunks proven to be holes by `SEEK_DATA`/`SEEK_HOLE` reuse the zero digest without reading; chunks overlapping data extents are read and verified normally. Allocated all-zero chunks reuse the same digest after reading. Unsupported extent queries fall back to reads; physical allocation size is never used as proof of artifact completeness. This optimization does not authorize a remote memory placeholder as a local incremental base. Overlay and memory sealing durations are logged separately.
+
+### Zero memory chunks during remote restore
+
+For chunk-manifest restores, a chunk whose recorded digest equals the SHA-256 of the correctly sized zero buffer is served from locally generated zero bytes. Fault handling allocates only the requested page/span, including short-tail bounds; prefetch does not GET or persist the redundant zero object. Nonzero chunks retain download length and digest checks before becoming readable. Sparse backing allocation is never evidence for this fast path. The fetched bitmap therefore records either verified cache bytes or digest-derived zero content. Plain HTTP Range and complete local backing reads retain their existing behavior.

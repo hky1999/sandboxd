@@ -105,6 +105,24 @@ type pageSource struct {
 	fetched map[uint64]struct{}
 }
 
+// zeroChunkLength recognizes content from its digest, never from sparse file
+// allocation. The short tail has a different zero digest from a full chunk.
+func (src *pageSource) zeroChunkLength(index uint64) uint64 {
+	m := src.chunkManifest
+	if m == nil || m.ChunkBytes <= 0 || index >= uint64(len(m.Entries)) {
+		return 0
+	}
+	entry := m.Entries[index]
+	if entry.Offset < 0 || entry.Offset >= m.FileSize {
+		return 0
+	}
+	length := min(int64(m.ChunkBytes), m.FileSize-entry.Offset)
+	if entry.Digest != checkpointchunks.ZeroChunkDigest(int(length)) {
+		return 0
+	}
+	return uint64(length)
+}
+
 // resolveChunk returns the bytes for [fileOff, fileOff+want) clamped to the
 // artifact end. The page fault path calls it with want = 4KiB: on an
 // already-fetched chunk only those bytes are read back from the cache, not
@@ -126,7 +144,15 @@ func (s *faultServer) resolveChunk(fileOff, want uint64) ([]byte, error) {
 	cacheOff := chunkIdx * s.source.chunk
 	subOff := fileOff - cacheOff // offset within the chunk
 	src := s.source
-	// A chunk is readable only once its fetch completed (bitmap). Reading
+	// A chunk whose manifest digest specifies zero bytes needs no remote object or
+	// cache extent. Construct only the requested page/span, bounded by the tail.
+	if length := src.zeroChunkLength(chunkIdx); length > 0 {
+		if subOff >= length {
+			return nil, io.EOF
+		}
+		return make([]byte, min(want, length-subOff)), nil
+	}
+	// A nonzero chunk is readable only once its fetch completed (bitmap). Reading
 	// before that can return a hole: another worker's write to a higher
 	// chunk extends the sparse file, and ReadAt then returns a full-length
 	// zero buffer for this chunk's unwritten extent — indistinguishable
@@ -154,7 +180,7 @@ func (s *faultServer) resolveChunk(fileOff, want uint64) ([]byte, error) {
 
 // readCache reads n bytes back from the sparse cache at the given absolute
 // offset. The caller must have established (via the fetched bitmap) that the
-// enclosing chunk's bytes are fully written: a sparse hole reads back as a
+// enclosing nonzero chunk's bytes are fully written: a sparse hole reads back as a
 // full-length run of zeros once the file has been extended past it, so this
 // function deliberately does not try to validate completeness by length.
 func (s *faultServer) readCache(off, n uint64) ([]byte, bool) {
@@ -185,7 +211,7 @@ func (s *faultServer) fetchChunk(chunkIdx uint64) error {
 		src.inflightMu.Lock()
 		if _, done := src.fetched[chunkIdx]; done {
 			src.inflightMu.Unlock()
-			// F1: the chunk is already verified in the cache. A background
+			// F1: the chunk is already verified in the cache or known zero. A background
 			// prefetch reaching an already-served chunk must be a no-op:
 			// refetching would overwrite verified bytes before the new copy
 			// passes validation, and the stale bitmap would then vouch for
@@ -305,6 +331,12 @@ func (s *faultServer) fetchChunkFromStore(chunkIdx uint64) error {
 		end = uint64(manifest.FileSize)
 	}
 	length := end - start
+	if src.zeroChunkLength(chunkIdx) > 0 {
+		src.inflightMu.Lock()
+		src.fetched[chunkIdx] = struct{}{}
+		src.inflightMu.Unlock()
+		return nil
+	}
 
 	// F1: download fully into a private buffer; nothing touches the shared
 	// per-sandbox cache until the bytes have passed length + digest
