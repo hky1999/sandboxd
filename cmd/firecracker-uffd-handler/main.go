@@ -183,10 +183,29 @@ func (s *faultServer) fetchChunk(chunkIdx uint64) error {
 			time.Sleep(time.Duration(attempt) * 50 * time.Millisecond)
 		}
 		src.inflightMu.Lock()
+		if _, done := src.fetched[chunkIdx]; done {
+			src.inflightMu.Unlock()
+			// F1: the chunk is already verified in the cache. A background
+			// prefetch reaching an already-served chunk must be a no-op:
+			// refetching would overwrite verified bytes before the new copy
+			// passes validation, and the stale bitmap would then vouch for
+			// whatever landed there.
+			return nil
+		}
 		if wg, ok := src.inflight[chunkIdx]; ok {
 			src.inflightMu.Unlock()
 			wg.Wait()
-			return nil // someone fetched it; caller re-reads the cache
+			// The leader may have failed; the bitmap is the outcome of
+			// record, so re-check it instead of assuming success (F1:
+			// waiters used to return nil unconditionally).
+			src.inflightMu.Lock()
+			_, done := src.fetched[chunkIdx]
+			src.inflightMu.Unlock()
+			if done {
+				return nil
+			}
+			lastErr = fmt.Errorf("chunk %d: concurrent fetch failed; retrying", chunkIdx)
+			continue
 		}
 		wg := &sync.WaitGroup{}
 		wg.Add(1)
@@ -202,49 +221,7 @@ func (s *faultServer) fetchChunk(chunkIdx uint64) error {
 			if src.chunkManifest != nil {
 				return s.fetchChunkFromStore(chunkIdx)
 			}
-			start := chunkIdx * src.chunk
-			req, err := http.NewRequest(http.MethodGet, src.remote, nil)
-			if err != nil {
-				return err
-			}
-			req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, start+src.chunk-1))
-			resp, err := src.client.Do(req)
-			if err != nil {
-				return fmt.Errorf("range fetch %s [%d,+%d): %w", src.remote, start, src.chunk, err)
-			}
-			defer resp.Body.Close()
-			log.Printf("DEBUG fetch chunk=%d status=%s contentLen=%s", chunkIdx, resp.Status, resp.Header.Get("Content-Length"))
-			if resp.StatusCode != http.StatusPartialContent && resp.StatusCode != http.StatusOK {
-				return fmt.Errorf("range fetch %s: status %s", src.remote, resp.Status)
-			}
-			// The body must deliver the whole chunk. A server that
-			// advertises a shorter Content-Length is describing the
-			// artifact tail; anything less than that is a truncated
-			// transfer and must be retried, not cached.
-			expected := int64(src.chunk)
-			if resp.ContentLength >= 0 && resp.ContentLength < expected {
-				expected = resp.ContentLength
-			}
-			// Copy straight into the sparse cache at the chunk offset.
-			written, err := io.Copy(newOffsetWriter(src.cache, int64(start)), resp.Body)
-			if err != nil {
-				return fmt.Errorf("cache chunk %d: %w", chunkIdx, err)
-			}
-			if written < expected {
-				return fmt.Errorf("chunk %d: truncated body %d bytes, want %d",
-					chunkIdx, written, expected)
-			}
-			if written == 0 {
-				// Zero-length chunk past the artifact end: touch the cache so
-				// readers see zeros instead of retrying forever.
-				_, _ = src.cache.WriteAt(make([]byte, 1), int64(start))
-			}
-			// Publish the chunk before the deferred inflight cleanup wakes
-			// any waiter: from here on ReadAt cannot observe a hole for it.
-			src.inflightMu.Lock()
-			src.fetched[chunkIdx] = struct{}{}
-			src.inflightMu.Unlock()
-			return nil
+			return s.fetchChunkRange(chunkIdx)
 		}()
 		if err == nil {
 			return nil
@@ -252,6 +229,58 @@ func (s *faultServer) fetchChunk(chunkIdx uint64) error {
 		lastErr = err
 	}
 	return lastErr
+}
+
+// fetchChunkRange fills one chunk over plain HTTP Range from -remote (no
+// chunk manifest, no digest). The body is fully buffered and length-checked
+// before anything is written to the cache, so a truncated or failed refetch
+// can never partially overwrite previously verified pages.
+func (s *faultServer) fetchChunkRange(chunkIdx uint64) error {
+	src := s.source
+	start := chunkIdx * src.chunk
+	req, err := http.NewRequest(http.MethodGet, src.remote, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, start+src.chunk-1))
+	resp, err := src.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("range fetch %s [%d,+%d): %w", src.remote, start, src.chunk, err)
+	}
+	defer resp.Body.Close()
+	log.Printf("DEBUG fetch chunk=%d status=%s contentLen=%s", chunkIdx, resp.Status, resp.Header.Get("Content-Length"))
+	if resp.StatusCode != http.StatusPartialContent && resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("range fetch %s: status %s", src.remote, resp.Status)
+	}
+	// The body must deliver the whole chunk. A server that advertises a
+	// shorter Content-Length is describing the artifact tail; anything less
+	// than that is a truncated transfer and must be retried, not cached.
+	expected := int64(src.chunk)
+	if resp.ContentLength >= 0 && resp.ContentLength < expected {
+		expected = resp.ContentLength
+	}
+	if expected <= 0 {
+		// Zero-length chunk past the artifact end: touch the cache so
+		// readers see zeros instead of retrying forever.
+		_, _ = src.cache.WriteAt(make([]byte, 1), int64(start))
+		src.inflightMu.Lock()
+		src.fetched[chunkIdx] = struct{}{}
+		src.inflightMu.Unlock()
+		return nil
+	}
+	buf := make([]byte, expected)
+	if _, err := io.ReadFull(resp.Body, buf); err != nil {
+		return fmt.Errorf("chunk %d: truncated body: %w", chunkIdx, err)
+	}
+	// Publish: verified bytes land in the cache first, then the bitmap —
+	// readers gate on the bitmap, so they can never observe partial writes.
+	if _, err := src.cache.WriteAt(buf, int64(start)); err != nil {
+		return fmt.Errorf("cache chunk %d: %w", chunkIdx, err)
+	}
+	src.inflightMu.Lock()
+	src.fetched[chunkIdx] = struct{}{}
+	src.inflightMu.Unlock()
+	return nil
 }
 
 // fetchChunkFromStore fills one cache chunk from the content-addressed
@@ -277,130 +306,133 @@ func (s *faultServer) fetchChunkFromStore(chunkIdx uint64) error {
 	}
 	length := end - start
 
-	// The chunk store is either a local directory tree or an HTTP object
-	// endpoint (S3 REST anonymous subset); both speak the same <aa>/<digest>
-	// key layout and both are verified by the digest below. An http store
-	// fronted by -chunk-local consults the persistent local cache first:
-	// hits never touch the network, misses stream once and land in both the
-	// per-sandbox sparse cache and the persistent local cache. A persistent
-	// copy that fails verification is evicted so the retry refetches from
-	// the store instead of poisoning every attempt.
-	var body io.Reader
-	localHitPath := ""
+	// F1: download fully into a private buffer; nothing touches the shared
+	// per-sandbox cache until the bytes have passed length + digest
+	// verification. A failed or truncated refetch therefore can never
+	// overwrite a previously verified chunk while its bitmap bit still
+	// vouches for it, and the retry loop starts from clean state.
+	//
+	// The persistent local cache (when configured) is consulted first:
+	// hits skip the network, and any local copy that proves unusable —
+	// short, unreadable, or hash-mismatched — is evicted before failing so
+	// the retry refetches from the store instead of hitting the same bad
+	// bytes again (F6).
+	buf := make([]byte, length)
+	localHit := false
 	httpSource := strings.HasPrefix(src.chunkStore, "http://") || strings.HasPrefix(src.chunkStore, "https://")
-	if httpSource && src.chunkLocal != "" {
-		if localPath := filepath.Join(src.chunkLocal, entry.Digest[:2], entry.Digest); fileExists(localPath) {
-			f, err := os.Open(localPath)
-			if err != nil {
-				return fmt.Errorf("open local chunk %s: %w", entry.Digest, err)
+	fill := func() error {
+		if httpSource && src.chunkLocal != "" {
+			localPath := filepath.Join(src.chunkLocal, entry.Digest[:2], entry.Digest)
+			if fileExists(localPath) {
+				f, err := os.Open(localPath)
+				if err != nil {
+					os.Remove(localPath)
+					return fmt.Errorf("persistent chunk %s unreadable (evicted): %w", entry.Digest, err)
+				}
+				n, rerr := io.ReadFull(f, buf)
+				f.Close()
+				if rerr != nil && !errors.Is(rerr, io.EOF) && !errors.Is(rerr, io.ErrUnexpectedEOF) {
+					os.Remove(localPath)
+					return fmt.Errorf("persistent chunk %s unreadable (evicted): %w", entry.Digest, rerr)
+				}
+				if uint64(n) != length {
+					os.Remove(localPath)
+					return fmt.Errorf("persistent chunk %s short: %d bytes, want %d (evicted)",
+						entry.Digest, n, length)
+				}
+				log.Printf("DEBUG local-hit chunk=%d digest=%s", chunkIdx, entry.Digest[:12])
+				localHit = true
+				return nil
 			}
-			defer f.Close()
-			log.Printf("DEBUG local-hit chunk=%d digest=%s", chunkIdx, entry.Digest[:12])
-			body = io.LimitReader(f, int64(length))
-			localHitPath = localPath
-			httpSource = false // served locally; skip the persist step
 		}
-	}
-	if body == nil {
-		if strings.HasPrefix(src.chunkStore, "http://") || strings.HasPrefix(src.chunkStore, "https://") {
+		if httpSource {
 			resp, err := storeHTTPClient.Get(strings.TrimRight(src.chunkStore, "/") +
 				"/" + entry.Digest[:2] + "/" + entry.Digest)
 			if err != nil {
 				return fmt.Errorf("fetch store chunk %s: %w", entry.Digest, err)
 			}
+			defer resp.Body.Close()
 			if resp.StatusCode != http.StatusOK {
-				resp.Body.Close()
 				return fmt.Errorf("fetch store chunk %s: status %d", entry.Digest, resp.StatusCode)
 			}
-			defer resp.Body.Close()
-			body = io.LimitReader(resp.Body, int64(length))
-		} else {
-			objectPath := filepath.Join(src.chunkStore, entry.Digest[:2], entry.Digest)
-			f, err := os.Open(objectPath)
-			if err != nil {
-				return fmt.Errorf("open store chunk %s: %w", entry.Digest, err)
+			if _, err := io.ReadFull(resp.Body, buf); err != nil {
+				return fmt.Errorf("fetch store chunk %s: %w", entry.Digest, err)
 			}
-			defer f.Close()
-			body = io.LimitReader(f, int64(length))
-			httpSource = false // a directory store needs no local persist
+			return nil
 		}
-	}
-
-	hash := sha256.New()
-	var persist *os.File
-	var persistPath string
-	if httpSource && src.chunkLocal != "" {
-		// Persist this fetch for the next sandbox on the node. The temp
-		// file is renamed in only after the digest verifies, so the local
-		// cache never holds a partial or corrupt object.
-		persistPath = filepath.Join(src.chunkLocal, entry.Digest[:2], entry.Digest)
-		if err := os.MkdirAll(filepath.Dir(persistPath), 0o755); err != nil {
-			return err
-		}
-		tmp, err := os.CreateTemp(filepath.Dir(persistPath), ".put-*")
+		objectPath := filepath.Join(src.chunkStore, entry.Digest[:2], entry.Digest)
+		f, err := os.Open(objectPath)
 		if err != nil {
-			return err
+			return fmt.Errorf("open store chunk %s: %w", entry.Digest, err)
 		}
-		persist = tmp
-	}
-	sink := io.Writer(newOffsetWriter(src.cache, int64(start)))
-	if persist != nil {
-		sink = io.MultiWriter(sink, persist)
-	}
-	written, err := io.Copy(sink, io.TeeReader(body, hash))
-	if err != nil {
-		if persist != nil {
-			persist.Close()
-			os.Remove(persist.Name())
+		defer f.Close()
+		n, rerr := io.ReadFull(f, buf)
+		if rerr != nil && !errors.Is(rerr, io.EOF) && !errors.Is(rerr, io.ErrUnexpectedEOF) {
+			return fmt.Errorf("read store chunk %s: %w", entry.Digest, rerr)
 		}
-		return fmt.Errorf("cache chunk %d from store: %w", chunkIdx, err)
-	}
-	if uint64(written) != length {
-		if persist != nil {
-			persist.Close()
-			os.Remove(persist.Name())
+		if uint64(n) != length {
+			return fmt.Errorf("store chunk %s short: %d bytes, want %d", entry.Digest, n, length)
 		}
-		return fmt.Errorf("store chunk %s short: %d bytes, want %d", entry.Digest, written, length)
+		return nil
 	}
-	if got := hex.EncodeToString(hash.Sum(nil)); got != entry.Digest {
-		if persist != nil {
-			persist.Close()
-			os.Remove(persist.Name())
-		}
-		if localHitPath != "" {
-			// Evict the poisoned persistent copy; fetchChunk's retry then
-			// refetches from the store instead of hitting the same bad
-			// bytes again.
-			os.Remove(localHitPath)
+	if err := fill(); err != nil {
+		return err
+	}
+	sum := sha256.Sum256(buf)
+	if got := hex.EncodeToString(sum[:]); got != entry.Digest {
+		if localHit {
+			// Evict the poisoned persistent copy; the retry refetches from
+			// the store instead of hitting the same bad bytes again.
+			os.Remove(filepath.Join(src.chunkLocal, entry.Digest[:2], entry.Digest))
 			return fmt.Errorf("persistent chunk %s failed verification (hashed %s); evicted, retrying from store",
 				entry.Digest, got)
 		}
 		return fmt.Errorf("store chunk %s digest mismatch: hashed %s", entry.Digest, got)
 	}
-	if persist != nil {
-		// The bytes are already in the per-sandbox cache and verified, so
-		// the fault can be served now; the persistent copy is rebuildable
-		// state, and its fsync+rename moves off the fault's critical path
-		// (P4: a per-chunk fsync blocked every faulting vCPU on cache
-		// persistence the store can always redo).
-		pending := persist
+	// Verified: publish in order — cache bytes first, then the bitmap (the
+	// only gate readers consult), then the rebuildable persistent copy.
+	if _, err := src.cache.WriteAt(buf, int64(start)); err != nil {
+		return fmt.Errorf("cache chunk %d: %w", chunkIdx, err)
+	}
+	if httpSource && src.chunkLocal != "" && !localHit {
+		// Persist asynchronously for the next sandbox on this node; the
+		// fault path is already served from the verified per-sandbox cache,
+		// so persistence (temp + fsync + rename) stays off the critical
+		// path and its failure only costs a future refetch.
+		digest, body := entry.Digest, buf
 		go func() {
-			defer pending.Close()
-			if err := pending.Sync(); err != nil {
-				os.Remove(pending.Name())
-				log.Printf("persist chunk %s: sync: %v (cache copy remains valid)", entry.Digest[:12], err)
+			persistPath := filepath.Join(src.chunkLocal, digest[:2], digest)
+			if err := os.MkdirAll(filepath.Dir(persistPath), 0o755); err != nil {
+				log.Printf("persist chunk %s: mkdir: %v", digest[:12], err)
 				return
 			}
-			if err := os.Rename(pending.Name(), persistPath); err != nil {
-				os.Remove(pending.Name())
-				log.Printf("persist chunk %s: rename: %v (cache copy remains valid)", entry.Digest[:12], err)
+			tmp, err := os.CreateTemp(filepath.Dir(persistPath), ".put-*")
+			if err != nil {
+				log.Printf("persist chunk %s: create: %v", digest[:12], err)
+				return
+			}
+			if _, err := tmp.Write(body); err != nil {
+				tmp.Close()
+				os.Remove(tmp.Name())
+				log.Printf("persist chunk %s: write: %v", digest[:12], err)
+				return
+			}
+			if err := tmp.Sync(); err != nil {
+				tmp.Close()
+				os.Remove(tmp.Name())
+				log.Printf("persist chunk %s: sync: %v", digest[:12], err)
+				return
+			}
+			if err := tmp.Close(); err != nil {
+				os.Remove(tmp.Name())
+				return
+			}
+			if err := os.Rename(tmp.Name(), persistPath); err != nil {
+				os.Remove(tmp.Name())
+				log.Printf("persist chunk %s: rename: %v", digest[:12], err)
 			}
 		}()
 	}
-	// Publish the fetched bitmap exactly like the remote path does: the
-	// bitmap is the only discriminator against sparse-hole reads, and
-	// without it every fault on this chunk re-fetches, re-hashes, and
-	// re-writes (F1).
 	src.inflightMu.Lock()
 	src.fetched[chunkIdx] = struct{}{}
 	src.inflightMu.Unlock()
