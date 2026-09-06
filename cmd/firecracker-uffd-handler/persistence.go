@@ -42,10 +42,10 @@ type chunkPersister struct {
 	write   func(persistRef) error
 }
 
-func newChunkPersister(limit int, write func(persistRef) error) *chunkPersister {
+func newChunkPersister(limit, workers int, write func(persistRef) error) *chunkPersister {
 	p := &chunkPersister{limit: limit, write: write}
 	p.ready = sync.NewCond(&p.mu)
-	for i := 0; i < persistenceWorkers; i++ {
+	for i := 0; i < workers; i++ {
 		p.wg.Add(1)
 		go p.run()
 	}
@@ -88,7 +88,7 @@ func (p *chunkPersister) run() {
 }
 
 // stop never waits for filesystem IO. Pending cache work is rebuildable and
-// irrelevant once the VMM exits; at most persistenceWorkers writes remain.
+// irrelevant once the VMM exits; at most the configured worker count writes remain.
 func (p *chunkPersister) stop() {
 	p.mu.Lock()
 	p.stopped = true
@@ -107,7 +107,11 @@ func (src *pageSource) schedulePersistence(job persistRef) {
 		// Digest reuse enqueues each successful unique digest at most once.
 		// Thus the manifest count bounds metadata without dropping live work
 		// or blocking faults behind a full payload queue.
-		src.persister = newChunkPersister(len(src.chunkManifest.Entries), func(job persistRef) error {
+		workers := src.persistenceWorkerCount
+		if workers == 0 {
+			workers = persistenceWorkers
+		}
+		src.persister = newChunkPersister(len(src.chunkManifest.Entries), workers, func(job persistRef) error {
 			return persistCacheExtent(src.cache, src.chunkLocal, job)
 		})
 	}
