@@ -70,6 +70,10 @@ func main() {
 	}
 
 	report := migrateReport{Sandbox: *sandbox, Source: *source, Checkpoint: migrationCheckpointDir(*sandbox)}
+	// Each attempt gets its own immutable checkpoint ID: a retry must never
+	// overwrite a generation a previous (possibly still-live) target already
+	// restored from, and published objects stay addressable under the old ID.
+	report.Checkpoint = fmt.Sprintf("%s-%d", report.Checkpoint, time.Now().Unix())
 	fail := func(step, detail string) {
 		report.Error = detail
 		report.Steps = append(report.Steps, stepLog{Step: step, Detail: detail, Failed: true})
@@ -91,33 +95,57 @@ func main() {
 		})
 		return trimmed, err == nil
 	}
+	// sourceFinalized flips once the checkpoint request with
+	// --leave-running=false returns: sandboxd has stopped and retired the
+	// source instance by then. Every failure past that point must either
+	// roll the source back from the (complete, local) checkpoint directory
+	// or state plainly that the source is gone.
+	sourceFinalized := false
+	failPastCheckpoint := func(step, detail string) {
+		if sourceFinalized {
+			if _, ok := run(*source, "rollback-restore", *bin+"/checkpoint-restore",
+				"--action", "restore", "--socket", "/run/sandboxd/sandboxd.sock",
+				"--target-id", *sandbox, "--request-file", *ckReq,
+				"--checkpoint-dir", report.Checkpoint); ok {
+				detail += " (rolled back: source restored and running from local checkpoint)"
+			} else {
+				detail += " (ROLLBACK FAILED — source finalized; checkpoint preserved at " +
+					report.Checkpoint + " on source for manual recovery)"
+			}
+		}
+		fail(step, detail)
+	}
 
 	// 1. Confirm the sandbox is running on the source.
 	if _, ok := run(*source, "list", *bin+"/sbox", "--address", "/run/sandboxd/sandboxd.sock", "list"); !ok {
 		fail("list", "source listing failed")
 	}
-	if !containsField(report.lastDetail(), *sandbox) {
-		fail("list", fmt.Sprintf("sandbox %s not found on source %s", *sandbox, *source))
+	if !listHasRunningSandbox(report.lastDetail(), *sandbox) {
+		fail("list", fmt.Sprintf("sandbox %s not RUNNING on source %s", *sandbox, *source))
+	}
+	if *to == *source {
+		fail("place", fmt.Sprintf("target -to %s equals the source node", *to))
 	}
 
-	// A previous failed attempt may have left its checkpoint directory
-	// behind; sandboxd refuses non-empty directories, so clear it for an
-	// idempotent retry.
-	run(*source, "clean-dir", "rm", "-rf", report.Checkpoint)
-
-	// 2. Checkpoint it (stop semantics: leave_running=false).
+	// 2. Checkpoint it. --leave-running=false gives stop-and-copy
+	// semantics: the source freezes at the checkpoint instant, sandboxd
+	// finalizes it after the seal, and no post-checkpoint write can be
+	// lost or double-applied. Failures before this point leave the source
+	// untouched; failures after it trigger rollback-restore below.
 	if _, ok := run(*source, "checkpoint", *bin+"/checkpoint-restore",
 		"--action", "checkpoint", "--socket", "/run/sandboxd/sandboxd.sock",
 		"--request-file", *ckReq, "--sandbox-id", *sandbox,
-		"--checkpoint-dir", report.Checkpoint, "--compress=false"); !ok {
-		fail("checkpoint", "checkpoint failed (see steps)")
+		"--checkpoint-dir", report.Checkpoint, "--compress=false",
+		"--leave-running=false"); !ok {
+		fail("checkpoint", "checkpoint failed (source untouched)")
 	}
+	sourceFinalized = true
 
 	// 3. Publish on the source node (paths are node-local; the executor
 	// runs cn-publish where the checkpoint landed, idempotent either way).
 	if _, ok := run(*source, "publish", *bin+"/cn-publish",
 		"-checkpoint-dir", report.Checkpoint, "-store", *storeSpec); !ok {
-		fail("publish", "cn-publish failed on source")
+		failPastCheckpoint("publish", "cn-publish failed on source")
 	}
 
 	// 4. Place: federate node records, decide with the source excluded.
@@ -141,68 +169,74 @@ func main() {
 		}
 	}
 	if compatErr != nil {
-		fail("place", compatErr.Error())
+		failPastCheckpoint("place", compatErr.Error())
+	}
+	// An explicit -to is honored by making it the only eligible candidate:
+	// the locator still applies the compat gate, so an incompatible or
+	// draining pick fails here instead of silently overriding safety.
+	exclude := []string{*source}
+	if *to != "" {
+		exclude = append(exclude, nodeIDsExcept(nodeRecords, *source, *to)...)
 	}
 	placement, err := checkpointlocator.Decide(checkpointlocator.Input{
 		CheckpointID:     dirBase(report.Checkpoint),
 		Compat:           compat,
 		OriginNodeID:     *source,
-		ExcludeNodes:     []string{*source},
+		ExcludeNodes:     exclude,
 		RequirePublished: true,
 		PublishState:     checkpointpublish.StatePublished,
 		Nodes:            nodeRecords,
 	})
 	if err != nil {
-		fail("place", err.Error())
-	}
-	if *to != "" && placement.NodeID != *to {
-		// Honor an explicit target when it is compatible; the locator's
-		// pick is advisory here.
-		found := false
-		for _, n := range nodeRecords {
-			if n.ID == *to {
-				found = true
-				break
-			}
-		}
-		if !found {
-			fail("place", fmt.Sprintf("requested target %s not in registry", *to))
-		}
-		placement.NodeID, placement.Address = *to, ""
+		failPastCheckpoint("place", err.Error())
 	}
 	report.Target = placement.NodeID
 
 	// 5. Materialize + restore on the target.
 	if _, ok := run(placement.NodeID, "materialize", *bin+"/cn-fetch",
 		"-into", report.Checkpoint, "-id", dirBase(report.Checkpoint), "-store", *storeSpec); !ok {
-		fail("materialize", "cn-fetch failed on target")
+		failPastCheckpoint("materialize", "cn-fetch failed on target")
 	}
 	if _, ok := run(placement.NodeID, "restore", *bin+"/checkpoint-restore",
 		"--action", "restore", "--socket", "/run/sandboxd/sandboxd.sock",
 		"--target-id", *sandbox, "--request-file", *ckReq,
 		"--checkpoint-dir", report.Checkpoint); !ok {
-		fail("restore", "restore failed on target (source preserved)")
+		failPastCheckpoint("restore", "restore failed on target")
 	}
 
-	// 6. Verify RUNNING on the target before touching the source.
+	// 6. Verify RUNNING on the target before declaring success. Parse the
+	// tab-separated listing instead of substring matching: a plain
+	// strings.Contains would also match longer IDs sharing a prefix.
 	verified := false
 	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
 		if _, ok := run(placement.NodeID, "verify", *bin+"/sbox",
 			"--address", "/run/sandboxd/sandboxd.sock", "list"); ok &&
-			containsField(report.lastDetail(), *sandbox) {
+			listHasRunningSandbox(report.lastDetail(), *sandbox) {
 			verified = true
 			break
 		}
 		time.Sleep(3 * time.Second)
 	}
 	if !verified {
-		fail("verify", "target never reported the sandbox running (source preserved)")
+		failPastCheckpoint("verify", "target never reported the sandbox running")
 	}
 
-	// 7. Safe to retire the source copy.
-	run(*source, "delete-source", *bin+"/sbox",
-		"--address", "/run/sandboxd/sandboxd.sock", "delete", *sandbox)
+	// 7. Retire the source copy. With --leave-running=false the source was
+	// already finalized at checkpoint time; the explicit delete is kept as
+	// an idempotent confirmation and its failure is fatal — a lingering
+	// copy would be a second writer.
+	if _, ok := run(*source, "delete-source", *bin+"/sbox",
+		"--address", "/run/sandboxd/sandboxd.sock", "delete", *sandbox); !ok {
+		if out, ok2 := run(*source, "confirm-source-gone", *bin+"/sbox",
+			"--address", "/run/sandboxd/sandboxd.sock", "list"); ok2 &&
+			!listHasSandbox(out, *sandbox) {
+			// Already retired by the checkpoint — acceptable.
+		} else {
+			failPastCheckpoint("delete-source",
+				"source delete failed and the sandbox still lists on the source — resolve manually to avoid dual writers")
+		}
+	}
 	report.OK = true
 	finish(report, *jsonOut, true)
 }
@@ -214,8 +248,42 @@ func (r *migrateReport) lastDetail() string {
 	return r.Steps[len(r.Steps)-1].Detail
 }
 
-func containsField(haystack, needle string) bool {
-	return strings.Contains(haystack, needle)
+// listHasSandbox parses the tab-separated `sbox list` output and reports
+// whether the sandbox ID appears as an exact ID column value.
+func listHasSandbox(listOutput, sandboxID string) bool {
+	return sandboxListState(listOutput, sandboxID) != ""
+}
+
+// listHasRunningSandbox additionally requires the row to report the
+// SANDBOX_STATE_RUNNING state, so a half-created or exited sandbox cannot
+// pass verification.
+func listHasRunningSandbox(listOutput, sandboxID string) bool {
+	return sandboxListState(listOutput, sandboxID) == "SANDBOX_STATE_RUNNING"
+}
+
+// sandboxListState returns the STATUS column of the row whose ID column
+// equals sandboxID exactly, or "" when absent.
+func sandboxListState(listOutput, sandboxID string) string {
+	for _, line := range strings.Split(listOutput, "\n") {
+		cols := strings.Split(line, "\t")
+		if len(cols) >= 2 && strings.TrimSpace(cols[0]) == sandboxID {
+			return strings.TrimSpace(cols[1])
+		}
+	}
+	return ""
+}
+
+// nodeIDsExcept lists node IDs other than keepA/keepB so an explicit -to
+// can be expressed through the locator's ExcludeNodes without bypassing
+// its compat gate.
+func nodeIDsExcept(records []checkpointlocator.NodeRecord, keepA, keepB string) []string {
+	var rest []string
+	for _, n := range records {
+		if n.ID != keepA && n.ID != keepB {
+			rest = append(rest, n.ID)
+		}
+	}
+	return rest
 }
 
 func migrationCheckpointDir(sandbox string) string {

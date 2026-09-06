@@ -107,7 +107,34 @@ func writeState(state State) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, append(encoded, '\n'), 0o600)
+	// Write-through-temp + atomic rename: a daemon or CLI reading the
+	// state concurrently (publishd scanners, catalog) must never observe a
+	// half-written JSON, and a crash mid-write must leave the previous
+	// state intact.
+	tmp, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp-")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer func() {
+		if err != nil {
+			tmp.Close()
+			os.Remove(tmpName)
+		}
+	}()
+	if _, err = tmp.Write(append(encoded, '\n')); err != nil {
+		return err
+	}
+	if err = tmp.Chmod(0o600); err != nil {
+		return err
+	}
+	if err = tmp.Sync(); err != nil {
+		return err
+	}
+	if err = tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, path)
 }
 
 // Result summarizes one Run.
@@ -166,16 +193,45 @@ func Run(ctx context.Context, checkpointDir, id string, store chunkstore.Store, 
 	if workers > 8 {
 		workers = 8
 	}
+	// Error slot: every read and write goes through errMu; failedFlag is
+	// the lock-free fast path workers check per job. (A sync.Once around
+	// the first writer does not guard concurrent readers — the race the
+	// source review reproduced with injected HEAD errors.)
+	var errMu sync.Mutex
+	uploadErr := error(nil)
+	failedFlag := atomic.Bool{}
+	failUpload := func(cause error) {
+		errMu.Lock()
+		if uploadErr == nil {
+			uploadErr = cause
+		}
+		errMu.Unlock()
+		failedFlag.Store(true)
+	}
+	readUploadErr := func() error {
+		errMu.Lock()
+		defer errMu.Unlock()
+		return uploadErr
+	}
+	// P2: request dedup by digest. Entries repeat digests heavily (the
+	// all-zero chunk alone recurs thousands of times at 4GiB); Has/Put is
+	// keyed by content, so one representative entry per unique digest
+	// serves every duplicate. This collapses the HEAD count from
+	// len(Entries) to the number of distinct chunks.
+	uniqueChunks := make([]checkpointchunks.Chunk, 0, len(manifest.Entries))
+	seenDigest := make(map[string]struct{}, len(manifest.Entries))
+	for _, chunk := range manifest.Entries {
+		if _, dup := seenDigest[chunk.Digest]; dup {
+			continue
+		}
+		seenDigest[chunk.Digest] = struct{}{}
+		uniqueChunks = append(uniqueChunks, chunk)
+	}
 	type uploadJob struct {
 		chunk checkpointchunks.Chunk
 	}
 	upload := make(chan uploadJob, workers*2)
-	var uploadErr error
-	var uploadErrOnce sync.Once
 	var skippedCount int64
-	failUpload := func(cause error) {
-		uploadErrOnce.Do(func() { uploadErr = cause })
-	}
 	var wg sync.WaitGroup
 	var progress int64
 	var progressMu sync.Mutex
@@ -185,7 +241,7 @@ func Run(ctx context.Context, checkpointDir, id string, store chunkstore.Store, 
 			defer wg.Done()
 			buf := make([]byte, manifest.ChunkBytes)
 			for job := range upload {
-				if uploadErr != nil {
+				if failedFlag.Load() {
 					continue // drain
 				}
 				if ok, err := store.Has(ctx, job.chunk.Digest); err != nil {
@@ -215,25 +271,24 @@ func Run(ctx context.Context, checkpointDir, id string, store chunkstore.Store, 
 			}
 		}()
 	}
-	// O-1b: parallel Has pre-check. Feeding the sequential loop from the
-	// main goroutine bounded the publish at HEAD latency x total chunks
-	// (16-50s for 16,384 entries); workers now do Has+Put together.
+	// O-1b: workers run Has+Put together; the producer feeds only unique
+	// digests (P2) and stops at the first failure or cancellation.
 	put := 0
 	skipped := 0
-	for _, chunk := range manifest.Entries {
-		if uploadErr != nil {
+	for _, chunk := range uniqueChunks {
+		if failedFlag.Load() {
 			break
 		}
 		if err := ctx.Err(); err != nil {
-			uploadErr = err
+			failUpload(err)
 			break
 		}
 		upload <- uploadJob{chunk: chunk}
 	}
 	close(upload)
 	wg.Wait()
-	if uploadErr != nil {
-		return failState(state, uploadErr)
+	if err := readUploadErr(); err != nil {
+		return failState(state, err)
 	}
 	put = int(progress)
 	skipped = int(atomic.LoadInt64(&skippedCount))
