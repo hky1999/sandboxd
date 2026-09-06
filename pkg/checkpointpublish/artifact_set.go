@@ -213,6 +213,10 @@ func publishArtifactSet(
 	store chunkstore.Keyed,
 	state *State,
 ) error {
+	return publishArtifactSetWithTransport(ctx, checkpointDir, id, store, state, nil)
+}
+
+func publishArtifactSetWithTransport(ctx context.Context, checkpointDir, id string, store chunkstore.Keyed, state *State, transport *checkpointchunks.Manifest) error {
 	// A directory carrying only a memory file (chunk-scan fixtures, or
 	// callers publishing bare memory layers) publishes its chunks without
 	// an artifact set; blind materialization is simply not advertised for
@@ -223,6 +227,19 @@ func publishArtifactSet(
 	chunks, err := checkpointchunks.Load(checkpointDir)
 	if err != nil {
 		return fmt.Errorf("load chunk sidecar for artifact set: %w", err)
+	}
+	var transportRaw []byte
+	if transport != nil {
+		if err := checkpointchunks.ValidateTransport(transport); err != nil {
+			return err
+		}
+		if transport.FileDigest != chunks.FileDigest || transport.FileSize != chunks.FileSize || transport.ChunkCount != chunks.ChunkCount {
+			return fmt.Errorf("transport changed sealed memory identity")
+		}
+		transportRaw, err = json.MarshalIndent(transport, "", "  ")
+		if err != nil {
+			return err
+		}
 	}
 	index := ArtifactIndex{
 		CheckpointID: id,
@@ -247,6 +264,14 @@ func publishArtifactSet(
 		path := filepath.Join(checkpointDir, name)
 		if _, err := os.Stat(path); os.IsNotExist(err) {
 			return fmt.Errorf("artifact set file %s missing", name)
+		}
+		if name == checkpointchunks.ManifestName && transportRaw != nil {
+			digest := sha256.Sum256(transportRaw)
+			index.Files[name] = hex.EncodeToString(digest[:])
+			if err := store.PutKey(ctx, ArtifactKey(id, name), bytes.NewReader(transportRaw)); err != nil {
+				return fmt.Errorf("upload packed sidecar: %w", err)
+			}
+			continue
 		}
 		digest, err := digestFile(ctx, path)
 		if err != nil {

@@ -231,16 +231,38 @@ func (l *Local) PutKey(ctx context.Context, key string, r io.Reader) error {
 	if err := os.MkdirAll(path.Dir(target), 0o755); err != nil {
 		return err
 	}
-	f, err := os.Create(target)
-	if err != nil {
-		if os.IsExist(err) {
-			return nil // objects are immutable; identical key, identical bytes
-		}
+	if err := ctx.Err(); err != nil {
 		return err
 	}
-	defer f.Close()
-	_, err = io.Copy(f, r)
-	return err
+	f, err := os.CreateTemp(path.Dir(target), ".key-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(f.Name())
+	if _, err := io.Copy(f, r); err != nil {
+		f.Close()
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(f.Name(), target); err != nil {
+		return err
+	}
+	dir, err := os.Open(path.Dir(target))
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	return dir.Sync()
 }
 
 func (l *Local) GetKey(ctx context.Context, key string) (io.ReadCloser, error) {
