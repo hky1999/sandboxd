@@ -371,7 +371,7 @@ func Materialize(ctx context.Context, targetDir, id string, store chunkstore.Key
 	} else if err := json.Unmarshal(raw, &fcManifest); err != nil {
 		return fmt.Errorf("decode Firecracker manifest for closure check: %w", err)
 	}
-	sidecar, err := checkpointchunks.Load(staging)
+	sidecar, err := checkpointchunks.LoadTransport(staging)
 	if err != nil {
 		return fmt.Errorf("verify sidecar against index: %w", err)
 	}

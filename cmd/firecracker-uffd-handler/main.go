@@ -12,6 +12,7 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
@@ -34,6 +35,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/inclusionAI/sandboxd/pkg/checkpointchunks"
+	"github.com/inclusionAI/sandboxd/pkg/chunkstore"
 )
 
 // regionMapping mirrors firecracker's GuestRegionUffdMapping.
@@ -82,6 +84,7 @@ type chunkContentKey struct {
 // a local backing file, or through a sparse local cache filled from a remote
 // HTTP range source on miss.
 type pageSource struct {
+	ctx  context.Context
 	file *os.File // local backing (nil when remote mode is used)
 
 	cachePath string // sparse local cache file (remote mode)
@@ -407,7 +410,7 @@ func (s *faultServer) fetchChunkFromStore(chunkIdx uint64) error {
 	// short, unreadable, or hash-mismatched — is evicted before failing so
 	// the retry refetches from the store instead of hitting the same bad
 	// bytes again (F6).
-	buf := make([]byte, length)
+	var buf []byte
 	localHit := false
 	httpSource := strings.HasPrefix(src.chunkStore, "http://") || strings.HasPrefix(src.chunkStore, "https://")
 	fill := func() error {
@@ -419,6 +422,7 @@ func (s *faultServer) fetchChunkFromStore(chunkIdx uint64) error {
 					os.Remove(localPath)
 					return fmt.Errorf("persistent chunk %s unreadable (evicted): %w", entry.Digest, err)
 				}
+				buf = make([]byte, length)
 				n, rerr := io.ReadFull(f, buf)
 				f.Close()
 				if rerr != nil && !errors.Is(rerr, io.EOF) && !errors.Is(rerr, io.ErrUnexpectedEOF) {
@@ -434,6 +438,27 @@ func (s *faultServer) fetchChunkFromStore(chunkIdx uint64) error {
 				localHit = true
 				return nil
 			}
+		}
+		if ref, ok := manifest.Packs[entry.Digest]; ok {
+			store, err := chunkstore.Open(src.chunkStore)
+			if err != nil {
+				return err
+			}
+			parent := src.ctx
+			if parent == nil {
+				parent = context.Background()
+			}
+			ctx, cancel := context.WithTimeout(parent, 60*time.Second)
+			defer cancel()
+			data, err := store.(chunkstore.RangeReader).ReadKeyRange(ctx, checkpointchunks.PackKey(ref.Digest), chunkstore.ObjectRange{Offset: ref.Offset, Length: ref.Length, ObjectSize: ref.ObjectSize})
+			if err != nil {
+				return fmt.Errorf("fetch packed chunk %s: %w", entry.Digest, err)
+			}
+			buf = data
+			return nil
+		}
+		if buf == nil {
+			buf = make([]byte, length)
 		}
 		if httpSource {
 			resp, err := storeHTTPClient.Get(strings.TrimRight(src.chunkStore, "/") +
@@ -716,7 +741,10 @@ func main() {
 	// treats partially written chunks as misses so faults never race the
 	// writer (see readCache).
 	chunk := uint64(*chunkKB) << 10
+	sourceCtx, cancelSource := context.WithCancel(context.Background())
+	defer cancelSource()
 	source := &pageSource{
+		ctx:                    sourceCtx,
 		persistenceWorkerCount: *persistWorkers,
 		chunk:                  chunk,
 		inflight:               make(map[uint64]*sync.WaitGroup),
@@ -755,7 +783,7 @@ func main() {
 		// produces blocks>=size without real content); only an unmarked,
 		// fully-allocated file counts as a complete local image.
 		backingComplete := fileFullyAllocated(*backingPath) && !materializedMarkerPresent(filepath.Dir(*backingPath))
-		manifest, err := checkpointchunks.Load(filepath.Dir(*backingPath))
+		manifest, err := checkpointchunks.LoadTransport(filepath.Dir(*backingPath))
 		switch {
 		case err == nil && backingComplete:
 			file, ferr := os.Open(*backingPath)
@@ -825,6 +853,7 @@ func main() {
 	shutdown := func() {
 		stopOnce.Do(func() {
 			close(stop)
+			cancelSource()
 			source.stopPersistence()
 		})
 	}
