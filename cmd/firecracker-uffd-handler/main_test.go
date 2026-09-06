@@ -26,6 +26,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -262,5 +263,101 @@ func TestZeroChunksNeedNoStoreOrCache(t *testing.T) {
 	}
 	if _, err := f.srv.resolveChunk(8195, 4096); !errors.Is(err, io.EOF) {
 		t.Fatalf("past tail: %v", err)
+	}
+}
+
+func TestRepeatedDigestAcrossOffsets(t *testing.T) {
+	for _, failFirst := range []bool{false, true} {
+		name := "success"
+		if failFirst {
+			name = "failed-leader"
+		}
+		t.Run(name, func(t *testing.T) {
+			const count = 64
+			body := bytes.Repeat([]byte{1, 2, 3, 4}, 1024)
+			f := newFixture(t, body, false)
+			if failFirst {
+				f.store.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					n := f.gets.Add(1)
+					if n == 1 {
+						_, _ = w.Write(bytes.Repeat([]byte{0xff}, len(body)))
+						return
+					}
+					_, _ = w.Write(body)
+				})
+			}
+			src := f.srv.source
+			digest := src.chunkManifest.Entries[0].Digest
+			src.chunkManifest.FileSize = int64(count * len(body))
+			src.chunkManifest.ChunkCount = count
+			src.chunkManifest.Entries = nil
+			for i := 0; i < count; i++ {
+				src.chunkManifest.Entries = append(src.chunkManifest.Entries, checkpointchunks.Chunk{Offset: int64(i * len(body)), Digest: digest})
+			}
+			start := make(chan struct{})
+			errs := make(chan error, count)
+			var wg sync.WaitGroup
+			for i := 0; i < count; i++ {
+				wg.Add(1)
+				go func(i int) {
+					defer wg.Done()
+					<-start
+					got, err := f.srv.resolveChunk(uint64(i*len(body)+17), 128)
+					if err == nil && !bytes.Equal(got, body[17:145]) {
+						err = fmt.Errorf("wrong bytes at position %d", i)
+					}
+					errs <- err
+				}(i)
+			}
+			close(start)
+			wg.Wait()
+			close(errs)
+			for err := range errs {
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			wantGets := int64(1)
+			if failFirst {
+				wantGets = 2
+			}
+			if got := f.gets.Load(); got != wantGets {
+				t.Fatalf("GET=%d want=%d for %d positions", got, wantGets, count)
+			}
+			got, err := os.ReadFile(src.cachePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(got, bytes.Repeat(body, count)) {
+				t.Fatal("logical cache layout differs")
+			}
+			// Revisit after poisoning the backend: verified extents stay immutable.
+			f.body.Store(bytes.Repeat([]byte{0xff}, len(body)))
+			if err := f.srv.fetchChunk(count - 1); err != nil {
+				t.Fatal(err)
+			}
+			if f.gets.Load() != wantGets {
+				t.Fatal("verified digest refetched")
+			}
+		})
+	}
+}
+
+func TestRepeatedDigestDoesNotAliasDifferentLength(t *testing.T) {
+	body := bytes.Repeat([]byte{1, 2, 3, 4}, 1024)
+	f := newFixture(t, body, false)
+	src := f.srv.source
+	digest := src.chunkManifest.Entries[0].Digest
+	src.chunkManifest.Entries = append(src.chunkManifest.Entries, checkpointchunks.Chunk{Offset: int64(len(body)), Digest: digest})
+	src.chunkManifest.FileSize = int64(len(body) + len(body)/2)
+	src.chunkManifest.ChunkCount = 2
+	if err := f.srv.fetchChunk(0); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.srv.fetchChunk(1); err == nil {
+		t.Fatal("incorrect tail digest accepted by reuse")
+	}
+	if _, ok := src.fetched[1]; ok {
+		t.Fatal("failed tail marked ready")
 	}
 }
