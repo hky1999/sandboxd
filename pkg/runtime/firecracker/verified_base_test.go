@@ -277,3 +277,68 @@ func TestDenseBaseMarkerAddedAfterAdoption(t *testing.T) {
 		}
 	}
 }
+
+func TestSealedCheckpointContinuationPolicy(t *testing.T) {
+	for _, leaveRunning := range []bool{false, true} {
+		name := "stopping"
+		if leaveRunning {
+			name = "continuing"
+		}
+		t.Run(name, func(t *testing.T) {
+			instance, path, manifest, data := sealedSparseBaseFixture(t)
+			adoptSealedCheckpointMemory(context.Background(), instance, path, manifest)
+			if instance.checkpointBaseProof() == nil {
+				t.Fatal("fixture has no previous proof")
+			}
+			updateSealedCheckpointLineage(context.Background(), instance, path, manifest, leaveRunning)
+			state, proof := instance.checkpointStateAndProof()
+			typ, base, _, _, err := selectCheckpointTierWithProof(state, "", proof)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if leaveRunning {
+				if proof == nil || typ != firecrackerSnapshotTypeSoftDirty || base != path {
+					t.Fatal("continuing checkpoint lost its verified base")
+				}
+			} else {
+				// This is the state before stop is attempted. If stop fails and the
+				// process survives, a subsequent checkpoint must not patch its old base.
+				if proof != nil || !state.BaseMemoryLineageLost || base != "" || typ != firecrackerSnapshotTypeFull {
+					t.Fatalf("stopping lineage retained: %+v", state)
+				}
+				if _, _, _, _, err = selectCheckpointTierWithProof(state, firecrackerSnapshotTypeSoftDirty, proof); err == nil {
+					t.Fatal("explicit delta accepted after invalidation")
+				}
+				raw, err := json.Marshal(state)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var recovered firecrackerPersistedState
+				if err = json.Unmarshal(raw, &recovered); err != nil {
+					t.Fatal(err)
+				}
+				if !recovered.BaseMemoryLineageLost || recovered.BaseMemoryPath != "" {
+					t.Fatal("persisted stale lineage")
+				}
+			}
+			actual, err := os.ReadFile(path)
+			if err != nil || !bytes.Equal(actual, data) {
+				t.Fatal("lineage policy changed sealed bytes")
+			}
+		})
+	}
+}
+
+func TestStoppingLineageInvalidatesAfterCancellation(t *testing.T) {
+	instance, path, manifest, _ := sealedSparseBaseFixture(t)
+	adoptSealedCheckpointMemory(context.Background(), instance, path, manifest)
+	// Cancellation after sealing must not leave the previous dirty window
+	// eligible for reuse if source cleanup fails.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	updateSealedCheckpointLineage(ctx, instance, path, manifest, false)
+	state, proof := instance.checkpointStateAndProof()
+	if proof != nil || state.BaseMemoryPath != "" || !state.BaseMemoryLineageLost {
+		t.Fatal("old proof survived stopping policy")
+	}
+}

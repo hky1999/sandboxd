@@ -321,16 +321,16 @@ func (handler *Handler) Checkpoint(
 		))
 	}
 	tFinalized := time.Now()
-	adoptSealedCheckpointMemory(ctx, instance, files.Memory, manifest)
+	updateSealedCheckpointLineage(ctx, instance, files.Memory, manifest, config.LeaveRunning)
 	tAdopted := time.Now()
-	// Persist the adopted base. A persist failure does not fail the sealed
-	// artifact, and it cannot corrupt a later generation: recovery never
+	// Persist the continuation base or invalidated lineage. A persist failure
+	// does not fail the sealed artifact, and it cannot corrupt a later generation: recovery never
 	// trusts a pre-restart lineage (recoverState marks it lost and forces
 	// the next checkpoint to Full), so a stale durable state only costs one
 	// Full snapshot after the eventual restart.
 	if err := handler.persistInstance(instance); err != nil {
 		logrus.Warnf(
-			"firecracker: persist adopted base for %s failed (recovery forces a Full snapshot after the next daemon restart): %v",
+			"firecracker: persist checkpoint lineage for %s failed (recovery forces a Full snapshot after the next daemon restart): %v",
 			sandboxID, err,
 		)
 	}
