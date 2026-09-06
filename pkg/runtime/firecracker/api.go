@@ -126,11 +126,21 @@ func (api *firecrackerAPI) createSnapshot(
 	memoryPath,
 	snapshotType string,
 ) error {
+	return api.createSnapshotWithSparse(ctx, statePath, memoryPath, snapshotType, false)
+}
+
+func (api *firecrackerAPI) createSnapshotWithSparse(ctx context.Context, statePath, memoryPath, snapshotType string, sparseFull bool) error {
+	if sparseFull && snapshotType != firecrackerSnapshotTypeFull {
+		return fmt.Errorf("sparse_full requires Full")
+	}
 	body := map[string]any{
 		"snapshot_type": snapshotType,
 		"snapshot_path": statePath,
 		"mem_file_path": memoryPath,
 		"deferred_sync": true,
+	}
+	if sparseFull {
+		body["sparse_full"] = true
 	}
 	// Checkpoint artifacts deliberately remain in the host page cache. The
 	// caller accepts that success does not imply immediate power-loss

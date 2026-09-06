@@ -202,6 +202,8 @@ type FirecrackerConfig struct {
 	// generation as a Full snapshot. "incremental" enables the three-tier
 	// chain against a VMM that supports Incremental and SoftDirty snapshots.
 	CheckpointMode string `toml:"checkpoint_mode" json:"checkpointMode"`
+	// SparseFull requires the experimental fork and verified sparse UFFD support.
+	SparseFull bool `toml:"sparse_full" json:"sparseFull"`
 	// OCIRootfsEnabled permits an OCI image rootfs to be materialized as a
 	// local EROFS image before the Firecracker VM starts. It is opt-in because
 	// conversion eagerly reads the complete merged image.
