@@ -460,14 +460,6 @@ func materializeOverlayChunks(
 	// Zero-chunk bypass: an all-zero chunk's digest is a constant per
 	// length, and an unwritten region of the fresh file already reads as
 	// zeros — skip both the GET and the write, keeping the layer sparse.
-	zeroFull := checkpointchunks.ZeroChunkDigest(scan.ChunkBytes)
-	zeroTail := ""
-	if tail := scan.FileSize - int64(len(scan.Entries)-1)*int64(scan.ChunkBytes); tail > 0 && tail < int64(scan.ChunkBytes) {
-		zeroTail = checkpointchunks.ZeroChunkDigest(int(tail))
-	}
-	isZero := func(digest string) bool {
-		return digest == zeroFull || (zeroTail != "" && digest == zeroTail)
-	}
 	// One job per unique digest, carrying every offset that references it:
 	// a worker fetches, verifies, writes all references, and releases the
 	// buffer before taking the next digest.
@@ -478,17 +470,18 @@ func materializeOverlayChunks(
 	jobs := make(map[string][]ref, len(scan.Entries))
 	order := make([]string, 0, len(scan.Entries))
 	for _, entry := range scan.Entries {
-		if isZero(entry.Digest) {
+		length := int(min(int64(scan.ChunkBytes), scan.FileSize-entry.Offset))
+		// A zero digest proves only its own length, including a short tail.
+		if entry.Digest == checkpointchunks.ZeroChunkDigest(length) {
 			continue
 		}
-		if _, ok := jobs[entry.Digest]; !ok {
+		refs := jobs[entry.Digest]
+		if len(refs) == 0 {
 			order = append(order, entry.Digest)
+		} else if refs[0].length != length {
+			return fmt.Errorf("overlay chunk %s referenced with inconsistent lengths %d and %d", entry.Digest, refs[0].length, length)
 		}
-		length := scan.ChunkBytes
-		if tail := int(scan.FileSize - entry.Offset); tail < length {
-			length = tail
-		}
-		jobs[entry.Digest] = append(jobs[entry.Digest], ref{offset: entry.Offset, length: length})
+		jobs[entry.Digest] = append(refs, ref{offset: entry.Offset, length: length})
 	}
 	var errMu sync.Mutex
 	firstErr := error(nil)
@@ -514,9 +507,14 @@ func materializeOverlayChunks(
 			rc = rc2
 		}
 		defer rc.Close()
-		body, err := io.ReadAll(io.LimitReader(rc, int64(scan.ChunkBytes)+1))
+		expected := jobs[digest][0].length
+		body, err := io.ReadAll(io.LimitReader(rc, int64(expected)+1))
 		if err != nil {
 			failJob(fmt.Errorf("read overlay chunk %s: %w", digest[:12], err))
+			return nil, false
+		}
+		if len(body) != expected {
+			failJob(fmt.Errorf("overlay chunk %s length mismatch: expected %d got %d", digest, expected, len(body)))
 			return nil, false
 		}
 		sum := sha256.Sum256(body)
