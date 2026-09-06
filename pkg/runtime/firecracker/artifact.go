@@ -15,6 +15,7 @@
 package firecracker
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -966,12 +967,18 @@ func zeroChunkDigest(n int) string {
 	return checkpointchunks.ZeroChunkDigest(n)
 }
 
+// zeroCompareBlock is read-only after initialization. Keep the comparison
+// working set small while using the standard library's optimized equality.
+var zeroCompareBlock [32 * 1024]byte
+
 // isAllZero reports whether every byte is zero (O-4 fast path).
 func isAllZero(buf []byte) bool {
-	for _, b := range buf {
-		if b != 0 {
+	for len(buf) > 0 {
+		n := min(len(buf), len(zeroCompareBlock))
+		if !bytes.Equal(buf[:n], zeroCompareBlock[:n]) {
 			return false
 		}
+		buf = buf[n:]
 	}
 	return true
 }
