@@ -297,13 +297,26 @@ func Verify(ctx context.Context, dir string) error {
 		return err
 	}
 	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() || info.Size() != manifest.FileSize {
+		return fmt.Errorf("memory file size/type does not match manifest: size %d, want %d", info.Size(), manifest.FileSize)
+	}
+	return verifyContents(ctx, f, manifest)
+}
+
+// verifyContents consumes exactly the manifest's logical bytes. Callers must
+// check the backing's exact size and, for reusable proofs, its stable identity.
+func verifyContents(ctx context.Context, reader io.Reader, manifest *Manifest) error {
 	buf := make([]byte, manifest.ChunkBytes)
 	fileHash := sha256.New()
 	for i, chunk := range manifest.Entries {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		n, err := io.ReadFull(f, buf)
+		n, err := io.ReadFull(reader, buf)
 		if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
 			return err
 		}
@@ -312,7 +325,9 @@ func Verify(ctx context.Context, dir string) error {
 		}
 		chunkHash := sha256.New()
 		chunkHash.Write(buf[:n])
-		fileHash.Write(buf[:n])
+		if manifest.FileDigestMode != FileDigestChunks {
+			fileHash.Write(buf[:n])
+		}
 		if got := hex.EncodeToString(chunkHash.Sum(nil)); got != chunk.Digest {
 			return fmt.Errorf("chunk %d (offset %d) digest mismatch: manifest %s on disk %s",
 				i, chunk.Offset, chunk.Digest, got)
