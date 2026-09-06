@@ -206,7 +206,32 @@ func (p *BackingProof) Check(ctx context.Context, f *os.File) error {
 	if m.File != "memory" || m.FileSize != p.memory.size || m.FileDigest != p.digest || normalizeDigestMode(m.FileDigestMode) != p.mode {
 		return fmt.Errorf("verified sidecar no longer matches expected content")
 	}
-	if err = verifyContents(ctx, io.NewSectionReader(f, 0, p.memory.size), m); err != nil {
+	section := io.NewSectionReader(f, 0, p.memory.size)
+	var reader io.Reader = section
+	if p.mode == FileDigestChunks {
+		// dup would share f's offset. Open independently and bind the query
+		// descriptor to the same identity before using its extent answers.
+		extents, err := openMemory(p.dir)
+		if err != nil {
+			return err
+		}
+		defer extents.Close()
+		info, err := extents.Stat()
+		if err != nil {
+			return err
+		}
+		extentID, err := backingID(info)
+		if err != nil {
+			return err
+		}
+		if extentID != p.memory {
+			return fmt.Errorf("extent descriptor does not match verified backing")
+		}
+		reader = &memoryHoleReader{SectionReader: section, seekData: func(offset int64) (int64, error) {
+			return unix.Seek(int(extents.Fd()), offset, unix.SEEK_DATA)
+		}}
+	}
+	if err = verifyContents(ctx, reader, m); err != nil {
 		return err
 	}
 	// Recheck the actual fd and pathname after the scan. Content checking
@@ -252,4 +277,50 @@ func (p *BackingProof) Open(ctx context.Context) (*os.File, error) {
 		return nil, err
 	}
 	return f, nil
+}
+
+// memoryHoleReader is private to verified backing checks. Its extent state is
+// rebuilt for each check, and the file must remain immutable during that check.
+// Only verifyContents' expected-zero, chunks-mode branch may skip these bytes.
+type memoryHoleReader struct {
+	*io.SectionReader
+	seekData    func(int64) (int64, error)
+	nextData    int64
+	unsupported bool
+}
+
+func (r *memoryHoleReader) skipZeroHole(length int64) (bool, error) {
+	if r.unsupported {
+		return false, nil
+	}
+	offset, err := r.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return false, err
+	}
+	if length <= 0 || offset < 0 || length > r.Size()-offset {
+		return false, fmt.Errorf("invalid hole verification range at %d length %d", offset, length)
+	}
+	end := offset + length
+	if r.nextData < end {
+		start, err := r.seekData(offset)
+		switch {
+		case errors.Is(err, unix.ENXIO):
+			r.nextData = r.Size()
+		case errors.Is(err, unix.EINVAL), errors.Is(err, unix.ENOTSUP), errors.Is(err, unix.ENOSYS):
+			r.unsupported = true
+			return false, nil
+		case err != nil:
+			return false, fmt.Errorf("query verified memory extent: %w", err)
+		default:
+			if start < offset || start >= r.Size() {
+				return false, fmt.Errorf("invalid data offset %d at %d", start, offset)
+			}
+			r.nextData = start
+		}
+	}
+	if r.nextData < end {
+		return false, nil
+	}
+	_, err = r.Seek(length, io.SeekCurrent)
+	return err == nil, err
 }
