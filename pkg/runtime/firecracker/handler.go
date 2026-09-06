@@ -255,9 +255,10 @@ type Handler struct {
 	uffdHandlerBin string
 	// uffdRemoteURLTemplate, uffdCacheDir and uffdChunkKB configure the
 	// handler's remote source chain (empty = serve from local artifact).
-	uffdRemoteURL string
-	uffdCacheDir  string
-	uffdChunkKB   uint
+	uffdRemoteURL      string
+	uffdCacheDir       string
+	uffdChunkKB        uint
+	uffdPersistWorkers int
 
 	// digestMemory records a sha256 of the memory artifact in the sealed
 	// manifest so restores can reject corrupted transfers. Default on; the
@@ -411,6 +412,7 @@ func NewHandler(
 		uffdRemoteURL:          firecrackerConfig.UffdRemoteURLTemplate,
 		uffdCacheDir:           firecrackerConfig.UffdCacheDir,
 		uffdChunkKB:            firecrackerConfig.UffdChunkKB,
+		uffdPersistWorkers:     firecrackerConfig.UffdPersistWorkers,
 		digestMemory:           firecrackerConfig.DigestMemoryOrDefault(),
 		uffdChunkStore:         firecrackerConfig.UffdChunkStore,
 		digestMemoryMode:       firecrackerConfig.DigestMemoryMode,

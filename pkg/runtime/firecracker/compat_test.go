@@ -20,6 +20,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/inclusionAI/sandboxd/config"
 )
 
 // stackFixture lays out the three stack files a handler digests and returns
@@ -162,5 +164,16 @@ func TestManifestRejectsMalformedCompatDigest(t *testing.T) {
 	if _, err := openFirecrackerCheckpoint(dir); err == nil ||
 		!strings.Contains(err.Error(), "compat kernel digest") {
 		t.Fatalf("malformed compat digest accepted: %v", err)
+	}
+}
+
+func TestRejectInvalidPersistenceBudgetBeforeRuntimeSetup(t *testing.T) {
+	for _, n := range []int{-1, 65} {
+		var cfg config.Config
+		cfg.RuntimeConfig.Firecracker.UffdPersistWorkers = n
+		_, err := NewHandler(cfg, "", nil)
+		if err == nil || !strings.Contains(err.Error(), "uffd_persist_workers") {
+			t.Fatalf("budget %d must fail before accessing runtime files or KVM: %v", n, err)
+		}
 	}
 }
