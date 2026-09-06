@@ -64,7 +64,7 @@ func (handler *Handler) Checkpoint(
 	}
 	instance.operationMu.Lock()
 	defer instance.operationMu.Unlock()
-	state := instance.snapshot()
+	state, baseProof := instance.checkpointStateAndProof()
 	if state.Exited || !state.Configured ||
 		!firecrackerProcessMatches(state.PID, handler.binary, state.APIPath, state.ID) {
 		return fmt.Errorf("Firecracker sandbox %s is not running", sandboxID)
@@ -82,13 +82,7 @@ func (handler *Handler) Checkpoint(
 	if err != nil {
 		return fmt.Errorf("Firecracker sandbox %s: %w", sandboxID, err)
 	}
-	snapshotType, base, _, layoutMemorySize, err := selectFirecrackerSnapshotTier(
-		int64(state.MemoryMiB)<<20,
-		state.BaseMemoryPath,
-		state.BaseMemoryIncremental,
-		state.BaseMemoryLineageLost,
-		requestedType,
-	)
+	snapshotType, base, _, layoutMemorySize, err := selectCheckpointTierWithProof(state, requestedType, baseProof)
 	if err != nil {
 		return err
 	}
@@ -327,7 +321,7 @@ func (handler *Handler) Checkpoint(
 		))
 	}
 	tFinalized := time.Now()
-	adoptCheckpointMemory(instance, files.Memory, false)
+	adoptSealedCheckpointMemory(ctx, instance, files.Memory, manifest)
 	tAdopted := time.Now()
 	// Persist the adopted base. A persist failure does not fail the sealed
 	// artifact, and it cannot corrupt a later generation: recovery never
@@ -443,8 +437,12 @@ func selectFirecrackerSnapshotTier(
 	lineageLost bool,
 	requested string,
 ) (snapshotType, base string, incremental bool, layoutMemorySize int64, err error) {
+	return selectFirecrackerSnapshotTierUsable(memorySize, basePath, baseIncremental, lineageLost, requested, firecrackerBaseMemoryUsable(basePath, memorySize))
+}
+
+func selectFirecrackerSnapshotTierUsable(memorySize int64, basePath string, baseIncremental, lineageLost bool, requested string, baseUsable bool) (snapshotType, base string, incremental bool, layoutMemorySize int64, err error) {
 	base, incremental = basePath, baseIncremental
-	if memorySize > 0 && base != "" && !firecrackerBaseMemoryUsable(base, memorySize) {
+	if memorySize > 0 && base != "" && !baseUsable {
 		// The base drifted (crash cleanup, operator interference): the VMM
 		// ledger may still be armed against it, so this is a lost lineage,
 		// not a first-window opportunity.
@@ -606,9 +604,11 @@ func digestFirecrackerStackFile(path string) (string, error) {
 // would survive as zeros in every later generation.
 func firecrackerBaseMemoryUsable(path string, memorySize int64) bool {
 	info, err := os.Lstat(path)
-	return err == nil && info.Mode().IsRegular() &&
-		info.Mode()&os.ModeSymlink == 0 && info.Size() == memorySize &&
-		!firecrackerMemoryHasHoles(info)
+	if err != nil || !info.Mode().IsRegular() || info.Size() != memorySize || firecrackerMemoryHasHoles(info) {
+		return false
+	}
+	_, markerErr := os.Lstat(filepath.Join(filepath.Dir(path), ".materialized"))
+	return os.IsNotExist(markerErr)
 }
 
 // firecrackerMemoryHasHoles reports whether the file has fewer blocks
@@ -667,7 +667,7 @@ func adoptCheckpointMemory(
 	// representation and forbids incremental lineage even when allocation
 	// looks complete (fallocate/preallocation can fake blocks>=size);
 	// holes are the secondary signal for unmarked files.
-	if _, markerErr := os.Stat(filepath.Join(filepath.Dir(memoryPath), ".materialized")); markerErr == nil ||
+	if _, markerErr := os.Lstat(filepath.Join(filepath.Dir(memoryPath), ".materialized")); !os.IsNotExist(markerErr) ||
 		firecrackerMemoryHasHoles(info) {
 		logrus.Warnf(
 			"firecracker: checkpoint base %s is a materialized placeholder (unfetched chunks live in the store); adopting it would lose every unfaulted page in later incremental generations — forcing Full until the image is complete",
