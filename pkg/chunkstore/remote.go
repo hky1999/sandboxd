@@ -81,15 +81,45 @@ func (r *Remote) objectURL(digest string) (string, error) {
 	return r.baseURL + "/" + digest[:2] + "/" + digest, nil
 }
 
+// readRemoteChunk takes a stable copy before digest verification and upload.
+// Only concrete standard memory readers provide a trusted remaining length;
+// arbitrary Len methods and seekable files must not bypass the bounded path.
+func readRemoteChunk(body io.Reader) ([]byte, error) {
+	size := -1
+	switch r := body.(type) {
+	case *bytes.Reader:
+		size = r.Len()
+	case *bytes.Buffer:
+		size = r.Len()
+	case *strings.Reader:
+		size = r.Len()
+	}
+	if size > maxRemotePutBytes {
+		return nil, fmt.Errorf("remote Put is for chunks (>%d bytes); use PutKey", maxRemotePutBytes)
+	}
+	if size >= 0 {
+		buf := make([]byte, size)
+		if _, err := io.ReadFull(body, buf); err != nil {
+			return nil, err
+		}
+		return buf, nil
+	}
+	buf, err := io.ReadAll(io.LimitReader(body, maxRemotePutBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(buf) > maxRemotePutBytes {
+		return nil, fmt.Errorf("remote Put is for chunks (>%d bytes); use PutKey", maxRemotePutBytes)
+	}
+	return buf, nil
+}
+
 func (r *Remote) Put(ctx context.Context, digest string, body io.Reader) error {
 	// Chunks are small: buffer to verify the content hashes to its claimed
 	// digest before the object ever lands (S3 PUTs are not transactional).
-	buf, err := io.ReadAll(io.LimitReader(body, maxRemotePutBytes+1))
+	buf, err := readRemoteChunk(body)
 	if err != nil {
 		return err
-	}
-	if len(buf) > maxRemotePutBytes {
-		return fmt.Errorf("remote Put is for chunks (>%d bytes); use PutKey", maxRemotePutBytes)
 	}
 	if got := sha256Hex(buf); got != digest {
 		return fmt.Errorf("content hashes to %s, claimed %s", got, digest)
