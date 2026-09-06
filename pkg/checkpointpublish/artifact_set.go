@@ -156,9 +156,25 @@ func publishOverlayChunks(
 					continue
 				}
 				block := make([]byte, j.length)
-				if _, err := overlay.ReadAt(block, j.offset); err != nil &&
+				n, err := overlay.ReadAt(block, j.offset)
+				if err != nil &&
 					!errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
 					failJob(fmt.Errorf("read overlay chunk at %d: %w", j.offset, err))
+					continue
+				}
+				if n != j.length {
+					failJob(fmt.Errorf("overlay chunk at %d short: %d bytes, want %d",
+						j.offset, n, j.length))
+					continue
+				}
+				// The object key is the content address shared by every
+				// future generation: upload only bytes that actually hash
+				// to it, or a corrupted local original would poison the
+				// global namespace for all Has-hit readers (F9).
+				sum := sha256.Sum256(block)
+				if hex.EncodeToString(sum[:]) != j.digest {
+					failJob(fmt.Errorf("overlay chunk at %d content hashes to %s, sidecar claims %s — refusing to publish",
+						j.offset, hex.EncodeToString(sum[:]), j.digest))
 					continue
 				}
 				if err := store.PutKey(ctx, key, bytes.NewReader(block)); err != nil {
@@ -295,10 +311,15 @@ func Materialize(ctx context.Context, targetDir, id string, store chunkstore.Key
 		return fmt.Errorf("target %s is not empty; refusing to overwrite an in-use generation", targetDir)
 	}
 	parent := filepath.Dir(targetDir)
-	if err := os.MkdirAll(parent, 0o700); err != nil {
+	// Staging lives under the reserved .publish namespace, not beside the
+	// final directory: a dot-prefixed staging dir at scan level would be
+	// picked up by the catalog and publishd scanners the moment its
+	// manifest lands, advertising a half-materialized artifact (F4).
+	stagingRoot := filepath.Join(parent, StateDirName)
+	if err := os.MkdirAll(stagingRoot, 0o700); err != nil {
 		return err
 	}
-	staging, err := os.MkdirTemp(parent, "."+filepath.Base(targetDir)+".staging-")
+	staging, err := os.MkdirTemp(stagingRoot, "staging-")
 	if err != nil {
 		return err
 	}
@@ -334,21 +355,54 @@ func Materialize(ctx context.Context, targetDir, id string, store chunkstore.Key
 			return err
 		}
 	}
-	// Closure check: the memory root advertised by the INDEX must be the
-	// root the sidecar actually derives, otherwise the sidecar describes a
-	// different file than the checkpoint claims to own.
-	if index.OverlayChunks || index.MemoryRoot != "" {
-		if sidecar, err := checkpointchunks.Load(staging); err == nil {
-			switch sidecar.FileDigestMode {
-			case checkpointchunks.FileDigestChunks, "":
-				if root := checkpointchunks.RootDigest(sidecar.Entries); root != index.MemoryRoot {
-					return fmt.Errorf("index memory root %s does not match sidecar root %s",
-						index.MemoryRoot, root)
-				}
-			}
-		} else {
-			return fmt.Errorf("verify sidecar against index: %w", err)
+	// Closure check (F5): three authorities must agree before the artifact
+	// is committed — the chunk sidecar (what bytes exist per offset), the
+	// INDEX (what the publisher advertised), and the Firecracker manifest
+	// (what the runtime will actually restore). Any pairwise disagreement
+	// means the sidecar describes a different file than this checkpoint
+	// owns, and an unknown digest mode is rejected rather than waived.
+	var fcManifest struct {
+		MemorySize       int64             `json:"memory_size"`
+		Digests          map[string]string `json:"digests"`
+		MemoryDigestMode string            `json:"memory_digest_mode"`
+	}
+	if raw, err := os.ReadFile(filepath.Join(staging, "manifest.json")); err != nil {
+		return fmt.Errorf("read Firecracker manifest for closure check: %w", err)
+	} else if err := json.Unmarshal(raw, &fcManifest); err != nil {
+		return fmt.Errorf("decode Firecracker manifest for closure check: %w", err)
+	}
+	sidecar, err := checkpointchunks.Load(staging)
+	if err != nil {
+		return fmt.Errorf("verify sidecar against index: %w", err)
+	}
+	switch sidecar.FileDigestMode {
+	case checkpointchunks.FileDigestChunks:
+		if root := checkpointchunks.RootDigest(sidecar.Entries); root != index.MemoryRoot {
+			return fmt.Errorf("index memory root %s does not match sidecar root %s",
+				index.MemoryRoot, root)
 		}
+	case checkpointchunks.FileDigestSha256:
+		// Sequential-hash sidecars cannot be root-rederived without the
+		// whole file, but the recorded digest must still agree with both
+		// the INDEX and the Firecracker manifest below.
+	default:
+		return fmt.Errorf("sidecar carries unknown file digest mode %q", sidecar.FileDigestMode)
+	}
+	if index.MemoryRoot != "" && sidecar.FileDigest != index.MemoryRoot {
+		return fmt.Errorf("index memory root %s does not match sidecar file digest %s",
+			index.MemoryRoot, sidecar.FileDigest)
+	}
+	if index.ChunkCount != sidecar.ChunkCount {
+		return fmt.Errorf("index chunk count %d does not match sidecar %d",
+			index.ChunkCount, sidecar.ChunkCount)
+	}
+	if fcManifest.MemorySize != sidecar.FileSize {
+		return fmt.Errorf("Firecracker manifest memory size %d does not match sidecar file size %d",
+			fcManifest.MemorySize, sidecar.FileSize)
+	}
+	if fcDigest, ok := fcManifest.Digests["memory"]; ok && fcDigest != sidecar.FileDigest {
+		return fmt.Errorf("Firecracker manifest memory digest %s does not match sidecar %s",
+			fcDigest, sidecar.FileDigest)
 	}
 	if index.OverlayChunks {
 		if err := materializeOverlayChunks(ctx, staging, id, store); err != nil {
@@ -383,9 +437,11 @@ func Materialize(ctx context.Context, targetDir, id string, store chunkstore.Key
 
 // materializeOverlayChunks reassembles the writable layer from digest-keyed
 // chunk objects: unique digests only, all-zero chunks synthesized as sparse
-// holes (no GET, no write), bounded-concurrency GETs with per-run digest
-// reuse, and legacy per-ID keys probed as fallback so checkpoints published
-// before the global namespace remain restorable.
+// holes (no GET, no write), bounded-concurrency GETs, and legacy per-ID keys
+// probed as fallback so checkpoints published before the global namespace
+// remain restorable. Each verified body is written straight to every
+// referencing offset and released, so peak heap is bounded by
+// overlayWorkers x chunk bytes rather than the total unique payload (F7).
 func materializeOverlayChunks(
 	ctx context.Context,
 	targetDir, id string,
@@ -409,21 +465,31 @@ func materializeOverlayChunks(
 	if tail := scan.FileSize - int64(len(scan.Entries)-1)*int64(scan.ChunkBytes); tail > 0 && tail < int64(scan.ChunkBytes) {
 		zeroTail = checkpointchunks.ZeroChunkDigest(int(tail))
 	}
-	// Unique-digest jobs with a shared body cache: repeated blocks are
-	// fetched once and written to every offset that references them.
-	seen := make(map[string][][]byte, len(scan.Entries))
-	var order []string
+	isZero := func(digest string) bool {
+		return digest == zeroFull || (zeroTail != "" && digest == zeroTail)
+	}
+	// One job per unique digest, carrying every offset that references it:
+	// a worker fetches, verifies, writes all references, and releases the
+	// buffer before taking the next digest.
+	type ref struct {
+		offset int64
+		length int
+	}
+	jobs := make(map[string][]ref, len(scan.Entries))
+	order := make([]string, 0, len(scan.Entries))
 	for _, entry := range scan.Entries {
-		if entry.Digest == zeroFull || (zeroTail != "" && entry.Digest == zeroTail) {
-			continue // sparse hole
-		}
-		if _, dup := seen[entry.Digest]; dup {
+		if isZero(entry.Digest) {
 			continue
 		}
-		seen[entry.Digest] = nil
-		order = append(order, entry.Digest)
+		if _, ok := jobs[entry.Digest]; !ok {
+			order = append(order, entry.Digest)
+		}
+		length := scan.ChunkBytes
+		if tail := int(scan.FileSize - entry.Offset); tail < length {
+			length = tail
+		}
+		jobs[entry.Digest] = append(jobs[entry.Digest], ref{offset: entry.Offset, length: length})
 	}
-	var bodyMu sync.Mutex
 	var errMu sync.Mutex
 	firstErr := error(nil)
 	failed := atomic.Bool{}
@@ -436,12 +502,6 @@ func materializeOverlayChunks(
 		failed.Store(true)
 	}
 	fetchBody := func(digest string) ([]byte, bool) {
-		bodyMu.Lock()
-		cached, ok := seen[digest]
-		bodyMu.Unlock()
-		if ok && cached != nil {
-			return cached[0], true
-		}
 		rc, err := store.GetKey(ctx, OverlayChunkKey(digest))
 		if err != nil {
 			// Legacy namespace fallback for artifacts published before
@@ -453,8 +513,8 @@ func materializeOverlayChunks(
 			}
 			rc = rc2
 		}
-		body, err := io.ReadAll(rc)
-		rc.Close()
+		defer rc.Close()
+		body, err := io.ReadAll(io.LimitReader(rc, int64(scan.ChunkBytes)+1))
 		if err != nil {
 			failJob(fmt.Errorf("read overlay chunk %s: %w", digest[:12], err))
 			return nil, false
@@ -465,9 +525,6 @@ func materializeOverlayChunks(
 				digest, hex.EncodeToString(sum[:])))
 			return nil, false
 		}
-		bodyMu.Lock()
-		seen[digest] = [][]byte{body}
-		bodyMu.Unlock()
 		return body, true
 	}
 	queue := make(chan string)
@@ -480,7 +537,17 @@ func materializeOverlayChunks(
 				if failed.Load() {
 					continue // drain
 				}
-				fetchBody(digest)
+				body, ok := fetchBody(digest)
+				if !ok {
+					continue
+				}
+				for _, r := range jobs[digest] {
+					if _, err := overlay.WriteAt(body[:r.length], r.offset); err != nil {
+						failJob(fmt.Errorf("write overlay chunk at %d: %w", r.offset, err))
+						break
+					}
+				}
+				// body goes out of scope: the next job reuses the heap.
 			}
 		}()
 	}
@@ -501,23 +568,6 @@ func materializeOverlayChunks(
 		cause := firstErr
 		errMu.Unlock()
 		return cause
-	}
-	// Writes are issued from one goroutine after all bodies are verified:
-	// WriteAt ordering does not matter, but this keeps the failure mode a
-	// clean all-or-nothing through staging + rename.
-	for _, entry := range scan.Entries {
-		if entry.Digest == zeroFull || (zeroTail != "" && entry.Digest == zeroTail) {
-			continue
-		}
-		bodyMu.Lock()
-		cached := seen[entry.Digest]
-		bodyMu.Unlock()
-		if len(cached) == 0 {
-			return fmt.Errorf("internal: verified body for %s vanished", entry.Digest[:12])
-		}
-		if _, err := overlay.WriteAt(cached[0], entry.Offset); err != nil {
-			return err
-		}
 	}
 	return overlay.Truncate(scan.FileSize)
 }

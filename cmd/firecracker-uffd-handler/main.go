@@ -612,6 +612,14 @@ var storeHTTPClient = &http.Client{
 	},
 }
 
+// materializedMarkerPresent reports whether the artifact directory carries
+// the blind-materialization marker naming the memory file as a remote
+// placeholder.
+func materializedMarkerPresent(dir string) bool {
+	_, err := os.Stat(filepath.Join(dir, ".materialized"))
+	return err == nil
+}
+
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	sockPath := flag.String("sock", "", "unix socket path Firecracker will connect to")
@@ -625,6 +633,7 @@ func main() {
 	chunkKB := flag.Uint("chunk-kb", 4, "bytes copied per fault, in KiB")
 	workers := flag.Int("workers", 8, "concurrent UFFDIO_COPY workers")
 	prefetch := flag.Int("prefetch", 4, "background chunk prefetch concurrency (0 = disabled)")
+	prefetchBudgetMB := flag.Int("prefetch-budget-mb", 0, "cap background prefetch to this many MiB (0 = walk the whole artifact)")
 	flag.Parse()
 	if *sockPath == "" || (*backingPath == "" && *remoteURL == "") {
 		log.Fatal("-sock plus -backing or -remote is required")
@@ -673,7 +682,13 @@ func main() {
 		//   - broken manifest + sparse placeholder -> refuse: serving the
 		//     backing would feed zeros for every unfetched chunk, which is
 		//     silent memory corruption rather than a failure.
-		backingComplete := fileFullyAllocated(*backingPath)
+		// F3: the explicit artifact representation decides, with block
+		// allocation only as a secondary signal. A .materialized marker
+		// means the memory file is a remote placeholder even when its
+		// allocation looks complete (an fallocate or full-copy spoof
+		// produces blocks>=size without real content); only an unmarked,
+		// fully-allocated file counts as a complete local image.
+		backingComplete := fileFullyAllocated(*backingPath) && !materializedMarkerPresent(filepath.Dir(*backingPath))
 		manifest, err := checkpointchunks.Load(filepath.Dir(*backingPath))
 		switch {
 		case err == nil && backingComplete:
@@ -773,9 +788,28 @@ func main() {
 	if *prefetch > 0 && (source.remote != "" || source.chunkStore != "") &&
 		os.Getenv("UFFD_NO_BULK") == "" {
 		go func() {
+			// Walk at the granularity the artifact actually uses: a chunk
+			// manifest overrides the flag's chunk size, and counting with
+			// the stale flag would over- or under-fetch at non-default
+			// sizes (F7).
+			walk := chunk
+			if source.chunkManifest != nil && source.chunkManifest.ChunkBytes > 0 {
+				walk = uint64(source.chunkManifest.ChunkBytes)
+			}
+			var budgetBytes uint64
+			if *prefetchBudgetMB > 0 {
+				budgetBytes = uint64(*prefetchBudgetMB) << 20
+			}
 			totalChunks := uint64(0)
 			for _, r := range regions {
-				totalChunks += (r.Size + chunk - 1) / chunk
+				totalChunks += (r.Size + walk - 1) / walk
+			}
+			if budgetBytes > 0 {
+				maxByBudget := budgetBytes / walk
+				if maxByBudget < totalChunks {
+					totalChunks = maxByBudget
+					log.Printf("prefetch: budget %dMiB caps walk at %d chunks", *prefetchBudgetMB, totalChunks)
+				}
 			}
 			workers := *prefetch
 			if workers > 16 {

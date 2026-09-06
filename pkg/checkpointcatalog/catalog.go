@@ -29,6 +29,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/inclusionAI/sandboxd/pkg/checkpointlocator"
@@ -137,7 +138,10 @@ func List(ctx context.Context, cfg Config) ([]Entry, error) {
 			if err := ctx.Err(); err != nil {
 				return nil, err
 			}
-			if !sub.IsDir() {
+			if !sub.IsDir() || strings.HasPrefix(sub.Name(), ".") {
+				// Dot-prefixed directories are system namespaces (publish
+				// state, materialization staging) and never catalog
+				// entries (F4).
 				continue
 			}
 			dir := filepath.Join(root, sub.Name())
