@@ -67,10 +67,11 @@ type Manifest struct {
 	// FileDigestMode names how FileDigest was derived: "sha256"
 	// (sequential whole-file hash, the default for pre-existing sidecars)
 	// or "chunks" (sha256 over the concatenated chunk digests).
-	FileDigestMode string  `json:"file_digest_mode,omitempty"`
-	ChunkBytes     int     `json:"chunk_bytes"`
-	ChunkCount     int     `json:"chunk_count"`
-	Entries        []Chunk `json:"entries"`
+	FileDigestMode string                   `json:"file_digest_mode,omitempty"`
+	ChunkBytes     int                      `json:"chunk_bytes"`
+	ChunkCount     int                      `json:"chunk_count"`
+	Entries        []Chunk                  `json:"entries"`
+	Packs          map[string]PackReference `json:"packs,omitempty"`
 }
 
 // RootDigest derives the "chunks"-mode file digest from ordered chunk
@@ -186,22 +187,7 @@ func LoadNamed(dir, name string) (*Manifest, error) {
 	if err != nil {
 		return nil, err
 	}
-	var manifest Manifest
-	if err := json.Unmarshal(raw, &manifest); err != nil {
-		return nil, fmt.Errorf("decode chunk manifest: %w", err)
-	}
-	if manifest.Version != 1 {
-		return nil, fmt.Errorf("unsupported chunk manifest version %d", manifest.Version)
-	}
-	for i, entry := range manifest.Entries {
-		if !digestPattern.MatchString(entry.Digest) {
-			return nil, fmt.Errorf("chunk manifest entry %d has invalid digest %q", i, entry.Digest)
-		}
-	}
-	if err := validateManifest(&manifest); err != nil {
-		return nil, err
-	}
-	return &manifest, nil
+	return decodeManifest(raw, false)
 }
 
 // SidecarName is the chunk sidecar file name for an artifact file.
@@ -214,26 +200,7 @@ func Load(dir string) (*Manifest, error) {
 	if err != nil {
 		return nil, err
 	}
-	var manifest Manifest
-	if err := json.Unmarshal(raw, &manifest); err != nil {
-		return nil, fmt.Errorf("decode chunk manifest: %w", err)
-	}
-	if manifest.Version != 1 {
-		return nil, fmt.Errorf("unsupported chunk manifest version %d", manifest.Version)
-	}
-	// Digests are used as object keys (sliced and path-joined) by every
-	// consumer: an empty or non-hex value would panic the slice at best and
-	// path-traverse the store at worst. The write side already rejects
-	// these; loading must be equally defensive (F2).
-	for i, entry := range manifest.Entries {
-		if !digestPattern.MatchString(entry.Digest) {
-			return nil, fmt.Errorf("chunk manifest entry %d has invalid digest %q", i, entry.Digest)
-		}
-	}
-	if err := validateManifest(&manifest); err != nil {
-		return nil, err
-	}
-	return &manifest, nil
+	return decodeManifest(raw, false)
 }
 
 // validateManifest enforces the structural invariants every consumer

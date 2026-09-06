@@ -475,6 +475,18 @@ func TestFinalizeChunksModeRoundtrip(t *testing.T) {
 		t.Fatalf("verify chunks mode: %v", err)
 	}
 
+	// A complete local image is verified from local bytes even when its
+	// transport sidecar locates the same chunks in remote packs.
+	scan.Version = checkpointchunks.PackedVersion
+	scan.Packs = map[string]checkpointchunks.PackReference{scan.Entries[0].Digest: {Digest: scan.Entries[0].Digest, Offset: 0, Length: int64(scan.ChunkBytes), ObjectSize: int64(scan.ChunkBytes)}}
+	if err := checkpointchunks.Write(dir, scan); err != nil {
+		t.Fatal(err)
+	}
+	cache = checkpointDigestCache{}
+	if err := cache.verifyFirecrackerCheckpointDigests(context.Background(), artifact); err != nil {
+		t.Fatalf("verify complete packed image: %v", err)
+	}
+
 	// Tampering one byte fails the chunk verification.
 	data[70000] ^= 0xFF
 	if err := os.WriteFile(files.Memory, data, 0o600); err != nil {
