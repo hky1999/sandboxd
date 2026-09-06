@@ -115,6 +115,10 @@ type pageSource struct {
 	// malformed references and short tails without trusting a digest alone.
 	verifiedDigests map[chunkContentKey]uint64
 	digestInflight  map[chunkContentKey]chan struct{}
+
+	persistenceMu      sync.Mutex
+	persister          *chunkPersister
+	persistenceStopped bool
 }
 
 // zeroChunkLength recognizes content from its digest, never from sparse file
@@ -480,44 +484,11 @@ func (s *faultServer) fetchChunkFromStore(chunkIdx uint64) error {
 		return fmt.Errorf("cache chunk %d: %w", chunkIdx, err)
 	}
 	if httpSource && src.chunkLocal != "" && !localHit {
-		// Persist asynchronously for the next sandbox on this node; the
-		// fault path is already served from the verified per-sandbox cache,
-		// so persistence (temp + fsync + rename) stays off the critical
-		// path and its failure only costs a future refetch.
-		digest, body := entry.Digest, buf
-		go func() {
-			persistPath := filepath.Join(src.chunkLocal, digest[:2], digest)
-			if err := os.MkdirAll(filepath.Dir(persistPath), 0o755); err != nil {
-				log.Printf("persist chunk %s: mkdir: %v", digest[:12], err)
-				return
-			}
-			tmp, err := os.CreateTemp(filepath.Dir(persistPath), ".put-*")
-			if err != nil {
-				log.Printf("persist chunk %s: create: %v", digest[:12], err)
-				return
-			}
-			if _, err := tmp.Write(body); err != nil {
-				tmp.Close()
-				os.Remove(tmp.Name())
-				log.Printf("persist chunk %s: write: %v", digest[:12], err)
-				return
-			}
-			if err := tmp.Sync(); err != nil {
-				tmp.Close()
-				os.Remove(tmp.Name())
-				log.Printf("persist chunk %s: sync: %v", digest[:12], err)
-				return
-			}
-			if err := tmp.Close(); err != nil {
-				os.Remove(tmp.Name())
-				return
-			}
-			if err := os.Rename(tmp.Name(), persistPath); err != nil {
-				os.Remove(tmp.Name())
-				log.Printf("persist chunk %s: rename: %v", digest[:12], err)
-			}
-		}()
+		// Queue only a reference to immutable verified bytes. Bounded workers
+		// read their payload on demand, keeping fsync off the fault path.
+		src.schedulePersistence(persistRef{digest: entry.Digest, offset: start, length: length})
 	}
+
 	src.inflightMu.Lock()
 	if src.verifiedDigests == nil {
 		src.verifiedDigests = make(map[chunkContentKey]uint64)
@@ -845,7 +816,12 @@ func main() {
 	var wg sync.WaitGroup
 	stop := make(chan struct{})
 	var stopOnce sync.Once
-	shutdown := func() { stopOnce.Do(func() { close(stop) }) }
+	shutdown := func() {
+		stopOnce.Do(func() {
+			close(stop)
+			source.stopPersistence()
+		})
+	}
 
 	// The VMM never writes after the handshake, so a read-side EOF on the
 	// handshake connection means the Firecracker process is gone (stopped,

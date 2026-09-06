@@ -100,6 +100,9 @@ func newFixture(t *testing.T, chunk []byte, withLocal bool) *fixture {
 	}
 	t.Cleanup(func() {
 		store.Close()
+		if p := src.stopPersistence(); p != nil {
+			p.wg.Wait()
+		}
 		cache.Close()
 		os.RemoveAll(tmp)
 	})
