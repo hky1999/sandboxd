@@ -1145,6 +1145,9 @@ func (handler *Handler) launchUffdHandler(sandboxID, sockPath, backingPath, stat
 	if handler.uffdChunkKB > 0 {
 		args = append(args, "-chunk-kb", strconv.FormatUint(uint64(handler.uffdChunkKB), 10))
 	}
+	if handler.uffdPersistWorkers > 0 {
+		args = append(args, "-persist-workers", strconv.Itoa(handler.uffdPersistWorkers))
+	}
 	cmd := exec.Command(bin, args...)
 	cmd.Dir = stateDir
 	cmd.Stdout = logFile
