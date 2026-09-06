@@ -117,6 +117,10 @@ func prepareFirecrackerCheckpointV2(
 	dir, baseMemoryPath string,
 	memorySize int64,
 ) (files firecrackerCheckpointFiles, retErr error) {
+	return prepareFirecrackerCheckpointWithClone(dir, baseMemoryPath, memorySize, cloneFileNoSync)
+}
+
+func prepareFirecrackerCheckpointWithClone(dir, baseMemoryPath string, memorySize int64, clone func(string, string) (bool, error)) (files firecrackerCheckpointFiles, retErr error) {
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return files, fmt.Errorf("create Firecracker checkpoint directory: %w", err)
 	}
@@ -156,7 +160,7 @@ func prepareFirecrackerCheckpointV2(
 		return files, nil
 	}
 
-	if _, err := cloneFileNoSync(baseMemoryPath, files.Memory); err != nil {
+	if _, err := clone(baseMemoryPath, files.Memory); err != nil {
 		return files, err
 	}
 	return files, nil

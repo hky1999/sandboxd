@@ -108,6 +108,7 @@ type firecrackerPersistedState struct {
 }
 
 type firecrackerInstance struct {
+	baseProof   *verifiedBaseMemory // process-local; never recovered from persisted state
 	mu          sync.RWMutex
 	state       firecrackerPersistedState
 	exit        runtimecore.Exit
@@ -148,7 +149,12 @@ func (instance *firecrackerInstance) setVcpus(count uint32) {
 }
 
 func (instance *firecrackerInstance) setBaseMemory(path string, incremental bool) {
+	instance.setBaseMemoryProof(path, incremental, nil)
+}
+
+func (instance *firecrackerInstance) setBaseMemoryProof(path string, incremental bool, proof *verifiedBaseMemory) {
 	instance.mu.Lock()
+	instance.baseProof = proof
 	instance.state.BaseMemoryPath = path
 	instance.state.BaseMemoryIncremental = incremental
 	instance.state.BaseMemoryLineageLost = false
@@ -162,6 +168,7 @@ func (instance *firecrackerInstance) setBaseMemory(path string, incremental bool
 // every page written before the discarded generation.
 func (instance *firecrackerInstance) markBaseMemoryLineageLost() {
 	instance.mu.Lock()
+	instance.baseProof = nil
 	instance.state.BaseMemoryPath = ""
 	instance.state.BaseMemoryIncremental = false
 	instance.state.BaseMemoryLineageLost = true
@@ -175,6 +182,7 @@ func (instance *firecrackerInstance) markBaseMemoryLineageLost() {
 func (instance *firecrackerInstance) clearBaseMemory() bool {
 	instance.mu.Lock()
 	changed := instance.state.BaseMemoryPath != ""
+	instance.baseProof = nil
 	instance.state.BaseMemoryPath = ""
 	instance.state.BaseMemoryIncremental = false
 	instance.mu.Unlock()
@@ -1579,4 +1587,16 @@ func requestFirecrackerAgentWaiting(
 		return err
 	}
 	return firecrackerproto.ReadResponse(connection)
+}
+
+func (instance *firecrackerInstance) checkpointBaseProof() *verifiedBaseMemory {
+	instance.mu.RLock()
+	defer instance.mu.RUnlock()
+	return instance.baseProof
+}
+
+func (instance *firecrackerInstance) checkpointStateAndProof() (firecrackerPersistedState, *verifiedBaseMemory) {
+	instance.mu.RLock()
+	defer instance.mu.RUnlock()
+	return instance.state, instance.baseProof
 }
