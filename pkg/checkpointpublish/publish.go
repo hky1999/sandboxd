@@ -27,6 +27,7 @@
 package checkpointpublish
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -299,7 +300,7 @@ func RunWithOptions(ctx context.Context, checkpointDir, id string, store chunkst
 				if end > manifest.ChunkBytes {
 					end = manifest.ChunkBytes
 				}
-				if err := store.Put(ctx, job.chunk.Digest, &byteReader{b: buf[:end]}); err != nil {
+				if err := store.Put(ctx, job.chunk.Digest, bytes.NewReader(buf[:end])); err != nil {
 					failUpload(fmt.Errorf("put chunk at %d: %w", job.chunk.Offset, err))
 					continue
 				}
@@ -361,18 +362,4 @@ func failState(state State, cause error) (Result, error) {
 		return Result{}, err
 	}
 	return Result{State: state}, cause
-}
-
-// byteReader adapts a byte slice to a one-shot Reader.
-type byteReader struct {
-	b []byte
-}
-
-func (r *byteReader) Read(p []byte) (int, error) {
-	if len(r.b) == 0 {
-		return 0, io.EOF
-	}
-	n := copy(p, r.b)
-	r.b = r.b[n:]
-	return n, nil
 }
