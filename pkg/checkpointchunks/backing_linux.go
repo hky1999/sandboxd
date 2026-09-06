@@ -91,58 +91,81 @@ func normalizeDigestMode(mode string) string {
 // when their zero bytes match that expected content. The .materialized marker
 // always forbids a local proof, even for preallocated or all-zero placeholders.
 func VerifyMemoryBacking(ctx context.Context, dir, expectedDigest, expectedMode string) (*BackingProof, error) {
+	proof, f, err := verifyAndOpenMemoryBacking(ctx, dir, expectedDigest, expectedMode)
+	if f != nil {
+		f.Close()
+	}
+	return proof, err
+}
+
+// OpenVerifiedMemoryBacking returns the same descriptor whose complete contents
+// were just verified. Immediate consumers avoid closing it and rescanning via
+// BackingProof.Open. The caller owns the fd and must keep the managed artifact
+// immutable while serving it; this is not a lock against concurrent writes.
+func OpenVerifiedMemoryBacking(ctx context.Context, dir, expectedDigest, expectedMode string) (*os.File, error) {
+	_, f, err := verifyAndOpenMemoryBacking(ctx, dir, expectedDigest, expectedMode)
+	return f, err
+}
+
+func verifyAndOpenMemoryBacking(ctx context.Context, dir, expectedDigest, expectedMode string) (*BackingProof, *os.File, error) {
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if !validDigest(expectedDigest) {
-		return nil, fmt.Errorf("invalid expected memory digest")
+		return nil, nil, fmt.Errorf("invalid expected memory digest")
 	}
 	expectedMode = normalizeDigestMode(expectedMode)
 	if expectedMode != FileDigestChunks && expectedMode != FileDigestSha256 {
-		return nil, fmt.Errorf("invalid expected digest mode %q", expectedMode)
+		return nil, nil, fmt.Errorf("invalid expected digest mode %q", expectedMode)
 	}
 	dir, err := filepath.Abs(dir)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if err = rejectMaterialized(dir); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	sidecar, err := identityAt(filepath.Join(dir, ManifestName))
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	m, err := Load(dir)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if m.File != "memory" || m.FileDigest != expectedDigest || normalizeDigestMode(m.FileDigestMode) != expectedMode {
-		return nil, fmt.Errorf("memory sidecar does not match expected file/digest/mode")
+		return nil, nil, fmt.Errorf("memory sidecar does not match expected file/digest/mode")
 	}
 	f, err := openMemory(dir)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	defer f.Close()
+	keep := false
+	defer func() {
+		if !keep {
+			f.Close()
+		}
+	}()
 	info, err := f.Stat()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	id, err := backingID(info)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if id.size != m.FileSize {
-		return nil, fmt.Errorf("memory backing size %d does not match manifest %d", id.size, m.FileSize)
+		return nil, nil, fmt.Errorf("memory backing size %d does not match manifest %d", id.size, m.FileSize)
 	}
 	proof := &BackingProof{dir: dir, digest: expectedDigest, mode: expectedMode, memory: id, sidecar: sidecar, verified: true}
 	if err = proof.Check(ctx, f); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if err = ctx.Err(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return proof, nil
+	keep = true
+	return proof, f, nil
 }
 
 // Check validates the actual opened source fd and its current pathname against
