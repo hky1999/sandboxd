@@ -468,14 +468,48 @@ artifact): `local_ready -> publishing -> published | publish_failed`.
 Publishing is external orchestration: the checkpoint RPC has already
 returned, local restores are unaffected by its outcome, and a failed or
 interrupted run resumes and re-puts only the chunks the store is missing.
-Published objects are immutable and content-addressed in the store
-(`root/<aa>/<sha256>`), so generations sharing page ranges share objects and
-no consumer can fetch wrong bytes.
+State files are written to a temp file and atomically renamed, and publish
+requests are deduplicated by digest first — repeated chunks (the all-zero
+chunk above all) cost one Has/Put, not one per entry. Published objects are
+immutable and content-addressed in the store (`root/<aa>/<sha256>`), so
+generations sharing page ranges share objects and no consumer can fetch
+wrong bytes.
+
+`cn-publishd` treats a `publishing` record older than `-stale` (default
+10m) as a crash leftover and re-queues it: publishing is idempotent, so the
+rerun only puts objects the store still lacks. Younger `publishing`
+records may belong to a live concurrent publisher and are skipped.
+
+The writable layer ships the same way when its sidecar
+(`overlay.ext4.chunks.json`) exists: overlay chunks live in a global
+content-addressed namespace (`overlay-chunks/<aa>/<sha256>`, no checkpoint
+id in the key), so unchanged overlay blocks are shared across generations
+and nodes. Materialization recognizes the all-zero chunk digests by length
+and synthesizes those blocks as sparse holes — no GET, no write.
+
+`Materialize` (cn-fetch) rebuilds a restorable directory on a node that
+never saw the source. Every file is digest-verified against the INDEX, the
+INDEX's memory root is cross-checked against the chunk sidecar, and the
+whole rebuild lands in a staging directory committed by one rename — a
+crash leaves either nothing or a complete artifact, never a half-built
+directory, and a non-empty target is refused rather than overwritten.
 
 Only `published` unlocks cross-node placement: `cn-locator
 -require-published` gates the cross-node branch of the placement tree on the
 persisted state (the origin is exempt — it holds the local artifact), and
 the catalog reports each entry's `publish_state`.
+
+A remote-restore caveat shapes later checkpoints: the materialized memory
+file is a sparse placeholder whose real bytes live in the chunk store.
+Until every page has been faulted in, that file is not a complete image, so
+it is never adopted as an incremental base — the next checkpoint takes a
+Full snapshot (which pulls any unfetched pages through the handler inside
+the pause window) rather than silently emitting zeros for unfaulted pages
+in later incremental generations. Correspondingly, the uffd handler serves
+a complete local memory image directly from the backing file even when a
+chunk store is configured (fail-open to local); a broken chunk manifest
+over a sparse placeholder is a hard failure, never a silent fall-back to
+zeros.
 
 ### Placement (checkpointlocator)
 
