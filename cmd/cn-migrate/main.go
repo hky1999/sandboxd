@@ -73,7 +73,9 @@ func main() {
 	// Each attempt gets its own immutable checkpoint ID: a retry must never
 	// overwrite a generation a previous (possibly still-live) target already
 	// restored from, and published objects stay addressable under the old ID.
-	report.Checkpoint = fmt.Sprintf("%s-%d", report.Checkpoint, time.Now().Unix())
+	// Nanosecond granularity still admits collisions across processes; the
+	// sandbox ID and run directory keep attempts practically distinct.
+	report.Checkpoint = fmt.Sprintf("%s-%d", report.Checkpoint, time.Now().UnixNano())
 	fail := func(step, detail string) {
 		report.Error = detail
 		report.Steps = append(report.Steps, stepLog{Step: step, Detail: detail, Failed: true})
@@ -95,23 +97,59 @@ func main() {
 		})
 		return trimmed, err == nil
 	}
-	// sourceFinalized flips once the checkpoint request with
-	// --leave-running=false returns: sandboxd has stopped and retired the
-	// source instance by then. Every failure past that point must either
-	// roll the source back from the (complete, local) checkpoint directory
-	// or state plainly that the source is gone.
-	sourceFinalized := false
+	// Ownership phases gate the compensation path (F2): rolling the source
+	// back is only safe while nothing has been started on the target. Once
+	// the restore command is in flight the target may be running even if
+	// its response was lost, so a rollback first has to fence the target;
+	// once the target is verified RUNNING it owns the sandbox outright and
+	// the only legal failure mode left is source-cleanup-pending.
+	const (
+		phaseCheckpointing   = iota // checkpoint in flight; outcome unknown on failure
+		phaseSourceOwned            // checkpoint sealed; target untouched; rollback is safe
+		phaseTargetRestoring        // restore issued; target state unknown; fence before rollback
+		phaseTargetOwned            // target verified RUNNING; never roll back
+	)
+	phase := phaseCheckpointing
+	fenceTarget := func(target string) bool {
+		// Idempotent stop+delete plus an absence check: only a confirmed
+		// fence makes a source rollback safe again.
+		run(target, "fence-target", *bin+"/sbox",
+			"--address", "/run/sandboxd/sandboxd.sock", "delete", *sandbox)
+		if out, ok := run(target, "confirm-fenced", *bin+"/sbox",
+			"--address", "/run/sandboxd/sandboxd.sock", "list"); ok &&
+			!listHasSandbox(out, *sandbox) {
+			return true
+		}
+		return false
+	}
+	rollbackSource := func(detail string) string {
+		if _, ok := run(*source, "rollback-restore", *bin+"/checkpoint-restore",
+			"--action", "restore", "--socket", "/run/sandboxd/sandboxd.sock",
+			"--target-id", *sandbox, "--request-file", *ckReq,
+			"--checkpoint-dir", report.Checkpoint); ok {
+			return detail + " (rolled back: source restored and running from local checkpoint)"
+		}
+		return detail + " (ROLLBACK FAILED — source finalized; checkpoint preserved at " +
+			report.Checkpoint + " on source for manual recovery)"
+	}
 	failPastCheckpoint := func(step, detail string) {
-		if sourceFinalized {
-			if _, ok := run(*source, "rollback-restore", *bin+"/checkpoint-restore",
-				"--action", "restore", "--socket", "/run/sandboxd/sandboxd.sock",
-				"--target-id", *sandbox, "--request-file", *ckReq,
-				"--checkpoint-dir", report.Checkpoint); ok {
-				detail += " (rolled back: source restored and running from local checkpoint)"
+		switch phase {
+		case phaseSourceOwned:
+			detail = rollbackSource(detail)
+		case phaseTargetRestoring:
+			// The restore response (or the verify listing) never arrived;
+			// the target may already be running the sandbox. Only a
+			// confirmed fence clears the way for a rollback — otherwise
+			// restoring the source would create dual writers.
+			target := report.Target
+			if target != "" && fenceTarget(target) {
+				detail = rollbackSource(detail)
 			} else {
-				detail += " (ROLLBACK FAILED — source finalized; checkpoint preserved at " +
-					report.Checkpoint + " on source for manual recovery)"
+				detail += " (TARGET OUTCOME UNKNOWN and could not be fenced; rollback skipped to avoid dual writers — resolve the target manually, then restore the source from " +
+					report.Checkpoint + " if needed)"
 			}
+		case phaseTargetOwned:
+			detail += " (target verified RUNNING and owns the sandbox; no rollback — delete the lingering source copy manually to finish cleanup)"
 		}
 		fail(step, detail)
 	}
@@ -130,16 +168,23 @@ func main() {
 	// 2. Checkpoint it. --leave-running=false gives stop-and-copy
 	// semantics: the source freezes at the checkpoint instant, sandboxd
 	// finalizes it after the seal, and no post-checkpoint write can be
-	// lost or double-applied. Failures before this point leave the source
-	// untouched; failures after it trigger rollback-restore below.
+	// lost or double-applied. A failed command does NOT prove the server
+	// never executed it (timeout, lost reply): probe the source before
+	// claiming anything about its state (F2).
 	if _, ok := run(*source, "checkpoint", *bin+"/checkpoint-restore",
 		"--action", "checkpoint", "--socket", "/run/sandboxd/sandboxd.sock",
 		"--request-file", *ckReq, "--sandbox-id", *sandbox,
 		"--checkpoint-dir", report.Checkpoint, "--compress=false",
 		"--leave-running=false"); !ok {
-		fail("checkpoint", "checkpoint failed (source untouched)")
+		if out, ok2 := run(*source, "probe-source", *bin+"/sbox",
+			"--address", "/run/sandboxd/sandboxd.sock", "list"); ok2 &&
+			listHasRunningSandbox(out, *sandbox) {
+			fail("checkpoint", "checkpoint failed; sandbox still RUNNING on source (not executed)")
+		}
+		fail("checkpoint", "checkpoint failed and the sandbox is gone from the source — outcome unknown; the sealed local checkpoint at "+
+			report.Checkpoint+" (if complete) supports a manual rollback-restore")
 	}
-	sourceFinalized = true
+	phase = phaseSourceOwned
 
 	// 3. Publish on the source node (paths are node-local; the executor
 	// runs cn-publish where the checkpoint landed, idempotent either way).
@@ -197,6 +242,10 @@ func main() {
 		"-into", report.Checkpoint, "-id", dirBase(report.Checkpoint), "-store", *storeSpec); !ok {
 		failPastCheckpoint("materialize", "cn-fetch failed on target")
 	}
+	// The restore command is about to be issued: from here a lost or
+	// failed reply does not mean the target stayed down, so compensation
+	// must fence the target before touching the source (F2).
+	phase = phaseTargetRestoring
 	if _, ok := run(placement.NodeID, "restore", *bin+"/checkpoint-restore",
 		"--action", "restore", "--socket", "/run/sandboxd/sandboxd.sock",
 		"--target-id", *sandbox, "--request-file", *ckReq,
@@ -221,6 +270,9 @@ func main() {
 	if !verified {
 		failPastCheckpoint("verify", "target never reported the sandbox running")
 	}
+	// The target is confirmed RUNNING: it owns the sandbox from here on,
+	// and no later failure may resurrect the source (F2).
+	phase = phaseTargetOwned
 
 	// 7. Retire the source copy. With --leave-running=false the source was
 	// already finalized at checkpoint time; the explicit delete is kept as
