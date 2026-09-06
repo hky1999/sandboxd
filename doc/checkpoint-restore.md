@@ -614,3 +614,7 @@ Remote object-store instances share a package-owned HTTP transport. On first use
 ### Experimental UFFD forward population
 
 The standalone `firecracker-uffd-handler` accepts `-copy-kb` (4–256, a multiple of 4). The default remains 4 KiB. Larger values opt into forward population beginning at the faulting page, bounded by the source chunk and guest region; this does not change remote fetch chunk size. Existing guest pages are never overwritten by COPY. A partial COPY resolves only its installed prefix; the handler does not mark the remaining guest range populated. This option is experimental and is not yet exposed through sandboxd runtime configuration. Userfaultfd kernel tests do not replace KVM cross-node acceptance.
+
+### Local backing verification foundation
+
+`checkpointchunks.VerifyMemoryBacking` provides a Linux process-local proof bound to an outer expected digest/mode, the exact memory bytes and file identities. It rejects `.materialized` even when the file is preallocated. Reopening or checking a proof revalidates content: filesystem timestamps can remain unchanged across rapid writes, so metadata alone cannot certify cached contents. Callers must keep artifacts immutable during use; this proof is not a writer lock or a serialized completeness certificate. The tier/adoption and UFFD source-selection paths do not yet consume this proof, so sparse bases remain subject to the existing Full fallback. `checkpointchunks.Verify` also rejects extra trailing bytes beyond the sidecar's declared size.
