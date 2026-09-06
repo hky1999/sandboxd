@@ -30,7 +30,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"sync"
 )
@@ -238,9 +237,20 @@ func validateManifest(manifest *Manifest) error {
 	return nil
 }
 
-// digestPattern is the strict shape of a sha256 hex digest, shared by the
-// chunk store's object-key validation.
-var digestPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
+// validDigest accepts exactly 64 lowercase ASCII hexadecimal bytes.
+// Check bytes rather than runes: non-ASCII and malformed UTF-8 are invalid.
+func validDigest(digest string) bool {
+	if len(digest) != sha256.Size*2 {
+		return false
+	}
+	for i := 0; i < len(digest); i++ {
+		c := digest[i]
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+			return false
+		}
+	}
+	return true
+}
 
 // zeroChunkDigestCache publishes initialization before hashing, so concurrent
 // cold callers do not each allocate and hash the same all-zero chunk.
