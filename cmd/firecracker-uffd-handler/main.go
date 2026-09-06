@@ -116,9 +116,10 @@ type pageSource struct {
 	verifiedDigests map[chunkContentKey]uint64
 	digestInflight  map[chunkContentKey]chan struct{}
 
-	persistenceMu      sync.Mutex
-	persister          *chunkPersister
-	persistenceStopped bool
+	persistenceMu          sync.Mutex
+	persister              *chunkPersister
+	persistenceStopped     bool
+	persistenceWorkerCount int
 }
 
 // zeroChunkLength recognizes content from its digest, never from sparse file
@@ -694,7 +695,11 @@ func main() {
 	workers := flag.Int("workers", 8, "concurrent UFFDIO_COPY workers")
 	prefetch := flag.Int("prefetch", 4, "background chunk prefetch concurrency (0 = disabled)")
 	prefetchBudgetMB := flag.Int("prefetch-budget-mb", 0, "cap background prefetch to this many MiB (0 = walk the whole artifact)")
+	persistWorkers := flag.Int("persist-workers", persistenceWorkers, "background persistent cache IO workers (1-64)")
 	flag.Parse()
+	if *persistWorkers < 1 || *persistWorkers > 64 {
+		log.Fatal("-persist-workers must be between 1 and 64")
+	}
 	if *sockPath == "" || (*backingPath == "" && *remoteURL == "") {
 		log.Fatal("-sock plus -backing or -remote is required")
 	}
@@ -712,9 +717,10 @@ func main() {
 	// writer (see readCache).
 	chunk := uint64(*chunkKB) << 10
 	source := &pageSource{
-		chunk:    chunk,
-		inflight: make(map[uint64]*sync.WaitGroup),
-		fetched:  make(map[uint64]struct{}),
+		persistenceWorkerCount: *persistWorkers,
+		chunk:                  chunk,
+		inflight:               make(map[uint64]*sync.WaitGroup),
+		fetched:                make(map[uint64]struct{}),
 	}
 	if *remoteURL != "" {
 		cacheFile, err := os.OpenFile(*cachePath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o600)

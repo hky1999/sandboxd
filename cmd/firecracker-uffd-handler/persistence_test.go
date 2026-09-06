@@ -28,13 +28,19 @@ import (
 )
 
 func TestPersistenceBoundsIOWithoutDroppingQueuedWork(t *testing.T) {
+	for _, workers := range []int{1, 4, 16, 64} {
+		t.Run(fmt.Sprint(workers), func(t *testing.T) { testPersistenceBoundsIO(t, workers) })
+	}
+}
+
+func testPersistenceBoundsIO(t *testing.T, workers int) {
 	const count = 512
 	gate := make(chan struct{})
 	var release sync.Once
 	entered := make(chan struct{}, count)
 	finished := make(chan struct{}, count)
 	var active, maxActive atomic.Int64
-	p := newChunkPersister(count, func(job persistRef) error {
+	p := newChunkPersister(count, workers, func(job persistRef) error {
 		n := active.Add(1)
 		for old := maxActive.Load(); n > old; old = maxActive.Load() {
 			if maxActive.CompareAndSwap(old, n) {
@@ -66,14 +72,14 @@ func TestPersistenceBoundsIOWithoutDroppingQueuedWork(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("submission blocked on IO")
 	}
-	for i := 0; i < persistenceWorkers; i++ {
+	for i := 0; i < workers; i++ {
 		select {
 		case <-entered:
 		case <-time.After(2 * time.Second):
 			t.Fatal("workers not started")
 		}
 	}
-	if got := active.Load(); got != persistenceWorkers {
+	if got := active.Load(); got != int64(workers) {
 		t.Fatalf("active=%d", got)
 	}
 	release.Do(func() { close(gate) })
@@ -84,7 +90,7 @@ func TestPersistenceBoundsIOWithoutDroppingQueuedWork(t *testing.T) {
 			t.Fatal("queued warm-cache work lost")
 		}
 	}
-	if got := maxActive.Load(); got > persistenceWorkers {
+	if got := maxActive.Load(); got > int64(workers) {
 		t.Fatalf("IO concurrency %d exceeds budget", got)
 	}
 }
@@ -94,7 +100,7 @@ func TestPersistenceShutdownDropsOnlyUnstartedWork(t *testing.T) {
 	var release sync.Once
 	entered := make(chan struct{}, 128)
 	var writes atomic.Int64
-	p := newChunkPersister(128, func(job persistRef) error { writes.Add(1); entered <- struct{}{}; <-gate; return nil })
+	p := newChunkPersister(128, persistenceWorkers, func(job persistRef) error { writes.Add(1); entered <- struct{}{}; <-gate; return nil })
 	t.Cleanup(func() { release.Do(func() { close(gate) }); p.stop(); p.wg.Wait() })
 	for i := 0; i < 100; i++ {
 		if !p.enqueue(persistRef{digest: fmt.Sprintf("%064x", i)}) {
