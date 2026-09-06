@@ -18,6 +18,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -124,4 +125,59 @@ func BenchmarkScanFileChunks(b *testing.B) {
 	}
 	b.StopTimer()
 	b.Logf("root=%s", root)
+}
+
+func TestIsAllZeroPositions(t *testing.T) {
+	for n := 0; n <= 129; n++ {
+		data := make([]byte, n)
+		if !isAllZero(data) {
+			t.Fatalf("zero length %d", n)
+		}
+		for i := range data {
+			data[i] = 0x80
+			if isAllZero(data) {
+				t.Fatalf("missed nonzero at %d of %d", i, n)
+			}
+			data[i] = 0
+		}
+	}
+	for _, n := range []int{32767, 32768, 32769, 65536, 262144, 262147} {
+		data := make([]byte, n)
+		if !isAllZero(data) {
+			t.Fatalf("zero length %d", n)
+		}
+		for _, i := range []int{0, 31, 32, 32766, 32767, 32768, n - 1} {
+			if i >= n {
+				continue
+			}
+			data[i] = 1
+			if isAllZero(data) {
+				t.Fatalf("missed nonzero at %d of %d", i, n)
+			}
+			data[i] = 0
+		}
+	}
+}
+
+var zeroBenchmarkResult bool
+
+func BenchmarkIsAllZero(b *testing.B) {
+	for _, n := range []int{4096, 262144} {
+		for _, pos := range []string{"zero", "first", "last"} {
+			b.Run(fmt.Sprintf("%d/%s", n, pos), func(b *testing.B) {
+				data := make([]byte, n)
+				if pos == "first" {
+					data[0] = 1
+				}
+				if pos == "last" {
+					data[n-1] = 1
+				}
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					zeroBenchmarkResult = isAllZero(data)
+				}
+			})
+		}
+	}
 }
