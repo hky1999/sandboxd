@@ -82,12 +82,18 @@ func (r *Remote) ReadKeyRange(ctx context.Context, key string, span ObjectRange)
 	if resp.ContentLength >= 0 && resp.ContentLength != span.Length {
 		return nil, fmt.Errorf("range GET %s: Content-Length %d, want %d", key, resp.ContentLength, span.Length)
 	}
-	data, err := io.ReadAll(io.LimitReader(resp.Body, span.Length+1))
-	if err != nil {
+	// The validated size is known: avoid ReadAll's repeated growth and
+	// copying on each page-fault fetch, while still rejecting extra bytes.
+	data := make([]byte, span.Length)
+	if _, err := io.ReadFull(resp.Body, data); err != nil {
 		return nil, fmt.Errorf("range GET %s: %w", key, err)
 	}
-	if int64(len(data)) != span.Length {
-		return nil, fmt.Errorf("range GET %s: body length %d, want %d", key, len(data), span.Length)
+	var extra [1]byte
+	if n, err := io.ReadFull(resp.Body, extra[:]); n != 0 || err != io.EOF {
+		if err != nil {
+			return nil, fmt.Errorf("range GET %s trailing body: %w", key, err)
+		}
+		return nil, fmt.Errorf("range GET %s: body exceeds expected length %d", key, span.Length)
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
