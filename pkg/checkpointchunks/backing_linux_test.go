@@ -278,3 +278,60 @@ func TestBackingProofCheckPreservesOffset(t *testing.T) {
 		t.Fatalf("check moved descriptor offset: %d %v", off, err)
 	}
 }
+
+func TestBackingProofZeroDigestRequiresZeroBytes(t *testing.T) {
+	for _, off := range []int64{0, 4095, 8192, 12287} {
+		dir, m := backingFixture(t, FileDigestChunks)
+		f, err := os.OpenFile(filepath.Join(dir, "memory"), os.O_WRONLY, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = f.WriteAt([]byte{1}, off)
+		f.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = VerifyMemoryBacking(context.Background(), dir, m.FileDigest, m.FileDigestMode); err == nil {
+			t.Fatalf("accepted nonzero byte at %d against zero digest", off)
+		}
+	}
+}
+
+func TestZeroVerificationChecksWholeChunkAndTail(t *testing.T) {
+	for _, off := range []int64{0, 32 << 10, DefaultChunkBytes - 1, DefaultChunkBytes + 2} {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "memory")
+		f, err := os.Create(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err = f.Truncate(DefaultChunkBytes + 3); err != nil {
+			t.Fatal(err)
+		}
+		f.Close()
+		m, err := Compute(context.Background(), dir, DefaultChunkBytes)
+		if err != nil {
+			t.Fatal(err)
+		}
+		m.FileDigestMode = FileDigestChunks
+		m.FileDigest = RootDigest(m.Entries)
+		if err = Write(dir, m); err != nil {
+			t.Fatal(err)
+		}
+		if err = Verify(context.Background(), dir); err != nil {
+			t.Fatal(err)
+		}
+		f, err = os.OpenFile(path, os.O_WRONLY, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = f.WriteAt([]byte{1}, off)
+		f.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if Verify(context.Background(), dir) == nil {
+			t.Fatalf("zero verification missed corrupt byte at %d", off)
+		}
+	}
+}
