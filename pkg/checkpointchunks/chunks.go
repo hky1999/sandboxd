@@ -242,20 +242,37 @@ func validateManifest(manifest *Manifest) error {
 // chunk store's object-key validation.
 var digestPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
-// zeroChunkDigestCache memoizes sha256(n zero bytes) per length.
+// zeroChunkDigestCache publishes initialization before hashing, so concurrent
+// cold callers do not each allocate and hash the same all-zero chunk.
 var zeroChunkDigestCache sync.Map
 
-// ZeroChunkDigest returns the sha256 of n zero bytes. An all-zero chunk of
-// a known length has a constant digest, so publishers and materializers can
-// recognize (and synthesize or skip) zero chunks without hashing them.
+type zeroChunkDigestEntry struct {
+	once   sync.Once
+	digest string
+}
+
+// ZeroChunkDigest returns the sha256 of n zero bytes. Initialization uses a
+// fixed scratch buffer; the hot path retains only one digest per length.
 func ZeroChunkDigest(n int) string {
-	if d, ok := zeroChunkDigestCache.Load(n); ok {
-		return d.(string)
+	if n < 0 {
+		panic("negative zero chunk length")
 	}
-	sum := sha256.Sum256(make([]byte, n))
-	d := hex.EncodeToString(sum[:])
-	zeroChunkDigestCache.Store(n, d)
-	return d
+	value, ok := zeroChunkDigestCache.Load(n)
+	if !ok {
+		value, _ = zeroChunkDigestCache.LoadOrStore(n, &zeroChunkDigestEntry{})
+	}
+	entry := value.(*zeroChunkDigestEntry)
+	entry.once.Do(func() {
+		var block [32 << 10]byte
+		hash := sha256.New()
+		for left := n; left > 0; {
+			count := min(left, len(block))
+			hash.Write(block[:count])
+			left -= count
+		}
+		entry.digest = hex.EncodeToString(hash.Sum(nil))
+	})
+	return entry.digest
 }
 
 // Verify re-hashes the memory file chunk by chunk against the manifest.
