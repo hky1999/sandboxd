@@ -44,6 +44,8 @@ func main() {
 	checkpointDir := flag.String("checkpoint-dir", "", "checkpoint directory to publish")
 	storePath := flag.String("store", "", "chunk store path (directory backend)")
 	status := flag.Bool("status", false, "print the persisted publish state and exit")
+	packMiB := flag.Int("pack-mib", 0, "pack memory into 1-8MiB objects (0 disables; candidate 4)")
+	baseID := flag.String("base-id", "", "verified published baseline in the same store for pack reuse")
 	workers := flag.Int("workers", 0, "memory upload concurrency (1-64; 0 = at most 8 GOMAXPROCS workers)")
 	timeout := flag.Duration("timeout", 10*time.Minute, "overall deadline")
 	flag.Usage = func() {
@@ -51,6 +53,14 @@ func main() {
 		flag.PrintDefaults()
 	}
 	flag.Parse()
+	if *packMiB < 0 || *packMiB > 8 {
+		fmt.Fprintln(os.Stderr, "error: -pack-mib must be between 0 and 8")
+		os.Exit(2)
+	}
+	if *baseID != "" && *packMiB == 0 {
+		fmt.Fprintln(os.Stderr, "error: -base-id requires -pack-mib")
+		os.Exit(2)
+	}
 	if *workers < 0 || *workers > 64 {
 		fmt.Fprintln(os.Stderr, "error: -workers must be between 0 and 64")
 		os.Exit(2)
@@ -86,12 +96,15 @@ func main() {
 	defer cancel()
 
 	start := time.Now()
-	result, err := checkpointpublish.RunWithOptions(ctx, *checkpointDir, id, store, *storePath, checkpointpublish.Options{Workers: *workers})
+	result, err := checkpointpublish.RunWithOptions(ctx, *checkpointDir, id, store, *storePath, checkpointpublish.Options{Workers: *workers, PackBytes: *packMiB << 20, BaseID: *baseID})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "publish failed (state persisted, retry resumes): %v\n", err)
 		encoded, _ := json.MarshalIndent(result.State, "", "  ")
 		fmt.Fprintln(os.Stderr, string(encoded))
 		os.Exit(1)
+	}
+	if *packMiB > 0 {
+		fmt.Printf("packs: %d uploaded, %d reused\n", result.PacksPut, result.PacksSkip)
 	}
 	fmt.Printf("published %s: %d/%d chunks (%d put, %d skipped), artifact_set=%v workers=%d in %s\n",
 		id, result.State.ChunksPut, result.State.ChunksTotal,
