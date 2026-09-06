@@ -45,7 +45,7 @@ func PackKey(digest string) string { return "memory-packs/" + digest }
 
 // Key validates the namespace and digest, including for callers without a manifest.
 func (r PackReference) Key() (string, error) {
-	if !digestPattern.MatchString(r.Digest) {
+	if !validDigest(r.Digest) {
 		return "", fmt.Errorf("invalid pack digest %q", r.Digest)
 	}
 	switch r.Identity {
@@ -78,7 +78,7 @@ func PackRootDigest(parts []PackPart) (string, error) {
 	h.Write(word[:])
 	var total int64
 	for _, p := range parts {
-		if p.Length <= 0 || p.Length > MaxPackBytes-total || !digestPattern.MatchString(p.Digest) {
+		if p.Length <= 0 || p.Length > MaxPackBytes-total || !validDigest(p.Digest) {
 			return "", fmt.Errorf("invalid pack part")
 		}
 		total += p.Length
@@ -135,14 +135,19 @@ func ValidateTransport(m *Manifest) error {
 		return err
 	}
 	for i, c := range m.Entries {
-		if !digestPattern.MatchString(c.Digest) {
+		// Only reuse a preceding digest after it has passed validation.
+		// Sparse overlays commonly repeat the same zero-chunk digest.
+		if i > 0 && c.Digest == m.Entries[i-1].Digest {
+			continue
+		}
+		if !validDigest(c.Digest) {
 			return fmt.Errorf("chunk manifest entry %d has invalid digest %q", i, c.Digest)
 		}
 	}
 	if m.Version == 1 {
 		return nil
 	}
-	if !digestPattern.MatchString(m.FileDigest) {
+	if !validDigest(m.FileDigest) {
 		return fmt.Errorf("packed manifest has invalid file digest")
 	}
 	switch m.FileDigestMode {
