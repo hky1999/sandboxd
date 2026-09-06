@@ -15,6 +15,9 @@
 package checkpointchunks
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -23,11 +26,14 @@ import (
 )
 
 const PackedVersion = 2
+const RootPackedVersion = 3
+const PackIdentityChunks = "chunks-v1"
 const MaxPackBytes = 8 << 20
 
 // PackReference locates a chunk inside a content-addressed immutable pack.
 // The chunk digest remains the cache identity and must be verified after reading.
 type PackReference struct {
+	Identity   string `json:"identity,omitempty"`
 	Digest     string `json:"digest"`
 	Offset     int64  `json:"offset"`
 	Length     int64  `json:"length"`
@@ -37,8 +43,58 @@ type PackReference struct {
 // PackKey is used only after the digest has passed manifest validation.
 func PackKey(digest string) string { return "memory-packs/" + digest }
 
+// Key validates the namespace and digest, including for callers without a manifest.
+func (r PackReference) Key() (string, error) {
+	if !digestPattern.MatchString(r.Digest) {
+		return "", fmt.Errorf("invalid pack digest %q", r.Digest)
+	}
+	switch r.Identity {
+	case "":
+		return PackKey(r.Digest), nil
+	case PackIdentityChunks:
+		return "memory-chunk-packs-v1/" + r.Digest, nil
+	default:
+		return "", fmt.Errorf("unsupported pack identity %q", r.Identity)
+	}
+}
+
+// PackPart describes one verified payload segment in its exact object order.
+type PackPart struct {
+	Digest string
+	Length int64
+}
+
+// PackRootDigest hashes a domain-separated, fixed-width sequence. Callers must
+// verify each payload segment against its digest before publishing the object.
+// It does not compute or assert the SHA256 of the concatenated payload.
+func PackRootDigest(parts []PackPart) (string, error) {
+	if len(parts) == 0 || len(parts) > MaxPackBytes {
+		return "", fmt.Errorf("invalid pack part count")
+	}
+	h := sha256.New()
+	h.Write([]byte("akernel.memory-chunk-pack\x00v1\x00"))
+	var word [8]byte
+	binary.BigEndian.PutUint64(word[:], uint64(len(parts)))
+	h.Write(word[:])
+	var total int64
+	for _, p := range parts {
+		if p.Length <= 0 || p.Length > MaxPackBytes-total || !digestPattern.MatchString(p.Digest) {
+			return "", fmt.Errorf("invalid pack part")
+		}
+		total += p.Length
+		digest, err := hex.DecodeString(p.Digest)
+		if err != nil {
+			return "", err
+		}
+		binary.BigEndian.PutUint64(word[:], uint64(p.Length))
+		h.Write(word[:])
+		h.Write(digest)
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
 // LoadTransport is for consumers that implement both CAS and packed reads.
-// Load and LoadNamed deliberately continue to reject version 2.
+// Load and LoadNamed deliberately continue to reject transport versions 2 and 3.
 func LoadTransport(dir string) (*Manifest, error) {
 	raw, err := os.ReadFile(filepath.Join(dir, ManifestName))
 	if err != nil {
@@ -54,7 +110,7 @@ func decodeManifest(raw []byte, packed bool) (*Manifest, error) {
 	if err := json.Unmarshal(raw, &m); err != nil {
 		return nil, fmt.Errorf("decode chunk manifest: %w", err)
 	}
-	if m.Version != 1 && (!packed || m.Version != PackedVersion) {
+	if m.Version != 1 && (!packed || (m.Version != PackedVersion && m.Version != RootPackedVersion)) {
 		return nil, fmt.Errorf("unsupported chunk manifest version %d", m.Version)
 	}
 	if err := ValidateTransport(&m); err != nil {
@@ -66,13 +122,13 @@ func decodeManifest(raw []byte, packed bool) (*Manifest, error) {
 // ValidateTransport checks logical identity and transport references before
 // they can reach an object store. Version 1 never carries packed references.
 func ValidateTransport(m *Manifest) error {
-	if m.Version != 1 && m.Version != PackedVersion {
+	if m.Version != 1 && m.Version != PackedVersion && m.Version != RootPackedVersion {
 		return fmt.Errorf("unsupported chunk manifest version %d", m.Version)
 	}
 	if m.Version == 1 && len(m.Packs) > 0 {
 		return fmt.Errorf("version 1 manifest cannot reference packs")
 	}
-	if m.Version == PackedVersion && (m.File != "memory" || m.ChunkBytes <= 0 || m.ChunkBytes > MaxPackBytes) {
+	if m.Version != 1 && (m.File != "memory" || m.ChunkBytes <= 0 || m.ChunkBytes > MaxPackBytes) {
 		return fmt.Errorf("packed manifest requires memory and chunk_bytes in [1,%d]", MaxPackBytes)
 	}
 	if err := validateManifest(m); err != nil {
@@ -112,13 +168,17 @@ func ValidateTransport(m *Manifest) error {
 		if !ok {
 			return fmt.Errorf("pack reference for absent chunk %s", digest)
 		}
-		if !digestPattern.MatchString(r.Digest) {
-			return fmt.Errorf("invalid pack digest %q", r.Digest)
+		key, err := r.Key()
+		if err != nil {
+			return err
+		}
+		if m.Version == PackedVersion && r.Identity != "" {
+			return fmt.Errorf("version 2 cannot use pack identity %q", r.Identity)
 		}
 		if r.Length != length || r.Offset < 0 || r.ObjectSize <= 0 || r.ObjectSize > MaxPackBytes || r.Offset > r.ObjectSize || r.Length > r.ObjectSize-r.Offset {
 			return fmt.Errorf("invalid pack range for chunk %s", digest)
 		}
-		byPack[r.Digest] = append(byPack[r.Digest], r)
+		byPack[key] = append(byPack[key], r)
 	}
 	for digest, refs := range byPack {
 		sort.Slice(refs, func(i, j int) bool { return refs[i].Offset < refs[j].Offset })

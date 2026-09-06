@@ -202,6 +202,9 @@ func runPacked(ctx context.Context, dir, id string, store chunkstore.Store, m *c
 	}
 	transport := *m
 	transport.Version = checkpointchunks.PackedVersion
+	if opts.PackIdentity == checkpointchunks.PackIdentityChunks {
+		transport.Version = checkpointchunks.RootPackedVersion
+	}
 	transport.Packs = make(map[string]checkpointchunks.PackReference)
 	if err := checkpointchunks.ValidateTransport(&transport); err != nil {
 		return fail(err)
@@ -246,7 +249,11 @@ func runPacked(ctx context.Context, dir, id string, store chunkstore.Store, m *c
 				if ref.Length != min(int64(m.ChunkBytes), m.FileSize-c.Offset) {
 					return fail(fmt.Errorf("baseline chunk length differs"))
 				}
-				parentPacks[ref.Digest] = false
+				key, err := ref.Key()
+				if err != nil {
+					return fail(err)
+				}
+				parentPacks[key] = false
 			}
 		}
 		keys := []string{}
@@ -256,7 +263,7 @@ func runPacked(ctx context.Context, dir, id string, store chunkstore.Store, m *c
 		present := make([]bool, len(keys))
 		err = parallelPackWork(ctx, len(keys), result.Workers, func(ctx context.Context, i int) error {
 			var err error
-			present[i], err = keyed.HasKey(ctx, checkpointchunks.PackKey(keys[i]))
+			present[i], err = keyed.HasKey(ctx, keys[i])
 			return err
 		})
 		if err != nil {
@@ -278,7 +285,13 @@ func runPacked(ctx context.Context, dir, id string, store chunkstore.Store, m *c
 		reuse := false
 		if base != nil {
 			ref, reuse = base.Packs[c.Digest]
-			reuse = reuse && parentPacks[ref.Digest]
+			if reuse {
+				key, err := ref.Key()
+				if err != nil {
+					return err
+				}
+				reuse = parentPacks[key]
+			}
 		}
 		present := c.Digest == checkpointchunks.ZeroChunkDigest(int(length))
 		if !present && !reuse {
@@ -293,6 +306,9 @@ func runPacked(ctx context.Context, dir, id string, store chunkstore.Store, m *c
 			result.ChunksSkip++
 			if reuse {
 				transport.Packs[c.Digest] = ref
+				if ref.Identity != "" {
+					transport.Version = checkpointchunks.RootPackedVersion
+				}
 			}
 			mu.Unlock()
 		} else {
@@ -332,6 +348,10 @@ func runPacked(ctx context.Context, dir, id string, store chunkstore.Store, m *c
 		job := jobs[i]
 		buf := make([]byte, job.size)
 		offset := 0
+		var parts []checkpointchunks.PackPart
+		if opts.PackIdentity == checkpointchunks.PackIdentityChunks {
+			parts = make([]checkpointchunks.PackPart, 0, len(job.chunks))
+		}
 		for _, c := range job.chunks {
 			n := int(min(int64(m.ChunkBytes), m.FileSize-c.Offset))
 			part := buf[offset : offset+n]
@@ -342,11 +362,26 @@ func runPacked(ctx context.Context, dir, id string, store chunkstore.Store, m *c
 			if hex.EncodeToString(sum[:]) != c.Digest {
 				return fmt.Errorf("source chunk %s changed before pack publication", c.Digest)
 			}
+			if opts.PackIdentity == checkpointchunks.PackIdentityChunks {
+				parts = append(parts, checkpointchunks.PackPart{Digest: c.Digest, Length: int64(n)})
+			}
 			offset += n
 		}
-		sum := sha256.Sum256(buf)
-		digest := hex.EncodeToString(sum[:])
-		key := checkpointchunks.PackKey(digest)
+		var digest string
+		if opts.PackIdentity == checkpointchunks.PackIdentityChunks {
+			var err error
+			digest, err = checkpointchunks.PackRootDigest(parts)
+			if err != nil {
+				return err
+			}
+		} else {
+			sum := sha256.Sum256(buf)
+			digest = hex.EncodeToString(sum[:])
+		}
+		key, err := (checkpointchunks.PackReference{Identity: opts.PackIdentity, Digest: digest}).Key()
+		if err != nil {
+			return err
+		}
 		buildTime := time.Since(buildStart)
 		uploadStart := time.Now()
 		present, err := keyed.HasKey(ctx, key)
@@ -373,7 +408,7 @@ func runPacked(ctx context.Context, dir, id string, store chunkstore.Store, m *c
 		offset = 0
 		for _, c := range job.chunks {
 			n := min(int64(m.ChunkBytes), m.FileSize-c.Offset)
-			transport.Packs[c.Digest] = checkpointchunks.PackReference{Digest: digest, Offset: int64(offset), Length: n, ObjectSize: int64(job.size)}
+			transport.Packs[c.Digest] = checkpointchunks.PackReference{Identity: opts.PackIdentity, Digest: digest, Offset: int64(offset), Length: n, ObjectSize: int64(job.size)}
 			offset += int(n)
 		}
 		return nil
