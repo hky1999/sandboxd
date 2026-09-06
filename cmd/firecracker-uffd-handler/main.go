@@ -727,8 +727,8 @@ var storeHTTPClient = &http.Client{
 // the blind-materialization marker naming the memory file as a remote
 // placeholder.
 func materializedMarkerPresent(dir string) bool {
-	_, err := os.Stat(filepath.Join(dir, ".materialized"))
-	return err == nil
+	_, err := os.Lstat(filepath.Join(dir, ".materialized"))
+	return !os.IsNotExist(err)
 }
 
 func main() {
@@ -792,36 +792,18 @@ func main() {
 		}}
 		// Cache writes go through fetchChunk which serializes via inflight.
 	} else if *chunkStorePath != "" {
-		// Chunk mode picks the source by artifact shape, not by manifest
-		// presence alone:
-		//
-		//   - complete local image  -> serve the backing file directly; the
-		//     chunk store is a distribution channel, not a dependency, and a
-		//     store outage must not block restoring artifacts this node
-		//     already holds in full (fail-open to local).
-		//   - sparse placeholder    -> real bytes live in the store; serve
-		//     chunks (persistent cache first, remote on miss).
-		//   - broken manifest + complete image -> serve the bytes we have.
-		//   - broken manifest + sparse placeholder -> refuse: serving the
-		//     backing would feed zeros for every unfetched chunk, which is
-		//     silent memory corruption rather than a failure.
-		// F3: the explicit artifact representation decides, with block
-		// allocation only as a secondary signal. A .materialized marker
-		// means the memory file is a remote placeholder even when its
-		// allocation looks complete (an fallocate or full-copy spoof
-		// produces blocks>=size without real content); only an unmarked,
-		// fully-allocated file counts as a complete local image.
-		backingComplete := fileFullyAllocated(*backingPath) && !materializedMarkerPresent(filepath.Dir(*backingPath))
-		manifest, err := checkpointchunks.LoadTransport(filepath.Dir(*backingPath))
-		switch {
-		case err == nil && backingComplete:
-			file, ferr := os.Open(*backingPath)
-			if ferr != nil {
-				log.Fatalf("open backing file: %v", ferr)
+		local, err := openLocalMemoryBacking(sourceCtx, *backingPath)
+		if err != nil {
+			log.Fatalf("verify local backing: %v", err)
+		}
+		if local != nil {
+			source.file = local
+			log.Printf("complete local memory image; serving backing file directly")
+		} else {
+			manifest, err := checkpointchunks.LoadTransport(filepath.Dir(*backingPath))
+			if err != nil {
+				log.Fatalf("remote placeholder manifest unusable: %v", err)
 			}
-			source.file = file
-			log.Printf("complete local memory image; serving backing file directly (chunk store not on the critical path)")
-		case err == nil:
 			cacheFile, cerr := os.OpenFile(*cachePath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o600)
 			if cerr != nil {
 				log.Fatalf("open cache file %s: %v", *cachePath, cerr)
@@ -837,21 +819,14 @@ func main() {
 				source.chunk = uint64(manifest.ChunkBytes)
 			}
 			log.Printf("chunk source: %d chunks from store %s", manifest.ChunkCount, *chunkStorePath)
-		case backingComplete:
-			log.Printf("no usable chunk manifest next to %s (%v); backing image is complete, serving it", *backingPath, err)
-			file, ferr := os.Open(*backingPath)
-			if ferr != nil {
-				log.Fatalf("open backing file: %v", ferr)
-			}
-			source.file = file
-		default:
-			log.Fatalf("chunk manifest unusable (%v) and backing %s is a sparse placeholder; refusing to serve zeros — repair the manifest or re-materialize the artifact",
-				err, *backingPath)
 		}
 	} else {
-		file, err := os.Open(*backingPath)
+		file, err := openLocalMemoryBacking(sourceCtx, *backingPath)
 		if err != nil {
-			log.Fatalf("open backing file: %v", err)
+			log.Fatalf("verify local backing: %v", err)
+		}
+		if file == nil {
+			log.Fatal("remote placeholder requires a chunk store")
 		}
 		source.file = file
 	}
