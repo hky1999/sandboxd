@@ -311,6 +311,11 @@ func Verify(ctx context.Context, dir string) error {
 // verifyContents consumes exactly the manifest's logical bytes. Callers must
 // check the backing's exact size and, for reusable proofs, its stable identity.
 func verifyContents(ctx context.Context, reader io.Reader, manifest *Manifest) error {
+	if manifest.FileDigestMode == FileDigestChunks {
+		if workers := parallelVerificationWorkers(manifest); workers > 1 {
+			return verifyContentsParallel(ctx, reader, manifest, workers)
+		}
+	}
 	buf := make([]byte, manifest.ChunkBytes)
 	fileHash := sha256.New()
 	for i, chunk := range manifest.Entries {
