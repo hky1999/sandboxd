@@ -450,7 +450,11 @@ func (s *faultServer) fetchChunkFromStore(chunkIdx uint64) error {
 			}
 			ctx, cancel := context.WithTimeout(parent, 60*time.Second)
 			defer cancel()
-			data, err := store.(chunkstore.RangeReader).ReadKeyRange(ctx, checkpointchunks.PackKey(ref.Digest), chunkstore.ObjectRange{Offset: ref.Offset, Length: ref.Length, ObjectSize: ref.ObjectSize})
+			key, err := ref.Key()
+			if err != nil {
+				return err
+			}
+			data, err := store.(chunkstore.RangeReader).ReadKeyRange(ctx, key, chunkstore.ObjectRange{Offset: ref.Offset, Length: ref.Length, ObjectSize: ref.ObjectSize})
 			if err != nil {
 				return fmt.Errorf("fetch packed chunk %s: %w", entry.Digest, err)
 			}

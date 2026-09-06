@@ -74,7 +74,7 @@ func assertPackedBytes(t *testing.T, store *chunkstore.Local, id string, want []
 	if err != nil {
 		t.Fatal(err)
 	}
-	if m.Version != 2 {
+	if m.Version != 2 && m.Version != 3 {
 		t.Fatal("not packed transport")
 	}
 	var got []byte
@@ -84,7 +84,11 @@ func assertPackedBytes(t *testing.T, store *chunkstore.Local, id string, want []
 		if c.Digest == checkpointchunks.ZeroChunkDigest(int(length)) {
 			data = make([]byte, length)
 		} else if r, ok := m.Packs[c.Digest]; ok {
-			data, err = store.ReadKeyRange(ctx, checkpointchunks.PackKey(r.Digest), chunkstore.ObjectRange{Offset: r.Offset, Length: r.Length, ObjectSize: r.ObjectSize})
+			key, keyErr := r.Key()
+			if keyErr != nil {
+				t.Fatal(keyErr)
+			}
+			data, err = store.ReadKeyRange(ctx, key, chunkstore.ObjectRange{Offset: r.Offset, Length: r.Length, ObjectSize: r.ObjectSize})
 		} else {
 			var f io.ReadCloser
 			f, err = store.Get(ctx, c.Digest)
@@ -109,13 +113,18 @@ func assertPackedBytes(t *testing.T, store *chunkstore.Local, id string, want []
 }
 
 func TestPackPublishBaselineRetryAndMissingPack(t *testing.T) {
+	for _, identity := range []string{"", checkpointchunks.PackIdentityChunks} {
+		t.Run("identity="+identity, func(t *testing.T) { packPublishBaselineRetryAndMissingPack(t, identity) })
+	}
+}
+func packPublishBaselineRetryAndMissingPack(t *testing.T, identity string) {
 	ctx := context.Background()
 	data := packData(4, 4096)
 	source := packSource(t, data, 4096)
 	root := t.TempDir()
 	store, _ := chunkstore.NewLocal(root)
 	before, _ := os.ReadFile(filepath.Join(source, "chunks.json"))
-	opts := Options{Workers: 4, PackBytes: 8192}
+	opts := Options{PackIdentity: identity, Workers: 4, PackBytes: 8192}
 	first, err := RunWithOptions(ctx, source, "base", store, "local", opts)
 	if err != nil {
 		t.Fatal(err)
@@ -156,7 +165,10 @@ func TestPackPublishBaselineRetryAndMissingPack(t *testing.T) {
 	assertPackedBytes(t, store, "delta", changed)
 	var missing string
 	for _, ref := range m.Packs {
-		missing = checkpointchunks.PackKey(ref.Digest)
+		missing, err = ref.Key()
+		if err != nil {
+			t.Fatal(err)
+		}
 		break
 	}
 	if err := os.Remove(filepath.Join(root, missing)); err != nil {
@@ -179,19 +191,24 @@ type packFailureStore struct {
 }
 
 func (s *packFailureStore) PutKey(ctx context.Context, key string, r io.Reader) error {
-	if strings.HasPrefix(key, "memory-packs/") && s.calls.Add(1) == 2 && s.fail.Load() {
+	if (strings.HasPrefix(key, "memory-packs/") || strings.HasPrefix(key, "memory-chunk-packs-v1/")) && s.calls.Add(1) == 2 && s.fail.Load() {
 		return errors.New("injected pack failure")
 	}
 	return s.Local.PutKey(ctx, key, r)
 }
 func TestPackFailureBeforeIndexAndResumption(t *testing.T) {
+	for _, identity := range []string{"", checkpointchunks.PackIdentityChunks} {
+		t.Run("identity="+identity, func(t *testing.T) { packFailureBeforeIndexAndResumption(t, identity) })
+	}
+}
+func packFailureBeforeIndexAndResumption(t *testing.T, identity string) {
 	ctx := context.Background()
 	data := packData(6, 4096)
 	source := packSource(t, data, 4096)
 	local, _ := chunkstore.NewLocal(t.TempDir())
 	store := &packFailureStore{Local: local}
 	store.fail.Store(true)
-	opts := Options{Workers: 1, PackBytes: 8192}
+	opts := Options{PackIdentity: identity, Workers: 1, PackBytes: 8192}
 	if _, err := RunWithOptions(ctx, source, "retry", store, "local", opts); err == nil {
 		t.Fatal("failure ignored")
 	}
@@ -254,6 +271,11 @@ func TestPackRejectsBadBaselineAndSource(t *testing.T) {
 	}
 }
 func TestPackMixedCASZeroAndTail(t *testing.T) {
+	for _, identity := range []string{"", checkpointchunks.PackIdentityChunks} {
+		t.Run("identity="+identity, func(t *testing.T) { packMixedCASZeroAndTail(t, identity) })
+	}
+}
+func packMixedCASZeroAndTail(t *testing.T, identity string) {
 	ctx := context.Background()
 	data := append(packData(2, 4096), make([]byte, 4096)...)
 	data = append(data, []byte("short-tail")...)
@@ -263,7 +285,7 @@ func TestPackMixedCASZeroAndTail(t *testing.T) {
 	if err := store.Put(ctx, m.Entries[0].Digest, bytes.NewReader(data[:4096])); err != nil {
 		t.Fatal(err)
 	}
-	result, err := RunWithOptions(ctx, source, "mixed", store, "local", Options{Workers: 4, PackBytes: 8192})
+	result, err := RunWithOptions(ctx, source, "mixed", store, "local", Options{PackIdentity: identity, Workers: 4, PackBytes: 8192})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -337,5 +359,58 @@ func TestPackPayloadConcurrencyBudget(t *testing.T) {
 	}
 	if peak != 4 || peakBytes > packPayloadBudget {
 		t.Fatalf("budget exceeded: %d workers %d bytes", peak, peakBytes)
+	}
+}
+
+func TestPackMixedIdentityGenerations(t *testing.T) {
+	ctx := context.Background()
+	data := packData(4, 4096)
+	local, _ := chunkstore.NewLocal(t.TempDir())
+	opts := Options{Workers: 4, PackBytes: 8192}
+	if _, err := RunWithOptions(ctx, packSource(t, data, 4096), "old", local, "local", opts); err != nil {
+		t.Fatal(err)
+	}
+	data[0] ^= 7
+	opts.BaseID = "old"
+	opts.PackIdentity = checkpointchunks.PackIdentityChunks
+	if _, err := RunWithOptions(ctx, packSource(t, data, 4096), "root", local, "local", opts); err != nil {
+		t.Fatal(err)
+	}
+	m := assertPackedBytes(t, local, "root", data)
+	modes := map[string]int{}
+	for _, r := range m.Packs {
+		modes[r.Identity]++
+	}
+	if m.Version != 3 || modes[""] != 3 || modes[checkpointchunks.PackIdentityChunks] != 1 {
+		t.Fatalf("not mixed v3: %d %v", m.Version, modes)
+	}
+	// New legacy packs can coexist with inherited root packs, but the envelope
+	// must stay v3 rather than silently giving an old reader unreadable refs.
+	data[4096] ^= 3
+	opts.BaseID = "root"
+	opts.PackIdentity = ""
+	if _, err := RunWithOptions(ctx, packSource(t, data, 4096), "mixed", local, "local", opts); err != nil {
+		t.Fatal(err)
+	}
+	m = assertPackedBytes(t, local, "mixed", data)
+	if m.Version != 3 {
+		t.Fatal("inherited root pack downgraded to v2")
+	}
+}
+
+func TestRootPackRejectsChangedPayload(t *testing.T) {
+	ctx := context.Background()
+	data := packData(2, 4096)
+	dir := packSource(t, data, 4096)
+	data[0] ^= 1
+	if err := os.WriteFile(filepath.Join(dir, "memory"), data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	local, _ := chunkstore.NewLocal(t.TempDir())
+	if _, err := RunWithOptions(ctx, dir, "bad", local, "local", Options{Workers: 1, PackBytes: 8192, PackIdentity: checkpointchunks.PackIdentityChunks}); err == nil {
+		t.Fatal("unverified root pack published")
+	}
+	if ok, err := local.HasKey(ctx, ArtifactKey("bad", IndexName)); err != nil || ok {
+		t.Fatalf("INDEX exists=%v err=%v", ok, err)
 	}
 }

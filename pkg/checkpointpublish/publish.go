@@ -160,14 +160,18 @@ func Run(ctx context.Context, checkpointDir, id string, store chunkstore.Store, 
 // Options bounds memory upload concurrency independently of host CPU count.
 // Zero Workers preserves Run's default (at most eight GOMAXPROCS workers).
 type Options struct {
-	Workers   int
-	PackBytes int    // zero keeps version-1 single-chunk publication
-	BaseID    string // optional verified published baseline in the same store
+	PackIdentity string // empty = legacy whole-pack SHA256; chunks-v1 = versioned chunk root
+	Workers      int
+	PackBytes    int    // zero keeps version-1 single-chunk publication
+	BaseID       string // optional verified published baseline in the same store
 }
 
 // RunWithOptions is Run with an explicit memory-upload concurrency bound.
 // Overlay publication retains its own bounded worker pool.
 func RunWithOptions(ctx context.Context, checkpointDir, id string, store chunkstore.Store, storeName string, opts Options) (Result, error) {
+	if opts.PackIdentity != "" && (opts.PackIdentity != checkpointchunks.PackIdentityChunks || opts.PackBytes == 0) {
+		return Result{}, fmt.Errorf("pack identity requires packing and must be chunks-v1 or empty")
+	}
 	if opts.Workers < 0 || opts.Workers > 64 {
 		return Result{}, fmt.Errorf("publish workers must be between 0 and 64, got %d", opts.Workers)
 	}

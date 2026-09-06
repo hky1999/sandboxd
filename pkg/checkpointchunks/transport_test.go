@@ -23,7 +23,7 @@ import (
 
 func transportFixture() *Manifest {
 	a, b := strings.Repeat("a", 64), strings.Repeat("b", 64)
-	m := &Manifest{Version: 2, File: "memory", FileSize: 10, ChunkBytes: 4, ChunkCount: 3, FileDigestMode: FileDigestChunks, Entries: []Chunk{{0, a}, {4, a}, {8, b}}, Packs: map[string]PackReference{a: {strings.Repeat("c", 64), 2, 4, 10}, b: {strings.Repeat("c", 64), 8, 2, 10}}}
+	m := &Manifest{Version: 2, File: "memory", FileSize: 10, ChunkBytes: 4, ChunkCount: 3, FileDigestMode: FileDigestChunks, Entries: []Chunk{{0, a}, {4, a}, {8, b}}, Packs: map[string]PackReference{a: {Digest: strings.Repeat("c", 64), Offset: 2, Length: 4, ObjectSize: 10}, b: {Digest: strings.Repeat("c", 64), Offset: 8, Length: 2, ObjectSize: 10}}}
 	m.FileDigest = RootDigest(m.Entries)
 	return m
 }
@@ -65,7 +65,7 @@ func TestTransportRoundTripAndLegacyRejection(t *testing.T) {
 }
 func TestTransportRejectsMalformedReferences(t *testing.T) {
 	cases := map[string]func(*Manifest){
-		"version":           func(m *Manifest) { m.Version = 3 },
+		"version":           func(m *Manifest) { m.Version = 4 },
 		"legacy-with-packs": func(m *Manifest) { m.Version = 1 },
 		"wrong-file":        func(m *Manifest) { m.File = "overlay.ext4" },
 		"huge-chunk":        func(m *Manifest) { m.ChunkBytes = math.MaxInt },
@@ -103,5 +103,66 @@ func TestTransportRejectsMalformedReferences(t *testing.T) {
 				t.Fatal("accepted invalid transport")
 			}
 		})
+	}
+}
+
+func TestPackRootCanonicalEncoding(t *testing.T) {
+	a, b := strings.Repeat("a", 64), strings.Repeat("b", 64)
+	parts := []PackPart{{a, 4096}, {b, 3}}
+	got, err := PackRootDigest(parts)
+	// Independently encoded with Python struct.pack('>Q', ...) + bytes.fromhex.
+	const golden = "9e7b5f91b17e29acf13a3e9458c8ae0675ff17039af53edb73ccfa0e6be2b9af"
+	if err != nil || got != golden {
+		t.Fatalf("digest %s: %v", got, err)
+	}
+	for _, other := range [][]PackPart{{{b, 3}, {a, 4096}}, {{a, 4095}, {b, 4}}, {{a, 4099}}, {{a, 4096}, {a, 3}}} {
+		d, e := PackRootDigest(other)
+		if e != nil || d == got {
+			t.Fatalf("sequence not distinguished: %v %s %v", other, d, e)
+		}
+	}
+	for _, bad := range [][]PackPart{nil, {{a, 0}}, {{a, -1}}, {{a, MaxPackBytes + 1}}, {{a, MaxPackBytes}, {b, 1}}, {{"../bad", 1}}, {{strings.Repeat("A", 64), 1}}} {
+		if _, err := PackRootDigest(bad); err == nil {
+			t.Fatalf("accepted %v", bad)
+		}
+	}
+}
+
+func TestRootPackTransportCompatibility(t *testing.T) {
+	m := transportFixture()
+	m.Version = RootPackedVersion
+	first := m.Entries[0].Digest
+	r := m.Packs[first]
+	r.Identity = PackIdentityChunks
+	m.Packs[first] = r
+	// Equal digest strings in different namespaces are distinct objects, even
+	// when ranges overlap or object sizes differ.
+	r = m.Packs[m.Entries[2].Digest]
+	r.Offset = 0
+	r.ObjectSize = 2
+	m.Packs[m.Entries[2].Digest] = r
+	if err := ValidateTransport(m); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := json.Marshal(m)
+	if _, err := DecodeTransport(raw); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := decodeManifest(raw, false); err == nil {
+		t.Fatal("legacy reader accepted v3")
+	}
+	m.Version = PackedVersion
+	if err := ValidateTransport(m); err == nil {
+		t.Fatal("v2 accepted root identity")
+	}
+	m.Version = RootPackedVersion
+	r = m.Packs[first]
+	r.Identity = "unknown"
+	m.Packs[first] = r
+	if err := ValidateTransport(m); err == nil {
+		t.Fatal("accepted unknown namespace")
+	}
+	if _, err := r.Key(); err == nil {
+		t.Fatal("key allowed unknown namespace")
 	}
 }
