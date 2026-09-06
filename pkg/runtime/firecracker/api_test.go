@@ -302,3 +302,46 @@ func (function roundTripperFunc) RoundTrip(
 ) (*http.Response, error) {
 	return function(request)
 }
+
+func TestSparseFullRequestOptIn(t *testing.T) {
+	for _, tc := range []struct {
+		name, typ        string
+		enabled, wantErr bool
+	}{
+		{"legacy-full", "Full", false, false},
+		{"sparse-full", "Full", true, false},
+		{"legacy-delta", "SoftDirty", false, false},
+		{"invalid-delta", "SoftDirty", true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			api := &firecrackerAPI{client: &http.Client{Transport: roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+				calls++
+				defer r.Body.Close()
+				var body map[string]any
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Fatal(err)
+				}
+				value, present := body["sparse_full"]
+				if present != tc.enabled || (present && value != true) {
+					t.Fatalf("unexpected opt-in: %+v", body)
+				}
+				if body["snapshot_type"] != tc.typ || body["deferred_sync"] != true {
+					t.Fatalf("changed snapshot contract: %+v", body)
+				}
+				return &http.Response{StatusCode: http.StatusNoContent, Body: http.NoBody}, nil
+			})}}
+			err := api.createSnapshotWithSparse(context.Background(), "state", "memory", tc.typ, tc.enabled)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("error: %v", err)
+			}
+			want := 1
+			if tc.wantErr {
+				want = 0
+			}
+			if calls != want {
+				t.Fatalf("HTTP calls %d want %d", calls, want)
+			}
+		})
+	}
+}

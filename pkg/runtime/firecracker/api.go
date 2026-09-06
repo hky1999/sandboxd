@@ -127,6 +127,13 @@ func (api *firecrackerAPI) createSnapshot(
 	fsStatePath,
 	snapshotType string,
 ) error {
+	return api.createSnapshotWithSparse(ctx, statePath, memoryPath, snapshotType, false)
+}
+
+func (api *firecrackerAPI) createSnapshotWithSparse(ctx context.Context, statePath, memoryPath, snapshotType string, sparseFull bool) error {
+	if sparseFull && snapshotType != firecrackerSnapshotTypeFull {
+		return fmt.Errorf("sparse_full requires Full")
+	}
 	body := map[string]any{
 		"snapshot_type": snapshotType,
 		"snapshot_path": statePath,
