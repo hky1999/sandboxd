@@ -107,7 +107,22 @@ func OpenVerifiedMemoryBacking(ctx context.Context, dir, expectedDigest, expecte
 	return f, err
 }
 
+// VerifyLocalMemoryContents verifies a complete local file against an expected
+// digest, accepting both ordinary and transport sidecars. It does not return
+// lineage authority: transport metadata never becomes a reusable BackingProof.
+func VerifyLocalMemoryContents(ctx context.Context, dir, expectedDigest, expectedMode string) error {
+	_, f, err := verifyAndOpenMemoryBackingWithLoader(ctx, dir, expectedDigest, expectedMode, LoadTransport)
+	if f != nil {
+		f.Close()
+	}
+	return err
+}
+
 func verifyAndOpenMemoryBacking(ctx context.Context, dir, expectedDigest, expectedMode string) (*BackingProof, *os.File, error) {
+	return verifyAndOpenMemoryBackingWithLoader(ctx, dir, expectedDigest, expectedMode, Load)
+}
+
+func verifyAndOpenMemoryBackingWithLoader(ctx context.Context, dir, expectedDigest, expectedMode string, load func(string) (*Manifest, error)) (*BackingProof, *os.File, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, nil, err
 	}
@@ -129,7 +144,7 @@ func verifyAndOpenMemoryBacking(ctx context.Context, dir, expectedDigest, expect
 	if err != nil {
 		return nil, nil, err
 	}
-	m, err := Load(dir)
+	m, err := load(dir)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -158,7 +173,7 @@ func verifyAndOpenMemoryBacking(ctx context.Context, dir, expectedDigest, expect
 		return nil, nil, fmt.Errorf("memory backing size %d does not match manifest %d", id.size, m.FileSize)
 	}
 	proof := &BackingProof{dir: dir, digest: expectedDigest, mode: expectedMode, memory: id, sidecar: sidecar, verified: true}
-	if err = proof.Check(ctx, f); err != nil {
+	if err = proof.check(ctx, f, load); err != nil {
 		return nil, nil, err
 	}
 	if err = ctx.Err(); err != nil {
@@ -171,6 +186,10 @@ func verifyAndOpenMemoryBacking(ctx context.Context, dir, expectedDigest, expect
 // Check validates the actual opened source fd and its current pathname against
 // the verified identities. Neither the source nor sidecar may have changed.
 func (p *BackingProof) Check(ctx context.Context, f *os.File) error {
+	return p.check(ctx, f, Load)
+}
+
+func (p *BackingProof) check(ctx context.Context, f *os.File, load func(string) (*Manifest, error)) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -199,7 +218,7 @@ func (p *BackingProof) Check(ctx context.Context, f *os.File) error {
 	if id != p.memory || pathID != p.memory || sidecar != p.sidecar {
 		return fmt.Errorf("verified memory backing or sidecar changed")
 	}
-	m, err := Load(p.dir)
+	m, err := load(p.dir)
 	if err != nil {
 		return err
 	}

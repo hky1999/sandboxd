@@ -886,92 +886,28 @@ func (cache *checkpointDigestCache) verifyFirecrackerCheckpointMemoryChunks(
 	ctx context.Context,
 	artifact *firecrackerCheckpointArtifact,
 ) error {
-	scan, err := checkpointchunks.LoadTransport(filepath.Dir(artifact.Files.Memory))
+	if filepath.Base(artifact.Files.Memory) != firecrackerCheckpointMemoryName {
+		return fmt.Errorf("local memory artifact must be named %s", firecrackerCheckpointMemoryName)
+	}
+	dir := filepath.Dir(artifact.Files.Memory)
+	scan, err := checkpointchunks.LoadTransport(dir)
 	if err != nil {
 		return fmt.Errorf("load chunk manifest for memory verification: %w", err)
 	}
 	if scan.FileDigestMode != checkpointchunks.FileDigestChunks {
-		return fmt.Errorf("chunk manifest digest mode %q, want %q",
-			scan.FileDigestMode, checkpointchunks.FileDigestChunks)
+		return fmt.Errorf("chunk manifest digest mode %q, want %q", scan.FileDigestMode, checkpointchunks.FileDigestChunks)
 	}
-	f, err := os.Open(artifact.Files.Memory)
-	if err != nil {
-		return err
+	if scan.FileSize != artifact.Manifest.MemorySize {
+		return fmt.Errorf("memory sidecar size %d does not match checkpoint %d", scan.FileSize, artifact.Manifest.MemorySize)
 	}
-	defer f.Close()
-
-	workers := runtime.GOMAXPROCS(0)
-	if workers > 8 {
-		workers = 8
+	expected := artifact.Manifest.Digests[firecrackerCheckpointMemoryName]
+	if expected == "" {
+		// Preserve legacy optional outer digests, while still requiring the
+		// sidecar's own root to agree with its fully verified logical bytes.
+		expected = scan.FileDigest
 	}
-	type job struct {
-		index int
-		buf   []byte
-	}
-	type result struct {
-		index  int
-		digest string
-		err    error
-	}
-	jobs := make(chan job, workers*2)
-	results := make(chan result, workers*2)
-	var wg sync.WaitGroup
-	for i := 0; i < workers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for j := range jobs {
-				sum := sha256.Sum256(j.buf)
-				results <- result{index: j.index, digest: hex.EncodeToString(sum[:])}
-			}
-		}()
-	}
-	go func() { wg.Wait(); close(results) }()
-	byIndex := make(map[int]result)
-	var collect sync.WaitGroup
-	collect.Add(1)
-	go func() {
-		defer collect.Done()
-		for res := range results {
-			byIndex[res.index] = res
-		}
-	}()
-
-	for i := range scan.Entries {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		want := scan.ChunkBytes
-		if tail := int(scan.FileSize - scan.Entries[i].Offset); tail < want {
-			want = tail
-		}
-		block := make([]byte, want)
-		if _, err := io.ReadFull(io.NewSectionReader(f, scan.Entries[i].Offset, int64(want)), block); err != nil {
-			return fmt.Errorf("read chunk %d: %w", i, err)
-		}
-		jobs <- job{index: i, buf: block}
-	}
-	close(jobs)
-	collect.Wait()
-	for i, entry := range scan.Entries {
-		res, ok := byIndex[i]
-		if !ok {
-			return fmt.Errorf("memory chunk %d was not hashed", i)
-		}
-		if res.err != nil {
-			return res.err
-		}
-		if res.digest != entry.Digest {
-			return fmt.Errorf(
-				"Firecracker checkpoint component memory chunk %d digest mismatch: manifest %s on disk %s",
-				i, entry.Digest, res.digest)
-		}
-	}
-	root := checkpointchunks.RootDigest(scan.Entries)
-	if expected := artifact.Manifest.Digests[firecrackerCheckpointMemoryName]; expected != "" && root != expected {
-		return fmt.Errorf(
-			"Firecracker checkpoint component memory chunk root mismatch: manifest %s on disk %s",
-			expected, root)
+	if err := checkpointchunks.VerifyLocalMemoryContents(ctx, dir, expected, checkpointchunks.FileDigestChunks); err != nil {
+		return fmt.Errorf("verify local Firecracker memory contents: %w", err)
 	}
 	return nil
 }
