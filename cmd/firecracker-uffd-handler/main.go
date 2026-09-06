@@ -73,6 +73,11 @@ type uffdioRangeArg struct {
 	Len   uint64
 }
 
+type chunkContentKey struct {
+	digest string
+	length uint64
+}
+
 // pageSource resolves a chunk of guest memory content: either directly from
 // a local backing file, or through a sparse local cache filled from a remote
 // HTTP range source on miss.
@@ -103,6 +108,13 @@ type pageSource struct {
 	// write, so length cannot distinguish "written" from "hole": only the
 	// bitmap can. Guarded by inflightMu.
 	fetched map[uint64]struct{}
+
+	// Guarded by inflightMu. A verified digest points at an immutable cache
+	// extent; duplicate positions copy it into their own logical offsets.
+	// Payload buffers are not retained here. Include length to distinguish
+	// malformed references and short tails without trusting a digest alone.
+	verifiedDigests map[chunkContentKey]uint64
+	digestInflight  map[chunkContentKey]chan struct{}
 }
 
 // zeroChunkLength recognizes content from its digest, never from sparse file
@@ -338,6 +350,47 @@ func (s *faultServer) fetchChunkFromStore(chunkIdx uint64) error {
 		return nil
 	}
 
+	key := chunkContentKey{digest: entry.Digest, length: length}
+	for {
+		src.inflightMu.Lock()
+		if offset, ok := src.verifiedDigests[key]; ok {
+			src.inflightMu.Unlock()
+			// The source bitmap was published after verification and is never
+			// overwritten. Preserve the destination's logical cache layout.
+			buf := make([]byte, length)
+			if _, err := src.cache.ReadAt(buf, int64(offset)); err != nil {
+				return fmt.Errorf("read verified digest %s from cache: %w", entry.Digest, err)
+			}
+			if _, err := src.cache.WriteAt(buf, int64(start)); err != nil {
+				return fmt.Errorf("copy verified digest %s to chunk %d: %w", entry.Digest, chunkIdx, err)
+			}
+			src.inflightMu.Lock()
+			src.fetched[chunkIdx] = struct{}{}
+			src.inflightMu.Unlock()
+			return nil
+		}
+		if done, ok := src.digestInflight[key]; ok {
+			src.inflightMu.Unlock()
+			<-done
+			// A failed leader leaves no verified extent. Elect a new leader
+			// instead of exposing bytes from an incomplete download.
+			continue
+		}
+		if src.digestInflight == nil {
+			src.digestInflight = make(map[chunkContentKey]chan struct{})
+		}
+		done := make(chan struct{})
+		src.digestInflight[key] = done
+		src.inflightMu.Unlock()
+		defer func() {
+			src.inflightMu.Lock()
+			delete(src.digestInflight, key)
+			close(done)
+			src.inflightMu.Unlock()
+		}()
+		break
+	}
+
 	// F1: download fully into a private buffer; nothing touches the shared
 	// per-sandbox cache until the bytes have passed length + digest
 	// verification. A failed or truncated refetch therefore can never
@@ -466,6 +519,10 @@ func (s *faultServer) fetchChunkFromStore(chunkIdx uint64) error {
 		}()
 	}
 	src.inflightMu.Lock()
+	if src.verifiedDigests == nil {
+		src.verifiedDigests = make(map[chunkContentKey]uint64)
+	}
+	src.verifiedDigests[key] = start
 	src.fetched[chunkIdx] = struct{}{}
 	src.inflightMu.Unlock()
 	log.Printf("DEBUG store chunk=%d digest=%s bytes=%d", chunkIdx, entry.Digest[:12], length)
