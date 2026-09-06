@@ -869,7 +869,7 @@ func (cache *checkpointDigestCache) verifyFirecrackerCheckpointMemoryChunks(
 	ctx context.Context,
 	artifact *firecrackerCheckpointArtifact,
 ) error {
-	scan, err := checkpointchunks.Load(filepath.Dir(artifact.Files.Memory))
+	scan, err := checkpointchunks.LoadTransport(filepath.Dir(artifact.Files.Memory))
 	if err != nil {
 		return fmt.Errorf("load chunk manifest for memory verification: %w", err)
 	}
