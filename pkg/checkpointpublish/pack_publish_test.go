@@ -213,10 +213,13 @@ func TestPackFailureBeforeIndexAndResumption(t *testing.T) {
 	assertPackedBytes(t, local, "retry", data)
 }
 func TestPackRejectsBadBaselineAndSource(t *testing.T) {
-	for _, mode := range []string{"bad-baseline", "changed-source", "placeholder", "missing-baseline"} {
+	for _, mode := range []string{"bad-baseline", "changed-source", "placeholder", "missing-baseline", "empty"} {
 		t.Run(mode, func(t *testing.T) {
 			ctx := context.Background()
 			data := packData(3, 4096)
+			if mode == "empty" {
+				data = nil
+			}
 			source := packSource(t, data, 4096)
 			store, _ := chunkstore.NewLocal(t.TempDir())
 			opts := Options{Workers: 2, PackBytes: 8192}

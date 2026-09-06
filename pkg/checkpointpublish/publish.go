@@ -139,12 +139,13 @@ func writeState(state State) error {
 
 // Result summarizes one Run.
 type Result struct {
-	PacksPut   int   `json:"packs_put,omitempty"`
-	PacksSkip  int   `json:"packs_skip,omitempty"`
-	Workers    int   `json:"workers"` // actual memory upload concurrency
-	State      State `json:"state"`
-	ChunksPut  int   `json:"chunks_put"`  // objects written this run
-	ChunksSkip int   `json:"chunks_skip"` // objects already in the store
+	PackTimings *PackTimings `json:"pack_timings,omitempty"`
+	PacksPut    int          `json:"packs_put,omitempty"`
+	PacksSkip   int          `json:"packs_skip,omitempty"`
+	Workers     int          `json:"workers"` // actual memory upload concurrency
+	State       State        `json:"state"`
+	ChunksPut   int          `json:"chunks_put"`  // unique chunks written this run
+	ChunksSkip  int          `json:"chunks_skip"` // unique chunks reused or synthesized
 }
 
 // Run publishes the checkpoint's memory chunks: it computes (or reuses) the
