@@ -701,6 +701,19 @@ func scanFileChunks(ctx context.Context, path, name string) (*checkpointchunks.M
 }
 
 func digestMemoryWithChunkScan(ctx context.Context, memoryPath, digestMode string) (string, error) {
+	if digestMode == checkpointchunks.FileDigestChunks {
+		// A sealed local file's actual holes read as zero. Use extent queries
+		// to avoid reading those bytes; unsupported filesystems fall back to
+		// ordinary reads. This generates content metadata, not a backing proof.
+		scan, err := scanFileChunks(ctx, memoryPath, "memory")
+		if err != nil {
+			return "", fmt.Errorf("scan Firecracker checkpoint memory: %w", err)
+		}
+		if err := checkpointchunks.Write(filepath.Dir(memoryPath), scan); err != nil {
+			return "", fmt.Errorf("write chunk manifest: %w", err)
+		}
+		return scan.FileDigest, nil
+	}
 	f, err := os.Open(memoryPath)
 	if err != nil {
 		return "", fmt.Errorf("open Firecracker checkpoint memory: %w", err)
