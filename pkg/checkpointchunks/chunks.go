@@ -21,6 +21,7 @@
 package checkpointchunks
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -323,12 +324,19 @@ func verifyContents(ctx context.Context, reader io.Reader, manifest *Manifest) e
 		if int64(n) != expectedChunkLen(manifest, i) {
 			return fmt.Errorf("chunk %d short: %d bytes", i, n)
 		}
-		chunkHash := sha256.New()
-		chunkHash.Write(buf[:n])
+		var got string
+		if chunk.Digest == ZeroChunkDigest(n) && verifiedZeroBytes(buf[:n]) {
+			// The bytes were read and checked, not inferred from sparse allocation.
+			// Reuse the known digest instead of hashing every zero block again.
+			got = chunk.Digest
+		} else {
+			sum := sha256.Sum256(buf[:n])
+			got = hex.EncodeToString(sum[:])
+		}
 		if manifest.FileDigestMode != FileDigestChunks {
 			fileHash.Write(buf[:n])
 		}
-		if got := hex.EncodeToString(chunkHash.Sum(nil)); got != chunk.Digest {
+		if got != chunk.Digest {
 			return fmt.Errorf("chunk %d (offset %d) digest mismatch: manifest %s on disk %s",
 				i, chunk.Offset, chunk.Digest, got)
 		}
@@ -348,6 +356,20 @@ func verifyContents(ctx context.Context, reader io.Reader, manifest *Manifest) e
 		return fmt.Errorf("unknown file digest mode %q", manifest.FileDigestMode)
 	}
 	return nil
+}
+
+// A bounded immutable comparison block avoids allocating a second full chunk.
+var verificationZeroBlock [32 << 10]byte
+
+func verifiedZeroBytes(buf []byte) bool {
+	for len(buf) > 0 {
+		n := min(len(buf), len(verificationZeroBlock))
+		if !bytes.Equal(buf[:n], verificationZeroBlock[:n]) {
+			return false
+		}
+		buf = buf[n:]
+	}
+	return true
 }
 
 func expectedChunkLen(m *Manifest, i int) int64 {

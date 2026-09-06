@@ -15,11 +15,14 @@
 package firecracker
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"syscall"
+
+	"github.com/inclusionAI/sandboxd/pkg/checkpointchunks"
 )
 
 // ioctlFICLONE clones an entire file into the destination file descriptor
@@ -85,10 +88,16 @@ func cloneFileOpts(
 		retErr = errors.Join(retErr, destination.Close())
 	}()
 
+	return cloneFileContents(source, destination)
+}
+
+// cloneFileContents always copies from file offset zero and never reopens the
+// source pathname. Callers own both descriptors and any validity checks.
+func cloneFileContents(source, destination *os.File) (bool, error) {
 	if err := cloneFileIoctl(destination, source); err == nil {
 		return true, nil
 	} else if !isReflinkUnsupported(err) {
-		return false, fmt.Errorf("reflink %s to %s: %w", sourcePath, destinationPath, err)
+		return false, fmt.Errorf("reflink %s to %s: %w", source.Name(), destination.Name(), err)
 	}
 
 	// Filesystem-level reflink unavailable: degrade to a full copy. The
@@ -96,11 +105,52 @@ func cloneFileOpts(
 	if _, err := destination.Seek(0, io.SeekStart); err != nil {
 		return false, fmt.Errorf("rewind reflink fallback destination: %w", err)
 	}
-	if _, err := io.Copy(destination, source); err != nil {
+	info, err := source.Stat()
+	if err != nil {
+		return false, err
+	}
+	// Keep *os.File behind CopyN's LimitedReader so Go can use
+	// copy_file_range where available; SectionReader would force a userspace copy.
+	if _, err := source.Seek(0, io.SeekStart); err != nil {
+		return false, err
+	}
+	if n, err := io.CopyN(destination, source, info.Size()); err != nil || n != info.Size() {
+		if err == nil {
+			err = io.ErrUnexpectedEOF
+		}
 		return false, fmt.Errorf("copy %s to %s after missing reflink support: %w",
-			sourcePath, destinationPath, err)
+			source.Name(), destination.Name(), err)
 	}
 	return false, nil
+}
+
+// cloneVerifiedBackingNoSync uses the exact descriptor returned by a content
+// proof and validates it again after copying. Only a destination created by
+// this call is removed on failure; existing artifacts are never overwritten.
+func cloneVerifiedBackingNoSync(ctx context.Context, proof *checkpointchunks.BackingProof, destinationPath string) (reflinked bool, retErr error) {
+	source, err := proof.Open(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer source.Close()
+	destination, err := os.OpenFile(destinationPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if err != nil {
+		return false, err
+	}
+	defer func() {
+		retErr = errors.Join(retErr, destination.Close())
+		if retErr != nil {
+			retErr = errors.Join(retErr, os.Remove(destinationPath))
+		}
+	}()
+	reflinked, err = cloneFileContents(source, destination)
+	if err != nil {
+		return false, err
+	}
+	if err = proof.Check(ctx, source); err != nil {
+		return false, fmt.Errorf("base changed during clone: %w", err)
+	}
+	return reflinked, nil
 }
 
 // isReflinkUnsupported reports whether the ioctl error means "reflinks are
