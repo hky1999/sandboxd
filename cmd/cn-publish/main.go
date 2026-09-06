@@ -44,6 +44,7 @@ import (
 func main() {
 	checkpointDir := flag.String("checkpoint-dir", "", "checkpoint directory to publish")
 	storePath := flag.String("store", "", "chunk store path (directory backend)")
+	packIdentity := flag.String("pack-identity", "", "pack identity: empty for legacy SHA256, chunks-v1 for versioned chunk root (requires -pack-mib)")
 	cpuProfile := flag.String("cpu-profile", "", "write an optional CPU profile to a new file (diagnostic runs only)")
 	status := flag.Bool("status", false, "print the persisted publish state and exit")
 	packMiB := flag.Int("pack-mib", 0, "pack memory into 1-8MiB objects (0 disables; candidate 4)")
@@ -112,7 +113,7 @@ func main() {
 		stopProfile = func() { pprof.StopCPUProfile(); file.Close() }
 	}
 	start := time.Now()
-	result, err := checkpointpublish.RunWithOptions(ctx, *checkpointDir, id, store, *storePath, checkpointpublish.Options{Workers: *workers, PackBytes: *packMiB << 20, BaseID: *baseID})
+	result, err := checkpointpublish.RunWithOptions(ctx, *checkpointDir, id, store, *storePath, checkpointpublish.Options{PackIdentity: *packIdentity, Workers: *workers, PackBytes: *packMiB << 20, BaseID: *baseID})
 	elapsed := time.Since(start)
 	stopProfile()
 	if err != nil {
