@@ -44,12 +44,17 @@ func main() {
 	checkpointDir := flag.String("checkpoint-dir", "", "checkpoint directory to publish")
 	storePath := flag.String("store", "", "chunk store path (directory backend)")
 	status := flag.Bool("status", false, "print the persisted publish state and exit")
+	workers := flag.Int("workers", 0, "memory upload concurrency (1-64; 0 = at most 8 GOMAXPROCS workers)")
 	timeout := flag.Duration("timeout", 10*time.Minute, "overall deadline")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "usage: cn-publish -checkpoint-dir DIR -store DIR | cn-publish -status -checkpoint-dir DIR\n")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
+	if *workers < 0 || *workers > 64 {
+		fmt.Fprintln(os.Stderr, "error: -workers must be between 0 and 64")
+		os.Exit(2)
+	}
 	if *checkpointDir == "" || (!*status && *storePath == "") {
 		flag.Usage()
 		os.Exit(2)
@@ -81,15 +86,15 @@ func main() {
 	defer cancel()
 
 	start := time.Now()
-	result, err := checkpointpublish.Run(ctx, *checkpointDir, id, store, *storePath)
+	result, err := checkpointpublish.RunWithOptions(ctx, *checkpointDir, id, store, *storePath, checkpointpublish.Options{Workers: *workers})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "publish failed (state persisted, retry resumes): %v\n", err)
 		encoded, _ := json.MarshalIndent(result.State, "", "  ")
 		fmt.Fprintln(os.Stderr, string(encoded))
 		os.Exit(1)
 	}
-	fmt.Printf("published %s: %d/%d chunks (%d put, %d skipped), artifact_set=%v in %s\n",
+	fmt.Printf("published %s: %d/%d chunks (%d put, %d skipped), artifact_set=%v workers=%d in %s\n",
 		id, result.State.ChunksPut, result.State.ChunksTotal,
-		result.ChunksPut, result.ChunksSkip, result.State.ArtifactSet,
+		result.ChunksPut, result.ChunksSkip, result.State.ArtifactSet, result.Workers,
 		time.Since(start).Round(time.Millisecond))
 }
