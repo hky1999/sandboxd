@@ -558,3 +558,7 @@ Sealing an immutable local overlay preserves the SHA-256 of every logical chunk 
 ### Zero memory chunks during remote restore
 
 For chunk-manifest restores, a chunk whose recorded digest equals the SHA-256 of the correctly sized zero buffer is served from locally generated zero bytes. Fault handling allocates only the requested page/span, including short-tail bounds; prefetch does not GET or persist the redundant zero object. Nonzero chunks retain download length and digest checks before becoming readable. Sparse backing allocation is never evidence for this fast path. The fetched bitmap therefore records either verified cache bytes or digest-derived zero content. Plain HTTP Range and complete local backing reads retain their existing behavior.
+
+### Publisher memory-upload concurrency
+
+`cn-publish -workers N` selects 1–64 concurrent memory chunk jobs; `0` preserves the existing default of at most eight GOMAXPROCS workers. Library callers can use `checkpointpublish.RunWithOptions` with `Options.Workers`; `Run` keeps its defaults. Invalid values fail before touching publish state. Each worker processes one unique digest at a time, so this bounds worker buffers and concurrent HEAD/PUT requests; overlay workers remain independently capped at eight and run in their existing artifact phase. The selected memory worker count is included in the result and CLI output. Higher concurrency should be chosen using backend measurements, not assumed to improve throughput.
