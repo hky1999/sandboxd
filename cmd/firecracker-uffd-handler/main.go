@@ -975,39 +975,14 @@ func main() {
 			if workers > int(totalChunks) {
 				workers = int(totalChunks)
 			}
-			queue := make(chan uint64)
-			var pwg sync.WaitGroup
-			for w := 0; w < workers; w++ {
-				pwg.Add(1)
-				go func() {
-					defer pwg.Done()
-					for idx := range queue {
-						select {
-						case <-stop:
-							return
-						default:
-						}
-						if err := s.fetchChunk(idx); err != nil {
-							log.Printf("prefetch chunk %d: %v", idx, err)
-							return
-						}
-					}
-				}()
-			}
 			startT := time.Now()
-			for idx := uint64(0); idx < totalChunks; idx++ {
-				select {
-				case <-stop:
-					close(queue)
-					pwg.Wait()
-					return
-				case queue <- idx:
-				}
+			completed, err := runPrefetch(stop, totalChunks, workers, s.fetchChunk)
+			if err != nil {
+				log.Printf("prefetch stopped after %d/%d chunks: %v", completed, totalChunks, err)
+				return
 			}
-			close(queue)
-			pwg.Wait()
 			log.Printf("prefetch: %d chunks in %.2fs (concurrency %d)",
-				totalChunks, time.Since(startT).Seconds(), workers)
+				completed, time.Since(startT).Seconds(), workers)
 		}()
 	}
 
