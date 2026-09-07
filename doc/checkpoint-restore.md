@@ -480,6 +480,8 @@ wrong bytes.
 rerun only puts objects the store still lacks. Younger `publishing`
 records may belong to a live concurrent publisher and are skipped.
 
+`Run` and `RunWithOptions` acquire a nonblocking local `flock` before reading or changing publication state or issuing store requests. The lock covers memory, packed and overlay publication through the final state write. An overlapping attempt returns `ErrPublishBusy` without changing the active owner's state. The lock is keyed by the canonical checkpoint directory and stored beside its publication state; the file remains after release and must not be unlinked while publishers may use it. Closing the descriptor or process exit releases ownership, including after a crash. `StartedAt` remains a scheduling hint, not proof that an owner is dead. This coordinates cooperating publishers on the same filesystem, not independent checkpoint copies or a distributed object-store lease. Older publishers that do not acquire this lock must not overlap with the new version when relying on this guarantee.
+
 The writable layer ships the same way when its sidecar
 (`overlay.ext4.chunks.json`) exists: overlay chunks live in a global
 content-addressed namespace (`overlay-chunks/<aa>/<sha256>`, no checkpoint
