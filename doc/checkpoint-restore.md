@@ -346,6 +346,10 @@ After a successful checkpoint with `leave_running=false`, the caller still
 deletes the source through the normal sandbox API to release its metadata and
 resources.
 
+Firecracker `Delete` is exit-gated. For a sandbox whose recorded VMM process it can still identify (argv, executable, API socket, and ID all match), sandboxd first asks the guest agent to shut down as a best-effort graceful stop, then stops the process and waits for the kernel's exit notification through a pidfd — not the disappearance of `/proc` identity, which can precede the completion of exit teardown — before it removes the in-memory instance, the persisted state file, the writable layer, and the runtime socket directory. When the recorded PID cannot be identified, it may belong to another process after recycling or its identity may be unavailable while the exit is unconfirmed; sandboxd waits a bounded time for that process to exit on its own and never signals it. If the exit is not confirmed, `Delete` fails and leaves the instance, persisted state, and artifacts in place so the caller can retry.
+
+A `Delete` that finds no in-memory instance and no persisted state still returns success for idempotency, but that legacy nil is an absence observation, not a retirement proof: it does not attest that any persistent generation of the sandbox stopped, and conditional deletion or receipt generation must not treat it as evidence that one did. Full fencing still requires authoritative generation and operation identity (ownership records, idempotency tokens, or an epoch protocol); this exit gate confirms only that the locally recorded process exited, and does not provide that protocol.
+
 On failure, sandboxd returns an error and does not force-delete, stop, or
 resume the source. The caller decides how to handle the source sandbox.
 sandboxd only cleans partial checkpoint output: it removes a leaf directory it

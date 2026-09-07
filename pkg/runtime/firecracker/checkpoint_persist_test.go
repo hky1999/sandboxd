@@ -16,8 +16,9 @@ func TestCheckpointWritebackObservesStoppedPersistedSource(t *testing.T) {
 	for _, live := range []bool{false, true} {
 		t.Run(fmt.Sprintf("live=%v", live), func(t *testing.T) {
 			handler, instance := checkpointPersistenceFixture(t)
-			if live {
-				startCheckpointPersistenceChild(t, handler, instance)
+			command := startCheckpointPersistenceChild(t, handler, instance)
+			if !live {
+				stopCheckpointPersistenceChild(t, command)
 			}
 			before := instance.snapshot()
 			fd := -1
@@ -179,6 +180,28 @@ func startCheckpointPersistenceChild(t *testing.T, handler *Handler, instance *f
 	return command
 }
 
+// stopCheckpointPersistenceChild kills the owned child without reaping it, so
+// its recorded PID remains a zombie whose pidfd reports the completed exit.
+// Kill is asynchronous: the pidfd is opened before it fires and this helper
+// returns only after the kernel exit notification arrives, so callers observe
+// a genuinely exited source. This is the honest "source already gone" fixture:
+// a PID that was never a valid process is an invalid record, not a confirmed
+// exit.
+func stopCheckpointPersistenceChild(t *testing.T, command *exec.Cmd) {
+	t.Helper()
+	fd := checkpointTestPidfd(t, command.Process.Pid)
+	if err := command.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	exited, err := waitProcessExitNotification(fd, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !exited {
+		t.Fatalf("owned child pid %d did not report a kernel exit notification", command.Process.Pid)
+	}
+}
+
 func TestRecoveryDiscardsUnpersistedCheckpointLineage(t *testing.T) {
 	handler, instance := checkpointPersistenceFixture(t)
 	command := startCheckpointPersistenceChild(t, handler, instance)
@@ -247,8 +270,9 @@ func TestCheckpointStopPersistsAlreadyFinishedSource(t *testing.T) {
 		}
 		t.Run(name, func(t *testing.T) {
 			handler, instance := checkpointPersistenceFixture(t)
-			if running {
-				startCheckpointPersistenceChild(t, handler, instance)
+			command := startCheckpointPersistenceChild(t, handler, instance)
+			if !running {
+				stopCheckpointPersistenceChild(t, command)
 			}
 			before := instance.snapshot()
 			if err := handler.persistInstance(instance); err != nil {

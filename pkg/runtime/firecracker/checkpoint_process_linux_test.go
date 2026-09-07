@@ -15,6 +15,7 @@
 package firecracker
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -34,8 +35,17 @@ func checkpointTestPidfd(t *testing.T, pid int) int {
 func checkpointTestExitReady(t *testing.T, fd int) bool {
 	t.Helper()
 	fds := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}}
-	if _, err := unix.Poll(fds, 0); err != nil {
-		t.Fatal(err)
+	for {
+		_, err := unix.Poll(fds, 0)
+		// The Go runtime's preemption signal can interrupt even a zero-timeout
+		// poll; retry instead of failing the observation.
+		if errors.Is(err, unix.EINTR) {
+			continue
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		break
 	}
 	return fds[0].Revents&(unix.POLLIN|unix.POLLHUP) != 0
 }
@@ -83,13 +93,13 @@ func TestCheckpointExitPoll(t *testing.T) {
 	handler, instance := checkpointPersistenceFixture(t)
 	child := startCheckpointPersistenceChild(t, handler, instance)
 	fd := checkpointTestPidfd(t, instance.state.PID)
-	if exited, err := waitCheckpointProcessExit(fd, 10*time.Millisecond); exited || err != nil {
+	if exited, err := waitProcessExitNotification(fd, 10*time.Millisecond); exited || err != nil {
 		t.Fatalf("live process: exited=%v error=%v", exited, err)
 	}
 	if err := child.Process.Kill(); err != nil {
 		t.Fatal(err)
 	}
-	if exited, err := waitCheckpointProcessExit(fd, time.Second); !exited || err != nil {
+	if exited, err := waitProcessExitNotification(fd, time.Second); !exited || err != nil {
 		t.Fatalf("killed process: exited=%v error=%v", exited, err)
 	}
 	invalid, err := unix.Dup(fd)
@@ -97,7 +107,7 @@ func TestCheckpointExitPoll(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = unix.Close(invalid)
-	if exited, err := waitCheckpointProcessExit(invalid, 0); exited || err == nil {
+	if exited, err := waitProcessExitNotification(invalid, 0); exited || err == nil {
 		t.Fatalf("invalid handle: exited=%v error=%v", exited, err)
 	}
 }
