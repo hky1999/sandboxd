@@ -655,6 +655,11 @@ func scanFileChunks(ctx context.Context, path, name string) (*checkpointchunks.M
 		block []byte
 	}
 	jobs := make(chan chunkJob, workers*2)
+	// Each buffer belongs to the producer, a queued job, or one worker.
+	// Return it only after hashing, so reads never overwrite in-flight bytes.
+	// At most 2w queued + w hashing + 1 reading buffers can be live. The
+	// return channel fits all of them, including during cancellation/join.
+	buffers := make(chan []byte, workers*3+1)
 	var wg sync.WaitGroup
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
@@ -663,6 +668,7 @@ func scanFileChunks(ctx context.Context, path, name string) (*checkpointchunks.M
 			for job := range jobs {
 				sum := sha256.Sum256(job.block)
 				scan.Entries[job.index].Digest = hex.EncodeToString(sum[:])
+				buffers <- job.block[:cap(job.block)]
 			}
 		}()
 	}
@@ -671,7 +677,7 @@ func scanFileChunks(ctx context.Context, path, name string) (*checkpointchunks.M
 	finish := func() { finishOnce.Do(func() { close(jobs); wg.Wait() }) }
 	defer finish()
 	extents := chunkExtentReader{f: f}
-	buf := make([]byte, chunkBytes)
+	var buf []byte
 	for i := range scan.Entries {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -686,6 +692,13 @@ func scanFileChunks(ctx context.Context, path, name string) (*checkpointchunks.M
 			scan.Entries[i].Digest = zeroChunkDigest(int(length))
 			continue
 		}
+		if buf == nil {
+			select {
+			case buf = <-buffers:
+			default:
+				buf = make([]byte, chunkBytes)
+			}
+		}
 		if _, err := f.ReadAt(buf[:length], offset); err != nil {
 			return nil, err
 		}
@@ -693,9 +706,9 @@ func scanFileChunks(ctx context.Context, path, name string) (*checkpointchunks.M
 			scan.Entries[i].Digest = zeroChunkDigest(int(length))
 			continue
 		}
-		block := append([]byte(nil), buf[:length]...)
 		select {
-		case jobs <- chunkJob{index: i, block: block}:
+		case jobs <- chunkJob{index: i, block: buf[:length]}:
+			buf = nil // Ownership transfers to the worker until it returns it.
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		}
