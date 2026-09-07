@@ -1650,8 +1650,10 @@ type CheckpointResponse struct {
 	ArtifactPath   string                 `protobuf:"bytes,3,opt,name=artifact_path,json=artifactPath,proto3" json:"artifact_path,omitempty"`
 	ArtifactSize   int64                  `protobuf:"varint,4,opt,name=artifact_size,json=artifactSize,proto3" json:"artifact_size,omitempty"`
 	ArtifactSha256 string                 `protobuf:"bytes,5,opt,name=artifact_sha256,json=artifactSha256,proto3" json:"artifact_sha256,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// Physical lifetime bound to the published source manifest; empty for legacy artifacts.
+	SourceGeneration string `protobuf:"bytes,6,opt,name=source_generation,json=sourceGeneration,proto3" json:"source_generation,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *CheckpointResponse) Reset() {
@@ -1715,6 +1717,13 @@ func (x *CheckpointResponse) GetArtifactSize() int64 {
 func (x *CheckpointResponse) GetArtifactSha256() string {
 	if x != nil {
 		return x.ArtifactSha256
+	}
+	return ""
+}
+
+func (x *CheckpointResponse) GetSourceGeneration() string {
+	if x != nil {
+		return x.SourceGeneration
 	}
 	return ""
 }
@@ -3612,13 +3621,14 @@ const file_api_runtime_v1_sandbox_api_proto_rawDesc = "" +
 	"\btrace_id\x18\x05 \x01(\tR\atraceId\x12#\n" +
 	"\rcheckpoint_id\x18\x06 \x01(\tR\fcheckpointId\x12#\n" +
 	"\rleave_running\x18\a \x01(\bR\fleaveRunning\x12-\n" +
-	"\x12include_filesystem\x18\b \x01(\bR\x11includeFilesystem\"\xbb\x01\n" +
+	"\x12include_filesystem\x18\b \x01(\bR\x11includeFilesystem\"\xe8\x01\n" +
 	"\x12CheckpointResponse\x12\x18\n" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x18\n" +
 	"\amessage\x18\x02 \x01(\tR\amessage\x12#\n" +
 	"\rartifact_path\x18\x03 \x01(\tR\fartifactPath\x12#\n" +
 	"\rartifact_size\x18\x04 \x01(\x03R\fartifactSize\x12'\n" +
-	"\x0fartifact_sha256\x18\x05 \x01(\tR\x0eartifactSha256\"9\n" +
+	"\x0fartifact_sha256\x18\x05 \x01(\tR\x0eartifactSha256\x12+\n" +
+	"\x11source_generation\x18\x06 \x01(\tR\x10sourceGeneration\"9\n" +
 	"\fPauseRequest\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x19\n" +
 	"\btrace_id\x18\x02 \x01(\tR\atraceId\"\x0f\n" +

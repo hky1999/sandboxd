@@ -3,6 +3,8 @@ package server
 import (
 	"context"
 	"errors"
+	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
+	"google.golang.org/protobuf/proto"
 	"os"
 	"path/filepath"
 	"strings"
@@ -35,5 +37,23 @@ func TestCheckpointRevalidatesQueuedPhysicalGenerationBeforePublishing(t *testin
 	}
 	if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("stale command created artifact: %v", err)
+	}
+}
+
+func TestCheckpointResponsePreservesCommittedGenerationOnWire(t *testing.T) {
+	for _, generation := range []string{"physical-lifetime", ""} {
+		fact := checkpoint.Fact{Manifest: checkpoint.Manifest{SourceGeneration: generation}}
+		response := checkpointResponse(fact)
+		encoded, err := proto.Marshal(response)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var decoded runtime.CheckpointResponse
+		if err := proto.Unmarshal(encoded, &decoded); err != nil {
+			t.Fatal(err)
+		}
+		if !decoded.Success || decoded.SourceGeneration != generation {
+			t.Fatalf("lost source generation: %v", &decoded)
+		}
 	}
 }

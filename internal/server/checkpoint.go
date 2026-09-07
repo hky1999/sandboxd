@@ -160,7 +160,8 @@ func (h *sandboxService) Checkpoint(
 func checkpointResponse(fact checkpoint.Fact) *runtime.CheckpointResponse {
 	return &runtime.CheckpointResponse{
 		Success: true, ArtifactPath: fact.Paths.Image,
-		ArtifactSize: fact.Manifest.ImageSize, ArtifactSha256: fact.Manifest.ImageSHA256,
+		SourceGeneration: fact.Manifest.SourceGeneration,
+		ArtifactSize:     fact.Manifest.ImageSize, ArtifactSha256: fact.Manifest.ImageSHA256,
 	}
 }
 

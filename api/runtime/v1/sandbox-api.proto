@@ -291,6 +291,8 @@ message CheckpointResponse {
   string artifact_path = 3;
   int64 artifact_size = 4;
   string artifact_sha256 = 5;
+  // Physical lifetime bound to the published source manifest; empty for legacy artifacts.
+  string source_generation = 6;
 }
 
 // PauseRequest targets one running sandbox. Resume takes the same shape.

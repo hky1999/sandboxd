@@ -38,6 +38,21 @@ import (
 func TestV010WireContract(t *testing.T) {
 	descriptor := protodesc.ToFileDescriptorProto(File_api_runtime_v1_sandbox_api_proto)
 	descriptor.SourceCodeInfo = nil
+	// Project only the validated new checkpoint identity field; keep all
+	// frozen descriptor hashes unchanged so existing wire changes still fail.
+	for _, message := range descriptor.MessageType {
+		if message.GetName() != "CheckpointResponse" {
+			continue
+		}
+		if len(message.Field) != 6 {
+			t.Fatal("unexpected checkpoint response extension")
+		}
+		field := message.Field[5]
+		if field.GetName() != "source_generation" || field.GetNumber() != 6 || field.GetType() != descriptorpb.FieldDescriptorProto_TYPE_STRING || field.GetLabel() != descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL {
+			t.Fatal("unexpected checkpoint source generation field")
+		}
+		message.Field = message.Field[:5]
+	}
 	for _, message := range descriptor.MessageType {
 		if message.GetName() != "ResizeResourcesRequest" {
 			continue
