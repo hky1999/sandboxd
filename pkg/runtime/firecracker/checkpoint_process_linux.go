@@ -22,29 +22,34 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// stopCheckpointProcess waits for the kernel's exit notification, not the
-// disappearance of argv/exe, which can precede completion of exit teardown.
-func stopCheckpointProcess(state firecrackerPersistedState, binary string) error {
+// stopFirecrackerProcessConfirmed stops the Firecracker process recorded in
+// state and returns nil only after its exit is confirmed. It waits for the
+// kernel's exit notification, not the disappearance of argv/exe, which can
+// precede completion of exit teardown.
+func stopFirecrackerProcessConfirmed(state firecrackerPersistedState, binary string) error {
 	if state.PID <= 1 {
-		return nil
+		// A missing or sentinel PID — including init itself — is an invalid
+		// record, not evidence of an exit. Never probe or signal PID 1; a
+		// caller that can repair the state may retry.
+		return fmt.Errorf("Firecracker process pid %d is not a valid recorded pid; exit unconfirmed", state.PID)
 	}
 	fd, err := unix.PidfdOpen(state.PID, 0)
 	if errors.Is(err, unix.ESRCH) {
 		return nil
 	}
 	if err != nil {
-		return fmt.Errorf("open checkpoint source pidfd: %w", err)
+		return fmt.Errorf("open Firecracker process pidfd: %w", err)
 	}
 	defer unix.Close(fd)
 	if !firecrackerProcessMatches(state.PID, binary, state.APIPath, state.ID) {
 		// The original process may already be tearing down, or this PID may
 		// belong to somebody else. Never signal an unrecognized process.
-		exited, err := waitCheckpointProcessExit(fd, 1500*time.Millisecond)
+		exited, err := waitProcessExitNotification(fd, 1500*time.Millisecond)
 		if err != nil {
 			return err
 		}
 		if !exited {
-			return fmt.Errorf("checkpoint source pid %d identity unavailable and exit unconfirmed", state.PID)
+			return fmt.Errorf("Firecracker process pid %d identity unavailable and exit unconfirmed", state.PID)
 		}
 		return nil
 	}
@@ -55,9 +60,9 @@ func stopCheckpointProcess(state firecrackerPersistedState, binary string) error
 		// The handle continues to refer to the same process even if its
 		// numerical PID is recycled between the identity check and signal.
 		if err := unix.PidfdSendSignal(fd, step.signal, nil, 0); err != nil && !errors.Is(err, unix.ESRCH) {
-			return fmt.Errorf("signal checkpoint source: %w", err)
+			return fmt.Errorf("signal Firecracker process: %w", err)
 		}
-		exited, err := waitCheckpointProcessExit(fd, step.wait)
+		exited, err := waitProcessExitNotification(fd, step.wait)
 		if err != nil {
 			return err
 		}
@@ -65,10 +70,10 @@ func stopCheckpointProcess(state firecrackerPersistedState, binary string) error
 			return nil
 		}
 	}
-	return fmt.Errorf("checkpoint source pid %d did not exit after SIGKILL", state.PID)
+	return fmt.Errorf("Firecracker process pid %d did not exit after SIGKILL", state.PID)
 }
 
-func waitCheckpointProcessExit(fd int, timeout time.Duration) (bool, error) {
+func waitProcessExitNotification(fd int, timeout time.Duration) (bool, error) {
 	deadline := time.Now().Add(timeout)
 	for {
 		remaining := time.Until(deadline)
@@ -85,10 +90,10 @@ func waitCheckpointProcessExit(fd int, timeout time.Duration) (bool, error) {
 			return false, nil
 		}
 		if err != nil {
-			return false, fmt.Errorf("poll checkpoint source exit: %w", err)
+			return false, fmt.Errorf("poll Firecracker process exit: %w", err)
 		}
 		if fds[0].Revents&(unix.POLLERR|unix.POLLNVAL) != 0 {
-			return false, fmt.Errorf("poll checkpoint source exit: events %#x", fds[0].Revents)
+			return false, fmt.Errorf("poll Firecracker process exit: events %#x", fds[0].Revents)
 		}
 		return fds[0].Revents&(unix.POLLIN|unix.POLLHUP) != 0, nil
 	}
