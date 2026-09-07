@@ -2,6 +2,7 @@ package firecracker
 
 import (
 	"bufio"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -10,6 +11,46 @@ import (
 
 	runtimecore "github.com/inclusionAI/sandboxd/pkg/runtime"
 )
+
+func TestCheckpointWritebackObservesStoppedPersistedSource(t *testing.T) {
+	for _, live := range []bool{false, true} {
+		t.Run(fmt.Sprintf("live=%v", live), func(t *testing.T) {
+			handler, instance := checkpointPersistenceFixture(t)
+			if live {
+				startCheckpointPersistenceChild(t, handler, instance)
+			}
+			before := instance.snapshot()
+			if err := handler.persistInstance(instance); err != nil {
+				t.Fatal(err)
+			}
+			observed := make(chan error, 1)
+			memory := filepath.Join(before.BundlePath, "memory")
+			handler.checkpointWriteback = newCheckpointWritebackSchedulerWith(1, 1, func(path string) error {
+				disk, err := readFirecrackerState(before.BundlePath)
+				if err == nil && (path != memory || !disk.Exited || disk.ExitedAt == "" || disk.ExitCode != 0) {
+					err = fmt.Errorf("writeback preceded persisted exit: path=%s state=%+v", path, disk)
+				}
+				if err == nil && firecrackerProcessMatches(before.PID, handler.binary, before.APIPath, before.ID) {
+					err = fmt.Errorf("writeback started before source stopped")
+				}
+				observed <- err
+				return err
+			})
+			t.Cleanup(func() { close(handler.checkpointWriteback.queue) })
+			if err := handler.finishCheckpointedSandboxWithWriteback(instance, before, before.ID, memory); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case err := <-observed:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("writeback was not scheduled")
+			}
+		})
+	}
+}
 
 func checkpointPersistenceFixture(t *testing.T) (*Handler, *firecrackerInstance) {
 	t.Helper()
