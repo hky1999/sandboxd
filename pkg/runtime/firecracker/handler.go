@@ -250,10 +250,11 @@ type Handler struct {
 	// checkpointMode is the validated plugin.runtime.firecracker
 	// checkpoint_mode: full keeps upstream Full snapshots, incremental
 	// enables the three-tier chain.
-	checkpointMode          string
-	sparseFull              bool
-	skipUnchanged           bool
-	verifyIncrementalMemory bool
+	checkpointMode                  string
+	sparseFull                      bool
+	skipUnchanged                   bool
+	verifyIncrementalMemory         bool
+	verifyIncrementalMemoryStopOnly bool
 
 	// shrinkBeforeCheckpoint gates the pre-pause guest page-cache drop;
 	// see FirecrackerConfig.ShrinkBeforeCheckpoint for why it is off by
