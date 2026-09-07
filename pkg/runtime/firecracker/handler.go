@@ -899,6 +899,9 @@ func (handler *Handler) Delete(ctx context.Context, sandboxID string) error {
 	instance, err := handler.lookupInstance(sandboxID)
 	if err != nil {
 		if os.IsNotExist(err) {
+			// No in-memory instance and no persisted state: legacy idempotent
+			// delete. This nil observes absence; it does not prove that any
+			// persistent generation of the sandbox retired.
 			return nil
 		}
 		return err
@@ -923,7 +926,15 @@ func (handler *Handler) Delete(ctx context.Context, sandboxID string) error {
 			logrus.Debugf("firecracker: guest shutdown %s: %v", sandboxID, err)
 		}
 	}
-	handler.stopInstance(instance, false)
+	// Exit gate: the removal below retires the instance's state, writable
+	// layer, and runtime directory, so it may run only after the kernel
+	// confirms the recorded process exited. On error the instance, persisted
+	// state, and artifacts stay in place for a retry; an unrecognized PID is
+	// never signalled.
+	if err := stopFirecrackerProcessConfirmed(state, handler.binary); err != nil {
+		return fmt.Errorf("confirm Firecracker sandbox %s exit for delete: %w", sandboxID, err)
+	}
+	instance.finish(runtimecore.Exit{ExitedAt: time.Now(), ExitCode: state.ExitCode})
 	handler.mu.Lock()
 	delete(handler.instances, sandboxID)
 	handler.mu.Unlock()
