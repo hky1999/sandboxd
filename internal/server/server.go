@@ -29,6 +29,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/google/uuid"
+
 	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
 	"github.com/inclusionAI/sandboxd/config"
 	"github.com/inclusionAI/sandboxd/internal/checkpoint"
@@ -75,6 +77,14 @@ type xpuLeaseManager interface {
 	Release(string)
 }
 
+type sandboxCgroups interface {
+	Allocate() (string, error)
+	Recycle(string) error
+	Prepare(string, *runtime.LinuxSandboxResources) error
+	Stats(string) (cgroupmanager.Stats, error)
+	ShutDown() error
+}
+
 // sandboxService implements SandboxService.
 type sandboxService struct {
 	// config is the sandbox service config
@@ -86,7 +96,7 @@ type sandboxService struct {
 	// Resource and infrastructure managers owned by the server. SandboxManager
 	// receives only the cgroup manager reference it needs for OOM monitoring;
 	// allocation, release, and shutdown stay in server-owned managers.
-	cgroupMgr    *cgroupmanager.CgroupManager
+	cgroupMgr    sandboxCgroups
 	interfaceMgr *networkmanager.InterfaceManager
 	networkMgr   *networkManager
 	aclMgr       *networkacl.Manager
@@ -112,11 +122,13 @@ type sandboxService struct {
 	ready                             atomic.Bool
 	recoveryReady                     atomic.Bool
 	deleteGroup                       singleflight.Group
+	resourceLocks                     physicalLocks
 	aclMu                             sync.Mutex
 	checkpointMu                      sync.Mutex
 	checkpointing                     map[string]struct{}
 	firecrackerCheckpointMemorySlotMu sync.Mutex
-	firecrackerCheckpointMemorySlot   chan struct{}}
+	firecrackerCheckpointMemorySlot   chan struct{}
+}
 
 // loadRuntimeHandlers loads runtime handlers with exponential backoff.
 // It blocks until all configured runtimes are loaded or timeout is reached.
@@ -229,6 +241,7 @@ func (h *sandboxService) startSandboxRuntime(
 		}
 	}
 
+<<<<<<< HEAD
 	if startConfig.CheckpointDir != "" {
 		checkpointHandler, ok := handler.(svc.CheckpointHandler)
 		if !ok {
@@ -252,6 +265,12 @@ func (h *sandboxService) startSandboxRuntime(
 		err = handler.Start(ctx, startConfig)
 	}
 	if err != nil {
+=======
+	if err = h.verifyPreparedElasticLimits(startConfig, "start"); err != nil {
+		return err
+	}
+	if err = handler.Start(ctx, startConfig); err != nil {
+>>>>>>> 72e95c4 (feat: add incarnation-checked resource resize and startup limit readback)
 		logrus.WithField(trace.ContextKeyTraceId, traceID).Errorf("runtime handler create sandbox failed: %v", err)
 		h.sandboxManager.CleanSandboxRoot(startConfig.ID)
 		return errord.ToGRPC(err)
@@ -287,6 +306,9 @@ func (h *sandboxService) restoreSandboxRuntime(
 			return fmt.Errorf("prepare cgroup %s: %w", startConfig.CgroupPath, err)
 		}
 	}
+	if err = h.verifyPreparedElasticLimits(startConfig, "restore"); err != nil {
+		return err
+	}
 	if err := restoreHandler.Restore(ctx, startConfig, checkpointImage); err != nil {
 		if errors.Is(err, svc.ErrRestoreCleanupIncomplete) {
 			return err
@@ -298,6 +320,11 @@ func (h *sandboxService) restoreSandboxRuntime(
 }
 
 func (h *sandboxService) deleteSandboxRuntime(ctx context.Context, sandboxID string) (err error) {
+	unlock, err := h.resourceLocks.acquire(ctx, sandboxID)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	traceID, spanID := trace.GetContextID(ctx)
 	start := time.Now()
 	defer func() {
@@ -446,9 +473,19 @@ func sandboxStatusMatchesListRequest(
 }
 
 func (h *sandboxService) Stats(ctx context.Context, request *runtime.StatsRequest) (*runtime.StatsResponse, error) {
-	if request.ID == "" {
+	if request == nil || request.ID == "" {
 		return nil, errord.ToGRPC(errord.ErrInvalidArgument)
 	}
+	unlock, err := h.resourceLocks.acquire(ctx, request.ID)
+	if err != nil {
+		return nil, errord.ToGRPC(err)
+	}
+	defer unlock()
+	return h.resourceStats(request.ID)
+}
+
+// Caller holds resourceLocks for id until the physical read has completed.
+func (h *sandboxService) resourceStats(id string) (*runtime.StatsResponse, error) {
 	if h.config.DisableCgroup {
 		return nil, errord.ToGRPC(fmt.Errorf(
 			"sandbox stats require per-sandbox cgroups: %w",
@@ -457,7 +494,7 @@ func (h *sandboxService) Stats(ctx context.Context, request *runtime.StatsReques
 	}
 
 	// Look up the sandbox to verify it exists.
-	current, err := h.sandboxManager.Get(request.ID)
+	current, err := h.sandboxManager.Get(id)
 	if err != nil {
 		return nil, errord.ToGRPC(err)
 	}
@@ -469,7 +506,7 @@ func (h *sandboxService) Stats(ctx context.Context, request *runtime.StatsReques
 	}
 	cgroupPath, ok := resource.Resources[config.ResourceNameCgroup]
 	if !ok || cgroupPath == "" {
-		return nil, errord.ToGRPC(fmt.Errorf("cgroup path not found for sandbox %s", request.ID))
+		return nil, errord.ToGRPC(fmt.Errorf("cgroup path not found for sandbox %s", id))
 	}
 
 	if h.cgroupMgr == nil {
@@ -481,6 +518,8 @@ func (h *sandboxService) Stats(ctx context.Context, request *runtime.StatsReques
 	}
 
 	return &runtime.StatsResponse{
+		ResourceGeneration:  current.Metadata.GetLabels()[resourceGenerationLabel],
+		ElasticPolicy:       current.Metadata.GetLabels()[elasticResourcesLabel],
 		CpuUsageNs:          cgroupStats.CPUUsageNanos,
 		CpuQuotaUsec:        cgroupStats.CPUQuotaUsec,
 		CpuPeriodUsec:       cgroupStats.CPUPeriodUsec,
@@ -1244,6 +1283,7 @@ func (h *sandboxService) createSandbox(
 		return &runtime.StartResponse{Code: -1, Message: err.Error()}, err
 	}
 	startReq := proto.Clone(request).(*runtime.StartRequest)
+<<<<<<< HEAD
 	checkpointDir := ""
 	var err error
 	if startReq.CheckpointInfo != nil {
@@ -1254,6 +1294,13 @@ func (h *sandboxService) createSandbox(
 			return &runtime.StartResponse{Code: -1, Message: err.Error()}, errord.ToGRPC(err)
 		}
 	}
+=======
+	// A caller cannot choose/reuse the physical resource incarnation.
+	if startReq.Labels == nil {
+		startReq.Labels = make(map[string]string)
+	}
+	startReq.Labels[resourceGenerationLabel] = uuid.NewString()
+>>>>>>> 72e95c4 (feat: add incarnation-checked resource resize and startup limit readback)
 	if err := validateElasticResources(startReq, h.config, options.checkpointImage != ""); err != nil {
 		return &runtime.StartResponse{Code: -1, Message: err.Error()},
 			errord.ToGRPC(fmt.Errorf("%v: %w", err, errord.ErrInvalidArgument))
@@ -1430,6 +1477,12 @@ func (h *sandboxService) createSandbox(
 		}, errord.ToGRPC(err)
 	}
 	startReq.SandboxID = sandboxID
+	unlock, lockErr := h.resourceLocks.acquire(ctx, sandboxID)
+	if lockErr != nil {
+		h.sandboxManager.ReleaseID(sandboxID)
+		return nil, errord.ToGRPC(lockErr)
+	}
+	defer unlock()
 	startSucceeded := false
 	var preparedFilesystem *preparedFS
 	var preparedResources *preparedStartResources

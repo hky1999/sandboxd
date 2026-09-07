@@ -447,6 +447,8 @@ func normalizeRestoreConfig(input *runtime.StartRequest) (*runtime.StartRequest,
 		return nil, fmt.Errorf("rootfs is required: %w", errord.ErrInvalidArgument)
 	}
 	configCopy := proto.Clone(input).(*runtime.StartRequest)
+	// Physical incarnations belong to createSandbox, never to restore callers.
+	delete(configCopy.Labels, resourceGenerationLabel)
 	if rootfsLimit := configCopy.Rootfs.WritableLayerSizeBytes; rootfsLimit > 0 {
 		if configCopy.WritableLayerLimitBytes > 0 && configCopy.WritableLayerLimitBytes != rootfsLimit {
 			return nil, fmt.Errorf("conflicting writable layer limits: %w", errord.ErrInvalidArgument)
@@ -503,6 +505,12 @@ func (h *sandboxService) executeCheckpoint(
 	options svc.CheckpointOptions,
 	attempt *checkpointstate.Attempt,
 ) {
+	unlock, lockErr := h.resourceLocks.acquire(ctx, key.SandboxID)
+	if lockErr != nil {
+		h.checkpointState.Complete(attempt, lockErr)
+		return
+	}
+	defer unlock()
 	_, err := checkpoint.PublishAt(checkpointDir, source, func(imagePath string) error {
 		// W7-P1.1: snapshot the effective cgroup limits BEFORE the runtime
 		// checkpoint (sandbox still alive) so the restore can re-apply them

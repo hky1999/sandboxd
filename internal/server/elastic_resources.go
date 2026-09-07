@@ -12,6 +12,8 @@ import (
 
 	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
 	"github.com/inclusionAI/sandboxd/config"
+	svc "github.com/inclusionAI/sandboxd/pkg/runtime"
+	"github.com/sirupsen/logrus"
 )
 
 const elasticResourcesLabel = "akernel.scheduler/elastic-resources"
@@ -72,5 +74,32 @@ func validateElasticResources(req *runtime.StartRequest, cfg config.Config, rest
 			return fmt.Errorf("elastic %s effective limit does not match policy", name)
 		}
 	}
+	return nil
+}
+
+// Read the effective leaf cgroup limits before any workload process is started.
+// A setter returning nil alone is not proof that initial limits were applied.
+func (h *sandboxService) verifyPreparedElasticLimits(start svc.StartConfig, phase string) error {
+	if start.Annotations[elasticResourcesLabel] == "" {
+		return nil
+	}
+	if start.CgroupPath == "" || h.cgroupMgr == nil || start.Resources == nil {
+		return fmt.Errorf("elastic %s requires prepared cgroup limits", phase)
+	}
+	actual, err := h.cgroupMgr.Stats(start.CgroupPath)
+	if err != nil {
+		return fmt.Errorf("read elastic %s limits: %w", phase, err)
+	}
+	if !actual.CPULimitsKnown || actual.CPUQuotaUsec != start.Resources.CpuQuota ||
+		actual.CPUPeriodUsec != start.Resources.CpuPeriod ||
+		actual.MemoryLimitBytes != uint64(start.Resources.MemoryLimitInBytes) {
+		return fmt.Errorf("elastic %s cgroup readback does not match requested limits", phase)
+	}
+	logrus.WithFields(logrus.Fields{
+		"sandbox_id": start.ID, "resource_generation": start.Annotations[resourceGenerationLabel],
+		"phase": phase, "cpu_quota_usec": actual.CPUQuotaUsec,
+		"cpu_period_usec": actual.CPUPeriodUsec, "memory_limit_bytes": actual.MemoryLimitBytes,
+		"elastic_policy": start.Annotations[elasticResourcesLabel],
+	}).Info("scheduler resource limits prepared")
 	return nil
 }

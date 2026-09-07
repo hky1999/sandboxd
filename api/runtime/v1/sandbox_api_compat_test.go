@@ -17,10 +17,12 @@ package v1
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"slices"
 	"testing"
 
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protodesc"
+	"google.golang.org/protobuf/types/descriptorpb"
 )
 
 // TestV010WireContract pins the public protobuf descriptor while allowing
@@ -41,9 +43,34 @@ func TestV010WireContract(t *testing.T) {
 		t.Fatal(err)
 	}
 	sum := sha256.Sum256(wire)
-	const want = "3e7cd829a4878b42660a7cb52c1f0ca6ba2206f74be12e44727a119019abd670"
+	const want = "76eedf4ac128f108495be8ac8e743f7e507adbc08d8fad4d81fe28674676cf0e"
 	if got := hex.EncodeToString(sum[:]); got != want {
 		t.Fatalf("sandbox API descriptor hash = %s, want %s", got, want)
+	}
+	// Project away only the new resize contract; the entire prior descriptor
+	// must remain byte-for-byte identical, including all existing RPCs.
+	descriptor.MessageType = slices.DeleteFunc(descriptor.MessageType, func(m *descriptorpb.DescriptorProto) bool {
+		return m.GetName() == "ResourceLimits" || m.GetName() == "ResizeResourcesRequest" || m.GetName() == "ResizeResourcesResponse"
+	})
+	for _, service := range descriptor.Service {
+		service.Method = slices.DeleteFunc(service.Method, func(m *descriptorpb.MethodDescriptorProto) bool { return m.GetName() == "ResizeResources" })
+	}
+	for _, message := range descriptor.MessageType {
+		if message.GetName() == "StatsResponse" {
+			if len(message.Field) != 11 || message.Field[9].GetNumber() != 10 || message.Field[9].GetName() != "resource_generation" ||
+				message.Field[10].GetNumber() != 11 || message.Field[10].GetName() != "elastic_policy" {
+				t.Fatal("unexpected resize stats contract")
+			}
+			message.Field = message.Field[:9]
+		}
+	}
+	previousWire, err := proto.MarshalOptions{Deterministic: true}.Marshal(descriptor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	previousSum := sha256.Sum256(previousWire)
+	if hex.EncodeToString(previousSum[:]) != "3e7cd829a4878b42660a7cb52c1f0ca6ba2206f74be12e44727a119019abd670" {
+		t.Fatal("resize changed the prior wire contract")
 	}
 	for _, message := range descriptor.MessageType {
 		if message.GetName() == "SandboxStatus" {

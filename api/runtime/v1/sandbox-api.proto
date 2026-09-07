@@ -45,6 +45,8 @@ service SandboxService {
   rpc List(ListSandboxesRequest) returns (ListSandboxesResponse) {}
   // Stats returns resource usage statistics for a sandbox.
   rpc Stats(StatsRequest) returns (StatsResponse) {}
+  // Apply a scheduler-approved monotonic increase with incarnation and limit checks.
+  rpc ResizeResources(ResizeResourcesRequest) returns (ResizeResourcesResponse) {}
   // ListAvailableRuntimes lists runtime classes whose handlers are ready.
   rpc ListAvailableRuntimes(ListAvailableRuntimesRequest) returns (ListAvailableRuntimesResponse) {}
   // SetNetworkPolicy atomically replaces the network policy of a running sandbox.
@@ -530,6 +532,10 @@ message StatsResponse {
   uint64 cpu_period_usec = 8;
   bool cpu_limits_known = 9;
 
+  // Server-owned physical incarnation; changes whenever an ID is recreated.
+  string resource_generation = 10;
+  // Persisted elastic initial/ceiling policy, empty for non-elastic sandboxes.
+  string elastic_policy = 11;
 }
 
 // ListAvailableRuntimesRequest requests the runtime classes currently available
@@ -549,4 +555,29 @@ message RestoreIdentity {
   string checkpoint_id = 1;
   // RequestSHA256 is the digest of the normalized logical restore request.
   string request_sha256 = 2;
+}
+
+// ResourceLimits uses kernel cgroup units and finite, positive limits only.
+message ResourceLimits {
+  int64 cpu_quota_usec = 1;
+  uint64 cpu_period_usec = 2;
+  uint64 memory_limit_bytes = 3;
+}
+
+// The scheduler must reserve node capacity before sending this request. A
+// transport failure is an uncertain outcome: retain reservation until Stats
+// reconciles it. Matching target retries are idempotent within an incarnation.
+message ResizeResourcesRequest {
+  string sandbox_id = 1;
+  string resource_generation = 2;
+  ResourceLimits expected = 3;
+  ResourceLimits target = 4;
+}
+
+message ResizeResourcesResponse {
+  StatsResponse actual = 1;
+  // Complete includes successful soft-limit application and hard-limit readback.
+  bool complete = 2;
+  // A partial write is returned with actual limits, never disguised as no-op.
+  string update_error = 3;
 }

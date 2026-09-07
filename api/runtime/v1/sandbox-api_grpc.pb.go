@@ -43,6 +43,7 @@ const (
 	SandboxService_Wait_FullMethodName                  = "/runtime.v1.SandboxService/Wait"
 	SandboxService_List_FullMethodName                  = "/runtime.v1.SandboxService/List"
 	SandboxService_Stats_FullMethodName                 = "/runtime.v1.SandboxService/Stats"
+	SandboxService_ResizeResources_FullMethodName       = "/runtime.v1.SandboxService/ResizeResources"
 	SandboxService_ListAvailableRuntimes_FullMethodName = "/runtime.v1.SandboxService/ListAvailableRuntimes"
 	SandboxService_SetNetworkPolicy_FullMethodName      = "/runtime.v1.SandboxService/SetNetworkPolicy"
 )
@@ -78,6 +79,8 @@ type SandboxServiceClient interface {
 	List(ctx context.Context, in *ListSandboxesRequest, opts ...grpc.CallOption) (*ListSandboxesResponse, error)
 	// Stats returns resource usage statistics for a sandbox.
 	Stats(ctx context.Context, in *StatsRequest, opts ...grpc.CallOption) (*StatsResponse, error)
+	// Apply a scheduler-approved monotonic increase with incarnation and limit checks.
+	ResizeResources(ctx context.Context, in *ResizeResourcesRequest, opts ...grpc.CallOption) (*ResizeResourcesResponse, error)
 	// ListAvailableRuntimes lists runtime classes whose handlers are ready.
 	ListAvailableRuntimes(ctx context.Context, in *ListAvailableRuntimesRequest, opts ...grpc.CallOption) (*ListAvailableRuntimesResponse, error)
 	// SetNetworkPolicy atomically replaces the network policy of a running sandbox.
@@ -192,6 +195,16 @@ func (c *sandboxServiceClient) Stats(ctx context.Context, in *StatsRequest, opts
 	return out, nil
 }
 
+func (c *sandboxServiceClient) ResizeResources(ctx context.Context, in *ResizeResourcesRequest, opts ...grpc.CallOption) (*ResizeResourcesResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ResizeResourcesResponse)
+	err := c.cc.Invoke(ctx, SandboxService_ResizeResources_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *sandboxServiceClient) ListAvailableRuntimes(ctx context.Context, in *ListAvailableRuntimesRequest, opts ...grpc.CallOption) (*ListAvailableRuntimesResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ListAvailableRuntimesResponse)
@@ -243,6 +256,8 @@ type SandboxServiceServer interface {
 	List(context.Context, *ListSandboxesRequest) (*ListSandboxesResponse, error)
 	// Stats returns resource usage statistics for a sandbox.
 	Stats(context.Context, *StatsRequest) (*StatsResponse, error)
+	// Apply a scheduler-approved monotonic increase with incarnation and limit checks.
+	ResizeResources(context.Context, *ResizeResourcesRequest) (*ResizeResourcesResponse, error)
 	// ListAvailableRuntimes lists runtime classes whose handlers are ready.
 	ListAvailableRuntimes(context.Context, *ListAvailableRuntimesRequest) (*ListAvailableRuntimesResponse, error)
 	// SetNetworkPolicy atomically replaces the network policy of a running sandbox.
@@ -286,6 +301,9 @@ func (UnimplementedSandboxServiceServer) List(context.Context, *ListSandboxesReq
 }
 func (UnimplementedSandboxServiceServer) Stats(context.Context, *StatsRequest) (*StatsResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Stats not implemented")
+}
+func (UnimplementedSandboxServiceServer) ResizeResources(context.Context, *ResizeResourcesRequest) (*ResizeResourcesResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ResizeResources not implemented")
 }
 func (UnimplementedSandboxServiceServer) ListAvailableRuntimes(context.Context, *ListAvailableRuntimesRequest) (*ListAvailableRuntimesResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ListAvailableRuntimes not implemented")
@@ -494,6 +512,24 @@ func _SandboxService_Stats_Handler(srv interface{}, ctx context.Context, dec fun
 	return interceptor(ctx, in, info, handler)
 }
 
+func _SandboxService_ResizeResources_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ResizeResourcesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SandboxServiceServer).ResizeResources(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SandboxService_ResizeResources_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SandboxServiceServer).ResizeResources(ctx, req.(*ResizeResourcesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _SandboxService_ListAvailableRuntimes_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(ListAvailableRuntimesRequest)
 	if err := dec(in); err != nil {
@@ -576,6 +612,10 @@ var SandboxService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Stats",
 			Handler:    _SandboxService_Stats_Handler,
+		},
+		{
+			MethodName: "ResizeResources",
+			Handler:    _SandboxService_ResizeResources_Handler,
 		},
 		{
 			MethodName: "ListAvailableRuntimes",
