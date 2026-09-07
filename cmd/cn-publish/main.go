@@ -45,6 +45,7 @@ func main() {
 	checkpointDir := flag.String("checkpoint-dir", "", "checkpoint directory to publish")
 	storePath := flag.String("store", "", "chunk store path (directory backend)")
 	packIdentity := flag.String("pack-identity", "", "pack identity: empty for legacy SHA256, chunks-v1 for versioned chunk root (requires -pack-mib)")
+	packBatchHash := flag.Bool("pack-batch-hash", false, "verify packed chunks using synchronous SHA256 batches (requires -pack-mib)")
 	packSkipChunkProbe := flag.Bool("pack-skip-chunk-probe", false, "skip standalone chunk reuse checks; may upload duplicate content in packs (requires -pack-mib)")
 	cpuProfile := flag.String("cpu-profile", "", "write an optional CPU profile to a new file (diagnostic runs only)")
 	status := flag.Bool("status", false, "print the persisted publish state and exit")
@@ -58,6 +59,10 @@ func main() {
 		flag.PrintDefaults()
 	}
 	flag.Parse()
+	if *packBatchHash && *packMiB == 0 {
+		fmt.Fprintln(os.Stderr, "error: -pack-batch-hash requires -pack-mib")
+		os.Exit(2)
+	}
 	if *packSkipChunkProbe && *packMiB == 0 {
 		fmt.Fprintln(os.Stderr, "error: -pack-skip-chunk-probe requires -pack-mib")
 		os.Exit(2)
@@ -123,7 +128,7 @@ func main() {
 		stopProfile = func() { pprof.StopCPUProfile(); file.Close() }
 	}
 	start := time.Now()
-	result, err := checkpointpublish.RunWithOptions(ctx, *checkpointDir, id, store, *storePath, checkpointpublish.Options{PackSkipChunkProbe: *packSkipChunkProbe, PackPayloadBytes: *packPayloadMiB << 20, PackIdentity: *packIdentity, Workers: *workers, PackBytes: *packMiB << 20, BaseID: *baseID})
+	result, err := checkpointpublish.RunWithOptions(ctx, *checkpointDir, id, store, *storePath, checkpointpublish.Options{PackBatchHash: *packBatchHash, PackSkipChunkProbe: *packSkipChunkProbe, PackPayloadBytes: *packPayloadMiB << 20, PackIdentity: *packIdentity, Workers: *workers, PackBytes: *packMiB << 20, BaseID: *baseID})
 	elapsed := time.Since(start)
 	stopProfile()
 	if err != nil {
