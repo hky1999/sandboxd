@@ -213,6 +213,9 @@ type FirecrackerConfig struct {
 	SparseFull bool `toml:"sparse_full" json:"sparseFull"`
 	// SkipUnchanged requires the experimental fork; only incremental snapshots use it.
 	SkipUnchanged bool `toml:"skip_unchanged" json:"skipUnchanged"`
+	// VerifyIncrementalMemory adds a full paused-RAM comparison for diagnosis.
+	// It requires the matching experimental VMM and is disabled by default.
+	VerifyIncrementalMemory bool `toml:"verify_incremental_memory" json:"verifyIncrementalMemory"`
 	// OCIRootfsEnabled permits an OCI image rootfs to be materialized as a
 	// local EROFS image before the Firecracker VM starts. It is opt-in because
 	// conversion eagerly reads the complete merged image.
