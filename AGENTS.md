@@ -150,7 +150,14 @@ CPU quota/period and memory hard limit. Create clears any caller/checkpoint copy
 restore records its newly observed limits under its fresh generation.
 Only associate this record with a successfully committed matching incarnation.
 It proves prepared leaf limits, not ancestor-effective capacity or runtime success.
-List exposes the committed label; resolver/report ingestion is still pending.
+List exposes the committed label. The authenticated `/resources` resolver route
+accepts the same selector as `/resolve` and returns schema 1 with `identity`,
+validated `birth`, Stats RPC start/end timestamps, and an allowlisted `current`
+sample. Missing, malformed, mismatching or changing birth labels return 409;
+`/resolve` remains available without birth evidence. `current.memory_peak_known`
+is false because the daemon currently substitutes current usage when memory.peak
+is unavailable. Do not label that fallback as a measured lifetime peak. Harbor
+collector/report ingestion and capture before physical deletion remain pending.
 Metadata atomic writes now fsync the file, rename, then fsync its directory;
 PersistMetadata also syncs parent entries through the containers-root parent
 before publishing an INTENT in memory. A post-rename sync error can leave the

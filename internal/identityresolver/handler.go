@@ -103,11 +103,17 @@ func (s selector) matches(status *runtime.SandboxStatus) bool {
 	}
 	return status.Ip == s.ip
 }
-func selectIdentity(list *runtime.ListSandboxesResponse, sel selector) (Identity, bool) {
+
+// selectIncarnation resolves the unique RUNNING match to its complete
+// identity, together with the raw bytes of its persisted birth-evidence label
+// so /resources can compare that label across both List snapshots. /resolve
+// ignores the birth bytes entirely.
+func selectIncarnation(list *runtime.ListSandboxesResponse, sel selector) (Identity, string, bool) {
 	var identity Identity
+	var birth string
 	count := 0
 	if list == nil {
-		return identity, false
+		return identity, birth, false
 	}
 	for _, status := range list.Sandboxes {
 		if !sel.matches(status) {
@@ -115,8 +121,9 @@ func selectIdentity(list *runtime.ListSandboxesResponse, sel selector) (Identity
 		}
 		count++
 		identity = Identity{Instance: status.Labels[InstanceLabel], SandboxID: status.ID, RuntimeID: status.Labels[RuntimeLabel], ResourceGeneration: status.Labels[GenerationLabel]}
+		birth = status.Labels[birthResourcesLabel]
 	}
-	return identity, count == 1 && identity.Instance != "" && identity.SandboxID != "" && identity.RuntimeID != "" && identity.ResourceGeneration != ""
+	return identity, birth, count == 1 && identity.Instance != "" && identity.SandboxID != "" && identity.RuntimeID != "" && identity.ResourceGeneration != ""
 }
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
@@ -124,10 +131,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unauthorized", 401)
 		return
 	}
-	if r.URL.Path != "/resolve" {
+	if r.URL.Path != "/resolve" && r.URL.Path != "/resources" {
 		http.NotFound(w, r)
 		return
 	}
+	resources := r.URL.Path == "/resources"
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", 405)
 		return
@@ -156,12 +164,16 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "sandbox identity unavailable", 503)
 		return
 	}
-	identity, ok := selectIdentity(list, sel)
+	identity, birth, ok := selectIncarnation(list, sel)
 	if !ok {
 		http.Error(w, "no unique complete running identity", 409)
 		return
 	}
+	// The sample window brackets the physical Stats RPC only: it bounds the
+	// live reading's staleness and is unrelated to the birth observation.
+	sampleStartedUnixMs := time.Now().UnixMilli()
 	stats, err := h.client.Stats(ctx, &runtime.StatsRequest{ID: identity.SandboxID})
+	sampleFinishedUnixMs := time.Now().UnixMilli()
 	if err != nil || stats == nil || stats.ResourceGeneration != identity.ResourceGeneration {
 		http.Error(w, "physical identity changed or unavailable", 503)
 		return
@@ -174,9 +186,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "sandbox identity unavailable", 503)
 		return
 	}
-	current, ok := selectIdentity(list, sel)
+	current, currentBirth, ok := selectIncarnation(list, sel)
 	if !ok || current != identity {
 		http.Error(w, "identity changed during lookup", 409)
+		return
+	}
+	if resources {
+		serveResources(w, identity, birth, currentBirth, stats, sampleStartedUnixMs, sampleFinishedUnixMs)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
