@@ -1034,11 +1034,15 @@ func (handler *Handler) Restore(
 		if restoreSucceeded {
 			return
 		}
-		instance.markDeleting()
-		handler.stopInstance(instance, true)
-		handler.mu.Lock()
-		delete(handler.instances, startConfig.ID)
-		handler.mu.Unlock()
+		var retained bool
+		retErr, retained = handler.rollbackStartedInstance(instance, retErr)
+		if retained {
+			// The recorded process exit is unconfirmed: the persisted state,
+			// writable layer, and runtime directory must survive with the
+			// instance so the sandbox can be reconciled or retired later.
+			keepStorage = true
+			keepRuntimeArtifacts = true
+		}
 	}()
 	if err := attachFirecrackerProcess(startConfig.CgroupPath, command.Process.Pid); err != nil {
 		return fmt.Errorf("attach restored Firecracker to cgroup: %w", err)
