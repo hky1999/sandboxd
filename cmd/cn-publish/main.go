@@ -131,6 +131,10 @@ func main() {
 		fmt.Printf("packs: %d uploaded, %d reused\n", result.PacksPut, result.PacksSkip)
 		fmt.Printf("pack_payload budget=%d peak=%d\n", result.PackPayloadBudget, result.PackPayloadPeak)
 	}
+	if result.StateTimings != nil {
+		encoded, _ := json.Marshal(result.StateTimings)
+		fmt.Printf("state_timings=%s\n", encoded)
+	}
 	if result.PackTimings != nil {
 		encoded, _ := json.Marshal(result.PackTimings)
 		fmt.Printf("pack_timings=%s\n", encoded)
