@@ -219,8 +219,9 @@ func (handler *Handler) Checkpoint(
 		state,
 		func() error {
 			snapshotAttempted = true
-			return api.createSnapshotWithSparse(
+			return api.createSnapshotWithMemoryOptions(
 				ctx, files.State, files.Memory, snapshotType, handler.sparseFull && snapshotType == firecrackerSnapshotTypeFull,
+				handler.skipUnchanged && (snapshotType == firecrackerSnapshotTypeSoftDirty || snapshotType == firecrackerSnapshotTypeIncremental),
 			)
 		},
 	)

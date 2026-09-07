@@ -211,6 +211,8 @@ type FirecrackerConfig struct {
 	CheckpointMode string `toml:"checkpoint_mode" json:"checkpointMode"`
 	// SparseFull requires the experimental fork and verified sparse UFFD support.
 	SparseFull bool `toml:"sparse_full" json:"sparseFull"`
+	// SkipUnchanged requires the experimental fork; only incremental snapshots use it.
+	SkipUnchanged bool `toml:"skip_unchanged" json:"skipUnchanged"`
 	// OCIRootfsEnabled permits an OCI image rootfs to be materialized as a
 	// local EROFS image before the Firecracker VM starts. It is opt-in because
 	// conversion eagerly reads the complete merged image.
