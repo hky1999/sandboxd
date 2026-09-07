@@ -121,7 +121,7 @@ func PublishAt(directory string, source SourceIdentity, build func(string) error
 	if err != nil {
 		return Fact{}, err
 	}
-	manifest := Manifest{Version: manifestVersion, CheckpointID: source.CheckpointID,
+	manifest := Manifest{SourceGeneration: source.SourceGeneration, Version: manifestVersion, CheckpointID: source.CheckpointID,
 		SourceID: source.SourceID, Runtime: source.Runtime, RootfsSHA256: source.RootfsSHA256,
 		LeaveRunning: source.LeaveRunning, IncludeFilesystem: source.IncludeFilesystem,
 		ImageSHA256: imageDigest, ImageSize: imageSize}

@@ -19,6 +19,7 @@ const manifestVersion = 1
 // Manifest is the durable identity and integrity record published atomically
 // with a checkpoint image.
 type Manifest struct {
+	SourceGeneration     string `json:"sourceGeneration,omitempty"`
 	ResourceLimitsSHA256 string `json:"resourceLimitsSha256,omitempty"`
 	ResourceLimitsSize   int64  `json:"resourceLimitsSize,omitempty"`
 	Version              int    `json:"version"`
@@ -37,8 +38,10 @@ type Manifest struct {
 }
 
 // SourceIdentity describes the logical source whose checkpoint may be
-// replayed. It deliberately excludes transient process and node identities.
+// replayed. SourceGeneration binds new artifacts to the physical sandbox
+// lifetime; empty means a legacy artifact whose physical generation is unknown.
 type SourceIdentity struct {
+	SourceGeneration  string
 	CheckpointID      string
 	SourceID          string
 	Runtime           string
@@ -62,6 +65,7 @@ type Fact struct {
 
 func (manifest Manifest) sourceIdentity() SourceIdentity {
 	return SourceIdentity{
+		SourceGeneration:  manifest.SourceGeneration,
 		CheckpointID:      manifest.CheckpointID,
 		SourceID:          manifest.SourceID,
 		Runtime:           manifest.Runtime,

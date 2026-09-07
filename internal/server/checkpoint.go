@@ -84,6 +84,7 @@ func (h *sandboxService) Checkpoint(
 		return nil, checkpointGRPCError(err)
 	}
 	source := checkpoint.SourceIdentity{
+		SourceGeneration:  sandbox.Metadata.Labels[resourceGenerationLabel],
 		CheckpointID:      request.CheckpointID,
 		SourceID:          request.ID,
 		Runtime:           sandbox.Metadata.RuntimeHandler,
@@ -511,6 +512,16 @@ func (h *sandboxService) executeCheckpoint(
 		return
 	}
 	defer unlock()
+	// Source metadata was read before waiting for the physical operation lock.
+	// Revalidate the lifetime while replacement/resize/delete are excluded.
+	current, identityErr := h.sandboxManager.Get(key.SandboxID)
+	if identityErr != nil || current == nil || current.Metadata == nil || current.Metadata.Labels[resourceGenerationLabel] != source.SourceGeneration {
+		if identityErr == nil {
+			identityErr = fmt.Errorf("checkpoint source generation changed: %w", errord.ErrFailedPrecondition)
+		}
+		h.checkpointState.Complete(attempt, identityErr)
+		return
+	}
 	_, err := checkpoint.PublishAt(checkpointDir, source, func(imagePath string) error {
 		// W7-P1.1: snapshot the effective cgroup limits BEFORE the runtime
 		// checkpoint (sandbox still alive) so the restore can re-apply them

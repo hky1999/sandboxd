@@ -105,3 +105,33 @@ func TestResourceLimitsAreBoundToPublishedManifest(t *testing.T) {
 		})
 	}
 }
+
+func TestCheckpointReplayBindsPhysicalGeneration(t *testing.T) {
+	source := SourceIdentity{CheckpointID: "physical", SourceID: "same-id", Runtime: "runsc", RootfsSHA256: strings.Repeat("a", 64), SourceGeneration: "generation-one"}
+	dir := filepath.Join(t.TempDir(), "published")
+	build := func(image string) error { return os.WriteFile(image, []byte("checkpoint image"), 0600) }
+	if _, err := PublishAt(dir, source, build); err != nil {
+		t.Fatal(err)
+	}
+	fact, err := InspectAt(dir, source.CheckpointID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fact.Manifest.SourceGeneration != source.SourceGeneration {
+		t.Fatal("physical generation not persisted")
+	}
+	if _, err := MatchSource(fact, source); err != nil {
+		t.Fatal(err)
+	}
+	for _, changed := range []string{"generation-two", ""} {
+		other := source
+		other.SourceGeneration = changed
+		if _, err := MatchSource(fact, other); err == nil {
+			t.Fatalf("accepted changed generation %q", changed)
+		}
+		called := false
+		if _, err := PublishAt(dir, other, func(string) error { called = true; return nil }); err == nil || called {
+			t.Fatal("replay overwrote another physical generation")
+		}
+	}
+}
