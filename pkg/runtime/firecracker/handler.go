@@ -347,6 +347,9 @@ func NewHandler(
 	loader runtimecore.OciLoader,
 ) (*Handler, error) {
 	firecrackerConfig := cfg.RuntimeConfig.Firecracker
+	if err := validateVMMLogLevel(firecrackerConfig.VMMLogLevel); err != nil {
+		return nil, err
+	}
 	applyFirecrackerDefaults(&firecrackerConfig)
 	if err := validateFirecrackerWritablePolicy(firecrackerConfig); err != nil {
 		return nil, err
@@ -402,6 +405,7 @@ func NewHandler(
 	}
 	handler := &Handler{
 		binary:                 binary,
+		vmmLogLevel:            firecrackerConfig.VMMLogLevel,
 		sandboxRoot:            sandboxRoot,
 		storageRoot:            storageRoot,
 		runtimeRoot:            firecrackerproto.HostRuntimeRoot,
@@ -707,11 +711,7 @@ func (handler *Handler) Start(
 		}
 	}
 
-	command := exec.Command(
-		handler.binary,
-		"--api-sock", apiPath,
-		"--id", startConfig.ID,
-	)
+	command := handler.vmmCommand(apiPath, startConfig.ID)
 	command.Dir = stateDir
 	command.Stdout = stdout
 	command.Stderr = stderr
