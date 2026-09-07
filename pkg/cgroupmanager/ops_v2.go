@@ -198,8 +198,9 @@ func (o *cgroupV2) stat(name string) (Stats, error) {
 	if err != nil {
 		return Stats{}, err
 	}
-	result := readV2PressureStats(filepath.Join(o.mountpoint, name))
-	result.CPUQuotaUsec, result.CPUPeriodUsec, result.CPULimitsKnown = readCPUMax(filepath.Join(o.mountpoint, name, "cpu.max"))
+	groupPath := filepath.Join(o.mountpoint, name)
+	result := readV2PressureStats(groupPath)
+	result.CPUQuotaUsec, result.CPUPeriodUsec, result.CPULimitsKnown = readCPUMax(filepath.Join(groupPath, "cpu.max"))
 	if metrics.CPU != nil {
 		result.CPUUsageNanos = usecToNS(metrics.CPU.UsageUsec)
 		result.CPUUserNanos = usecToNS(metrics.CPU.UserUsec)
@@ -208,10 +209,32 @@ func (o *cgroupV2) stat(name string) (Stats, error) {
 	if metrics.Memory != nil {
 		result.MemoryUsageBytes = metrics.Memory.Usage
 		result.MemoryLimitBytes = metrics.Memory.UsageLimit
-		result.MemoryMaxUsageBytes = readUintFile(filepath.Join(o.mountpoint, name, "memory.peak"))
+		result.MemoryMaxUsageBytes = readUintFile(filepath.Join(groupPath, "memory.peak"))
 		if result.MemoryMaxUsageBytes == 0 {
 			result.MemoryMaxUsageBytes = result.MemoryUsageBytes
 		}
+	}
+	// Known readings are decided only by the bounded strict reads below: the
+	// containerd struct above cannot distinguish an absent source file from an
+	// observed zero and is kept purely as the legacy numeric fallback.
+	if usageUsec, ok := readV2CPUUsageUsec(filepath.Join(groupPath, "cpu.stat")); ok {
+		result.CPUUsageNanos = usecToNS(usageUsec)
+		result.CPUUsageKnown = true
+	}
+	if usage, ok := readUsageCounter(filepath.Join(groupPath, "memory.current")); ok {
+		result.MemoryUsageBytes = usage
+		result.MemoryUsageKnown = true
+	}
+	if limit, ok := readUsageLimit(filepath.Join(groupPath, "memory.max")); ok {
+		result.MemoryLimitBytes = limit
+		result.MemoryLimitKnown = true
+	}
+	// A measured memory.peak — including a genuine 0 — replaces the legacy
+	// current-usage substitution above; without one the numbers stay as the
+	// backwards-compatible fallback and the flag stays false.
+	if peak, ok := readUsageCounter(filepath.Join(groupPath, "memory.peak")); ok {
+		result.MemoryMaxUsageBytes = peak
+		result.MemoryPeakKnown = true
 	}
 	return result, nil
 }

@@ -123,6 +123,12 @@ func (*cgroupV1) update(name string, resources *specs.LinuxResources) error {
 	return group.Update(resources)
 }
 
+// stat keeps the legacy containerd v1 numbers. The v1 metrics aggregate
+// cannot prove source presence: its cpuacct/memory entries are zero-filled
+// structs regardless of which hierarchy files were readable, and sandboxd
+// does not wire direct v1 hierarchy reads here. Every usage/limit/peak known
+// flag therefore stays false rather than treating a non-nil metrics pointer
+// as evidence of a real source.
 func (*cgroupV1) stat(name string) (Stats, error) {
 	group, err := cg.Load(cg.StaticPath(name), cg.WithHiearchy(cg.Default))
 	if err != nil {

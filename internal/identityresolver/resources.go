@@ -51,9 +51,16 @@ type resourceReport struct {
 
 type resourceSample struct {
 	CpuUsageNs          uint64 `json:"cpu_usage_ns"`
+	CpuUsageKnown       bool   `json:"cpu_usage_known"`
 	MemoryUsageBytes    uint64 `json:"memory_usage_bytes"`
+	MemoryUsageKnown    bool   `json:"memory_usage_known"`
 	MemoryLimitBytes    uint64 `json:"memory_limit_bytes"`
+	MemoryLimitKnown    bool   `json:"memory_limit_known"`
 	MemoryMaxUsageBytes uint64 `json:"memory_max_usage_bytes"`
+	// True only when memory_max_usage_bytes is a measured memory.peak; when
+	// false the daemon may have substituted current usage for legacy
+	// consumers, which is not an observed peak.
+	MemoryPeakKnown     bool   `json:"memory_peak_known"`
 	CpuQuotaUsec        int64  `json:"cpu_quota_usec"`
 	CpuPeriodUsec       uint64 `json:"cpu_period_usec"`
 	CpuLimitsKnown      bool   `json:"cpu_limits_known"`
@@ -65,8 +72,6 @@ type resourceSample struct {
 	MemoryHighEvents    uint64 `json:"memory_high_events"`
 	MemoryOomEvents     uint64 `json:"memory_oom_events"`
 	MemoryOomKillEvents uint64 `json:"memory_oom_kill_events"`
-	// Stats currently falls back to current usage if memory.peak is unavailable.
-	MemoryPeakKnown bool `json:"memory_peak_known"`
 }
 
 // decodeBirthResourceEvidence parses the persisted birth label under strict
@@ -130,9 +135,13 @@ func serveResources(w http.ResponseWriter, identity Identity, firstBirth, second
 		SampleFinishedUnixMs: sampleFinishedUnixMs,
 		Current: resourceSample{
 			CpuUsageNs:          stats.CpuUsageNs,
+			CpuUsageKnown:       stats.CpuUsageKnown,
 			MemoryUsageBytes:    stats.MemoryUsageBytes,
+			MemoryUsageKnown:    stats.MemoryUsageKnown,
 			MemoryLimitBytes:    stats.MemoryLimitBytes,
+			MemoryLimitKnown:    stats.MemoryLimitKnown,
 			MemoryMaxUsageBytes: stats.MemoryMaxUsageBytes,
+			MemoryPeakKnown:     stats.MemoryPeakKnown,
 			CpuQuotaUsec:        stats.CpuQuotaUsec,
 			CpuPeriodUsec:       stats.CpuPeriodUsec,
 			CpuLimitsKnown:      stats.CpuLimitsKnown,

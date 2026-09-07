@@ -154,10 +154,20 @@ List exposes the committed label. The authenticated `/resources` resolver route
 accepts the same selector as `/resolve` and returns schema 1 with `identity`,
 validated `birth`, Stats RPC start/end timestamps, and an allowlisted `current`
 sample. Missing, malformed, mismatching or changing birth labels return 409;
-`/resolve` remains available without birth evidence. `current.memory_peak_known`
-is false because the daemon currently substitutes current usage when memory.peak
-is unavailable. Do not label that fallback as a measured lifetime peak. Harbor
-collector/report ingestion and capture before physical deletion remain pending.
+`/resolve` remains available without birth evidence. StatsResponse and the
+`current` sample carry source-validity flags `cpu_usage_known`,
+`memory_usage_known`, `memory_limit_known`, and `memory_peak_known`: true only
+when the cgroup v2 backend parsed the exact kernel file (cpu.stat usage_usec
+within the nanosecond conversion range, memory.current, memory.max with its
+"max" sentinel, memory.peak) under strict bounded rules, a genuine zero
+included. When a flag is false the matching numeric still holds the legacy
+fallback — a missing memory.peak substitutes current usage — so it must not be
+read as an observed value, let alone a lifetime peak. The cgroup v1 backend
+reports all four flags false: its library metrics cannot prove source presence.
+Servers predating the flags default them false on the wire for the same
+reason, so consumers must consult the flags, never infer validity from a
+nonzero number. Harbor collector/report ingestion and capture before physical
+deletion remain pending.
 Metadata atomic writes now fsync the file, rename, then fsync its directory;
 PersistMetadata also syncs parent entries through the containers-root parent
 before publishing an INTENT in memory. A post-rename sync error can leave the

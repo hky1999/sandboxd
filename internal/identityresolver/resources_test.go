@@ -46,14 +46,19 @@ func birthStatus() *runtime.SandboxStatus {
 }
 
 // grownStats carries live limits that grew past the birth evidence: 4GiB and
-// 200ms quota against the 2GiB and 100ms prepared at birth.
+// 200ms quota against the 2GiB and 100ms prepared at birth, with every source
+// validity flag proven by the daemon.
 func grownStats() *runtime.StatsResponse {
 	return &runtime.StatsResponse{
 		ResourceGeneration:  "generation",
 		CpuUsageNs:          123456789,
+		CpuUsageKnown:       true,
 		MemoryUsageBytes:    1073741824,
+		MemoryUsageKnown:    true,
 		MemoryLimitBytes:    4294967296,
+		MemoryLimitKnown:    true,
 		MemoryMaxUsageBytes: 3221225472,
+		MemoryPeakKnown:     true,
 		CpuQuotaUsec:        200000,
 		CpuPeriodUsec:       100000,
 		CpuLimitsKnown:      true,
@@ -109,8 +114,8 @@ func TestResourcesReturnsValidatedBirthAndLiveSample(t *testing.T) {
 			if report.Birth.SchemaVersion != 1 || report.Birth.SandboxID != "sandbox" || report.Birth.ResourceGeneration != "generation" || report.Birth.Phase != "start" || report.Birth.ObservedAtUnixMs <= 0 || report.Birth.CpuQuotaUsec != 100000 || report.Birth.CpuPeriodUsec != 100000 || report.Birth.MemoryLimitBytes != 2147483648 {
 				t.Fatalf("invalid birth evidence %+v", report.Birth)
 			}
-			if report.Current.MemoryPeakKnown {
-				t.Fatal("unproven kernel memory peak reported known")
+			if !report.Current.MemoryPeakKnown || !report.Current.CpuUsageKnown || !report.Current.MemoryUsageKnown || !report.Current.MemoryLimitKnown {
+				t.Fatalf("stats source-validity flags not copied: %+v", report.Current)
 			}
 			if report.Current.MemoryLimitBytes != 4294967296 || report.Current.MemoryLimitBytes == report.Birth.MemoryLimitBytes || report.Current.CpuQuotaUsec != 200000 || report.Current.CpuQuotaUsec == report.Birth.CpuQuotaUsec {
 				t.Fatalf("grown live sample not reported: %+v", report)
@@ -130,6 +135,40 @@ func TestResourcesReturnsValidatedBirthAndLiveSample(t *testing.T) {
 				t.Fatalf("unexpected backend calls %d %d", client.calls, client.statsCalls)
 			}
 		})
+	}
+}
+
+// The resolver must mirror the daemon's source-validity flags, not
+// manufacture them: unproven readings (including the legacy memory.peak
+// fallback) stay unknown in the report even though the numerics are copied.
+func TestResourcesMirrorsUnknownSourceValidityFlags(t *testing.T) {
+	status := birthStatus()
+	first := &runtime.ListSandboxesResponse{Sandboxes: []*runtime.SandboxStatus{status}}
+	second := proto.Clone(first).(*runtime.ListSandboxesResponse)
+	stats := grownStats()
+	stats.CpuUsageKnown = false
+	stats.MemoryUsageKnown = false
+	stats.MemoryLimitKnown = false
+	stats.MemoryPeakKnown = false
+	client := &fakeClient{first: first, second: second, stats: stats}
+	token := strings.Repeat("x", 32)
+	handler, err := New(client, token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest("GET", "/resources?ip=10.88.0.1", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, req)
+	var report resourceReport
+	if response.Code != 200 || json.Unmarshal(response.Body.Bytes(), &report) != nil {
+		t.Fatalf("invalid response %d %s", response.Code, response.Body.String())
+	}
+	if report.Current.CpuUsageKnown || report.Current.MemoryUsageKnown || report.Current.MemoryLimitKnown || report.Current.MemoryPeakKnown {
+		t.Fatalf("unproven stats sources reported known: %+v", report.Current)
+	}
+	if report.Current.CpuUsageNs != 123456789 || report.Current.MemoryMaxUsageBytes != 3221225472 {
+		t.Fatalf("legacy numerics not preserved alongside unknown flags: %+v", report.Current)
 	}
 }
 

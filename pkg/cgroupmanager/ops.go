@@ -65,7 +65,9 @@ func validateCgroupProcesses(processes []uint64) error {
 
 // Stats is the version-neutral subset of cgroup accounting exposed by
 // sandboxd. CPU accounting uses nanoseconds; quota/period use microseconds.
-// Memory values are bytes.
+// Memory values are bytes. Every usage/limit/peak numeric keeps a legacy
+// fallback value when its known flag is false; only the flag distinguishes a
+// strict direct kernel-file reading (cgroup v1 never proves one).
 type Stats struct {
 	CPUPressureKnown    bool
 	CPUPeriods          uint64
@@ -80,11 +82,15 @@ type Stats struct {
 	CPUPeriodUsec       uint64
 	CPULimitsKnown      bool
 	CPUUsageNanos       uint64
+	CPUUsageKnown       bool // strict cpu.stat usage_usec reading
 	CPUUserNanos        uint64
 	CPUKernelNanos      uint64
 	MemoryUsageBytes    uint64
+	MemoryUsageKnown    bool // strict memory.current reading
 	MemoryLimitBytes    uint64
+	MemoryLimitKnown    bool // strict memory.max reading; "max" = unlimited
 	MemoryMaxUsageBytes uint64
+	MemoryPeakKnown     bool // measured memory.peak, not the usage fallback
 }
 
 type cgroupOps interface {

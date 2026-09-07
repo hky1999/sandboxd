@@ -172,6 +172,28 @@ func TestV010WireContract(t *testing.T) {
 		}
 		message.Field = message.Field[:4]
 	}
+	// Validate only the four additive source-validity flags before projecting
+	// them out. Keep all previously frozen descriptor hashes unchanged.
+	for _, message := range descriptor.MessageType {
+		if message.GetName() != "StatsResponse" {
+			continue
+		}
+		if len(message.Field) != 23 {
+			t.Fatalf("unexpected source-validity field count %d", len(message.Field))
+		}
+		names := []string{"cpu_usage_known", "memory_usage_known", "memory_limit_known", "memory_peak_known"}
+		jsonNames := []string{"cpuUsageKnown", "memoryUsageKnown", "memoryLimitKnown", "memoryPeakKnown"}
+		for i, name := range names {
+			field := message.Field[19+i]
+			if field.GetName() != name || field.GetJsonName() != jsonNames[i] ||
+				field.GetNumber() != int32(20+i) || field.GetType() != descriptorpb.FieldDescriptorProto_TYPE_BOOL ||
+				field.GetLabel() != descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL ||
+				field.OneofIndex != nil || field.GetProto3Optional() {
+				t.Fatalf("unexpected source-validity field %s", name)
+			}
+		}
+		message.Field = message.Field[:19]
+	}
 	// Pressure telemetry is strictly additive to the frozen resize contract.
 	for _, message := range descriptor.MessageType {
 		if message.GetName() != "StatsResponse" {

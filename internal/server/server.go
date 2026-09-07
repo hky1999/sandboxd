@@ -593,9 +593,13 @@ func (h *sandboxService) resourceStats(id string) (*runtime.StatsResponse, error
 		CpuLimitsKnown:      cgroupStats.CPULimitsKnown,
 		CpuKernelNs:         cgroupStats.CPUKernelNanos,
 		CpuUserNs:           cgroupStats.CPUUserNanos,
+		CpuUsageKnown:       cgroupStats.CPUUsageKnown,
 		MemoryUsageBytes:    cgroupStats.MemoryUsageBytes,
+		MemoryUsageKnown:    cgroupStats.MemoryUsageKnown,
 		MemoryLimitBytes:    cgroupStats.MemoryLimitBytes,
+		MemoryLimitKnown:    cgroupStats.MemoryLimitKnown,
 		MemoryMaxUsageBytes: cgroupStats.MemoryMaxUsageBytes,
+		MemoryPeakKnown:     cgroupStats.MemoryPeakKnown,
 	}, nil
 }
 

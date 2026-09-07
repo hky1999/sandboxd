@@ -565,6 +565,20 @@ message StatsResponse {
   uint64 memory_oom_events = 18;
   uint64 memory_oom_kill_events = 19;
 
+  // Source validity of the matching numeric field: true only when the daemon
+  // parsed the exact kernel cgroup file (cpu.stat usage_usec, memory.current,
+  // memory.max, memory.peak) under strict bounded rules. False covers missing,
+  // malformed, or overflowing sources and the cgroup v1 backend, which cannot
+  // prove source presence; the legacy numeric fallback may still be populated,
+  // so consumers must consult the flag before trusting the number. Servers
+  // predating these fields default them to false for the same reason.
+  bool cpu_usage_known = 20;
+  bool memory_usage_known = 21;
+  bool memory_limit_known = 22;
+  // memory_max_usage_bytes is a measured memory.peak only when this is true;
+  // otherwise the server may have substituted current usage as the legacy
+  // fallback, which is not an observed peak.
+  bool memory_peak_known = 23;
 }
 
 // ListAvailableRuntimesRequest requests the runtime classes currently available

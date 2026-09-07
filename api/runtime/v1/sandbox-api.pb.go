@@ -3067,8 +3067,22 @@ type StatsResponse struct {
 	MemoryHighEvents    uint64 `protobuf:"varint,17,opt,name=memory_high_events,json=memoryHighEvents,proto3" json:"memory_high_events,omitempty"`
 	MemoryOomEvents     uint64 `protobuf:"varint,18,opt,name=memory_oom_events,json=memoryOomEvents,proto3" json:"memory_oom_events,omitempty"`
 	MemoryOomKillEvents uint64 `protobuf:"varint,19,opt,name=memory_oom_kill_events,json=memoryOomKillEvents,proto3" json:"memory_oom_kill_events,omitempty"`
-	unknownFields       protoimpl.UnknownFields
-	sizeCache           protoimpl.SizeCache
+	// Source validity of the matching numeric field: true only when the daemon
+	// parsed the exact kernel cgroup file (cpu.stat usage_usec, memory.current,
+	// memory.max, memory.peak) under strict bounded rules. False covers missing,
+	// malformed, or overflowing sources and the cgroup v1 backend, which cannot
+	// prove source presence; the legacy numeric fallback may still be populated,
+	// so consumers must consult the flag before trusting the number. Servers
+	// predating these fields default them to false for the same reason.
+	CpuUsageKnown    bool `protobuf:"varint,20,opt,name=cpu_usage_known,json=cpuUsageKnown,proto3" json:"cpu_usage_known,omitempty"`
+	MemoryUsageKnown bool `protobuf:"varint,21,opt,name=memory_usage_known,json=memoryUsageKnown,proto3" json:"memory_usage_known,omitempty"`
+	MemoryLimitKnown bool `protobuf:"varint,22,opt,name=memory_limit_known,json=memoryLimitKnown,proto3" json:"memory_limit_known,omitempty"`
+	// memory_max_usage_bytes is a measured memory.peak only when this is true;
+	// otherwise the server may have substituted current usage as the legacy
+	// fallback, which is not an observed peak.
+	MemoryPeakKnown bool `protobuf:"varint,23,opt,name=memory_peak_known,json=memoryPeakKnown,proto3" json:"memory_peak_known,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *StatsResponse) Reset() {
@@ -3232,6 +3246,34 @@ func (x *StatsResponse) GetMemoryOomKillEvents() uint64 {
 		return x.MemoryOomKillEvents
 	}
 	return 0
+}
+
+func (x *StatsResponse) GetCpuUsageKnown() bool {
+	if x != nil {
+		return x.CpuUsageKnown
+	}
+	return false
+}
+
+func (x *StatsResponse) GetMemoryUsageKnown() bool {
+	if x != nil {
+		return x.MemoryUsageKnown
+	}
+	return false
+}
+
+func (x *StatsResponse) GetMemoryLimitKnown() bool {
+	if x != nil {
+		return x.MemoryLimitKnown
+	}
+	return false
+}
+
+func (x *StatsResponse) GetMemoryPeakKnown() bool {
+	if x != nil {
+		return x.MemoryPeakKnown
+	}
+	return false
 }
 
 // ListAvailableRuntimesRequest requests the runtime classes currently available
@@ -3912,7 +3954,7 @@ const file_api_runtime_v1_sandbox_api_proto_rawDesc = "" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x121\n" +
 	"\x05value\x18\x02 \x01(\v2\x1b.runtime.v1.SandboxMetadataR\x05value:\x028\x01\"\x1e\n" +
 	"\fStatsRequest\x12\x0e\n" +
-	"\x02id\x18\x01 \x01(\tR\x02id\"\xc6\x06\n" +
+	"\x02id\x18\x01 \x01(\tR\x02id\"\xf6\a\n" +
 	"\rStatsResponse\x12 \n" +
 	"\fcpu_usage_ns\x18\x01 \x01(\x04R\n" +
 	"cpuUsageNs\x12,\n" +
@@ -3935,7 +3977,11 @@ const file_api_runtime_v1_sandbox_api_proto_rawDesc = "" +
 	"\x15memory_pressure_known\x18\x10 \x01(\bR\x13memoryPressureKnown\x12,\n" +
 	"\x12memory_high_events\x18\x11 \x01(\x04R\x10memoryHighEvents\x12*\n" +
 	"\x11memory_oom_events\x18\x12 \x01(\x04R\x0fmemoryOomEvents\x123\n" +
-	"\x16memory_oom_kill_events\x18\x13 \x01(\x04R\x13memoryOomKillEvents\"\x1e\n" +
+	"\x16memory_oom_kill_events\x18\x13 \x01(\x04R\x13memoryOomKillEvents\x12&\n" +
+	"\x0fcpu_usage_known\x18\x14 \x01(\bR\rcpuUsageKnown\x12,\n" +
+	"\x12memory_usage_known\x18\x15 \x01(\bR\x10memoryUsageKnown\x12,\n" +
+	"\x12memory_limit_known\x18\x16 \x01(\bR\x10memoryLimitKnown\x12*\n" +
+	"\x11memory_peak_known\x18\x17 \x01(\bR\x0fmemoryPeakKnown\"\x1e\n" +
 	"\x1cListAvailableRuntimesRequest\"H\n" +
 	"\x1dListAvailableRuntimesResponse\x12'\n" +
 	"\x0fruntime_classes\x18\x01 \x03(\tR\x0eruntimeClasses\"]\n" +
