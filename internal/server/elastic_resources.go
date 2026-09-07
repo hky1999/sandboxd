@@ -116,7 +116,12 @@ func (h *sandboxService) verifyPreparedElasticLimits(start svc.StartConfig, phas
 	if err != nil {
 		return fmt.Errorf("read elastic %s limits: %w", phase, err)
 	}
-	if !actual.CPULimitsKnown || actual.CPUQuotaUsec != start.Resources.CpuQuota ||
+	// Numeric equality alone is not proof: with MemoryLimitKnown false the
+	// number is a legacy fallback that must never become birth evidence.
+	if !actual.CPULimitsKnown || !actual.MemoryLimitKnown {
+		return fmt.Errorf("elastic %s cgroup readback cannot prove requested limits", phase)
+	}
+	if actual.CPUQuotaUsec != start.Resources.CpuQuota ||
 		actual.CPUPeriodUsec != start.Resources.CpuPeriod ||
 		actual.MemoryLimitBytes != uint64(start.Resources.MemoryLimitInBytes) {
 		return fmt.Errorf("elastic %s cgroup readback does not match requested limits", phase)

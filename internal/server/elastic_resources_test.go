@@ -101,7 +101,7 @@ func TestElasticRestoreRequiresSavedLimitsAndRetainsSourceCeiling(t *testing.T) 
 	policy := request.Labels[elasticResourcesLabel]
 	snapshot := resourceLimitsSnapshot{
 		ElasticPolicy: policy, CPUQuotaUsec: 125000, CPUPeriodUsec: 100000,
-		CPULimitsKnown: true, MemoryLimitBytes: 2048 * 1024 * 1024,
+		CPULimitsKnown: true, MemoryLimitBytes: 2048 * 1024 * 1024, MemoryLimitKnown: true,
 	}
 	raw, err := json.Marshal(snapshot)
 	require.NoError(t, err)

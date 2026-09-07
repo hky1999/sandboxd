@@ -32,6 +32,7 @@ type resourceLimitsSnapshot struct {
 	CPUPeriodUsec    uint64 `json:"cpu_period_usec,omitempty"`
 	CPULimitsKnown   bool   `json:"cpu_limits_known,omitempty"`
 	MemoryLimitBytes uint64 `json:"memory_limit_bytes"`
+	MemoryLimitKnown bool   `json:"memory_limit_known,omitempty"`
 }
 
 // captureResourceLimits reads the sandbox's effective cgroup limits and
@@ -64,7 +65,9 @@ func (h *sandboxService) captureResourceLimits(sandboxID, dir string) error {
 	if err != nil {
 		return fmt.Errorf("capture resource limits: stat cgroup %s: %w", cgroupPath, err)
 	}
-	if policy != "" && (!stats.CPULimitsKnown || stats.CPUQuotaUsec <= 0 || stats.CPUPeriodUsec == 0 || stats.MemoryLimitBytes < 1024*1024) {
+	// A false MemoryLimitKnown carries only a legacy fallback number; elastic
+	// capture must not publish it as an observed limit.
+	if policy != "" && (!stats.CPULimitsKnown || !stats.MemoryLimitKnown || stats.CPUQuotaUsec <= 0 || stats.CPUPeriodUsec == 0 || stats.MemoryLimitBytes < 1024*1024) {
 		return fmt.Errorf("elastic checkpoint requires known finite resource limits")
 	}
 	if policy != "" {
@@ -80,7 +83,7 @@ func (h *sandboxService) captureResourceLimits(sandboxID, dir string) error {
 			return fmt.Errorf("cannot checkpoint elastic limits outside policy: %w", err)
 		}
 	}
-	snapshot := resourceLimitsSnapshot{ElasticPolicy: policy, MemoryLimitBytes: stats.MemoryLimitBytes, CPUQuotaUsec: stats.CPUQuotaUsec, CPUPeriodUsec: stats.CPUPeriodUsec, CPULimitsKnown: stats.CPULimitsKnown}
+	snapshot := resourceLimitsSnapshot{ElasticPolicy: policy, MemoryLimitBytes: stats.MemoryLimitBytes, MemoryLimitKnown: stats.MemoryLimitKnown, CPUQuotaUsec: stats.CPUQuotaUsec, CPUPeriodUsec: stats.CPUPeriodUsec, CPULimitsKnown: stats.CPULimitsKnown}
 	data, err := json.Marshal(snapshot)
 	if err != nil {
 		return err
@@ -112,8 +115,10 @@ func applyCheckpointResourceLimits(startConfig *runtime.StartRequest, checkpoint
 		return nil
 	}
 	if elastic || snapshot.ElasticPolicy != "" {
-		if snapshot.ElasticPolicy == "" || !snapshot.CPULimitsKnown || snapshot.CPUQuotaUsec <= 0 ||
-			snapshot.CPUPeriodUsec == 0 || snapshot.MemoryLimitBytes < 1024*1024 {
+		// Legacy elastic sidecars without a saved memory_limit_known flag fail
+		// closed: their number cannot be proven to be an observed limit.
+		if snapshot.ElasticPolicy == "" || !snapshot.CPULimitsKnown || !snapshot.MemoryLimitKnown ||
+			snapshot.CPUQuotaUsec <= 0 || snapshot.CPUPeriodUsec == 0 || snapshot.MemoryLimitBytes < 1024*1024 {
 			return fmt.Errorf("elastic restore requires saved policy and finite CPU/memory limits")
 		}
 		if startConfig.Labels == nil {

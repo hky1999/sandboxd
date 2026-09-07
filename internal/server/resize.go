@@ -16,8 +16,10 @@ import (
 
 const resourceGenerationLabel = "akernel.scheduler/resource-generation"
 
+// limitsMatch requires proven observations: an unknown memory limit is a
+// legacy fallback number that must not pass as the enforced hard limit.
 func limitsMatch(stats *runtime.StatsResponse, limits *runtime.ResourceLimits) bool {
-	return stats.CpuLimitsKnown && stats.CpuQuotaUsec == limits.CpuQuotaUsec &&
+	return stats.CpuLimitsKnown && stats.MemoryLimitKnown && stats.CpuQuotaUsec == limits.CpuQuotaUsec &&
 		stats.CpuPeriodUsec == limits.CpuPeriodUsec && stats.MemoryLimitBytes == limits.MemoryLimitBytes
 }
 
@@ -87,6 +89,9 @@ func (h *sandboxService) ResizeResources(ctx context.Context, req *runtime.Resiz
 	if !before.CpuLimitsKnown || before.CpuQuotaUsec <= 0 || before.CpuPeriodUsec == 0 {
 		return nil, errord.ToGRPCf(errord.ErrFailedPrecondition, "effective CPU limits are unknown or unlimited")
 	}
+	if !before.MemoryLimitKnown {
+		return nil, errord.ToGRPCf(errord.ErrFailedPrecondition, "effective memory limit is unknown")
+	}
 	if req.Target.CpuPeriodUsec != before.CpuPeriodUsec || req.Target.CpuQuotaUsec < before.CpuQuotaUsec || req.Target.MemoryLimitBytes < before.MemoryLimitBytes {
 		return nil, errord.ToGRPCf(errord.ErrInvalidArgument, "resize cannot lower limits or change CPU period")
 	}
@@ -119,7 +124,13 @@ func (h *sandboxService) ResizeResources(ctx context.Context, req *runtime.Resiz
 		response.UpdateError = updateErr.Error()
 	}
 	if !response.Complete && response.UpdateError == "" {
-		response.UpdateError = "effective hard limits did not match target"
+		if !after.CpuLimitsKnown || !after.MemoryLimitKnown {
+			// An unproven readback cannot claim success or a no-op write; the
+			// scheduler must reconcile via Stats while holding its reservation.
+			response.UpdateError = "effective limits unknown after possible write"
+		} else {
+			response.UpdateError = "effective hard limits did not match target"
+		}
 	}
 	logrus.WithFields(logrus.Fields{
 		"sandbox_id": req.SandboxID, "resource_generation": req.ResourceGeneration,

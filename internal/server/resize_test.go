@@ -73,7 +73,7 @@ func newResizeService(t *testing.T) (*sandboxService, *resizeCgroups, *runtime.R
 	}))
 	c := &resizeCgroups{stats: cgroupmanager.Stats{
 		CPUQuotaUsec: 50000, CPUPeriodUsec: 100000, CPULimitsKnown: true,
-		MemoryLimitBytes: 512 * 1024 * 1024,
+		MemoryLimitBytes: 512 * 1024 * 1024, MemoryLimitKnown: true,
 	}}
 	h.cgroupMgr = c
 	request := &runtime.ResizeResourcesRequest{
