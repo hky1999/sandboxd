@@ -276,10 +276,14 @@ func TestResizeResourcesOverGRPCPreservesIdentityAndReadback(t *testing.T) {
 
 type observedStartHandler struct {
 	svc.Handler
-	started bool
+	beforeStart func()
+	started     bool
 }
 
 func (h *observedStartHandler) Start(context.Context, svc.StartConfig) error {
+	if h.beforeStart != nil {
+		h.beforeStart()
+	}
 	h.started = true
 	return nil
 }
@@ -293,12 +297,18 @@ func TestElasticReadbackMustPassBeforeRuntimeStart(t *testing.T) {
 			c.noWrite = mismatch
 			c.stats.CPUQuotaUsec = 800000
 			c.stats.MemoryLimitBytes = 8192 * 1024 * 1024
+			annotations := elasticTestRequest(t).Labels
+			annotations[resourceGenerationLabel] = "generation-1"
 			start := svc.StartConfig{
 				ID: "elastic", CgroupPath: "/sandbox/lease",
 				Resources:   &runtime.LinuxSandboxResources{CpuQuota: 50000, CpuPeriod: 100000, MemoryLimitInBytes: 512 * 1024 * 1024},
-				Annotations: elasticTestRequest(t).Labels,
+				Annotations: annotations,
 			}
-			err := h.startSandboxRuntime(context.Background(), "runsc", start)
+			metadata := &runtime.SandboxMetadata{
+				ID: "elastic", RuntimeHandler: "runsc", Labels: annotations,
+				PhysicalPhase: runtime.SandboxPhysicalPhase_SANDBOX_PHYSICAL_PHASE_INTENT,
+			}
+			err := h.startSandboxRuntime(context.Background(), "runsc", start, metadata)
 			if mismatch {
 				require.ErrorContains(t, err, "readback does not match")
 				require.False(t, handler.started)

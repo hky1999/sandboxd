@@ -9,6 +9,7 @@ import (
 	"io"
 	"math"
 	"strings"
+	"time"
 
 	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
 	"github.com/inclusionAI/sandboxd/config"
@@ -17,6 +18,28 @@ import (
 )
 
 const elasticResourcesLabel = "akernel.scheduler/elastic-resources"
+
+// Reserved label holding the birth evidence observed for this incarnation.
+// Like the elastic policy, it is persisted through the metadata/checkpoint
+// path; a caller or a checkpoint source must never supply it.
+const birthResourcesLabel = "akernel.scheduler/birth-resources"
+
+const birthResourceEvidenceSchemaVersion = 1
+
+// birthResourceEvidence is a compact record of the leaf hard limits the node
+// was actually enforcing when this incarnation was born. It is an observation
+// of the prepared leaf cgroup before any workload process exists: it is not
+// ancestor-effective capacity, and it is not proof that the runtime started.
+type birthResourceEvidence struct {
+	SchemaVersion      int    `json:"schema_version"`
+	SandboxID          string `json:"sandbox_id"`
+	ResourceGeneration string `json:"resource_generation"`
+	Phase              string `json:"phase"`
+	ObservedAtUnixMs   int64  `json:"observed_at_unix_ms"`
+	CpuQuotaUsec       int64  `json:"cpu_quota_usec"`
+	CpuPeriodUsec      uint64 `json:"cpu_period_usec"`
+	MemoryLimitBytes   uint64 `json:"memory_limit_bytes"`
+}
 
 type elasticBounds struct {
 	Initial float64 `json:"initial"`
@@ -79,7 +102,10 @@ func validateElasticResources(req *runtime.StartRequest, cfg config.Config, rest
 
 // Read the effective leaf cgroup limits before any workload process is started.
 // A setter returning nil alone is not proof that initial limits were applied.
-func (h *sandboxService) verifyPreparedElasticLimits(start svc.StartConfig, phase string) error {
+// The elastic path additionally persists the observed limits as birth evidence
+// on the prepared metadata before the runtime handler runs; any failure there
+// must stop the handler rather than start an unevidenced incarnation.
+func (h *sandboxService) verifyPreparedElasticLimits(start svc.StartConfig, phase string, metadata *runtime.SandboxMetadata) error {
 	if start.Annotations[elasticResourcesLabel] == "" {
 		return nil
 	}
@@ -95,8 +121,40 @@ func (h *sandboxService) verifyPreparedElasticLimits(start svc.StartConfig, phas
 		actual.MemoryLimitBytes != uint64(start.Resources.MemoryLimitInBytes) {
 		return fmt.Errorf("elastic %s cgroup readback does not match requested limits", phase)
 	}
+	// The evidence binds the observation to this incarnation's prepared
+	// identity: a fresh nonempty generation, still in the INTENT phase. It is
+	// an observation of the leaf cgroup only — not ancestor-effective capacity
+	// and not proof that the runtime started.
+	generation := start.Annotations[resourceGenerationLabel]
+	if metadata == nil || h.sandboxManager == nil || metadata.ID != start.ID ||
+		generation == "" || metadata.Labels[resourceGenerationLabel] != generation ||
+		metadata.PhysicalPhase != runtime.SandboxPhysicalPhase_SANDBOX_PHYSICAL_PHASE_INTENT {
+		return fmt.Errorf("elastic %s birth evidence requires prepared INTENT metadata for this generation", phase)
+	}
+	evidence, err := json.Marshal(birthResourceEvidence{
+		SchemaVersion:      birthResourceEvidenceSchemaVersion,
+		SandboxID:          start.ID,
+		ResourceGeneration: generation,
+		Phase:              phase,
+		ObservedAtUnixMs:   time.Now().UnixMilli(),
+		CpuQuotaUsec:       actual.CPUQuotaUsec,
+		CpuPeriodUsec:      actual.CPUPeriodUsec,
+		MemoryLimitBytes:   actual.MemoryLimitBytes,
+	})
+	if err != nil {
+		return fmt.Errorf("encode elastic %s birth evidence: %w", phase, err)
+	}
+	if metadata.Labels == nil {
+		metadata.Labels = make(map[string]string)
+	}
+	metadata.Labels[birthResourcesLabel] = string(evidence)
+	// Persist while still INTENT so the durable record names the observed
+	// limits before the handler could claim any runtime fact.
+	if err := h.sandboxManager.PersistMetadata(start.ID, metadata); err != nil {
+		return fmt.Errorf("persist elastic %s birth evidence: %w", phase, err)
+	}
 	logrus.WithFields(logrus.Fields{
-		"sandbox_id": start.ID, "resource_generation": start.Annotations[resourceGenerationLabel],
+		"sandbox_id": start.ID, "resource_generation": generation,
 		"phase": phase, "cpu_quota_usec": actual.CPUQuotaUsec,
 		"cpu_period_usec": actual.CPUPeriodUsec, "memory_limit_bytes": actual.MemoryLimitBytes,
 		"elastic_policy": start.Annotations[elasticResourcesLabel],

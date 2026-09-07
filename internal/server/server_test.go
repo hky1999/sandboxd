@@ -527,7 +527,7 @@ func TestRestoreSandboxRuntimePreservesPhysicalIntentWhenCleanupIsIncomplete(t *
 
 	err := s.restoreSandboxRuntime(context.Background(), config.RuntimeNameRunsc, svc.StartConfig{
 		ID: sandboxID,
-	}, filepath.Join(t.TempDir(), "checkpoint.img"))
+	}, filepath.Join(t.TempDir(), "checkpoint.img"), nil)
 
 	assert.ErrorIs(t, err, svc.ErrRestoreCleanupIncomplete)
 	assert.FileExists(t, filepath.Join(bundleDir, config.SandboxSpecFile))

@@ -137,5 +137,19 @@ and no additional parameters. Instance lookup does not require an IP address.
 Both paths require a unique RUNNING sandbox with complete instance/runtime/
 sandbox/resource-generation identity, matching Stats generation, and an unchanged
 second List result. The response is a fresh observation, not a lease for future
-mutations. It contains no birth-resource proof; prepared elastic limits currently
-have log evidence only. Keep the separate resolver token out of trial artifacts.
+mutations. Its response contains no birth-resource proof. Keep the separate
+resolver token out of trial artifacts.
+
+# Scheduler birth-resource evidence
+
+Elastic Start/Restore now saves `akernel.scheduler/birth-resources` in the
+incarnation's INTENT metadata after leaf cgroup readback and before invoking the
+runtime handler. Persistence failure prevents that invocation. The label contains
+schema 1, sandbox ID, resource generation, start/restore phase, observation time,
+CPU quota/period and memory hard limit. Create clears any caller/checkpoint copy;
+restore records its newly observed limits under its fresh generation.
+Only associate this record with a successfully committed matching incarnation.
+It proves prepared leaf limits, not ancestor-effective capacity or runtime success.
+List exposes the committed label; resolver/report ingestion is still pending.
+Existing metadata atomic writes lack directory fsync, so power-loss durability
+has not been accepted. Preserve generation-segmented evidence before deletion.

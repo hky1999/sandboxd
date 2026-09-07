@@ -210,6 +210,7 @@ func (h *sandboxService) startSandboxRuntime(
 	ctx context.Context,
 	runtimeName string,
 	startConfig svc.StartConfig,
+	metadata *runtime.SandboxMetadata,
 ) (err error) {
 	traceID, spanID := trace.GetContextID(ctx)
 	start := time.Now()
@@ -276,7 +277,7 @@ func (h *sandboxService) startSandboxRuntime(
 			)
 		}
 	} else {
-		if err = h.verifyPreparedElasticLimits(startConfig, "start"); err != nil {
+		if err = h.verifyPreparedElasticLimits(startConfig, "start", metadata); err != nil {
 			return err
 		}
 		err = handler.Start(ctx, startConfig)
@@ -296,6 +297,7 @@ func (h *sandboxService) restoreSandboxRuntime(
 	runtimeName string,
 	startConfig svc.StartConfig,
 	checkpointImage string,
+	metadata *runtime.SandboxMetadata,
 ) (err error) {
 	if err = h.checkRuntime(runtimeName); err != nil {
 		return fmt.Errorf("runtime %q is not available: %w", runtimeName, err)
@@ -317,7 +319,7 @@ func (h *sandboxService) restoreSandboxRuntime(
 			return fmt.Errorf("prepare cgroup %s: %w", startConfig.CgroupPath, err)
 		}
 	}
-	if err = h.verifyPreparedElasticLimits(startConfig, "restore"); err != nil {
+	if err = h.verifyPreparedElasticLimits(startConfig, "restore", metadata); err != nil {
 		return err
 	}
 	if err := restoreHandler.Restore(ctx, startConfig, checkpointImage); err != nil {
@@ -1376,6 +1378,11 @@ func (h *sandboxService) createSandbox(
 		startReq.Labels = make(map[string]string)
 	}
 	startReq.Labels[resourceGenerationLabel] = uuid.NewString()
+	// Birth-resource evidence is a fresh observation bound to the generation
+	// above: drop any caller-supplied or checkpoint-source-carried record
+	// before it can reach the metadata and annotations copies. A restored
+	// generation always gets a newly observed record.
+	delete(startReq.Labels, birthResourcesLabel)
 	if err := validateElasticResources(startReq, h.config, options.checkpointImage != ""); err != nil {
 		return &runtime.StartResponse{Code: -1, Message: err.Error()},
 			errord.ToGRPC(fmt.Errorf("%v: %w", err, errord.ErrInvalidArgument))
@@ -1858,9 +1865,9 @@ func (h *sandboxService) createSandbox(
 		CheckpointDir:           checkpointDir,
 	}
 	if options.checkpointImage == "" {
-		err = h.startSandboxRuntime(ctx, startReq.Runtime, runtimeConfig)
+		err = h.startSandboxRuntime(ctx, startReq.Runtime, runtimeConfig, metadata)
 	} else {
-		err = h.restoreSandboxRuntime(ctx, startReq.Runtime, runtimeConfig, options.checkpointImage)
+		err = h.restoreSandboxRuntime(ctx, startReq.Runtime, runtimeConfig, options.checkpointImage, metadata)
 	}
 	if err != nil {
 		return &runtime.StartResponse{
