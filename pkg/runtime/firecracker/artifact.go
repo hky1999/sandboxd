@@ -437,8 +437,13 @@ type cachedCheckpointDigest struct {
 // advisory and resets once it exceeds a generous entry bound (incremental
 // chains mint a fresh directory per generation).
 type checkpointDigestCache struct {
-	mu      sync.Mutex
-	entries map[string]cachedCheckpointDigest
+	// Local memory scans do not use entries. Keep their existing single-scan
+	// resource bound independently of the component cache, so a materialized
+	// restore can proceed while local memory is being verified.
+	memoryOnce sync.Once
+	memoryGate chan struct{}
+	mu         sync.Mutex
+	entries    map[string]cachedCheckpointDigest
 	// hashes counts component hashes performed; it exists so tests can
 	// observe cache hits without timing.
 	hashes int
@@ -454,8 +459,6 @@ func (cache *checkpointDigestCache) verifyFirecrackerCheckpointDigests(
 	ctx context.Context,
 	artifact *firecrackerCheckpointArtifact,
 ) error {
-	cache.mu.Lock()
-	defer cache.mu.Unlock()
 	// A materialized artifact (cn-fetch from the chunk store) carries a
 	// sparse memory placeholder: its integrity is guaranteed per chunk by
 	// the uffd handler at serve time (fetch-verify-copy), so re-hashing
@@ -485,6 +488,10 @@ func (cache *checkpointDigestCache) verifyFirecrackerCheckpointDigests(
 			return err
 		}
 	}
+	// Only the memoized components share this lock. Memory chunks above
+	// are always content-verified and never access the cache map.
+	cache.mu.Lock()
+	defer cache.mu.Unlock()
 	for _, component := range firecrackerCheckpointComponents(artifact.Files) {
 		expected, recorded := artifact.Manifest.Digests[component.name]
 		if !recorded || expected == "" {
@@ -886,6 +893,17 @@ func (cache *checkpointDigestCache) verifyFirecrackerCheckpointMemoryChunks(
 	ctx context.Context,
 	artifact *firecrackerCheckpointArtifact,
 ) error {
+	cache.memoryOnce.Do(func() { cache.memoryGate = make(chan struct{}, 1) })
+	select {
+	case cache.memoryGate <- struct{}{}:
+		defer func() { <-cache.memoryGate }()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	// Cancellation racing an available slot must not start a manifest read.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if filepath.Base(artifact.Files.Memory) != firecrackerCheckpointMemoryName {
 		return fmt.Errorf("local memory artifact must be named %s", firecrackerCheckpointMemoryName)
 	}
