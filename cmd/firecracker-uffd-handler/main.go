@@ -497,8 +497,12 @@ func (s *faultServer) fetchChunkFromStore(chunkIdx uint64) error {
 			buf = make([]byte, length)
 		}
 		if httpSource {
-			resp, err := storeHTTPClient.Get(strings.TrimRight(src.chunkStore, "/") +
-				"/" + entry.Digest[:2] + "/" + entry.Digest)
+			req, err := http.NewRequestWithContext(src.requestContext(), http.MethodGet,
+				strings.TrimRight(src.chunkStore, "/")+"/"+entry.Digest[:2]+"/"+entry.Digest, nil)
+			if err != nil {
+				return fmt.Errorf("build store chunk request %s: %w", entry.Digest, err)
+			}
+			resp, err := storeHTTPClient.Do(req)
 			if err != nil {
 				return fmt.Errorf("fetch store chunk %s: %w", entry.Digest, err)
 			}
