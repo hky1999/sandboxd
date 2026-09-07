@@ -860,6 +860,18 @@ func (handler *Handler) Restore(
 	if err := os.Mkdir(stateDir, 0700); err != nil {
 		return fmt.Errorf("create Firecracker restore state directory: %w", err)
 	}
+	// Durably record the new directory entries for the persisted incarnation
+	// state written below, mirroring the fresh Start path.
+	if err := syncFirecrackerDirectory(bundlePath); err != nil {
+		return fmt.Errorf("sync Firecracker bundle directory %s: %w", bundlePath, err)
+	}
+	if err := syncFirecrackerDirectory(filepath.Dir(bundlePath)); err != nil {
+		return fmt.Errorf(
+			"sync Firecracker sandbox root %s: %w",
+			filepath.Dir(bundlePath),
+			err,
+		)
+	}
 	runtimeDir := handler.runtimeDirectory(startConfig.ID)
 	runtimeCreated := false
 	keepRuntimeArtifacts := false
@@ -1003,6 +1015,7 @@ func (handler *Handler) Restore(
 			VirtioFS:    virtioFSState,
 			MemoryMiB:   uint32(memorySize >> 20),
 			Vcpus:       restoredVcpus,
+			Generation:  startConfig.ResourceGeneration,
 			CreatedAt:   time.Now().Format(time.RFC3339Nano),
 		},
 		done: make(chan struct{}),
