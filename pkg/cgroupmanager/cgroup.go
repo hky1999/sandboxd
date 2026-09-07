@@ -62,9 +62,21 @@ type CgroupManager struct {
 	// cgroups already handed to the asynchronous deletion worker.
 	total int
 
+	// lifecycleMu orders the short durable-handoff sections of Allocate
+	// (stopped re-check, active-set mark, synchronous store, rollback)
+	// against shutdown: stopCh closes before the write side is taken so
+	// cancellable waits are never blocked, and once the write side is held
+	// every handoff either already confirmed its lease — which the final
+	// shutdown store then keeps — or fails closed without writing.
+	lifecycleMu sync.RWMutex
+
 	createReqs chan *createRequest
 
-	db         store.DbStore
+	db store.DbStore
+	// storeMu covers both the snapshot and the write in store, so a store
+	// that acquired it earlier cannot let a pre-handout snapshot overwrite a
+	// lease that a later store already confirmed on disk.
+	storeMu    sync.Mutex
 	storeDirty atomic.Bool
 
 	gcQueue *util.Queue[string]
@@ -165,8 +177,17 @@ func gcBackoff(attempt int) time.Duration {
 
 func (c *CgroupManager) ShutDown() error {
 	c.shutdownOnce.Do(func() {
+		// Decide and cancel first: stopCh must close promptly so allocations
+		// waiting on a queued or delayed creation cancel exactly as they did
+		// before durable handoffs existed. Only then take the lifecycle lock
+		// to drain the short handoutDurable sections — they never wait on
+		// cancellable work — so every confirmed in-flight handoff is already
+		// durable and included in the final store below, and no later
+		// handout store can overtake it.
 		c.stopped.Store(true)
 		close(c.stopCh)
+		c.lifecycleMu.Lock()
+		defer c.lifecycleMu.Unlock()
 		c.wg.Wait()
 		if err := c.oom.Close(); err != nil {
 			c.shutdownErr = err
@@ -238,14 +259,23 @@ func (c *CgroupManager) cleanForReuse(name string) error {
 }
 
 // Allocate hands out an idle cgroup name (e.g. "/sandbox/<id>"). On a cache
-// miss, creation remains serialized by the maintenance goroutine.
+// miss, creation remains serialized by the maintenance goroutine. Both paths
+// make the lease durable in the persisted active set before it is returned:
+// a daemon restart recovers every existing cgroup that is not in that set as
+// idle, and recovery cleans idle cgroups by killing whatever runs inside
+// them, so a lease that only reaches the store on keepStoring's next tick
+// turns a restart into a kill window for the sandbox that already started.
+// Cancellation is preserved: only the short confirmation section below takes
+// the lifecycle read lock, never the wait for a queued or delayed creation,
+// so stopCh can always close promptly during shutdown.
 func (c *CgroupManager) Allocate() (string, error) {
 	if c.stopped.Load() {
 		return "", errCgroupManagerStopped
 	}
 	if id := c.idleID.Pop(); id != "" {
-		c.usingID.Set(id, struct{}{})
-		c.storeDirty.Store(true)
+		if err := c.handoutDurable(id); err != nil {
+			return "", err
+		}
 		return id, nil
 	}
 
@@ -272,12 +302,90 @@ func (c *CgroupManager) Allocate() (string, error) {
 		if res.err != nil {
 			return "", res.err
 		}
-		c.usingID.Set(res.id, struct{}{})
-		c.storeDirty.Store(true)
+		if err := c.handoutDurable(res.id); err != nil {
+			return "", err
+		}
 		return res.id, nil
 	case <-c.stopCh:
 		return "", errCgroupManagerStopped
 	}
+}
+
+// handoutDurable runs the short critical section that confirms a lease:
+// under the lifecycle read lock the stopped flag is re-checked, the lease is
+// recorded in the active set, and that record is persisted before the lease
+// can leave the manager. The section never waits on cancellable work — the
+// creation wait happens outside it — so ShutDown can always close stopCh
+// promptly and then drain these sections before its final store. A handout
+// that had not entered this section when shutdown decided fails closed and
+// its cgroup goes back through placeUnhandedOut; one that already entered is
+// a confirmed in-flight handoff that the final store must keep.
+func (c *CgroupManager) handoutDurable(id string) error {
+	c.lifecycleMu.RLock()
+	defer c.lifecycleMu.RUnlock()
+	if c.stopped.Load() {
+		return errors.Join(errCgroupManagerStopped, c.placeUnhandedOut(id))
+	}
+	c.usingID.Set(id, struct{}{})
+	c.storeDirty.Store(true)
+	if err := c.store(); err != nil {
+		return errors.Join(
+			fmt.Errorf("persist cgroup lease %s before handout: %w", id, err),
+			c.rollbackHandout(id),
+		)
+	}
+	return nil
+}
+
+// rollbackHandout undoes a lease whose active-set record could not be made
+// durable. The lease was never returned, so no process was started in the
+// cgroup and its kernel state is exactly the clean idle state — Allocate
+// itself applies no controls; Prepare only runs once the caller holds a
+// confirmed lease. Unlike the network manager's rollback there is therefore
+// no kernel state to converge on the idle path; storeDirty stays set so the
+// next keepStoring flush also corrects a StoreRaw that wrote and then
+// failed: the persisted set may transiently record a lease that is no longer
+// active, which is the safe direction — recovery keeps such a cgroup instead
+// of killing inside it.
+func (c *CgroupManager) rollbackHandout(id string) error {
+	c.usingID.Pop(id)
+	c.storeDirty.Store(true)
+	return c.placeUnhandedOut(id)
+}
+
+// placeUnhandedOut returns a cgroup whose lease was never confirmed to the
+// caller to a safe, non-leased state. With room in the idle cache the name
+// simply goes back to the queue and its reservation stays counted. Without
+// room the cgroup is destroyed synchronously, and the reservation is
+// released only after the physical removal succeeds: releasing it earlier
+// would let a concurrent allocation consume the capacity that a failed
+// delete must give back, pushing the pool past its ceiling. A failed destroy
+// keeps the name active, quarantined and counted in total — bounded by the
+// reservation it already holds — instead of being reused or queued for GC.
+func (c *CgroupManager) placeUnhandedOut(id string) error {
+	c.mu.Lock()
+	if c.idleID.Length() < c.cacheSize {
+		c.idleID.Push(id)
+		c.mu.Unlock()
+		return nil
+	}
+	c.mu.Unlock()
+
+	if err := c.removeCgroupFromSystem(id); err != nil {
+		c.usingID.Set(id, struct{}{})
+		return fmt.Errorf(
+			"place cgroup %s after unconfirmed lease: %w; lease stays active (quarantined)",
+			id,
+			err,
+		)
+	}
+	c.mu.Lock()
+	c.total--
+	c.mu.Unlock()
+	c.cgroups.Pop(id)
+	c.oom.Remove(id)
+	c.generator.Release(id)
+	return nil
 }
 
 func (c *CgroupManager) run() {
@@ -402,6 +510,20 @@ func NewCgroupManager(
 	if err != nil {
 		return nil, err
 	}
+	return newCgroupManagerWithOps(db, cfg, max, rootName, ops)
+}
+
+// newCgroupManagerWithOps completes construction around injected cgroup
+// operations, including restart recovery against the persisted active set,
+// so tests can drive lease durability and recovery without touching the real
+// cgroup filesystem.
+func newCgroupManagerWithOps(
+	db store.DbStore,
+	cfg config.ResourceConfig,
+	max int,
+	rootName string,
+	ops cgroupOps,
+) (*CgroupManager, error) {
 	if err := ops.prepareRoot(rootName, cfg.PidsMax); err != nil {
 		return nil, err
 	}
@@ -530,7 +652,14 @@ func (c *CgroupManager) keepStoring() {
 	}
 }
 
+// store persists the active set. The lock covers the snapshot and the write
+// as one unit: a store that acquires it after a handout store released the
+// lock snapshots the already-confirmed lease, so a keepStoring tick that
+// started earlier can never overwrite a newer active set with a stale
+// snapshot taken before the lease existed.
 func (c *CgroupManager) store() error {
+	c.storeMu.Lock()
+	defer c.storeMu.Unlock()
 	start := time.Now()
 	defer func() {
 		logrus.Debugf(
