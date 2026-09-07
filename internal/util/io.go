@@ -60,6 +60,8 @@ func AtomicWriteFile(filename string, data []byte, perm os.FileMode) error {
 	if err != nil {
 		return err
 	}
+	// Remove abandoned temporary files on failures before publication.
+	defer os.Remove(f.Name())
 	if err := os.Chmod(f.Name(), perm); err != nil {
 		f.Close()
 		return err
@@ -75,7 +77,29 @@ func AtomicWriteFile(filename string, data []byte, perm os.FileMode) error {
 	if err := f.Close(); err != nil {
 		return err
 	}
-	return os.Rename(f.Name(), filename)
+	if err := os.Rename(f.Name(), filename); err != nil {
+		return err
+	}
+	// A successful rename alone does not make its directory entry durable.
+	// An error here means publication may have happened; callers must retain
+	// the operation as unresolved rather than assuming the old file remains.
+	return SyncDirectory(filepath.Dir(filename))
+}
+
+// SyncDirectory persists directory entries, propagating unsupported/error cases.
+func SyncDirectory(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	info, err := f.Stat()
+	if err != nil {
+		return errors.Join(err, f.Close())
+	}
+	if !info.IsDir() {
+		return errors.Join(errors.New("sync target is not a directory"), f.Close())
+	}
+	return errors.Join(f.Sync(), f.Close())
 }
 
 func (e *EmbedIoUtil) MkdirAll(path string, perm os.FileMode) error {

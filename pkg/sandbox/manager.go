@@ -264,6 +264,22 @@ func (m *Manager) PersistMetadata(id string, data *runtime.SandboxMetadata) erro
 	if err := util.AtomicWriteFile(dataFile, bytes, 0600); err != nil {
 		return fmt.Errorf("save sandbox metadata %s: %w", data.ID, err)
 	}
+	// MkdirAll may have introduced the sandbox directory and containers root.
+	// Flush their parent entries too, including nested IDs accepted by the
+	// path guard. Do this on retries as well: an existing directory may be the
+	// result of a prior write whose durability was not confirmed.
+	rootAbs, err := filepath.Abs(m.root)
+	if err != nil {
+		return fmt.Errorf("resolve metadata root: %w", err)
+	}
+	for dir := filepath.Dir(sandboxRoot); ; dir = filepath.Dir(dir) {
+		if err := util.SyncDirectory(dir); err != nil {
+			return fmt.Errorf("sync metadata parent %s: %w", dir, err)
+		}
+		if dir == filepath.Dir(rootAbs) {
+			break
+		}
+	}
 	if data.PhysicalPhase == runtime.SandboxPhysicalPhase_SANDBOX_PHYSICAL_PHASE_INTENT &&
 		m.physicalIntents != nil {
 		metadata := proto.Clone(data).(*runtime.SandboxMetadata)

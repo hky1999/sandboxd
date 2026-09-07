@@ -151,5 +151,9 @@ restore records its newly observed limits under its fresh generation.
 Only associate this record with a successfully committed matching incarnation.
 It proves prepared leaf limits, not ancestor-effective capacity or runtime success.
 List exposes the committed label; resolver/report ingestion is still pending.
-Existing metadata atomic writes lack directory fsync, so power-loss durability
-has not been accepted. Preserve generation-segmented evidence before deletion.
+Metadata atomic writes now fsync the file, rename, then fsync its directory;
+PersistMetadata also syncs parent entries through the containers-root parent
+before publishing an INTENT in memory. A post-rename sync error can leave the
+new file visible and must remain unresolved. Syscall fault checks are not a real
+power-loss recovery acceptance run. Provision the daemon root durably and preserve
+generation-segmented evidence before deletion.
