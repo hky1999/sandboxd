@@ -500,6 +500,8 @@ whole rebuild lands in a staging directory committed by one rename — a
 crash leaves either nothing or a complete artifact, never a half-built
 directory, and a non-empty target is refused rather than overwritten.
 
+Materialization stages under `<target-parent>/.materialize/staging-*`, independently of the `.publish` control-state directory. Keep `.materialize` on the target filesystem so the final rename remains atomic; do not relocate that staging directory to the control-state filesystem. Relocating `.publish` therefore does not move fetched artifacts across filesystems. Scanners ignore the hidden staging namespace, and each materialization removes only its own temporary directory on completion or failure. Existing `.publish/staging-*` leftovers from older versions are not migrated or removed automatically. This separation does not itself configure or migrate the publication state directory.
+
 Only `published` unlocks cross-node placement: `cn-locator
 -require-published` gates the cross-node branch of the placement tree on the
 persisted state (the origin is exempt — it holds the local artifact), and
