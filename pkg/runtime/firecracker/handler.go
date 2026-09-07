@@ -764,11 +764,15 @@ func (handler *Handler) Start(
 		if startSucceeded {
 			return
 		}
-		instance.markDeleting()
-		handler.stopInstance(instance, true)
-		handler.mu.Lock()
-		delete(handler.instances, startConfig.ID)
-		handler.mu.Unlock()
+		var retained bool
+		retErr, retained = handler.rollbackStartedInstance(instance, retErr)
+		if retained {
+			// The recorded process exit is unconfirmed: the persisted state,
+			// writable layer, and runtime directory must survive with the
+			// instance so the sandbox can be reconciled or retired later.
+			keepStorage = true
+			keepRuntimeArtifacts = true
+		}
 	}()
 
 	if err := attachFirecrackerProcess(startConfig.CgroupPath, command.Process.Pid); err != nil {
@@ -1003,6 +1007,63 @@ func (handler *Handler) delete(ctx context.Context, sandboxID, expectedGeneratio
 		handler.cleanupRuntimeDirectory(sandboxID, state.APIPath),
 		cleanupFirecrackerOverlay(handler.storageRoot, sandboxID),
 	)
+}
+
+// rollbackStartedInstance unwinds a fresh Start or Restore that failed after
+// the VMM process was already running, reusing Delete's exit gate: the
+// instance mapping, persisted state, writable layer, and runtime directory
+// may be dropped only after the kernel confirms the recorded process exited.
+// A confirmed exit finishes the instance, removes the mapping, and returns
+// the original failure unchanged so the deferred artifact cleanup proceeds.
+// An unconfirmed exit retains the instance with every artifact, persists the
+// current incarnation identity (generation and PID) best effort — including
+// when the failure preceded the first ordinary persistence — and joins the
+// original failure, the stop failure, and any persistence failure behind
+// runtimecore.ErrStartCleanupPending, so upper layers can keep the sandbox
+// reserved for reconciliation instead of releasing its resources. An identity
+// mismatch or a missing PID never counts as an exit and never finishes the
+// instance on its own.
+//
+// deleting is marked before the process is touched, exactly like Delete: the
+// flag suppresses the asynchronous exit persistence of waitCommand and
+// waitGuest, which could otherwise start writing the state file while the
+// artifact cleanup below is already removing it. On an unconfirmed exit the
+// flag is deliberately left set on the retained instance: deleting is not a
+// terminal state — the instance stays mapped and unfinished, the identity
+// persist below remains the reconciliation anchor, a retry (Delete or
+// generation-checked DeleteStrict) still runs its full flow against the same
+// recorded generation, and a record that outlives its process without an
+// exit update is handled by recovery like any other unmarked dead record.
+func (handler *Handler) rollbackStartedInstance(
+	instance *firecrackerInstance,
+	original error,
+) (error, bool) {
+	instance.markDeleting()
+	state := instance.snapshot()
+	if err := stopFirecrackerProcessConfirmed(state, handler.binary); err != nil {
+		joined := errors.Join(
+			original,
+			fmt.Errorf(
+				"stop Firecracker sandbox %s after failed start: %w",
+				state.ID, err,
+			),
+		)
+		if persistErr := handler.persistInstance(instance); persistErr != nil {
+			joined = errors.Join(joined, fmt.Errorf(
+				"persist Firecracker sandbox %s identity after failed start: %w",
+				state.ID, persistErr,
+			))
+		}
+		return fmt.Errorf(
+			"%w: Firecracker sandbox %s exit unconfirmed, instance and artifacts retained: %w",
+			runtimecore.ErrStartCleanupPending, state.ID, joined,
+		), true
+	}
+	instance.finish(runtimecore.Exit{ExitedAt: time.Now(), ExitCode: state.ExitCode})
+	handler.mu.Lock()
+	delete(handler.instances, state.ID)
+	handler.mu.Unlock()
+	return original, false
 }
 
 func (handler *Handler) runtimeDirectory(sandboxID string) string {

@@ -350,6 +350,12 @@ Firecracker `Delete` is exit-gated. For a sandbox whose recorded VMM process it 
 
 A `Delete` that finds no in-memory instance and no persisted state still returns success for idempotency, but that legacy nil is an absence observation, not a retirement proof: it does not attest that any persistent generation of the sandbox stopped, and conditional deletion or receipt generation must not treat it as evidence that one did. Full fencing still requires authoritative generation and operation identity (ownership records, idempotency tokens, or an epoch protocol); this exit gate confirms only that the locally recorded process exited, and does not provide that protocol.
 
+A failed fresh `Start` or `Restore` whose VMM process was already spawned rolls back through the same exit gate. Only a kernel-confirmed exit of the recorded process lets the runtime finish the instance, drop it from its instance map, and allow the deferred cleanup of the persisted state, writable layer, and runtime socket directory; the original failure is returned unchanged. When the exit cannot be confirmed — the recorded identity no longer matches the live process, the recorded PID is invalid, or the process survives the bounded signal sequence — nothing is finished, unmapped, or deleted: the instance stays mapped with all of its artifacts, the current incarnation identity (resource generation and PID) is persisted best effort — including when the failure happened before the first ordinary state persistence — and the returned error joins the original failure, the stop failure, and any persistence failure behind `runtime.ErrStartCleanupPending`, detectable with `errors.Is` by direct in-process callers of `runtime.Handler.Start` and `runtime.CheckpointHandler.Restore` (see below for what the sentinel does not cover). The instance is marked deleting before the stop attempt, as `Delete` does, so asynchronous exit persistence cannot race the artifact cleanup; on an unconfirmed exit that flag is not terminal — the instance stays mapped and unfinished and a retry still runs the full gate sequence. An identity mismatch never counts as an exit and never finishes the instance. Failures before the VMM is spawned keep the previous behavior: every artifact is cleaned up and the plain failure is returned.
+
+`ErrStartCleanupPending` is a runtime-layer contract only, and the management plane does not protect the retained state today. On a runtime Start or Restore failure the server unconditionally cleans the sandbox root it allocated (`startSandboxRuntime` → `CleanSandboxRoot`) — erasing the very state file the runtime just retained — and then releases the sandbox ID, network, cgroup, and filesystem resources, so the retention above currently outlives the failed call only inside the runtime layer, not under the server's rollback. The public RPC path provides no sentinel detection either: crossing the gRPC boundary loses `errors.Is` semantics, so the sentinel is meaningful only on the direct runtime return value inside the daemon process. Until the management-plane integration lands (follow-up plan 0049) there is no promotion: a runtime-only fix must not be treated as closing the failure lifecycle. Nor is runtime-side retention a restart-safe quarantine: on daemon restart the loader moves a sandbox bundle without manager metadata (`meta.pb`) into `_recycle`, and housekeeping removes it, so a retained incarnation lives at most as long as the daemon that failed to start it.
+
+Reconciliation of a retained sandbox must stay identity-based against the runtime's own record — a generation-matched strict retirement where that state still exists. A recorded process that is not a verified owned incarnation is never authorization to signal it, and the public `DeleteIfGeneration` additionally depends on server metadata that a failed start may never have written or that the server rollback above may already have erased, so it is not guaranteed to work for a retained sandbox; a foreign recorded process is an operator incident requiring out-of-band verification, not a documented self-service cleanup path.
+
 On failure, sandboxd returns an error and does not force-delete, stop, or
 resume the source. The caller decides how to handle the source sandbox.
 sandboxd only cleans partial checkpoint output: it removes a leaf directory it
@@ -391,8 +397,12 @@ The caller must still provide the normal `Start` configuration, including the
 runtime, root filesystem, resources, mounts, and network settings. The target
 should use a new sandbox ID and receives newly allocated sandboxd resources.
 
-If restore fails, sandboxd rolls back the partially created target. It does not
-modify the source or delete the checkpoint input.
+If restore fails, sandboxd rolls back the partially created target. The
+runtime side of that rollback is exit-gated like `Delete`: when the restored
+VMM's exit cannot be confirmed, the target's runtime instance and artifacts
+are retained and the returned error carries `runtime.ErrStartCleanupPending`
+(see "Source and failure semantics"). It does not modify the source or delete
+the checkpoint input.
 
 After `Start` succeeds, the target no longer depends on the checkpoint
 directory — with one exception: a Firecracker v2 restore keeps the artifact's

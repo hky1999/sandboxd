@@ -38,6 +38,25 @@ type CheckpointHandler interface {
 	Restore(context.Context, StartConfig) error
 }
 
+// ErrStartCleanupPending is joined into the error a runtime returns from a
+// Start or Restore that failed after it had already spawned its processes,
+// when it could not confirm their exit while rolling back. Such a runtime
+// keeps the instance and its artifacts — persisted state, writable layer,
+// runtime files — in place, best-effort persisting the incarnation identity
+// it holds, so the sandbox can be reconciled or retired later. Callers must
+// not release the resources they allocated for the start (sandbox ID,
+// network, cgroup, filesystems) as if the runtime side were gone: a live
+// process may still survive under the recorded identity, and reusing the ID
+// could create a second incarnation. Detection is through errors.Is.
+//
+// The sentinel is a positive indication only, and it is defined solely for
+// the direct runtime return value. Its absence proves nothing: runtimes that
+// do not participate, older runtime versions, and any error conversion or
+// wrapping layer in between can return an equivalent failure without it, so
+// a caller must never turn a missing sentinel into a generic "no process
+// survives" guarantee.
+var ErrStartCleanupPending = errors.New("start cleanup pending")
+
 // StrictDeleteHandler is an optional capability implemented by runtimes whose
 // delete can prove it retired the runtime state of one exact physical
 // generation. DeleteStrict must compare expectedGeneration against the
