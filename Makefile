@@ -101,7 +101,9 @@ firecracker-initrd: firecracker-agent ## build output/initrd.img (/init = firecr
 	trap 'rm -rf "$${tmpdir}"' EXIT; \
 	cp output/firecracker-agent "$${tmpdir}/init"; \
 	(cd "$${tmpdir}" && echo init | cpio -o -H newc --owner 0:0 2>/dev/null | gzip -1) > output/initrd.img
-
+.PHONY: scheduler-resolver
+scheduler-resolver: ## build the scheduler identity resolver
+	@CGO_ENABLED=0 GOOS=$(RELEASE_GOOS) GOARCH=$(RELEASE_GOARCH) $(GO) build -o output/scheduler-resolver ./cmd/scheduler-resolver
 test: ## run tests
 	@$(GO) clean -testcache
 	@$(GOTEST) ${TESTFLAGS} ${PACKAGES}

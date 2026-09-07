@@ -1,0 +1,11 @@
+# Scheduler identity resolver
+
+Build with `make scheduler-resolver`. Run `output/scheduler-resolver --sock /run/sandboxd/sandboxd.sock --token-file /path/to/private/token`; the default HTTP listener is `127.0.0.1:8093`. The token file must be regular, private (no group/other permissions), at most 4096 bytes, and contain at least 32 bytes of token text. The tool reads only a local Unix sandboxd socket; its service identity must have access to that socket. Include this binary and service configuration in the eventual node release; it is not automatically installed by this source change.
+
+`GET /resolve?ip=<IPv4>` requires `Authorization: Bearer <token>`. It returns `instance`, `sandbox_id`, `runtime_id`, and `resource_generation`. The labels `akernel.scheduler/instance-id` and `akernel.scheduler/runtime-id` are set by the scheduler executor's StartRequest builder; sandboxd owns `akernel.scheduler/resource-generation`. Do not grant untrusted workloads direct access to the daemon socket or permission to forge these labels.
+
+The resolver takes a fresh List, requires exactly one matching running sandbox with complete labels, confirms its generation through Stats, and rechecks List for the same unique binding. Any missing identity, duplicate IP, exit, changed generation, inconsistent reread or unavailable daemon rejects the lookup. Replies are no-store; backend errors and other sandbox fields are not exposed. Up to 64 requests may query concurrently, each with a one-second deadline; excess requests receive 503.
+
+Configure transducer `SANDBOX_RESOLVER_URL` to the resolver's reachable local endpoint and `SANDBOX_RESOLVER_TOKEN` to the same secret through deployment secret handling. Old sandboxes without scheduler labels must not be silently adopted by parsing logs. Recreate them with matching scheduler/sandboxd versions before the preparation gate can pass. If the listener is exposed beyond localhost, restrict the network path and provide authenticated encrypted transport appropriate to that deployment.
+
+A resolved binding is an observation, not a reservation of the IP. Later park/wake actions still need physical-generation checks, and cross-process restart/restore lifecycle validation remains required. This source change does not by itself prove end-to-end F7, deployment health, or pressure-test readiness.
