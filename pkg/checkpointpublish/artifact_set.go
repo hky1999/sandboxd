@@ -336,11 +336,11 @@ func Materialize(ctx context.Context, targetDir, id string, store chunkstore.Key
 		return fmt.Errorf("target %s is not empty; refusing to overwrite an in-use generation", targetDir)
 	}
 	parent := filepath.Dir(targetDir)
-	// Staging lives under the reserved .publish namespace, not beside the
-	// final directory: a dot-prefixed staging dir at scan level would be
-	// picked up by the catalog and publishd scanners the moment its
-	// manifest lands, advertising a half-materialized artifact (F4).
-	stagingRoot := filepath.Join(parent, StateDirName)
+	// Keep staging on the target filesystem, independently of publication
+	// state: .publish may be placed on a separate filesystem to isolate
+	// control-state fsync from bulk snapshot writeback. The reserved nested
+	// namespace keeps partial manifests out of catalog/publishd scans.
+	stagingRoot := filepath.Join(parent, ".materialize")
 	if err := os.MkdirAll(stagingRoot, 0o700); err != nil {
 		return err
 	}
