@@ -3512,6 +3512,103 @@ func (x *ResizeResourcesResponse) GetUpdateError() string {
 	return ""
 }
 
+// Deletes only the physical incarnation identified by expected_generation.
+type DeleteIfGenerationRequest struct {
+	state              protoimpl.MessageState `protogen:"open.v1"`
+	ID                 string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
+	ExpectedGeneration string                 `protobuf:"bytes,2,opt,name=expected_generation,json=expectedGeneration,proto3" json:"expected_generation,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
+}
+
+func (x *DeleteIfGenerationRequest) Reset() {
+	*x = DeleteIfGenerationRequest{}
+	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[41]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DeleteIfGenerationRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DeleteIfGenerationRequest) ProtoMessage() {}
+
+func (x *DeleteIfGenerationRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[41]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DeleteIfGenerationRequest.ProtoReflect.Descriptor instead.
+func (*DeleteIfGenerationRequest) Descriptor() ([]byte, []int) {
+	return file_api_runtime_v1_sandbox_api_proto_rawDescGZIP(), []int{41}
+}
+
+func (x *DeleteIfGenerationRequest) GetID() string {
+	if x != nil {
+		return x.ID
+	}
+	return ""
+}
+
+func (x *DeleteIfGenerationRequest) GetExpectedGeneration() string {
+	if x != nil {
+		return x.ExpectedGeneration
+	}
+	return ""
+}
+
+type DeleteIfGenerationResponse struct {
+	state             protoimpl.MessageState `protogen:"open.v1"`
+	RetiredGeneration string                 `protobuf:"bytes,1,opt,name=retired_generation,json=retiredGeneration,proto3" json:"retired_generation,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
+}
+
+func (x *DeleteIfGenerationResponse) Reset() {
+	*x = DeleteIfGenerationResponse{}
+	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[42]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DeleteIfGenerationResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DeleteIfGenerationResponse) ProtoMessage() {}
+
+func (x *DeleteIfGenerationResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[42]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DeleteIfGenerationResponse.ProtoReflect.Descriptor instead.
+func (*DeleteIfGenerationResponse) Descriptor() ([]byte, []int) {
+	return file_api_runtime_v1_sandbox_api_proto_rawDescGZIP(), []int{42}
+}
+
+func (x *DeleteIfGenerationResponse) GetRetiredGeneration() string {
+	if x != nil {
+		return x.RetiredGeneration
+	}
+	return ""
+}
+
 var File_api_runtime_v1_sandbox_api_proto protoreflect.FileDescriptor
 
 const file_api_runtime_v1_sandbox_api_proto_rawDesc = "" +
@@ -3788,7 +3885,12 @@ const file_api_runtime_v1_sandbox_api_proto_rawDesc = "" +
 	"\x17ResizeResourcesResponse\x121\n" +
 	"\x06actual\x18\x01 \x01(\v2\x19.runtime.v1.StatsResponseR\x06actual\x12\x1a\n" +
 	"\bcomplete\x18\x02 \x01(\bR\bcomplete\x12!\n" +
-	"\fupdate_error\x18\x03 \x01(\tR\vupdateError*}\n" +
+	"\fupdate_error\x18\x03 \x01(\tR\vupdateError\"\\\n" +
+	"\x19DeleteIfGenerationRequest\x12\x0e\n" +
+	"\x02id\x18\x01 \x01(\tR\x02id\x12/\n" +
+	"\x13expected_generation\x18\x02 \x01(\tR\x12expectedGeneration\"K\n" +
+	"\x1aDeleteIfGenerationResponse\x12-\n" +
+	"\x12retired_generation\x18\x01 \x01(\tR\x11retiredGeneration*}\n" +
 	"\x13NetworkPolicyAction\x12%\n" +
 	"!NETWORK_POLICY_ACTION_UNSPECIFIED\x10\x00\x12\x1f\n" +
 	"\x1bNETWORK_POLICY_ACTION_ALLOW\x10\x01\x12\x1e\n" +
@@ -3819,7 +3921,7 @@ const file_api_runtime_v1_sandbox_api_proto_rawDesc = "" +
 	"\x14SandboxPhysicalPhase\x12&\n" +
 	"\"SANDBOX_PHYSICAL_PHASE_UNSPECIFIED\x10\x00\x12!\n" +
 	"\x1dSANDBOX_PHYSICAL_PHASE_INTENT\x10\x01\x12$\n" +
-	" SANDBOX_PHYSICAL_PHASE_COMMITTED\x10\x022\x83\b\n" +
+	" SANDBOX_PHYSICAL_PHASE_COMMITTED\x10\x022\xea\b\n" +
 	"\x0eSandboxService\x12>\n" +
 	"\x05Start\x12\x18.runtime.v1.StartRequest\x1a\x19.runtime.v1.StartResponse\"\x00\x12M\n" +
 	"\n" +
@@ -3828,7 +3930,8 @@ const file_api_runtime_v1_sandbox_api_proto_rawDesc = "" +
 	"\x06Resume\x12\x18.runtime.v1.PauseRequest\x1a\x19.runtime.v1.PauseResponse\"\x00\x12B\n" +
 	"\aRestore\x12\x1a.runtime.v1.RestoreRequest\x1a\x19.runtime.v1.StartResponse\"\x00\x12_\n" +
 	"\x10DeleteCheckpoint\x12#.runtime.v1.DeleteCheckpointRequest\x1a$.runtime.v1.DeleteCheckpointResponse\"\x00\x12A\n" +
-	"\x06Delete\x12\x19.runtime.v1.DeleteRequest\x1a\x1a.runtime.v1.DeleteResponse\"\x00\x12;\n" +
+	"\x06Delete\x12\x19.runtime.v1.DeleteRequest\x1a\x1a.runtime.v1.DeleteResponse\"\x00\x12e\n" +
+	"\x12DeleteIfGeneration\x12%.runtime.v1.DeleteIfGenerationRequest\x1a&.runtime.v1.DeleteIfGenerationResponse\"\x00\x12;\n" +
 	"\x04Wait\x12\x17.runtime.v1.WaitRequest\x1a\x18.runtime.v1.WaitResponse\"\x00\x12M\n" +
 	"\x04List\x12 .runtime.v1.ListSandboxesRequest\x1a!.runtime.v1.ListSandboxesResponse\"\x00\x12>\n" +
 	"\x05Stats\x12\x18.runtime.v1.StatsRequest\x1a\x19.runtime.v1.StatsResponse\"\x00\x12\\\n" +
@@ -3849,7 +3952,7 @@ func file_api_runtime_v1_sandbox_api_proto_rawDescGZIP() []byte {
 }
 
 var file_api_runtime_v1_sandbox_api_proto_enumTypes = make([]protoimpl.EnumInfo, 7)
-var file_api_runtime_v1_sandbox_api_proto_msgTypes = make([]protoimpl.MessageInfo, 53)
+var file_api_runtime_v1_sandbox_api_proto_msgTypes = make([]protoimpl.MessageInfo, 55)
 var file_api_runtime_v1_sandbox_api_proto_goTypes = []any{
 	(NetworkPolicyAction)(0),              // 0: runtime.v1.NetworkPolicyAction
 	(NetworkDirection)(0),                 // 1: runtime.v1.NetworkDirection
@@ -3899,18 +4002,20 @@ var file_api_runtime_v1_sandbox_api_proto_goTypes = []any{
 	(*ResourceLimits)(nil),                // 45: runtime.v1.ResourceLimits
 	(*ResizeResourcesRequest)(nil),        // 46: runtime.v1.ResizeResourcesRequest
 	(*ResizeResourcesResponse)(nil),       // 47: runtime.v1.ResizeResourcesResponse
-	nil,                                   // 48: runtime.v1.StartRequest.EnvsEntry
-	nil,                                   // 49: runtime.v1.StartRequest.ResourcesEntry
-	nil,                                   // 50: runtime.v1.StartRequest.LabelsEntry
-	nil,                                   // 51: runtime.v1.StartRequest.MetricLabelsEntry
-	nil,                                   // 52: runtime.v1.ListSandboxesRequest.SelectorEntry
-	nil,                                   // 53: runtime.v1.SandboxStatus.LabelsEntry
-	nil,                                   // 54: runtime.v1.SandboxStatus.MetricLabelsEntry
-	nil,                                   // 55: runtime.v1.LinuxSandboxResources.UnifiedEntry
-	nil,                                   // 56: runtime.v1.SandboxMetadata.LabelsEntry
-	nil,                                   // 57: runtime.v1.SandboxMetadata.MetricLabelsEntry
-	nil,                                   // 58: runtime.v1.SandboxMetadata.ResourceFactsEntry
-	nil,                                   // 59: runtime.v1.SandboxMetadataList.SandboxesEntry
+	(*DeleteIfGenerationRequest)(nil),     // 48: runtime.v1.DeleteIfGenerationRequest
+	(*DeleteIfGenerationResponse)(nil),    // 49: runtime.v1.DeleteIfGenerationResponse
+	nil,                                   // 50: runtime.v1.StartRequest.EnvsEntry
+	nil,                                   // 51: runtime.v1.StartRequest.ResourcesEntry
+	nil,                                   // 52: runtime.v1.StartRequest.LabelsEntry
+	nil,                                   // 53: runtime.v1.StartRequest.MetricLabelsEntry
+	nil,                                   // 54: runtime.v1.ListSandboxesRequest.SelectorEntry
+	nil,                                   // 55: runtime.v1.SandboxStatus.LabelsEntry
+	nil,                                   // 56: runtime.v1.SandboxStatus.MetricLabelsEntry
+	nil,                                   // 57: runtime.v1.LinuxSandboxResources.UnifiedEntry
+	nil,                                   // 58: runtime.v1.SandboxMetadata.LabelsEntry
+	nil,                                   // 59: runtime.v1.SandboxMetadata.MetricLabelsEntry
+	nil,                                   // 60: runtime.v1.SandboxMetadata.ResourceFactsEntry
+	nil,                                   // 61: runtime.v1.SandboxMetadataList.SandboxesEntry
 }
 var file_api_runtime_v1_sandbox_api_proto_depIdxs = []int32{
 	0,  // 0: runtime.v1.TrafficRule.action:type_name -> runtime.v1.NetworkPolicyAction
@@ -3930,30 +4035,30 @@ var file_api_runtime_v1_sandbox_api_proto_depIdxs = []int32{
 	15, // 14: runtime.v1.RootfsConfig.s3_config:type_name -> runtime.v1.S3Config
 	15, // 15: runtime.v1.Mount.s3_config:type_name -> runtime.v1.S3Config
 	16, // 16: runtime.v1.StartRequest.rootfs:type_name -> runtime.v1.RootfsConfig
-	48, // 17: runtime.v1.StartRequest.envs:type_name -> runtime.v1.StartRequest.EnvsEntry
+	50, // 17: runtime.v1.StartRequest.envs:type_name -> runtime.v1.StartRequest.EnvsEntry
 	17, // 18: runtime.v1.StartRequest.mounts:type_name -> runtime.v1.Mount
-	49, // 19: runtime.v1.StartRequest.resources:type_name -> runtime.v1.StartRequest.ResourcesEntry
-	50, // 20: runtime.v1.StartRequest.labels:type_name -> runtime.v1.StartRequest.LabelsEntry
-	51, // 21: runtime.v1.StartRequest.metric_labels:type_name -> runtime.v1.StartRequest.MetricLabelsEntry
+	51, // 19: runtime.v1.StartRequest.resources:type_name -> runtime.v1.StartRequest.ResourcesEntry
+	52, // 20: runtime.v1.StartRequest.labels:type_name -> runtime.v1.StartRequest.LabelsEntry
+	53, // 21: runtime.v1.StartRequest.metric_labels:type_name -> runtime.v1.StartRequest.MetricLabelsEntry
 	18, // 22: runtime.v1.StartRequest.xpu_allocations:type_name -> runtime.v1.XpuAllocation
 	12, // 23: runtime.v1.StartRequest.network_policy:type_name -> runtime.v1.NetworkPolicy
 	19, // 24: runtime.v1.RestoreRequest.config:type_name -> runtime.v1.StartRequest
-	52, // 25: runtime.v1.ListSandboxesRequest.selector:type_name -> runtime.v1.ListSandboxesRequest.SelectorEntry
+	54, // 25: runtime.v1.ListSandboxesRequest.selector:type_name -> runtime.v1.ListSandboxesRequest.SelectorEntry
 	34, // 26: runtime.v1.ListSandboxesResponse.sandboxes:type_name -> runtime.v1.SandboxStatus
 	5,  // 27: runtime.v1.SandboxStatus.state:type_name -> runtime.v1.SandboxState
-	53, // 28: runtime.v1.SandboxStatus.labels:type_name -> runtime.v1.SandboxStatus.LabelsEntry
+	55, // 28: runtime.v1.SandboxStatus.labels:type_name -> runtime.v1.SandboxStatus.LabelsEntry
 	17, // 29: runtime.v1.SandboxStatus.mounts:type_name -> runtime.v1.Mount
 	35, // 30: runtime.v1.SandboxStatus.envs:type_name -> runtime.v1.KeyValue
 	36, // 31: runtime.v1.SandboxStatus.resources:type_name -> runtime.v1.LinuxSandboxResources
-	54, // 32: runtime.v1.SandboxStatus.metric_labels:type_name -> runtime.v1.SandboxStatus.MetricLabelsEntry
+	56, // 32: runtime.v1.SandboxStatus.metric_labels:type_name -> runtime.v1.SandboxStatus.MetricLabelsEntry
 	37, // 33: runtime.v1.LinuxSandboxResources.hugepage_limits:type_name -> runtime.v1.HugepageLimit
-	55, // 34: runtime.v1.LinuxSandboxResources.unified:type_name -> runtime.v1.LinuxSandboxResources.UnifiedEntry
-	56, // 35: runtime.v1.SandboxMetadata.labels:type_name -> runtime.v1.SandboxMetadata.LabelsEntry
-	57, // 36: runtime.v1.SandboxMetadata.metric_labels:type_name -> runtime.v1.SandboxMetadata.MetricLabelsEntry
+	57, // 34: runtime.v1.LinuxSandboxResources.unified:type_name -> runtime.v1.LinuxSandboxResources.UnifiedEntry
+	58, // 35: runtime.v1.SandboxMetadata.labels:type_name -> runtime.v1.SandboxMetadata.LabelsEntry
+	59, // 36: runtime.v1.SandboxMetadata.metric_labels:type_name -> runtime.v1.SandboxMetadata.MetricLabelsEntry
 	6,  // 37: runtime.v1.SandboxMetadata.physical_phase:type_name -> runtime.v1.SandboxPhysicalPhase
 	44, // 38: runtime.v1.SandboxMetadata.restore_identity:type_name -> runtime.v1.RestoreIdentity
-	58, // 39: runtime.v1.SandboxMetadata.resource_facts:type_name -> runtime.v1.SandboxMetadata.ResourceFactsEntry
-	59, // 40: runtime.v1.SandboxMetadataList.sandboxes:type_name -> runtime.v1.SandboxMetadataList.SandboxesEntry
+	60, // 39: runtime.v1.SandboxMetadata.resource_facts:type_name -> runtime.v1.SandboxMetadata.ResourceFactsEntry
+	61, // 40: runtime.v1.SandboxMetadataList.sandboxes:type_name -> runtime.v1.SandboxMetadataList.SandboxesEntry
 	45, // 41: runtime.v1.ResizeResourcesRequest.expected:type_name -> runtime.v1.ResourceLimits
 	45, // 42: runtime.v1.ResizeResourcesRequest.target:type_name -> runtime.v1.ResourceLimits
 	41, // 43: runtime.v1.ResizeResourcesResponse.actual:type_name -> runtime.v1.StatsResponse
@@ -3965,27 +4070,29 @@ var file_api_runtime_v1_sandbox_api_proto_depIdxs = []int32{
 	27, // 49: runtime.v1.SandboxService.Restore:input_type -> runtime.v1.RestoreRequest
 	25, // 50: runtime.v1.SandboxService.DeleteCheckpoint:input_type -> runtime.v1.DeleteCheckpointRequest
 	28, // 51: runtime.v1.SandboxService.Delete:input_type -> runtime.v1.DeleteRequest
-	30, // 52: runtime.v1.SandboxService.Wait:input_type -> runtime.v1.WaitRequest
-	32, // 53: runtime.v1.SandboxService.List:input_type -> runtime.v1.ListSandboxesRequest
-	40, // 54: runtime.v1.SandboxService.Stats:input_type -> runtime.v1.StatsRequest
-	46, // 55: runtime.v1.SandboxService.ResizeResources:input_type -> runtime.v1.ResizeResourcesRequest
-	42, // 56: runtime.v1.SandboxService.ListAvailableRuntimes:input_type -> runtime.v1.ListAvailableRuntimesRequest
-	13, // 57: runtime.v1.SandboxService.SetNetworkPolicy:input_type -> runtime.v1.SetNetworkPolicyRequest
-	20, // 58: runtime.v1.SandboxService.Start:output_type -> runtime.v1.StartResponse
-	22, // 59: runtime.v1.SandboxService.Checkpoint:output_type -> runtime.v1.CheckpointResponse
-	24, // 60: runtime.v1.SandboxService.Pause:output_type -> runtime.v1.PauseResponse
-	24, // 61: runtime.v1.SandboxService.Resume:output_type -> runtime.v1.PauseResponse
-	20, // 62: runtime.v1.SandboxService.Restore:output_type -> runtime.v1.StartResponse
-	26, // 63: runtime.v1.SandboxService.DeleteCheckpoint:output_type -> runtime.v1.DeleteCheckpointResponse
-	29, // 64: runtime.v1.SandboxService.Delete:output_type -> runtime.v1.DeleteResponse
-	31, // 65: runtime.v1.SandboxService.Wait:output_type -> runtime.v1.WaitResponse
-	33, // 66: runtime.v1.SandboxService.List:output_type -> runtime.v1.ListSandboxesResponse
-	41, // 67: runtime.v1.SandboxService.Stats:output_type -> runtime.v1.StatsResponse
-	47, // 68: runtime.v1.SandboxService.ResizeResources:output_type -> runtime.v1.ResizeResourcesResponse
-	43, // 69: runtime.v1.SandboxService.ListAvailableRuntimes:output_type -> runtime.v1.ListAvailableRuntimesResponse
-	14, // 70: runtime.v1.SandboxService.SetNetworkPolicy:output_type -> runtime.v1.SetNetworkPolicyResponse
-	58, // [58:71] is the sub-list for method output_type
-	45, // [45:58] is the sub-list for method input_type
+	48, // 52: runtime.v1.SandboxService.DeleteIfGeneration:input_type -> runtime.v1.DeleteIfGenerationRequest
+	30, // 53: runtime.v1.SandboxService.Wait:input_type -> runtime.v1.WaitRequest
+	32, // 54: runtime.v1.SandboxService.List:input_type -> runtime.v1.ListSandboxesRequest
+	40, // 55: runtime.v1.SandboxService.Stats:input_type -> runtime.v1.StatsRequest
+	46, // 56: runtime.v1.SandboxService.ResizeResources:input_type -> runtime.v1.ResizeResourcesRequest
+	42, // 57: runtime.v1.SandboxService.ListAvailableRuntimes:input_type -> runtime.v1.ListAvailableRuntimesRequest
+	13, // 58: runtime.v1.SandboxService.SetNetworkPolicy:input_type -> runtime.v1.SetNetworkPolicyRequest
+	20, // 59: runtime.v1.SandboxService.Start:output_type -> runtime.v1.StartResponse
+	22, // 60: runtime.v1.SandboxService.Checkpoint:output_type -> runtime.v1.CheckpointResponse
+	24, // 61: runtime.v1.SandboxService.Pause:output_type -> runtime.v1.PauseResponse
+	24, // 62: runtime.v1.SandboxService.Resume:output_type -> runtime.v1.PauseResponse
+	20, // 63: runtime.v1.SandboxService.Restore:output_type -> runtime.v1.StartResponse
+	26, // 64: runtime.v1.SandboxService.DeleteCheckpoint:output_type -> runtime.v1.DeleteCheckpointResponse
+	29, // 65: runtime.v1.SandboxService.Delete:output_type -> runtime.v1.DeleteResponse
+	49, // 66: runtime.v1.SandboxService.DeleteIfGeneration:output_type -> runtime.v1.DeleteIfGenerationResponse
+	31, // 67: runtime.v1.SandboxService.Wait:output_type -> runtime.v1.WaitResponse
+	33, // 68: runtime.v1.SandboxService.List:output_type -> runtime.v1.ListSandboxesResponse
+	41, // 69: runtime.v1.SandboxService.Stats:output_type -> runtime.v1.StatsResponse
+	47, // 70: runtime.v1.SandboxService.ResizeResources:output_type -> runtime.v1.ResizeResourcesResponse
+	43, // 71: runtime.v1.SandboxService.ListAvailableRuntimes:output_type -> runtime.v1.ListAvailableRuntimesResponse
+	14, // 72: runtime.v1.SandboxService.SetNetworkPolicy:output_type -> runtime.v1.SetNetworkPolicyResponse
+	59, // [59:73] is the sub-list for method output_type
+	45, // [45:59] is the sub-list for method input_type
 	45, // [45:45] is the sub-list for extension type_name
 	45, // [45:45] is the sub-list for extension extendee
 	0,  // [0:45] is the sub-list for field type_name
@@ -4012,7 +4119,7 @@ func file_api_runtime_v1_sandbox_api_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_api_runtime_v1_sandbox_api_proto_rawDesc), len(file_api_runtime_v1_sandbox_api_proto_rawDesc)),
 			NumEnums:      7,
-			NumMessages:   53,
+			NumMessages:   55,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

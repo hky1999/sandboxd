@@ -184,3 +184,18 @@ tools/               pinned protobuf code-generation image
 Copyright (c) 2026 Ant Group Corporation.
 
 Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE). Third-party Go modules are declared in `go.mod` and retain their respective licenses.
+
+### Generation-conditional scheduler deletion
+
+Schedulers can call `DeleteIfGeneration` with a sandbox ID and its observed
+`resource-generation`. The daemon checks the generation while holding the
+Start/Resize/Delete lock, then returns `retired_generation` after cleanup. A
+mismatch fails without invoking runtime deletion. The distinct RPC fails as
+unsupported on older daemons; callers must not fall back to unconditional
+`Delete`. A missing record returns NotFound rather than a generation receipt.
+
+Concurrent deletion coalesces only requests with the same ID and generation;
+legacy unconditional deletion cannot lend its success to a conditional caller.
+Caller cancellation does not cancel an already running cleanup. Lost replies,
+missing records and controller restart require authoritative reconciliation;
+this RPC alone does not provide a durable deletion receipt journal.

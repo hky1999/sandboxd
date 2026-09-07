@@ -38,6 +38,49 @@ import (
 func TestV010WireContract(t *testing.T) {
 	descriptor := protodesc.ToFileDescriptorProto(File_api_runtime_v1_sandbox_api_proto)
 	descriptor.SourceCodeInfo = nil
+	// Validate then project only this additive conditional-delete contract.
+	newMessages := map[string][]string{
+		"DeleteIfGenerationRequest":  {"id", "expected_generation"},
+		"DeleteIfGenerationResponse": {"retired_generation"},
+	}
+	for _, message := range descriptor.MessageType {
+		names, added := newMessages[message.GetName()]
+		if !added {
+			continue
+		}
+		if len(message.Field) != len(names) || len(message.NestedType) != 0 || len(message.EnumType) != 0 {
+			t.Fatal("unexpected conditional delete message")
+		}
+		for i, name := range names {
+			f := message.Field[i]
+			if f.GetName() != name || f.GetNumber() != int32(i+1) || f.GetType() != descriptorpb.FieldDescriptorProto_TYPE_STRING || f.GetLabel() != descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL {
+				t.Fatal("unexpected conditional delete field")
+			}
+		}
+		delete(newMessages, message.GetName())
+	}
+	if len(newMessages) != 0 {
+		t.Fatal("missing conditional delete messages")
+	}
+	foundDelete := false
+	for _, service := range descriptor.Service {
+		service.Method = slices.DeleteFunc(service.Method, func(m *descriptorpb.MethodDescriptorProto) bool {
+			if m.GetName() != "DeleteIfGeneration" {
+				return false
+			}
+			if foundDelete || service.GetName() != "SandboxService" || m.GetInputType() != "."+descriptor.GetPackage()+".DeleteIfGenerationRequest" || m.GetOutputType() != "."+descriptor.GetPackage()+".DeleteIfGenerationResponse" || m.GetClientStreaming() || m.GetServerStreaming() {
+				t.Fatal("unexpected conditional delete RPC")
+			}
+			foundDelete = true
+			return true
+		})
+	}
+	if !foundDelete {
+		t.Fatal("missing conditional delete RPC")
+	}
+	descriptor.MessageType = slices.DeleteFunc(descriptor.MessageType, func(m *descriptorpb.DescriptorProto) bool {
+		return m.GetName() == "DeleteIfGenerationRequest" || m.GetName() == "DeleteIfGenerationResponse"
+	})
 	// Project only the validated new checkpoint identity field; keep all
 	// frozen descriptor hashes unchanged so existing wire changes still fail.
 	for _, message := range descriptor.MessageType {

@@ -39,6 +39,8 @@ service SandboxService {
   rpc DeleteCheckpoint(DeleteCheckpointRequest) returns (DeleteCheckpointResponse) {}
   // Delete force-deletes a sandbox.
   rpc Delete(DeleteRequest) returns (DeleteResponse) {}
+  // Fails on old servers instead of silently ignoring a generation precondition.
+  rpc DeleteIfGeneration(DeleteIfGenerationRequest) returns (DeleteIfGenerationResponse) {}
   // Wait waits for a sandbox to exit.
   rpc Wait(WaitRequest) returns (WaitResponse) {}
   // List lists sandboxes by filters.
@@ -594,4 +596,13 @@ message ResizeResourcesResponse {
   bool complete = 2;
   // A partial write is returned with actual limits, never disguised as no-op.
   string update_error = 3;
+}
+
+// Deletes only the physical incarnation identified by expected_generation.
+message DeleteIfGenerationRequest {
+  string id = 1;
+  string expected_generation = 2;
+}
+message DeleteIfGenerationResponse {
+  string retired_generation = 1;
 }

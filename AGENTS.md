@@ -92,3 +92,12 @@ virtio-fs staging and restored live-memory files, and runtime state. Every
 virtio-fs export must remain read-only; never extend this path to writable host
 sharing. Bounded read-only regular-file injection remains a separate
 startup-metadata mechanism for files such as `resolv.conf`.
+
+# Scheduler generation-conditional deletion
+
+`DeleteIfGeneration` is a separate RPC requiring the current
+`akernel.scheduler/resource-generation` value. It checks identity under the
+physical resource lock and returns that generation only after successful cleanup.
+Do not fall back to legacy `Delete` when this RPC is unavailable or rejected.
+A missing sandbox returns NotFound; it is not a deletion receipt for a requested
+generation. Legacy Delete retains its existing unconditional semantics.

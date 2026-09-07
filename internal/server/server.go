@@ -319,7 +319,11 @@ func (h *sandboxService) restoreSandboxRuntime(
 	return nil
 }
 
-func (h *sandboxService) deleteSandboxRuntime(ctx context.Context, sandboxID string) (err error) {
+func (h *sandboxService) deleteSandboxRuntime(ctx context.Context, sandboxID string, generation ...string) (err error) {
+	expected := ""
+	if len(generation) > 0 {
+		expected = generation[0]
+	}
 	unlock, err := h.resourceLocks.acquire(ctx, sandboxID)
 	if err != nil {
 		return err
@@ -337,10 +341,14 @@ func (h *sandboxService) deleteSandboxRuntime(ctx context.Context, sandboxID str
 
 	c, err := h.sandboxManager.Get(sandboxID)
 	if err != nil {
-		if errors.Is(err, errord.ErrNotFound) {
+		if errors.Is(err, errord.ErrNotFound) && expected == "" {
 			return nil
 		}
 		return errord.ToGRPC(err)
+	}
+
+	if expected != "" && (c.Metadata == nil || c.Metadata.Labels[resourceGenerationLabel] != expected) {
+		return errord.ToGRPCf(errord.ErrFailedPrecondition, "sandbox resource generation changed before delete")
 	}
 
 	if h.checkRuntime(c.Metadata.RuntimeHandler) != nil {
@@ -404,8 +412,14 @@ func (h *sandboxService) deleteSandboxRuntime(ctx context.Context, sandboxID str
 // Cleanup runs independently from the initiating caller's cancellation so a
 // timed-out RPC cannot leave a partially deleted sandbox for another caller to
 // release again.
-func (h *sandboxService) deleteSandbox(ctx context.Context, sandboxID string) error {
-	resultCh := h.deleteGroup.DoChan(sandboxID, func() (interface{}, error) {
+func (h *sandboxService) deleteSandbox(ctx context.Context, sandboxID string, generation ...string) error {
+	expected := ""
+	if len(generation) > 0 {
+		expected = generation[0]
+	}
+	// Legacy and conditional deletes, and different generations, must not share receipts.
+	key, _ := json.Marshal([2]string{sandboxID, expected})
+	resultCh := h.deleteGroup.DoChan(string(key), func() (interface{}, error) {
 		cleanupCtx := context.WithoutCancel(ctx)
 		if h.checkpointState != nil {
 			if err := h.checkpointState.BeginDelete(sandboxID); err != nil {
@@ -414,7 +428,7 @@ func (h *sandboxService) deleteSandbox(ctx context.Context, sandboxID string) er
 			defer h.checkpointState.EndDelete(sandboxID)
 		}
 
-		return nil, h.deleteSandboxRuntime(cleanupCtx, sandboxID)
+		return nil, h.deleteSandboxRuntime(cleanupCtx, sandboxID, expected)
 	})
 
 	select {
@@ -1162,6 +1176,18 @@ func (h *sandboxService) Delete(ctx context.Context, request *runtime.DeleteRequ
 	}
 	err = h.deleteSandbox(ctx, request.ID)
 	return response, err
+}
+
+// DeleteIfGeneration requires a physical identity match under the same lock as
+// Start/Resize/Delete. A missing record is unknown, not a receipt for this generation.
+func (h *sandboxService) DeleteIfGeneration(ctx context.Context, request *runtime.DeleteIfGenerationRequest) (*runtime.DeleteIfGenerationResponse, error) {
+	if request == nil || request.ID == "" || request.ExpectedGeneration == "" || len(request.ExpectedGeneration) > 128 {
+		return nil, errord.ToGRPC(errord.ErrInvalidArgument)
+	}
+	if err := h.deleteSandbox(ctx, request.ID, request.ExpectedGeneration); err != nil {
+		return nil, err
+	}
+	return &runtime.DeleteIfGenerationResponse{RetiredGeneration: request.ExpectedGeneration}, nil
 }
 
 func (h *sandboxService) SetNetworkPolicy(
