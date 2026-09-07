@@ -183,6 +183,8 @@ restart always marks the lineage lost for surviving sandboxes: the restart
 cannot tell which generation the surviving VMM is armed against, so the
 cheapest provably-safe recovery is one `Full` checkpoint per sandbox.
 
+Checkpoint continuation lineage is process-local authority. A successful checkpoint does not rewrite the runtime state file when only `base_memory_path`, `base_memory_incremental`, or `base_memory_lineage_lost` changed. Values incidentally present in an older state file are neither a current baseline nor a GC retention reference; consumers must not use them to authorize incremental reuse. Recovery still invalidates lineage and forces Full, including repeated daemon restarts. Create/configure/restore, recovery reset and exit-state persistence keep their existing atomic-write and synchronization behavior. If another lifecycle field changed during checkpoint, that state is still persisted. Stop-and-copy persists the terminal state even if the stop helper had already marked a vanished source finished. Checkpoint artifact sealing, publication and their durability boundaries are unchanged.
+
 The manifest digests the small VM state component and — unless opted out —
 the memory artifact. Hashing guest memory costs roughly a second of CPU per
 GiB and runs in the post-resume tail (outside the pause window), so it can be
