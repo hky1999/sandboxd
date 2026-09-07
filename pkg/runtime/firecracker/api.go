@@ -131,6 +131,13 @@ func (api *firecrackerAPI) createSnapshot(
 }
 
 func (api *firecrackerAPI) createSnapshotWithSparse(ctx context.Context, statePath, memoryPath, snapshotType string, sparseFull bool) error {
+	return api.createSnapshotWithMemoryOptions(ctx, statePath, memoryPath, snapshotType, sparseFull, false)
+}
+
+func (api *firecrackerAPI) createSnapshotWithMemoryOptions(ctx context.Context, statePath, memoryPath, snapshotType string, sparseFull, skipUnchanged bool) error {
+	if skipUnchanged && snapshotType != firecrackerSnapshotTypeSoftDirty && snapshotType != firecrackerSnapshotTypeIncremental {
+		return fmt.Errorf("skip_unchanged requires Incremental or SoftDirty")
+	}
 	if sparseFull && snapshotType != firecrackerSnapshotTypeFull {
 		return fmt.Errorf("sparse_full requires Full")
 	}
@@ -142,6 +149,9 @@ func (api *firecrackerAPI) createSnapshotWithSparse(ctx context.Context, statePa
 	}
 	if fsStatePath != "" {
 		body["fs_state_path"] = fsStatePath
+	}
+	if skipUnchanged {
+		body["skip_unchanged"] = true
 	}
 	// Checkpoint artifacts deliberately remain in the host page cache. The
 	// caller accepts that success does not imply immediate power-loss
