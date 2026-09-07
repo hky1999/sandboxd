@@ -14,7 +14,9 @@
 //	           -source <source-node> -store http://minio:19000/bucket \
 //	           [-nodes http://n1:18090,http://n2:18090] [-to <node>] [-json]
 //
-// Exit codes: 0 migrated, 1 failed (source preserved), 2 usage error.
+// Exit codes: 0 migrated, 1 failed, 2 usage error. Exit 1 alone does not
+// say which side holds the sandbox — the report's error names the state
+// left behind (rolled back, target-owned, or unknown target outcome).
 package main
 
 import (
@@ -99,29 +101,20 @@ func main() {
 	}
 	// Ownership phases gate the compensation path (F2): rolling the source
 	// back is only safe while nothing has been started on the target. Once
-	// the restore command is in flight the target may be running even if
-	// its response was lost, so a rollback first has to fence the target;
-	// once the target is verified RUNNING it owns the sandbox outright and
-	// the only legal failure mode left is source-cleanup-pending.
+	// the restore command has been issued the target may be running even if
+	// its response was lost — and nothing this CLI can observe proves the
+	// request dead: a delete followed by an absent listing does not cancel
+	// an in-flight restore — so compensation stops entirely and the operator
+	// resolves the target; once the target is verified RUNNING it owns the
+	// sandbox outright and the only legal failure mode left is
+	// source-cleanup-pending.
 	const (
 		phaseCheckpointing   = iota // checkpoint in flight; outcome unknown on failure
 		phaseSourceOwned            // checkpoint sealed; target untouched; rollback is safe
-		phaseTargetRestoring        // restore issued; target state unknown; fence before rollback
+		phaseTargetRestoring        // restore issued; outcome unknown; no automatic compensation
 		phaseTargetOwned            // target verified RUNNING; never roll back
 	)
 	phase := phaseCheckpointing
-	fenceTarget := func(target string) bool {
-		// Idempotent stop+delete plus an absence check: only a confirmed
-		// fence makes a source rollback safe again.
-		run(target, "fence-target", *bin+"/sbox",
-			"--address", "/run/sandboxd/sandboxd.sock", "delete", *sandbox)
-		if out, ok := run(target, "confirm-fenced", *bin+"/sbox",
-			"--address", "/run/sandboxd/sandboxd.sock", "list"); ok &&
-			!listHasSandbox(out, *sandbox) {
-			return true
-		}
-		return false
-	}
 	rollbackSource := func(detail string) string {
 		if _, ok := run(*source, "rollback-restore", *bin+"/checkpoint-restore",
 			"--action", "restore", "--socket", "/run/sandboxd/sandboxd.sock",
@@ -138,16 +131,17 @@ func main() {
 			detail = rollbackSource(detail)
 		case phaseTargetRestoring:
 			// The restore response (or the verify listing) never arrived;
-			// the target may already be running the sandbox. Only a
-			// confirmed fence clears the way for a rollback — otherwise
-			// restoring the source would create dual writers.
-			target := report.Target
-			if target != "" && fenceTarget(target) {
-				detail = rollbackSource(detail)
-			} else {
-				detail += " (TARGET OUTCOME UNKNOWN and could not be fenced; rollback skipped to avoid dual writers — resolve the target manually, then restore the source from " +
-					report.Checkpoint + " if needed)"
-			}
+			// the target may already be running the sandbox. No command
+			// this CLI can issue proves the in-flight restore was dropped
+			// (a delete plus an empty listing is not such a proof), so any
+			// automatic compensation — deleting the target or restoring
+			// the source — could destroy the only live copy or create a
+			// second writer. Fail closed: issue neither, keep the
+			// checkpoint and the target as they are, and let the operator
+			// resolve the pending restore / the actual writer first.
+			detail += " (TARGET OUTCOME UNKNOWN — no rollback and no target delete: an in-flight restore cannot be proven cancelled; checkpoint " +
+				report.Checkpoint + " and target " + report.Target +
+				" are preserved. Resolve the pending restore or the actual writer on the target first, then recover manually)"
 		case phaseTargetOwned:
 			detail += " (target verified RUNNING and owns the sandbox; no rollback — delete the lingering source copy manually to finish cleanup)"
 		}
@@ -179,9 +173,9 @@ func main() {
 		if out, ok2 := run(*source, "probe-source", *bin+"/sbox",
 			"--address", "/run/sandboxd/sandboxd.sock", "list"); ok2 &&
 			listHasRunningSandbox(out, *sandbox) {
-			fail("checkpoint", "checkpoint failed; sandbox still RUNNING on source (not executed)")
+			fail("checkpoint", "checkpoint failed; source probe still observes the sandbox RUNNING — the checkpoint request's outcome is unknown (a failed command does not prove it was not executed) and no further action is taken here")
 		}
-		fail("checkpoint", "checkpoint failed and the sandbox is gone from the source — outcome unknown; the sealed local checkpoint at "+
+		fail("checkpoint", "checkpoint failed; the source does not confirm the sandbox RUNNING (probe unreachable or not RUNNING) — the checkpoint request's outcome is unknown; the sealed local checkpoint at "+
 			report.Checkpoint+" (if complete) supports a manual rollback-restore")
 	}
 	phase = phaseSourceOwned
@@ -243,8 +237,11 @@ func main() {
 		failPastCheckpoint("materialize", "cn-fetch failed on target")
 	}
 	// The restore command is about to be issued: from here a lost or
-	// failed reply does not mean the target stayed down, so compensation
-	// must fence the target before touching the source (F2).
+	// failed reply does not mean the target stayed down, and nothing this
+	// CLI can observe proves the request dead — so every failure until
+	// the target is verified RUNNING is reported as TARGET OUTCOME
+	// UNKNOWN and compensation stops; past verification the target owns
+	// the sandbox (F2).
 	phase = phaseTargetRestoring
 	if _, ok := run(placement.NodeID, "restore", *bin+"/checkpoint-restore",
 		"--action", "restore", "--socket", "/run/sandboxd/sandboxd.sock",

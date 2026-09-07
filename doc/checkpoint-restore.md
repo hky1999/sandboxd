@@ -557,16 +557,7 @@ binary, machine architecture, host or guest kernel, and runtime configuration.
 Compression changes only the runtime-specific artifact encoding; it does not
 make an artifact portable.
 
-Incremental checkpoint scheduling (which generations a caller takes and when),
-deterministic replay, and automatic recovery of a
-source after checkpoint failure are outside this design. `cn-migrate`
-orchestrates stop-and-copy migration on top of these primitives: it
-checkpoints with leave-running=false (the source freezes at the checkpoint
-instant — no dual-writer window, no lost post-checkpoint writes), uses a
-fresh immutable checkpoint id per attempt, verifies the target by parsing
-the listing for the exact id in the RUNNING state, rolls the source back
-from its local checkpoint directory if any post-checkpoint step fails, and
-treats a failed source deletion as a hard failure rather than success.
+Incremental checkpoint scheduling (which generations a caller takes and when), deterministic replay, and automatic recovery of a source after checkpoint failure are outside this design. `cn-migrate` orchestrates stop-and-copy migration on top of these primitives: it checkpoints with leave-running=false (the source freezes at the checkpoint instant — no dual-writer window, no lost post-checkpoint writes), uses a fresh immutable checkpoint id per attempt, verifies the target by parsing the listing for the exact id in the RUNNING state, and treats a failed source deletion as a hard failure rather than success. Compensation is phase-gated: while the target has not been asked to restore anything (publish, placement, or materialization failure), the source is rolled back from its local checkpoint directory; once the restore command has been issued, its outcome can be unknown (a lost or timed-out reply, or a verify that never observes RUNNING), and no observation the orchestrator can make — in particular a delete followed by an absent listing, which does not cancel an in-flight restore — proves the target stayed down, so the orchestrator issues no rollback and no target delete, reports TARGET OUTCOME UNKNOWN with the checkpoint id and target preserved, and leaves recovery to an operator who must first resolve the pending restore or the actual writer on the target; after the target is verified RUNNING it owns the sandbox and the source is only ever deleted, never resurrected. A checkpoint command that fails while the source probe still observes the sandbox RUNNING reports an unknown request outcome rather than claiming the checkpoint was not executed. These rules are a fail-closed containment boundary around unknown target outcomes, not a complete fix: there is still no persistent cross-node ownership record, idempotency token or epoch protocol, no runtime-side rejection of late requests under a controller lease, so a restore that lands after the orchestrator gave up can still start a target next to a manually recovered source, and every TARGET OUTCOME UNKNOWN exit requires a human decision.
 
 ### Sparse overlay chunk sealing
 
