@@ -112,7 +112,7 @@ type pageSource struct {
 	chunkLocal string
 
 	inflightMu sync.Mutex
-	inflight   map[uint64]*sync.WaitGroup // chunk index -> waiters' group
+	inflight   map[uint64]chan struct{} // chunk index -> leader completion
 	// fetched records the chunks whose cache bytes are fully written. A
 	// sparse hole inside the cache reads back as a full-length run of
 	// zeros once the file has been extended past it by ANY other chunk's
@@ -131,6 +131,13 @@ type pageSource struct {
 	persister              *chunkPersister
 	persistenceStopped     bool
 	persistenceWorkerCount int
+}
+
+func (src *pageSource) requestContext() context.Context {
+	if src.ctx != nil {
+		return src.ctx
+	}
+	return context.Background()
 }
 
 // zeroChunkLength recognizes content from its digest, never from sparse file
@@ -230,11 +237,21 @@ func (s *faultServer) readCache(off, n uint64) ([]byte, bool) {
 // guest memory one silent page at a time.
 func (s *faultServer) fetchChunk(chunkIdx uint64) error {
 	src := s.source
+	ctx := src.requestContext()
 	const attempts = 3
 	var lastErr error
 	for attempt := 0; attempt < attempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if attempt > 0 {
-			time.Sleep(time.Duration(attempt) * 50 * time.Millisecond)
+			timer := time.NewTimer(time.Duration(attempt) * 50 * time.Millisecond)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return ctx.Err()
+			case <-timer.C:
+			}
 		}
 		src.inflightMu.Lock()
 		if _, done := src.fetched[chunkIdx]; done {
@@ -246,9 +263,13 @@ func (s *faultServer) fetchChunk(chunkIdx uint64) error {
 			// whatever landed there.
 			return nil
 		}
-		if wg, ok := src.inflight[chunkIdx]; ok {
+		if done, ok := src.inflight[chunkIdx]; ok {
 			src.inflightMu.Unlock()
-			wg.Wait()
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-done:
+			}
 			// The leader may have failed; the bitmap is the outcome of
 			// record, so re-check it instead of assuming success (F1:
 			// waiters used to return nil unconditionally).
@@ -261,15 +282,14 @@ func (s *faultServer) fetchChunk(chunkIdx uint64) error {
 			lastErr = fmt.Errorf("chunk %d: concurrent fetch failed; retrying", chunkIdx)
 			continue
 		}
-		wg := &sync.WaitGroup{}
-		wg.Add(1)
-		src.inflight[chunkIdx] = wg
+		done := make(chan struct{})
+		src.inflight[chunkIdx] = done
 		src.inflightMu.Unlock()
 		err := func() error {
-			defer wg.Done()
 			defer func() {
 				src.inflightMu.Lock()
 				delete(src.inflight, chunkIdx)
+				close(done)
 				src.inflightMu.Unlock()
 			}()
 			if src.chunkManifest != nil {
@@ -292,7 +312,7 @@ func (s *faultServer) fetchChunk(chunkIdx uint64) error {
 func (s *faultServer) fetchChunkRange(chunkIdx uint64) error {
 	src := s.source
 	start := chunkIdx * src.chunk
-	req, err := http.NewRequest(http.MethodGet, src.remote, nil)
+	req, err := http.NewRequestWithContext(src.requestContext(), http.MethodGet, src.remote, nil)
 	if err != nil {
 		return err
 	}
@@ -387,7 +407,11 @@ func (s *faultServer) fetchChunkFromStore(chunkIdx uint64) error {
 		}
 		if done, ok := src.digestInflight[key]; ok {
 			src.inflightMu.Unlock()
-			<-done
+			select {
+			case <-src.requestContext().Done():
+				return src.requestContext().Err()
+			case <-done:
+			}
 			// A failed leader leaves no verified extent. Elect a new leader
 			// instead of exposing bytes from an incomplete download.
 			continue
@@ -827,7 +851,7 @@ func main() {
 		ctx:                    sourceCtx,
 		persistenceWorkerCount: *persistWorkers,
 		chunk:                  chunk,
-		inflight:               make(map[uint64]*sync.WaitGroup),
+		inflight:               make(map[uint64]chan struct{}),
 		fetched:                make(map[uint64]struct{}),
 	}
 	if *remoteURL != "" {
@@ -838,7 +862,7 @@ func main() {
 		source.cache = cacheFile
 		source.cachePath = *cachePath
 		source.remote = *remoteURL
-		source.client = &http.Client{Transport: &http.Transport{
+		source.client = &http.Client{Timeout: 60 * time.Second, Transport: &http.Transport{
 			MaxIdleConnsPerHost: 16,
 		}}
 		// Cache writes go through fetchChunk which serializes via inflight.
@@ -941,7 +965,7 @@ func main() {
 	// path too (the old remote-only gate silently disabled prefetch for
 	// exactly the deployments that needed it). fetchChunk's inflight
 	// tracking makes concurrent prefetch with fault serving safe: each
-	// chunk moves at most once, faults wait on the same WaitGroup.
+	// chunk moves at most once, faults wait on the same cancelable completion channel.
 	if *prefetch > 0 && (source.remote != "" || source.chunkStore != "") &&
 		os.Getenv("UFFD_NO_BULK") == "" {
 		go func() {
