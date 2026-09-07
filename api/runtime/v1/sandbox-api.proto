@@ -582,6 +582,8 @@ message ResizeResourcesRequest {
   string resource_generation = 2;
   ResourceLimits expected = 3;
   ResourceLimits target = 4;
+  // Required absolute command expiry, checked again under the resource lock.
+  int64 deadline_unix_ms = 5;
 }
 
 message ResizeResourcesResponse {

@@ -17,7 +17,9 @@ import (
 	svc "github.com/inclusionAI/sandboxd/pkg/runtime"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
 	"google.golang.org/protobuf/proto"
 )
@@ -29,12 +31,16 @@ type resizeCgroups struct {
 	failReadback bool
 	noWrite      bool
 	onPrepare    func()
+	onStats      func()
 }
 
 func (*resizeCgroups) Allocate() (string, error) { return "/sandbox/lease", nil }
 func (*resizeCgroups) Recycle(string) error      { return nil }
 func (*resizeCgroups) ShutDown() error           { return nil }
 func (c *resizeCgroups) Stats(string) (cgroupmanager.Stats, error) {
+	if c.onStats != nil {
+		c.onStats()
+	}
 	if c.failReadback && c.writes > 0 {
 		return cgroupmanager.Stats{}, errors.New("stats offline")
 	}
@@ -72,8 +78,9 @@ func newResizeService(t *testing.T) (*sandboxService, *resizeCgroups, *runtime.R
 	h.cgroupMgr = c
 	request := &runtime.ResizeResourcesRequest{
 		SandboxID: "elastic", ResourceGeneration: "generation-1",
-		Expected: &runtime.ResourceLimits{CpuQuotaUsec: 50000, CpuPeriodUsec: 100000, MemoryLimitBytes: 512 * 1024 * 1024},
-		Target:   &runtime.ResourceLimits{CpuQuotaUsec: 100000, CpuPeriodUsec: 100000, MemoryLimitBytes: 1024 * 1024 * 1024},
+		DeadlineUnixMs: time.Now().Add(30 * time.Second).UnixMilli(),
+		Expected:       &runtime.ResourceLimits{CpuQuotaUsec: 50000, CpuPeriodUsec: 100000, MemoryLimitBytes: 512 * 1024 * 1024},
+		Target:         &runtime.ResourceLimits{CpuQuotaUsec: 100000, CpuPeriodUsec: 100000, MemoryLimitBytes: 1024 * 1024 * 1024},
 	}
 	return h, c, request
 }
@@ -260,6 +267,11 @@ func TestResizeResourcesOverGRPCPreservesIdentityAndReadback(t *testing.T) {
 	require.True(t, response.Complete)
 	require.Equal(t, request.Target.MemoryLimitBytes, response.Actual.MemoryLimitBytes)
 	require.Equal(t, before.ResourceGeneration, response.Actual.ResourceGeneration)
+	// Even an otherwise idempotent request must not execute after its original
+	// command deadline; the RPC transport must preserve this field.
+	request.DeadlineUnixMs = time.Now().Add(-time.Second).UnixMilli()
+	_, err = client.ResizeResources(ctx, request)
+	require.Equal(t, codes.DeadlineExceeded, status.Code(err))
 }
 
 type observedStartHandler struct {
@@ -296,4 +308,42 @@ func TestElasticReadbackMustPassBeforeRuntimeStart(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestResizeCommandExpiryRejectsUndeliveredAndQueuedWrites(t *testing.T) {
+	for _, delta := range []time.Duration{0, -time.Second, 2 * time.Minute} {
+		t.Run(delta.String(), func(t *testing.T) {
+			h, c, req := newResizeService(t)
+			req.DeadlineUnixMs = 0
+			if delta != 0 {
+				req.DeadlineUnixMs = time.Now().Add(delta).UnixMilli()
+			}
+			_, err := h.ResizeResources(context.Background(), req)
+			require.Error(t, err)
+			require.Zero(t, c.writes)
+		})
+	}
+	t.Run("resource lock queue", func(t *testing.T) {
+		h, c, req := newResizeService(t)
+		unlock, err := h.resourceLocks.acquire(context.Background(), req.SandboxID)
+		require.NoError(t, err)
+		defer unlock()
+		req.DeadlineUnixMs = time.Now().Add(100 * time.Millisecond).UnixMilli()
+		_, err = h.ResizeResources(context.Background(), req)
+		require.Equal(t, codes.DeadlineExceeded, status.Code(err))
+		require.Zero(t, c.writes)
+	})
+	t.Run("expiry after readback before write", func(t *testing.T) {
+		h, c, req := newResizeService(t)
+		req.DeadlineUnixMs = time.Now().Add(100 * time.Millisecond).UnixMilli()
+		read := false
+		c.onStats = func() {
+			read = true
+			time.Sleep(time.Until(time.UnixMilli(req.DeadlineUnixMs).Add(10 * time.Millisecond)))
+		}
+		_, err := h.ResizeResources(context.Background(), req)
+		require.True(t, read)
+		require.Equal(t, codes.DeadlineExceeded, status.Code(err))
+		require.Zero(t, c.writes)
+	})
 }

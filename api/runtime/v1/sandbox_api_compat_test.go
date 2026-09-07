@@ -38,6 +38,16 @@ import (
 func TestV010WireContract(t *testing.T) {
 	descriptor := protodesc.ToFileDescriptorProto(File_api_runtime_v1_sandbox_api_proto)
 	descriptor.SourceCodeInfo = nil
+	for _, message := range descriptor.MessageType {
+		if message.GetName() != "ResizeResourcesRequest" {
+			continue
+		}
+		if len(message.Field) != 5 || message.Field[4].GetName() != "deadline_unix_ms" ||
+			message.Field[4].GetNumber() != 5 || message.Field[4].GetType() != descriptorpb.FieldDescriptorProto_TYPE_INT64 {
+			t.Fatal("unexpected resize command expiry field")
+		}
+		message.Field = message.Field[:4]
+	}
 	// Pressure telemetry is strictly additive to the frozen resize contract.
 	for _, message := range descriptor.MessageType {
 		if message.GetName() != "StatsResponse" {

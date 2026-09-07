@@ -3370,8 +3370,10 @@ type ResizeResourcesRequest struct {
 	ResourceGeneration string                 `protobuf:"bytes,2,opt,name=resource_generation,json=resourceGeneration,proto3" json:"resource_generation,omitempty"`
 	Expected           *ResourceLimits        `protobuf:"bytes,3,opt,name=expected,proto3" json:"expected,omitempty"`
 	Target             *ResourceLimits        `protobuf:"bytes,4,opt,name=target,proto3" json:"target,omitempty"`
-	unknownFields      protoimpl.UnknownFields
-	sizeCache          protoimpl.SizeCache
+	// Required absolute command expiry, checked again under the resource lock.
+	DeadlineUnixMs int64 `protobuf:"varint,5,opt,name=deadline_unix_ms,json=deadlineUnixMs,proto3" json:"deadline_unix_ms,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *ResizeResourcesRequest) Reset() {
@@ -3430,6 +3432,13 @@ func (x *ResizeResourcesRequest) GetTarget() *ResourceLimits {
 		return x.Target
 	}
 	return nil
+}
+
+func (x *ResizeResourcesRequest) GetDeadlineUnixMs() int64 {
+	if x != nil {
+		return x.DeadlineUnixMs
+	}
+	return 0
 }
 
 type ResizeResourcesResponse struct {
@@ -3758,13 +3767,14 @@ const file_api_runtime_v1_sandbox_api_proto_rawDesc = "" +
 	"\x0eResourceLimits\x12$\n" +
 	"\x0ecpu_quota_usec\x18\x01 \x01(\x03R\fcpuQuotaUsec\x12&\n" +
 	"\x0fcpu_period_usec\x18\x02 \x01(\x04R\rcpuPeriodUsec\x12,\n" +
-	"\x12memory_limit_bytes\x18\x03 \x01(\x04R\x10memoryLimitBytes\"\xd4\x01\n" +
+	"\x12memory_limit_bytes\x18\x03 \x01(\x04R\x10memoryLimitBytes\"\xfe\x01\n" +
 	"\x16ResizeResourcesRequest\x12\x1d\n" +
 	"\n" +
 	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x12/\n" +
 	"\x13resource_generation\x18\x02 \x01(\tR\x12resourceGeneration\x126\n" +
 	"\bexpected\x18\x03 \x01(\v2\x1a.runtime.v1.ResourceLimitsR\bexpected\x122\n" +
-	"\x06target\x18\x04 \x01(\v2\x1a.runtime.v1.ResourceLimitsR\x06target\"\x8b\x01\n" +
+	"\x06target\x18\x04 \x01(\v2\x1a.runtime.v1.ResourceLimitsR\x06target\x12(\n" +
+	"\x10deadline_unix_ms\x18\x05 \x01(\x03R\x0edeadlineUnixMs\"\x8b\x01\n" +
 	"\x17ResizeResourcesResponse\x121\n" +
 	"\x06actual\x18\x01 \x01(\v2\x19.runtime.v1.StatsResponseR\x06actual\x12\x1a\n" +
 	"\bcomplete\x18\x02 \x01(\bR\bcomplete\x12!\n" +

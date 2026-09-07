@@ -6,6 +6,7 @@ package server
 import (
 	"context"
 	"math"
+	"time"
 
 	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
 	"github.com/inclusionAI/sandboxd/config"
@@ -27,6 +28,16 @@ func (h *sandboxService) ResizeResources(ctx context.Context, req *runtime.Resiz
 	if req == nil || req.SandboxID == "" || req.ResourceGeneration == "" || req.Expected == nil || req.Target == nil {
 		return nil, errord.ToGRPCf(errord.ErrInvalidArgument, "sandbox, generation, expected and target limits are required")
 	}
+	if req.DeadlineUnixMs <= 0 || req.DeadlineUnixMs > time.Now().Add(time.Minute).UnixMilli() {
+		return nil, errord.ToGRPCf(errord.ErrInvalidArgument, "resize requires a command deadline within one minute")
+	}
+	if time.Now().UnixMilli() >= req.DeadlineUnixMs {
+		return nil, errord.ToGRPC(context.DeadlineExceeded)
+	}
+	// Preserve expiry through service/lock queues, independently of the gRPC
+	// deadline which a delayed intermediary could otherwise start afresh.
+	ctx, cancel := context.WithDeadline(ctx, time.UnixMilli(req.DeadlineUnixMs))
+	defer cancel()
 	if !h.recoveryReady.Load() {
 		return nil, errord.ToGRPCf(errord.ErrUnavailable, "resource recovery is incomplete")
 	}
@@ -89,6 +100,9 @@ func (h *sandboxService) ResizeResources(ctx context.Context, req *runtime.Resiz
 	// resourceStats already validated the managed cgroup and manager.
 	if err := ctx.Err(); err != nil {
 		return nil, errord.ToGRPC(err)
+	}
+	if time.Now().UnixMilli() >= req.DeadlineUnixMs {
+		return nil, errord.ToGRPC(context.DeadlineExceeded)
 	}
 	updateErr := h.cgroupMgr.Prepare(facts.Resources[config.ResourceNameCgroup], &runtime.LinuxSandboxResources{
 		CpuQuota: req.Target.CpuQuotaUsec, CpuPeriod: req.Target.CpuPeriodUsec,
