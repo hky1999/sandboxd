@@ -192,7 +192,7 @@ func TestSandbox_ApiStatus(t *testing.T) {
 func TestSandbox_ApiStatusBridgeIPLabelFallback(t *testing.T) {
 	sb := &Sandbox{
 		Metadata: &runtime.SandboxMetadata{
-			ID:            "sbox-test-ip",
+			ID:           "sbox-test-ip",
 			MetricLabels: map[string]string{"bridge_ip": "10.88.9.9"},
 		},
 		Status: &statusStorage{status: Status{Pid: 1, StartedAt: "20260828"}},
