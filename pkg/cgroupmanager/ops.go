@@ -64,8 +64,12 @@ func validateCgroupProcesses(processes []uint64) error {
 }
 
 // Stats is the version-neutral subset of cgroup accounting exposed by
-// sandboxd. All CPU values are nanoseconds and all memory values are bytes.
+// sandboxd. CPU accounting uses nanoseconds; quota/period use microseconds.
+// Memory values are bytes.
 type Stats struct {
+	CPUQuotaUsec        int64 // -1 means unlimited; consult CPULimitsKnown
+	CPUPeriodUsec       uint64
+	CPULimitsKnown      bool
 	CPUUsageNanos       uint64
 	CPUUserNanos        uint64
 	CPUKernelNanos      uint64

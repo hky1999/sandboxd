@@ -24,9 +24,11 @@ import (
 // memory-state image.
 const resourceLimitsFile = "resource-limits.json"
 
-// resourceLimitsSnapshot is the sidecar schema (extensible: CPU can join
-// later). MemoryLimitBytes mirrors cgroup memory.max at checkpoint time.
+// resourceLimitsSnapshot records effective cgroup limits at checkpoint time.
 type resourceLimitsSnapshot struct {
+	CPUQuotaUsec     int64  `json:"cpu_quota_usec,omitempty"`
+	CPUPeriodUsec    uint64 `json:"cpu_period_usec,omitempty"`
+	CPULimitsKnown   bool   `json:"cpu_limits_known,omitempty"`
 	MemoryLimitBytes uint64 `json:"memory_limit_bytes"`
 }
 
@@ -53,7 +55,7 @@ func (h *sandboxService) captureResourceLimits(sandboxID, dir string) error {
 	if err != nil {
 		return fmt.Errorf("capture resource limits: stat cgroup %s: %w", cgroupPath, err)
 	}
-	snapshot := resourceLimitsSnapshot{MemoryLimitBytes: stats.MemoryLimitBytes}
+	snapshot := resourceLimitsSnapshot{MemoryLimitBytes: stats.MemoryLimitBytes, CPUQuotaUsec: stats.CPUQuotaUsec, CPUPeriodUsec: stats.CPUPeriodUsec, CPULimitsKnown: stats.CPULimitsKnown}
 	data, err := json.Marshal(snapshot)
 	if err != nil {
 		return err
@@ -70,10 +72,18 @@ func applyCheckpointResourceLimits(startConfig *runtime.StartRequest, checkpoint
 		return
 	}
 	var snapshot resourceLimitsSnapshot
-	if err := json.Unmarshal(data, &snapshot); err != nil || snapshot.MemoryLimitBytes == 0 {
+	if err := json.Unmarshal(data, &snapshot); err != nil {
 		return
 	}
-	mb := float64(snapshot.MemoryLimitBytes / (1024 * 1024))
+	// Apply each known finite limit independently. Old memory-only sidecars
+	// preserve their historical behavior; unknown CPU never becomes zero.
+	if snapshot.CPULimitsKnown && snapshot.CPUQuotaUsec > 0 && snapshot.CPUPeriodUsec > 0 {
+		if startConfig.Resources == nil {
+			startConfig.Resources = make(map[string]float64)
+		}
+		startConfig.Resources["CPU"] = 1000 * float64(snapshot.CPUQuotaUsec) / float64(snapshot.CPUPeriodUsec)
+	}
+	mb := float64(snapshot.MemoryLimitBytes) / (1024 * 1024)
 	if mb < 1 {
 		return
 	}

@@ -550,6 +550,15 @@ func TestV2ResetAndStats(t *testing.T) {
 	assert.Equal(t, uint64(4096), stats.MemoryUsageBytes)
 	assert.Equal(t, uint64(8192), stats.MemoryLimitBytes)
 	assert.Equal(t, uint64(6144), stats.MemoryMaxUsageBytes)
+	assert.True(t, stats.CPULimitsKnown)
+	assert.Equal(t, int64(-1), stats.CPUQuotaUsec)
+	assert.Equal(t, uint64(100000), stats.CPUPeriodUsec)
+	writeTestFile(t, filepath.Join(groupPath, "cpu.max"), "50000 100000")
+	stats, err = ops.stat(name)
+	require.NoError(t, err)
+	assert.True(t, stats.CPULimitsKnown)
+	assert.Equal(t, int64(50000), stats.CPUQuotaUsec)
+
 }
 
 func TestV2OOMWatcherUsesCgroupBaseline(t *testing.T) {
@@ -761,4 +770,29 @@ func assertFileContents(t *testing.T, name, expected string) {
 	data, err := os.ReadFile(name)
 	require.NoError(t, err)
 	assert.Equal(t, expected, string(data))
+}
+
+func TestReadCPUMaxDistinguishesUnknownUnlimitedAndFinite(t *testing.T) {
+	for _, tc := range []struct {
+		text   string
+		quota  int64
+		period uint64
+		known  bool
+	}{
+		{"50000 100000", 50000, 100000, true}, {"125000 100000", 125000, 100000, true},
+		{"max 100000", -1, 100000, true}, {"50000 0", 0, 0, false},
+		{"bad 100000", 0, 0, false}, {"0 100000", 0, 0, false}, {"-1 100000", 0, 0, false},
+		{"50000", 0, 0, false}, {"50000 100000 junk", 0, 0, false},
+	} {
+		t.Run(tc.text, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "cpu.max")
+			writeTestFile(t, path, tc.text)
+			quota, period, known := readCPUMax(path)
+			assert.Equal(t, tc.quota, quota)
+			assert.Equal(t, tc.period, period)
+			assert.Equal(t, tc.known, known)
+		})
+	}
+	_, _, known := readCPUMax(filepath.Join(t.TempDir(), "missing"))
+	assert.False(t, known)
 }

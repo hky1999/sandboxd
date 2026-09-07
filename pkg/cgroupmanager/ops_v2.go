@@ -199,6 +199,7 @@ func (o *cgroupV2) stat(name string) (Stats, error) {
 		return Stats{}, err
 	}
 	result := Stats{}
+	result.CPUQuotaUsec, result.CPUPeriodUsec, result.CPULimitsKnown = readCPUMax(filepath.Join(o.mountpoint, name, "cpu.max"))
 	if metrics.CPU != nil {
 		result.CPUUsageNanos = usecToNS(metrics.CPU.UsageUsec)
 		result.CPUUserNanos = usecToNS(metrics.CPU.UserUsec)
@@ -300,4 +301,28 @@ func (o *cgroupV2) delete(name string) error {
 		return err
 	}
 	return nil
+}
+
+// readCPUMax keeps missing or malformed telemetry distinct from unlimited.
+func readCPUMax(path string) (int64, uint64, bool) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0, 0, false
+	}
+	fields := strings.Fields(string(data))
+	if len(fields) != 2 {
+		return 0, 0, false
+	}
+	period, err := strconv.ParseUint(fields[1], 10, 64)
+	if err != nil || period == 0 {
+		return 0, 0, false
+	}
+	if fields[0] == "max" {
+		return -1, period, true
+	}
+	quota, err := strconv.ParseInt(fields[0], 10, 64)
+	if err != nil || quota <= 0 {
+		return 0, 0, false
+	}
+	return quota, period, true
 }

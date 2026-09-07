@@ -110,3 +110,24 @@ func TestExistingRestorePhysicalFact_LiveSandboxRefused(t *testing.T) {
 	assert.Error(t, err)
 	assert.True(t, found)
 }
+
+func TestCheckpointRestoresEffectiveCPULimit(t *testing.T) {
+	for _, tc := range []struct {
+		name, data string
+		want       float64
+	}{
+		{"initial-half-core", `{"cpu_quota_usec":50000,"cpu_period_usec":100000,"cpu_limits_known":true}`, 500},
+		{"raised-fractional", `{"cpu_quota_usec":125000,"cpu_period_usec":100000,"cpu_limits_known":true}`, 1250},
+		{"unknown-keeps-booking", `{"cpu_quota_usec":50000,"cpu_period_usec":100000}`, 8000},
+		{"invalid-period", `{"cpu_quota_usec":50000,"cpu_period_usec":0,"cpu_limits_known":true}`, 8000},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			assert.NoError(t, os.WriteFile(filepath.Join(dir, resourceLimitsFile), []byte(tc.data), 0600))
+			req := &runtime.StartRequest{Resources: map[string]float64{"CPU": 8000, "Memory": 512}}
+			applyCheckpointResourceLimits(req, dir)
+			assert.Equal(t, tc.want, req.Resources["CPU"])
+			assert.Equal(t, float64(512), req.Resources["Memory"])
+		})
+	}
+}
