@@ -211,7 +211,7 @@ func runPacked(ctx context.Context, dir, id string, store chunkstore.Store, m *c
 	if err := checkpointchunks.ValidateTransport(&transport); err != nil {
 		return fail(err)
 	}
-	if err := writeState(state); err != nil {
+	if err := writeStateMeasured(state, &result.StateTimings.Publishing); err != nil {
 		return result, err
 	}
 	memory, err := os.Open(filepath.Join(dir, "memory"))
@@ -445,7 +445,7 @@ func runPacked(ctx context.Context, dir, id string, store chunkstore.Store, m *c
 	state.PublishedAt = time.Now().UTC()
 	state.ChunksPut = result.ChunksPut + result.ChunksSkip
 	state.LastError = ""
-	if err := writeState(state); err != nil {
+	if err := writeStateMeasured(state, &result.StateTimings.Published); err != nil {
 		return result, err
 	}
 	result.State = state

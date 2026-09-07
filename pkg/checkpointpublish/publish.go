@@ -99,7 +99,27 @@ func Status(checkpointDir string) (*State, error) {
 	return &state, nil
 }
 
+// StateWriteTiming separates the file Sync from the complete local state write.
+// Durations are wall-clock nanoseconds, not CPU time or remote store latency.
+type StateWriteTiming struct {
+	Total time.Duration `json:"total_ns"`
+	Sync  time.Duration `json:"sync_ns"`
+}
+
+type StateTimings struct {
+	Publishing StateWriteTiming `json:"publishing"`
+	Published  StateWriteTiming `json:"published"`
+}
+
 func writeState(state State) error {
+	return writeStateMeasured(state, nil)
+}
+
+func writeStateMeasured(state State, timing *StateWriteTiming) error {
+	if timing != nil {
+		start := time.Now()
+		defer func() { timing.Total = time.Since(start) }()
+	}
 	path := StatePath(state.Dir)
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
@@ -129,7 +149,12 @@ func writeState(state State) error {
 	if err = tmp.Chmod(0o600); err != nil {
 		return err
 	}
-	if err = tmp.Sync(); err != nil {
+	syncStart := time.Now()
+	err = tmp.Sync()
+	if timing != nil {
+		timing.Sync = time.Since(syncStart)
+	}
+	if err != nil {
 		return err
 	}
 	if err = tmp.Close(); err != nil {
@@ -140,15 +165,16 @@ func writeState(state State) error {
 
 // Result summarizes one Run.
 type Result struct {
-	PackPayloadBudget int          `json:"pack_payload_budget,omitempty"`
-	PackPayloadPeak   int64        `json:"pack_payload_peak,omitempty"`
-	PackTimings       *PackTimings `json:"pack_timings,omitempty"`
-	PacksPut          int          `json:"packs_put,omitempty"`
-	PacksSkip         int          `json:"packs_skip,omitempty"`
-	Workers           int          `json:"workers"` // actual memory upload concurrency
-	State             State        `json:"state"`
-	ChunksPut         int          `json:"chunks_put"`  // unique chunks written this run
-	ChunksSkip        int          `json:"chunks_skip"` // unique chunks reused or synthesized
+	StateTimings      *StateTimings `json:"state_timings,omitempty"`
+	PackPayloadBudget int           `json:"pack_payload_budget,omitempty"`
+	PackPayloadPeak   int64         `json:"pack_payload_peak,omitempty"`
+	PackTimings       *PackTimings  `json:"pack_timings,omitempty"`
+	PacksPut          int           `json:"packs_put,omitempty"`
+	PacksSkip         int           `json:"packs_skip,omitempty"`
+	Workers           int           `json:"workers"` // actual memory upload concurrency
+	State             State         `json:"state"`
+	ChunksPut         int           `json:"chunks_put"`  // unique chunks written this run
+	ChunksSkip        int           `json:"chunks_skip"` // unique chunks reused or synthesized
 }
 
 // Run publishes the checkpoint's memory chunks: it computes (or reuses) the
@@ -192,7 +218,7 @@ func RunWithOptions(ctx context.Context, checkpointDir, id string, store chunkst
 	if workers == 0 {
 		workers = min(runtime.GOMAXPROCS(0), 8)
 	}
-	result := Result{Workers: workers}
+	result := Result{Workers: workers, StateTimings: &StateTimings{}}
 	state := State{
 		CheckpointID: id,
 		Dir:          checkpointDir,
@@ -225,7 +251,7 @@ func RunWithOptions(ctx context.Context, checkpointDir, id string, store chunkst
 		return runPacked(ctx, checkpointDir, id, store, manifest, state, result, opts)
 	}
 
-	if err := writeState(state); err != nil {
+	if err := writeStateMeasured(state, &result.StateTimings.Publishing); err != nil {
 		return result, err
 	}
 
@@ -353,7 +379,7 @@ func RunWithOptions(ctx context.Context, checkpointDir, id string, store chunkst
 	state.PublishedAt = time.Now().UTC()
 	state.ChunksPut = put + skipped
 	state.LastError = ""
-	if err := writeState(state); err != nil {
+	if err := writeStateMeasured(state, &result.StateTimings.Published); err != nil {
 		return result, err
 	}
 	result.State = state
