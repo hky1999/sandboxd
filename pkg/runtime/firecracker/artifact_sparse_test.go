@@ -16,15 +16,59 @@ package firecracker
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/inclusionAI/sandboxd/pkg/checkpointchunks"
 )
+
+// Exceed the entire bounded pipeline with distinct data, interleaved zero
+// chunks, and a short tail. A producer reusing a worker's bytes too early
+// must disagree with this independent sequential oracle (or trip -race).
+func TestScanFileChunksBufferOwnership(t *testing.T) {
+	const chunk = checkpointchunks.DefaultChunkBytes
+	data := make([]byte, 96*chunk+37)
+	if _, err := rand.Read(data); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 96; i += 5 {
+		clear(data[i*chunk : (i+1)*chunk])
+	}
+	path := filepath.Join(t.TempDir(), "memory")
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	var want []checkpointchunks.Chunk
+	for offset := 0; offset < len(data); offset += chunk {
+		sum := sha256.Sum256(data[offset:min(offset+chunk, len(data))])
+		want = append(want, checkpointchunks.Chunk{Offset: int64(offset), Digest: hex.EncodeToString(sum[:])})
+	}
+	original := runtime.GOMAXPROCS(0)
+	t.Cleanup(func() { runtime.GOMAXPROCS(original) })
+	for _, workers := range []int{1, 8} {
+		t.Run(fmt.Sprint(workers), func(t *testing.T) {
+			runtime.GOMAXPROCS(workers)
+			got, err := scanFileChunks(context.Background(), path, "memory")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.FileSize != int64(len(data)) || got.ChunkCount != len(want) || got.FileDigest != checkpointchunks.RootDigest(want) {
+				t.Fatal("file geometry/root differs from sequential oracle")
+			}
+			for i, entry := range want {
+				if got.Entries[i] != entry {
+					t.Fatalf("chunk %d differs: got %+v want %+v", i, got.Entries[i], entry)
+				}
+			}
+		})
+	}
+}
 
 // Compare to independently hashed logical bytes, including data crossing a
 // chunk boundary, holes, allocated zeroes, a non-aligned tail and empty files.
