@@ -270,7 +270,7 @@ func (h *sandboxService) restoreCheckpoint(
 	}
 	// A checkpoint published with a filesystem artifact must restore it;
 	// silently dropping the writable layer would rewind workload state.
-	if _, err := checkpoint.FsArtifactPath(checkpointDir); err != nil {
+	if _, err := checkpoint.InspectAt(checkpointDir, request.CheckpointID); err != nil {
 		return nil, checkpointGRPCError(err)
 	}
 	if startConfig.Runtime != config.RuntimeNameRunsc {

@@ -173,11 +173,12 @@ func (r *Handler) Start(ctx context.Context, config runtimecore.StartConfig) err
 	}
 
 	startArgs := StartArgs{
-		ID:          config.ID,
-		BundleDir:   bundlePath,
+		ID:                 config.ID,
+		BundleDir:          bundlePath,
 		UserStdout:  config.Stdout,
 		UserStderr:  config.Stderr,
-		RootOverlay: rootOverlay,
+		RootOverlay:         rootOverlay,
+		FsRestoreImagePath:  fsImagePath,
 		Network: NetworkConfig{
 			Interface:   config.Network.Interface,
 			LinkAddress: config.Network.GuestHardwareAddr(),
@@ -240,6 +241,19 @@ func (r *Handler) Restore(
 	config runtimecore.StartConfig,
 	imagePath string,
 ) (retErr error) {
+	// Legacy local checkpoints may have no manifest. A published paired
+	// checkpoint, however, must supply its writable layer to runsc create.
+	var fsImagePath string
+	checkpointDir := filepath.Dir(imagePath)
+	if _, err := os.Lstat(filepath.Join(checkpointDir, checkpoint.ManifestName)); err == nil {
+		var pathErr error
+		fsImagePath, pathErr = checkpoint.FsArtifactPath(checkpointDir)
+		if pathErr != nil {
+			return pathErr
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
 	traceID, _ := trace.GetContextID(ctx)
 	if config.Network == nil {
 		return fmt.Errorf("network is required")
