@@ -2984,8 +2984,17 @@ type StatsResponse struct {
 	ResourceGeneration string `protobuf:"bytes,10,opt,name=resource_generation,json=resourceGeneration,proto3" json:"resource_generation,omitempty"`
 	// Persisted elastic initial/ceiling policy, empty for non-elastic sandboxes.
 	ElasticPolicy string `protobuf:"bytes,11,opt,name=elastic_policy,json=elasticPolicy,proto3" json:"elastic_policy,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	// Cumulative pressure counters for this physical generation; false means unknown.
+	CpuPressureKnown    bool   `protobuf:"varint,12,opt,name=cpu_pressure_known,json=cpuPressureKnown,proto3" json:"cpu_pressure_known,omitempty"`
+	CpuPeriods          uint64 `protobuf:"varint,13,opt,name=cpu_periods,json=cpuPeriods,proto3" json:"cpu_periods,omitempty"`
+	CpuThrottledPeriods uint64 `protobuf:"varint,14,opt,name=cpu_throttled_periods,json=cpuThrottledPeriods,proto3" json:"cpu_throttled_periods,omitempty"`
+	CpuThrottledNs      uint64 `protobuf:"varint,15,opt,name=cpu_throttled_ns,json=cpuThrottledNs,proto3" json:"cpu_throttled_ns,omitempty"`
+	MemoryPressureKnown bool   `protobuf:"varint,16,opt,name=memory_pressure_known,json=memoryPressureKnown,proto3" json:"memory_pressure_known,omitempty"`
+	MemoryHighEvents    uint64 `protobuf:"varint,17,opt,name=memory_high_events,json=memoryHighEvents,proto3" json:"memory_high_events,omitempty"`
+	MemoryOomEvents     uint64 `protobuf:"varint,18,opt,name=memory_oom_events,json=memoryOomEvents,proto3" json:"memory_oom_events,omitempty"`
+	MemoryOomKillEvents uint64 `protobuf:"varint,19,opt,name=memory_oom_kill_events,json=memoryOomKillEvents,proto3" json:"memory_oom_kill_events,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
 }
 
 func (x *StatsResponse) Reset() {
@@ -3093,6 +3102,62 @@ func (x *StatsResponse) GetElasticPolicy() string {
 		return x.ElasticPolicy
 	}
 	return ""
+}
+
+func (x *StatsResponse) GetCpuPressureKnown() bool {
+	if x != nil {
+		return x.CpuPressureKnown
+	}
+	return false
+}
+
+func (x *StatsResponse) GetCpuPeriods() uint64 {
+	if x != nil {
+		return x.CpuPeriods
+	}
+	return 0
+}
+
+func (x *StatsResponse) GetCpuThrottledPeriods() uint64 {
+	if x != nil {
+		return x.CpuThrottledPeriods
+	}
+	return 0
+}
+
+func (x *StatsResponse) GetCpuThrottledNs() uint64 {
+	if x != nil {
+		return x.CpuThrottledNs
+	}
+	return 0
+}
+
+func (x *StatsResponse) GetMemoryPressureKnown() bool {
+	if x != nil {
+		return x.MemoryPressureKnown
+	}
+	return false
+}
+
+func (x *StatsResponse) GetMemoryHighEvents() uint64 {
+	if x != nil {
+		return x.MemoryHighEvents
+	}
+	return 0
+}
+
+func (x *StatsResponse) GetMemoryOomEvents() uint64 {
+	if x != nil {
+		return x.MemoryOomEvents
+	}
+	return 0
+}
+
+func (x *StatsResponse) GetMemoryOomKillEvents() uint64 {
+	if x != nil {
+		return x.MemoryOomKillEvents
+	}
+	return 0
 }
 
 // ListAvailableRuntimesRequest requests the runtime classes currently available
@@ -3660,7 +3725,7 @@ const file_api_runtime_v1_sandbox_api_proto_rawDesc = "" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x121\n" +
 	"\x05value\x18\x02 \x01(\v2\x1b.runtime.v1.SandboxMetadataR\x05value:\x028\x01\"\x1e\n" +
 	"\fStatsRequest\x12\x0e\n" +
-	"\x02id\x18\x01 \x01(\tR\x02id\"\xd6\x03\n" +
+	"\x02id\x18\x01 \x01(\tR\x02id\"\xc6\x06\n" +
 	"\rStatsResponse\x12 \n" +
 	"\fcpu_usage_ns\x18\x01 \x01(\x04R\n" +
 	"cpuUsageNs\x12,\n" +
@@ -3674,7 +3739,16 @@ const file_api_runtime_v1_sandbox_api_proto_rawDesc = "" +
 	"\x10cpu_limits_known\x18\t \x01(\bR\x0ecpuLimitsKnown\x12/\n" +
 	"\x13resource_generation\x18\n" +
 	" \x01(\tR\x12resourceGeneration\x12%\n" +
-	"\x0eelastic_policy\x18\v \x01(\tR\relasticPolicy\"\x1e\n" +
+	"\x0eelastic_policy\x18\v \x01(\tR\relasticPolicy\x12,\n" +
+	"\x12cpu_pressure_known\x18\f \x01(\bR\x10cpuPressureKnown\x12\x1f\n" +
+	"\vcpu_periods\x18\r \x01(\x04R\n" +
+	"cpuPeriods\x122\n" +
+	"\x15cpu_throttled_periods\x18\x0e \x01(\x04R\x13cpuThrottledPeriods\x12(\n" +
+	"\x10cpu_throttled_ns\x18\x0f \x01(\x04R\x0ecpuThrottledNs\x122\n" +
+	"\x15memory_pressure_known\x18\x10 \x01(\bR\x13memoryPressureKnown\x12,\n" +
+	"\x12memory_high_events\x18\x11 \x01(\x04R\x10memoryHighEvents\x12*\n" +
+	"\x11memory_oom_events\x18\x12 \x01(\x04R\x0fmemoryOomEvents\x123\n" +
+	"\x16memory_oom_kill_events\x18\x13 \x01(\x04R\x13memoryOomKillEvents\"\x1e\n" +
 	"\x1cListAvailableRuntimesRequest\"H\n" +
 	"\x1dListAvailableRuntimesResponse\x12'\n" +
 	"\x0fruntime_classes\x18\x01 \x03(\tR\x0eruntimeClasses\"]\n" +

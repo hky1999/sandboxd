@@ -536,6 +536,16 @@ message StatsResponse {
   string resource_generation = 10;
   // Persisted elastic initial/ceiling policy, empty for non-elastic sandboxes.
   string elastic_policy = 11;
+  // Cumulative pressure counters for this physical generation; false means unknown.
+  bool cpu_pressure_known = 12;
+  uint64 cpu_periods = 13;
+  uint64 cpu_throttled_periods = 14;
+  uint64 cpu_throttled_ns = 15;
+  bool memory_pressure_known = 16;
+  uint64 memory_high_events = 17;
+  uint64 memory_oom_events = 18;
+  uint64 memory_oom_kill_events = 19;
+
 }
 
 // ListAvailableRuntimesRequest requests the runtime classes currently available

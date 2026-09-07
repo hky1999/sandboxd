@@ -519,6 +519,15 @@ func (h *sandboxService) resourceStats(id string) (*runtime.StatsResponse, error
 
 	return &runtime.StatsResponse{
 		ResourceGeneration:  current.Metadata.GetLabels()[resourceGenerationLabel],
+		CpuPressureKnown:    cgroupStats.CPUPressureKnown,
+		CpuPeriods:          cgroupStats.CPUPeriods,
+		CpuThrottledPeriods: cgroupStats.CPUThrottledPeriods,
+		CpuThrottledNs:      cgroupStats.CPUThrottledNanos,
+		MemoryPressureKnown: cgroupStats.MemoryPressureKnown,
+		MemoryHighEvents:    cgroupStats.MemoryHighEvents,
+		MemoryOomEvents:     cgroupStats.MemoryOOMEvents,
+		MemoryOomKillEvents: cgroupStats.MemoryOOMKillEvents,
+
 		ElasticPolicy:       current.Metadata.GetLabels()[elasticResourcesLabel],
 		CpuUsageNs:          cgroupStats.CPUUsageNanos,
 		CpuQuotaUsec:        cgroupStats.CPUQuotaUsec,

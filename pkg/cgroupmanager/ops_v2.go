@@ -198,7 +198,7 @@ func (o *cgroupV2) stat(name string) (Stats, error) {
 	if err != nil {
 		return Stats{}, err
 	}
-	result := Stats{}
+	result := readV2PressureStats(filepath.Join(o.mountpoint, name))
 	result.CPUQuotaUsec, result.CPUPeriodUsec, result.CPULimitsKnown = readCPUMax(filepath.Join(o.mountpoint, name, "cpu.max"))
 	if metrics.CPU != nil {
 		result.CPUUsageNanos = usecToNS(metrics.CPU.UsageUsec)

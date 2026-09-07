@@ -38,6 +38,27 @@ import (
 func TestV010WireContract(t *testing.T) {
 	descriptor := protodesc.ToFileDescriptorProto(File_api_runtime_v1_sandbox_api_proto)
 	descriptor.SourceCodeInfo = nil
+	// Pressure telemetry is strictly additive to the frozen resize contract.
+	for _, message := range descriptor.MessageType {
+		if message.GetName() != "StatsResponse" {
+			continue
+		}
+		names := []string{"cpu_pressure_known", "cpu_periods", "cpu_throttled_periods", "cpu_throttled_ns", "memory_pressure_known", "memory_high_events", "memory_oom_events", "memory_oom_kill_events"}
+		if len(message.Field) != 19 {
+			t.Fatalf("unexpected pressure field count %d", len(message.Field))
+		}
+		for i, name := range names {
+			field := message.Field[11+i]
+			wantType := descriptorpb.FieldDescriptorProto_TYPE_UINT64
+			if i == 0 || i == 4 {
+				wantType = descriptorpb.FieldDescriptorProto_TYPE_BOOL
+			}
+			if field.GetNumber() != int32(12+i) || field.GetName() != name || field.GetType() != wantType {
+				t.Fatalf("unexpected pressure field %d", i)
+			}
+		}
+		message.Field = message.Field[:11]
+	}
 	wire, err := proto.MarshalOptions{Deterministic: true}.Marshal(descriptor)
 	if err != nil {
 		t.Fatal(err)
@@ -119,5 +140,20 @@ func TestSandboxIPSurvivesWireRoundTrip(t *testing.T) {
 	}
 	if decoded.Ip != original.Ip {
 		t.Fatalf("bridge IP lost on wire: %q", decoded.Ip)
+	}
+}
+
+func TestPressureStatsSurviveWireRoundTrip(t *testing.T) {
+	original := &StatsResponse{ResourceGeneration: "generation-1", CpuPressureKnown: true, CpuPeriods: 25, CpuThrottledPeriods: 4, CpuThrottledNs: 123000, MemoryPressureKnown: true, MemoryHighEvents: 9, MemoryOomEvents: 2, MemoryOomKillEvents: 1}
+	wire, err := proto.Marshal(original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded := new(StatsResponse)
+	if err := proto.Unmarshal(wire, decoded); err != nil {
+		t.Fatal(err)
+	}
+	if !proto.Equal(original, decoded) {
+		t.Fatal("pressure stats changed on wire")
 	}
 }

@@ -221,7 +221,15 @@ func TestResizeCannotRunDuringPhysicalRecovery(t *testing.T) {
 }
 
 func TestResizeResourcesOverGRPCPreservesIdentityAndReadback(t *testing.T) {
-	h, _, request := newResizeService(t)
+	h, counters, request := newResizeService(t)
+	counters.stats.CPUPressureKnown = true
+	counters.stats.CPUPeriods = 25
+	counters.stats.CPUThrottledPeriods = 4
+	counters.stats.CPUThrottledNanos = 123000
+	counters.stats.MemoryPressureKnown = true
+	counters.stats.MemoryHighEvents = 9
+	counters.stats.MemoryOOMEvents = 2
+	counters.stats.MemoryOOMKillEvents = 1
 	listener := bufconn.Listen(1 << 20)
 	server := grpc.NewServer()
 	runtime.RegisterSandboxServiceServer(server, h)
@@ -239,6 +247,14 @@ func TestResizeResourcesOverGRPCPreservesIdentityAndReadback(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, request.ResourceGeneration, before.ResourceGeneration)
 	require.NotEmpty(t, before.ElasticPolicy)
+	require.True(t, before.CpuPressureKnown)
+	require.Equal(t, uint64(25), before.CpuPeriods)
+	require.Equal(t, uint64(4), before.CpuThrottledPeriods)
+	require.Equal(t, uint64(123000), before.CpuThrottledNs)
+	require.True(t, before.MemoryPressureKnown)
+	require.Equal(t, uint64(9), before.MemoryHighEvents)
+	require.Equal(t, uint64(2), before.MemoryOomEvents)
+	require.Equal(t, uint64(1), before.MemoryOomKillEvents)
 	response, err := client.ResizeResources(ctx, request)
 	require.NoError(t, err)
 	require.True(t, response.Complete)

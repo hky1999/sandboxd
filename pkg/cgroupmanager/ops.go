@@ -67,6 +67,15 @@ func validateCgroupProcesses(processes []uint64) error {
 // sandboxd. CPU accounting uses nanoseconds; quota/period use microseconds.
 // Memory values are bytes.
 type Stats struct {
+	CPUPressureKnown    bool
+	CPUPeriods          uint64
+	CPUThrottledPeriods uint64
+	CPUThrottledNanos   uint64
+	MemoryPressureKnown bool
+	MemoryHighEvents    uint64
+	MemoryOOMEvents     uint64
+	MemoryOOMKillEvents uint64
+
 	CPUQuotaUsec        int64 // -1 means unlimited; consult CPULimitsKnown
 	CPUPeriodUsec       uint64
 	CPULimitsKnown      bool

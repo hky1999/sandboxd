@@ -558,6 +558,14 @@ func TestV2ResetAndStats(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, stats.CPULimitsKnown)
 	assert.Equal(t, int64(50000), stats.CPUQuotaUsec)
+	writeTestFile(t, filepath.Join(groupPath, "cpu.stat"), "usage_usec 123\nuser_usec 80\nsystem_usec 43\nnr_periods 9\nnr_throttled 2\nthrottled_usec 7\n")
+	writeTestFile(t, filepath.Join(groupPath, "memory.events"), "high 5\noom 1\noom_kill 1\n")
+	stats, err = ops.stat(name)
+	require.NoError(t, err)
+	require.True(t, stats.CPUPressureKnown)
+	require.Equal(t, uint64(7000), stats.CPUThrottledNanos)
+	require.True(t, stats.MemoryPressureKnown)
+	require.Equal(t, uint64(5), stats.MemoryHighEvents)
 
 }
 
