@@ -42,6 +42,50 @@ func (h *sandboxService) Checkpoint(
 	ctx context.Context,
 	request *runtime.CheckpointRequest,
 ) (*runtime.CheckpointResponse, error) {
+	return h.checkpoint(ctx, request, "")
+}
+
+// CheckpointIfGeneration checkpoints only the physical incarnation identified
+// by expected_generation. The expectation is validated inside the shared
+// checkpoint path — never by a separate Get followed by an unguarded legacy
+// call — so a stale generation is rejected before rootfs reads, handler
+// lookup, or any mutation.
+func (h *sandboxService) CheckpointIfGeneration(
+	ctx context.Context,
+	request *runtime.CheckpointIfGenerationRequest,
+) (*runtime.CheckpointResponse, error) {
+	if request == nil {
+		return nil, checkpointGRPCError(fmt.Errorf(
+			"checkpoint request is required: %w", errord.ErrInvalidArgument))
+	}
+	if err := validateExpectedGeneration(request.ExpectedGeneration); err != nil {
+		return nil, checkpointGRPCError(err)
+	}
+	return h.checkpoint(ctx, request.Checkpoint, request.ExpectedGeneration)
+}
+
+// validateExpectedGeneration enforces the conditional-precondition shape.
+func validateExpectedGeneration(generation string) error {
+	if strings.TrimSpace(generation) == "" {
+		return fmt.Errorf("expected_generation is required: %w", errord.ErrInvalidArgument)
+	}
+	if len(generation) > 256 {
+		return fmt.Errorf("expected_generation exceeds 256 bytes: %w", errord.ErrInvalidArgument)
+	}
+	return nil
+}
+
+// checkpoint is the shared implementation for the legacy and conditional RPCs.
+// expectedGeneration is empty for the legacy path, which retains its
+// unconditional semantics. When set, the captured source generation must equal
+// it at every decision point: source lookup, artifact replay, and the
+// in-flight fingerprint, so one checkpoint key cannot merge attempts made
+// against different physical generations.
+func (h *sandboxService) checkpoint(
+	ctx context.Context,
+	request *runtime.CheckpointRequest,
+	expectedGeneration string,
+) (*runtime.CheckpointResponse, error) {
 	if request == nil || request.ID == "" || request.CheckpointDir == "" || request.CheckpointID == "" {
 		return nil, errord.ToGRPC(fmt.Errorf("id, checkpoint_dir, and checkpoint_id are required: %w", errord.ErrInvalidArgument))
 	}
@@ -64,6 +108,15 @@ func (h *sandboxService) Checkpoint(
 			request.CheckpointID,
 			errord.ErrFailedPrecondition))
 	}
+	// A conditional replay must match the generation that published the
+	// completed artifact; reject before consulting live sandbox state, so an
+	// absent sandbox can replay only its own generation's artifact.
+	if artifactErr == nil && expectedGeneration != "" && existing.Manifest.SourceGeneration != expectedGeneration {
+		return nil, checkpointGRPCError(fmt.Errorf(
+			"checkpoint %q belongs to source generation %q, want %q: %w",
+			request.CheckpointID, existing.Manifest.SourceGeneration, expectedGeneration,
+			errord.ErrFailedPrecondition))
+	}
 	sandbox, err := h.sandboxManager.Get(request.ID)
 	if err != nil {
 		if artifactErr == nil && errors.Is(err, errord.ErrNotFound) {
@@ -73,6 +126,14 @@ func (h *sandboxService) Checkpoint(
 	}
 	if sandbox.Metadata == nil || sandbox.Status == nil {
 		return nil, checkpointGRPCError(fmt.Errorf("sandbox %s metadata is incomplete: %w", request.ID, errord.ErrFailedPrecondition))
+	}
+	// Reject a stale expectation before any rootfs read, handler lookup, or
+	// mutation. A live replacement of the ID is rejected even when a
+	// completed artifact for the expected generation still exists.
+	if expectedGeneration != "" && sandbox.Metadata.Labels[resourceGenerationLabel] != expectedGeneration {
+		return nil, checkpointGRPCError(fmt.Errorf(
+			"checkpoint source generation changed, want %q: %w",
+			expectedGeneration, errord.ErrFailedPrecondition))
 	}
 
 	rootfs, err := h.fsMgr.RootfsConfig(request.ID)
@@ -113,7 +174,7 @@ func (h *sandboxService) Checkpoint(
 		return nil, checkpointGRPCError(fmt.Errorf("runtime %q does not support checkpoint: %w",
 			sandbox.Metadata.RuntimeHandler, errord.ErrNotImplemented))
 	}
-	fingerprint, err := checkpointFingerprint(request, request.CheckpointID)
+	fingerprint, err := checkpointSourceFingerprint(request, request.CheckpointID, source.SourceGeneration)
 	if err != nil {
 		return nil, checkpointGRPCError(err)
 	}
@@ -152,6 +213,12 @@ func (h *sandboxService) Checkpoint(
 	}
 	fact, err := checkpoint.InspectAt(checkpointDir, request.CheckpointID)
 	if err != nil {
+		return nil, checkpointGRPCError(err)
+	}
+	// Verify the published fact against the source identity captured for
+	// this attempt before returning; a merged or raced operation must not
+	// hand back an artifact bound to a different physical source.
+	if _, err := checkpoint.MatchSource(fact, source); err != nil {
 		return nil, checkpointGRPCError(err)
 	}
 	return checkpointResponse(fact), nil
@@ -559,6 +626,21 @@ func checkpointFingerprint(request *runtime.CheckpointRequest, canonicalDir stri
 		return "", fmt.Errorf("marshal checkpoint request: %w", err)
 	}
 	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+// checkpointSourceFingerprint binds the in-flight checkpoint fingerprint to
+// the physical source generation captured for this attempt, so the same
+// checkpoint key cannot merge attempts made across physical generations.
+// Both the legacy and the conditional RPC use the captured generation.
+func checkpointSourceFingerprint(request *runtime.CheckpointRequest, canonicalDir, sourceGeneration string) (string, error) {
+	base, err := checkpointFingerprint(request, canonicalDir)
+	if err != nil {
+		return "", err
+	}
+	// base is a fixed-length hexadecimal digest, so concatenating the
+	// generation is unambiguous.
+	sum := sha256.Sum256([]byte(base + sourceGeneration))
 	return hex.EncodeToString(sum[:]), nil
 }
 

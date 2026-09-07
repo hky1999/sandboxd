@@ -35,6 +35,9 @@ import (
 // removes those additions plus SandboxStatus.ip (field 17), which was
 // already in the source proto but missing from the prior generated descriptor.
 // It verifies that every other part of the prior wire contract is unchanged.
+// The generation-conditional CheckpointIfGeneration RPC reuses the existing
+// CheckpointResponse; its one new request message and method are validated
+// and projected out the same way before every frozen hash comparison.
 func TestV010WireContract(t *testing.T) {
 	descriptor := protodesc.ToFileDescriptorProto(File_api_runtime_v1_sandbox_api_proto)
 	descriptor.SourceCodeInfo = nil
@@ -93,6 +96,56 @@ func TestV010WireContract(t *testing.T) {
 	}
 	descriptor.MessageType = slices.DeleteFunc(descriptor.MessageType, func(m *descriptorpb.DescriptorProto) bool {
 		return m.GetName() == "DeleteIfGenerationRequest" || m.GetName() == "DeleteIfGenerationResponse"
+	})
+	// Validate then project only this additive conditional-checkpoint contract.
+	foundCheckpointRequest := false
+	for _, message := range descriptor.MessageType {
+		if message.GetName() != "CheckpointIfGenerationRequest" {
+			continue
+		}
+		if foundCheckpointRequest || len(message.Field) != 2 || len(message.NestedType) != 0 || len(message.EnumType) != 0 {
+			t.Fatal("unexpected conditional checkpoint request message")
+		}
+		foundCheckpointRequest = true
+		nested := message.Field[0]
+		if nested.GetName() != "checkpoint" || nested.GetNumber() != 1 ||
+			nested.GetType() != descriptorpb.FieldDescriptorProto_TYPE_MESSAGE ||
+			nested.GetTypeName() != "."+descriptor.GetPackage()+".CheckpointRequest" ||
+			nested.GetLabel() != descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL {
+			t.Fatal("unexpected conditional checkpoint request field")
+		}
+		generation := message.Field[1]
+		if generation.GetName() != "expected_generation" || generation.GetNumber() != 2 ||
+			generation.GetType() != descriptorpb.FieldDescriptorProto_TYPE_STRING ||
+			generation.GetTypeName() != "" ||
+			generation.GetLabel() != descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL {
+			t.Fatal("unexpected conditional checkpoint generation field")
+		}
+	}
+	if !foundCheckpointRequest {
+		t.Fatal("missing conditional checkpoint request message")
+	}
+	foundCheckpointRPC := false
+	for _, service := range descriptor.Service {
+		service.Method = slices.DeleteFunc(service.Method, func(m *descriptorpb.MethodDescriptorProto) bool {
+			if m.GetName() != "CheckpointIfGeneration" {
+				return false
+			}
+			if foundCheckpointRPC || service.GetName() != "SandboxService" ||
+				m.GetInputType() != "."+descriptor.GetPackage()+".CheckpointIfGenerationRequest" ||
+				m.GetOutputType() != "."+descriptor.GetPackage()+".CheckpointResponse" ||
+				m.GetClientStreaming() || m.GetServerStreaming() {
+				t.Fatal("unexpected conditional checkpoint RPC")
+			}
+			foundCheckpointRPC = true
+			return true
+		})
+	}
+	if !foundCheckpointRPC {
+		t.Fatal("missing conditional checkpoint RPC")
+	}
+	descriptor.MessageType = slices.DeleteFunc(descriptor.MessageType, func(m *descriptorpb.DescriptorProto) bool {
+		return m.GetName() == "CheckpointIfGenerationRequest"
 	})
 	// Project only the validated new checkpoint identity field; keep all
 	// frozen descriptor hashes unchanged so existing wire changes still fail.

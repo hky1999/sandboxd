@@ -24,6 +24,10 @@ service SandboxService {
   rpc Start(StartRequest) returns (StartResponse) {}
   // Checkpoint saves a running sandbox and stops its source process.
   rpc Checkpoint(CheckpointRequest) returns (CheckpointResponse) {}
+  // Checkpoints only the physical incarnation identified by the nested
+  // request's source sandbox and expected_generation. Fails on old servers
+  // instead of silently ignoring the generation precondition.
+  rpc CheckpointIfGeneration(CheckpointIfGenerationRequest) returns (CheckpointResponse) {}
   // Pause freezes all tasks in a running sandbox without terminating it.
   // The sandbox keeps its identity, network, and control-plane linkage;
   // Resume unfreezes it. This is the short-window parking primitive that
@@ -297,6 +301,15 @@ message CheckpointResponse {
   string artifact_sha256 = 5;
   // Physical lifetime bound to the published source manifest; empty for legacy artifacts.
   string source_generation = 6;
+}
+
+// CheckpointIfGenerationRequest checkpoints one exact physical incarnation.
+message CheckpointIfGenerationRequest {
+  // Checkpoint is the checkpoint command for the source sandbox.
+  CheckpointRequest checkpoint = 1;
+  // ExpectedGeneration must equal the source sandbox's current
+  // akernel.scheduler/resource-generation value at checkpoint time.
+  string expected_generation = 2;
 }
 
 // PauseRequest targets one running sandbox. Resume takes the same shape.

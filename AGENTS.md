@@ -115,3 +115,16 @@ Successful Start and Restore responses include `resource_generation` from the
 published physical metadata. Preserve this creation-time identity for subsequent
 conditional deletion; querying an ID later must not silently adopt a replacement
 sandbox's generation. Restore replay returns the existing physical generation.
+
+# Scheduler generation-conditional checkpoint
+
+`CheckpointIfGeneration` is a separate RPC wrapping CheckpointRequest and a
+required original source generation. Never fall back to legacy Checkpoint when
+it is unavailable. Conditional calls reject mismatching committed artifacts or
+live generations before rootfs/runtime work; a missing source can replay only a
+matching completed artifact. A live replacement is conservatively rejected even
+when an old matching artifact remains. The physical resource lock rechecks the
+captured generation before publication. In-flight fingerprints include source
+generation, and completion verifies the committed source identity again.
+The scheduler must preserve the original monitor identity across every async
+handoff and verify reply identity; this daemon API alone does not close F7.
