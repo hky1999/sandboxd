@@ -248,10 +248,11 @@ type Handler struct {
 	// checkpointMode is the validated plugin.runtime.firecracker
 	// checkpoint_mode: full keeps upstream Full snapshots, incremental
 	// enables the three-tier chain.
-	checkpointMode          string
-	sparseFull              bool
-	skipUnchanged           bool
-	verifyIncrementalMemory bool
+	checkpointMode                  string
+	sparseFull                      bool
+	skipUnchanged                   bool
+	verifyIncrementalMemory         bool
+	verifyIncrementalMemoryStopOnly bool
 
 	// shrinkBeforeCheckpoint gates the pre-pause guest page-cache drop;
 	// see FirecrackerConfig.ShrinkBeforeCheckpoint for why it is off by
@@ -407,36 +408,37 @@ func NewHandler(
 		}
 	}
 	handler := &Handler{
-		binary:                  binary,
-		vmmLogLevel:             firecrackerConfig.VMMLogLevel,
-		sandboxRoot:             sandboxRoot,
-		storageRoot:             storageRoot,
-		runtimeRoot:             firecrackerproto.HostRuntimeRoot,
-		kernelPath:              firecrackerConfig.KernelImagePath,
-		initrdPath:              firecrackerConfig.InitrdPath,
-		kernelArgs:              firecrackerConfig.KernelArgs,
-		kvmDevice:               firecrackerConfig.KVMDevice,
-		defaultVCPUs:            firecrackerConfig.DefaultVCPUCount,
-		defaultMem:              firecrackerConfig.DefaultMemoryMiB,
-		shrinkBeforeCheckpoint:  firecrackerConfig.ShrinkBeforeCheckpoint,
-		checkpointMode:          firecrackerConfig.CheckpointMode,
-		sparseFull:              firecrackerConfig.SparseFull,
-		skipUnchanged:           firecrackerConfig.SkipUnchanged,
-		verifyIncrementalMemory: firecrackerConfig.VerifyIncrementalMemory,
-		checkpointWriteback:     newCheckpointWritebackScheduler(),
-		memBackend:              firecrackerConfig.MemBackend,
-		uffdHandlerBin:          firecrackerConfig.UffdHandlerBin,
-		uffdRemoteURL:           firecrackerConfig.UffdRemoteURLTemplate,
-		uffdCacheDir:            firecrackerConfig.UffdCacheDir,
-		uffdChunkKB:             firecrackerConfig.UffdChunkKB,
-		uffdPersistWorkers:      firecrackerConfig.UffdPersistWorkers,
-		digestMemory:            firecrackerConfig.DigestMemoryOrDefault(),
-		uffdChunkStore:          firecrackerConfig.UffdChunkStore,
-		digestMemoryMode:        firecrackerConfig.DigestMemoryMode,
-		defaultDisk:             firecrackerConfig.DefaultOverlaySizeBytes,
-		ociLoader:               loader,
-		ociRootfsEnabled:        firecrackerConfig.OCIRootfsEnabled,
-		instances:               make(map[string]*firecrackerInstance),
+		binary:                          binary,
+		vmmLogLevel:                     firecrackerConfig.VMMLogLevel,
+		sandboxRoot:                     sandboxRoot,
+		storageRoot:                     storageRoot,
+		runtimeRoot:                     firecrackerproto.HostRuntimeRoot,
+		kernelPath:                      firecrackerConfig.KernelImagePath,
+		initrdPath:                      firecrackerConfig.InitrdPath,
+		kernelArgs:                      firecrackerConfig.KernelArgs,
+		kvmDevice:                       firecrackerConfig.KVMDevice,
+		defaultVCPUs:                    firecrackerConfig.DefaultVCPUCount,
+		defaultMem:                      firecrackerConfig.DefaultMemoryMiB,
+		shrinkBeforeCheckpoint:          firecrackerConfig.ShrinkBeforeCheckpoint,
+		checkpointMode:                  firecrackerConfig.CheckpointMode,
+		sparseFull:                      firecrackerConfig.SparseFull,
+		skipUnchanged:                   firecrackerConfig.SkipUnchanged,
+		verifyIncrementalMemory:         firecrackerConfig.VerifyIncrementalMemory,
+		verifyIncrementalMemoryStopOnly: firecrackerConfig.VerifyIncrementalMemoryStopOnly,
+		checkpointWriteback:             newCheckpointWritebackScheduler(),
+		memBackend:                      firecrackerConfig.MemBackend,
+		uffdHandlerBin:                  firecrackerConfig.UffdHandlerBin,
+		uffdRemoteURL:                   firecrackerConfig.UffdRemoteURLTemplate,
+		uffdCacheDir:                    firecrackerConfig.UffdCacheDir,
+		uffdChunkKB:                     firecrackerConfig.UffdChunkKB,
+		uffdPersistWorkers:              firecrackerConfig.UffdPersistWorkers,
+		digestMemory:                    firecrackerConfig.DigestMemoryOrDefault(),
+		uffdChunkStore:                  firecrackerConfig.UffdChunkStore,
+		digestMemoryMode:                firecrackerConfig.DigestMemoryMode,
+		defaultDisk:                     firecrackerConfig.DefaultOverlaySizeBytes,
+		ociLoader:                       loader,
+		ociRootfsEnabled:                firecrackerConfig.OCIRootfsEnabled,
+		instances:                       make(map[string]*firecrackerInstance),
 	}
 	handler.recoverInstances()
 	return handler, nil

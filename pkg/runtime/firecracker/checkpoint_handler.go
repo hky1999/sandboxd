@@ -222,7 +222,7 @@ func (handler *Handler) Checkpoint(
 			return api.createSnapshotWithMemoryAudit(
 				ctx, files.State, files.Memory, snapshotType, handler.sparseFull && snapshotType == firecrackerSnapshotTypeFull,
 				handler.skipUnchanged && (snapshotType == firecrackerSnapshotTypeSoftDirty || snapshotType == firecrackerSnapshotTypeIncremental),
-				handler.verifyIncrementalMemory && (snapshotType == firecrackerSnapshotTypeSoftDirty || snapshotType == firecrackerSnapshotTypeIncremental),
+				incrementalMemoryAuditEnabled(handler.verifyIncrementalMemory, handler.verifyIncrementalMemoryStopOnly, config.LeaveRunning, snapshotType),
 			)
 		},
 	)

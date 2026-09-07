@@ -216,6 +216,9 @@ type FirecrackerConfig struct {
 	// VerifyIncrementalMemory adds a full paused-RAM comparison for diagnosis.
 	// It requires the matching experimental VMM and is disabled by default.
 	VerifyIncrementalMemory bool `toml:"verify_incremental_memory" json:"verifyIncrementalMemory"`
+	// VerifyIncrementalMemoryStopOnly avoids diagnostic RAM reads on continuing checkpoints.
+	// It restricts VerifyIncrementalMemory and has no effect when that option is disabled.
+	VerifyIncrementalMemoryStopOnly bool `toml:"verify_incremental_memory_stop_only" json:"verifyIncrementalMemoryStopOnly"`
 	// OCIRootfsEnabled permits an OCI image rootfs to be materialized as a
 	// local EROFS image before the Firecracker VM starts. It is opt-in because
 	// conversion eagerly reads the complete merged image.
