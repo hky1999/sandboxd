@@ -176,3 +176,61 @@ func TestCanceledFetchDoesNotStartRequest(t *testing.T) {
 		t.Fatal("canceled fetch reached store")
 	}
 }
+
+func TestStoreCancellationStopsInFlightRequest(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "4096")
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		once.Do(func() { close(entered) })
+		select {
+		case <-r.Context().Done():
+			return
+		case <-release:
+			_, _ = w.Write(make([]byte, 4096))
+		}
+	}))
+	defer server.Close()
+	f := newFixture(t, bytes.Repeat([]byte{0x51}, 4096), false)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s := f.srv
+	s.source.ctx = ctx
+	s.source.chunkStore = server.URL
+	done := make(chan error, 1)
+	completed := false
+	go func() { done <- s.fetchChunk(0) }()
+	defer func() {
+		close(release)
+		if !completed {
+			select {
+			case <-done:
+			case <-time.After(3 * time.Second):
+				t.Error("fetch did not finish after cleanup release")
+			}
+		}
+	}()
+	select {
+	case <-entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("request did not start")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		completed = true
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("want cancellation, got %v", err)
+		}
+	case <-time.After(300 * time.Millisecond):
+		t.Fatal("source cancellation left v1 store request running")
+	}
+	s.source.inflightMu.Lock()
+	defer s.source.inflightMu.Unlock()
+	if len(s.source.fetched) != 0 || len(s.source.inflight) != 0 {
+		t.Fatal("canceled transfer was published or left in flight")
+	}
+}
