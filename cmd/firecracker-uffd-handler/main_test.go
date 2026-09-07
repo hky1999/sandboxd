@@ -82,7 +82,7 @@ func newFixture(t *testing.T, chunk []byte, withLocal bool) *fixture {
 	}
 	src := &pageSource{
 		chunk:         uint64(len(chunk)),
-		inflight:      make(map[uint64]*sync.WaitGroup),
+		inflight:      make(map[uint64]chan struct{}),
 		fetched:       make(map[uint64]struct{}),
 		cache:         cache,
 		cachePath:     cachePath,
