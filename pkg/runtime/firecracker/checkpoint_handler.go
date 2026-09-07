@@ -333,11 +333,8 @@ func (handler *Handler) Checkpoint(
 		)
 	}
 	tPersisted := time.Now()
-	if !handler.checkpointWriteback.schedule(files.Memory) {
-		logrus.Warnf(
-			"firecracker: checkpoint memory writeback queue is full; skip %s",
-			files.Memory,
-		)
+	if config.LeaveRunning {
+		handler.scheduleCheckpointMemoryWriteback(files.Memory)
 	}
 
 	// A leave-running checkpoint resumes before this host-side tail.
@@ -364,7 +361,7 @@ func (handler *Handler) Checkpoint(
 	)
 
 	if !config.LeaveRunning {
-		return handler.finishCheckpointedSandbox(instance, state, sandboxID)
+		return handler.finishCheckpointedSandboxWithWriteback(instance, state, sandboxID, files.Memory)
 	}
 	if resumeErr != nil {
 		// The artifact is sealed and the base adopted; only the guest is
@@ -376,6 +373,24 @@ func (handler *Handler) Checkpoint(
 		sandboxID, snapshotType, memoryInfo.Size()>>20, config.Directory,
 	)
 	return nil
+}
+
+func (handler *Handler) scheduleCheckpointMemoryWriteback(path string) {
+	if !handler.checkpointWriteback.schedule(path) {
+		logrus.Warnf("firecracker: checkpoint memory writeback queue is full; skip %s", path)
+	}
+}
+
+func (handler *Handler) finishCheckpointedSandboxWithWriteback(
+	instance *firecrackerInstance,
+	state firecrackerPersistedState,
+	sandboxID, memoryPath string,
+) error {
+	// Keep the large memory writeback from starting ahead of the small exit
+	// state sync. Queueing remains best effort, including when stopping fails;
+	// the stop error must still reach the caller unchanged.
+	defer handler.scheduleCheckpointMemoryWriteback(memoryPath)
+	return handler.finishCheckpointedSandbox(instance, state, sandboxID)
 }
 
 // persistCheckpointChanges does not write a state file solely to update the

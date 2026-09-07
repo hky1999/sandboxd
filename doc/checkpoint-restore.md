@@ -86,6 +86,8 @@ following generation can still catch writeback in progress and wait. Do not add
 an fsync to the checkpoint RPC to hide this cost, because that only moves the
 same wait into the request path.
 
+For stop-and-copy, the best-effort memory writeback is queued after stopping the source VMM and attempting to persist its terminal runtime state, so explicit bulk writeback does not start ahead of that small state-file sync. Leave-running checkpoints retain their post-seal scheduling. Stop errors still propagate; queue saturation remains best effort, and this ordering does not prevent the kernel from independently writing dirty pages or strengthen power-loss durability.
+
 Consecutive generations must use distinct `checkpoint_dir` values — sandboxd
 refuses to overwrite a directory that already holds a checkpoint. The
 incremental chain references the latest artifact's memory file directly, so a
