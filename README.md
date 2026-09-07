@@ -192,13 +192,24 @@ Schedulers can call `DeleteIfGeneration` with a sandbox ID and its observed
 Start/Resize/Delete lock, then returns `retired_generation` after cleanup. A
 mismatch fails without invoking runtime deletion. The distinct RPC fails as
 unsupported on older daemons; callers must not fall back to unconditional
-`Delete`. A missing record returns NotFound rather than a generation receipt.
+`Delete`. A missing sandbox returns NotFound unless a matching completed durable
+receipt exists. A completed receipt for an old generation may be replayed after
+ID reuse; this never deletes the new generation.
 
 Concurrent deletion coalesces only requests with the same ID and generation;
 legacy unconditional deletion cannot lend its success to a conditional caller.
-Caller cancellation does not cancel an already running cleanup. Lost replies,
-missing records and controller restart require authoritative reconciliation;
-this RPC alone does not provide a durable deletion receipt journal.
+Caller cancellation does not cancel an already running cleanup. The daemon
+writes a pending intent before runtime deletion, then a completed receipt after
+cleanup and metadata removal, using synced files and directory renames under
+`<RootDir>/scheduler-retirements`. Keep this directory on persistent daemon-owned
+storage. Completed receipts support retries after lost replies.
+
+A crash between physical cleanup and completion persistence may leave only a
+pending record; missing sandbox state still cannot prove retirement in that case.
+Controller restart and these unknown outcomes require authoritative reconciliation.
+The journal refuses new identities at 65536 entries and has no automatic GC;
+capacity exhaustion or corrupt records fail closed. Receipt acknowledgement and
+reclamation remain prerequisites for sustained operation.
 
 Successful Start and Restore responses include `resource_generation` from the
 published physical metadata. Preserve this creation-time identity for subsequent

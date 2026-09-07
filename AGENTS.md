@@ -99,8 +99,15 @@ startup-metadata mechanism for files such as `resolv.conf`.
 `akernel.scheduler/resource-generation` value. It checks identity under the
 physical resource lock and returns that generation only after successful cleanup.
 Do not fall back to legacy `Delete` when this RPC is unavailable or rejected.
-A missing sandbox returns NotFound; it is not a deletion receipt for a requested
-generation. Legacy Delete retains its existing unconditional semantics.
+A missing sandbox without a matching completed durable receipt returns NotFound;
+absence alone does not prove retirement. Completed receipts can be replayed even
+if the ID now belongs to another generation, without touching that replacement.
+Legacy Delete retains its existing unconditional semantics.
+
+Keep `<RootDir>/scheduler-retirements` on persistent daemon-owned storage.
+Pending records are not proof of completion; crash gaps require authoritative
+reconciliation. The journal is capped at 65536 entries and has no automatic GC.
+Do not delete receipts or release controller budgets merely because they aged out.
 
 generation. Legacy Delete retains its existing unconditional semantics.
 

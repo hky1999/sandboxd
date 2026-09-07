@@ -123,6 +123,7 @@ type sandboxService struct {
 	recoveryReady                     atomic.Bool
 	deleteGroup                       singleflight.Group
 	resourceLocks                     physicalLocks
+	retirementMu                      sync.Mutex
 	aclMu                             sync.Mutex
 	checkpointMu                      sync.Mutex
 	checkpointing                     map[string]struct{}
@@ -241,36 +242,46 @@ func (h *sandboxService) startSandboxRuntime(
 		}
 	}
 
-<<<<<<< HEAD
 	if startConfig.CheckpointDir != "" {
-		checkpointHandler, ok := handler.(svc.CheckpointHandler)
-		if !ok {
+		if managed, ok := handler.(svc.ManagedCheckpointHandler); ok {
+			// The scheduler line restores through the managed interface so
+			// the paired writable-layer artifact is applied with the state.
+			imagePath := filepath.Join(startConfig.CheckpointDir, "checkpoint.img")
+			err = h.withTransientFirecrackerCheckpointMemory(
+				ctx,
+				runtimeName,
+				startConfig.ID,
+				startConfig.CgroupPath,
+				startConfig.Resources,
+				handler,
+				false,
+				func() error { return managed.Restore(ctx, startConfig, imagePath) },
+			)
+		} else if checkpointHandler, ok := handler.(svc.CheckpointHandler); ok {
+			err = h.withTransientFirecrackerCheckpointMemory(
+				ctx,
+				runtimeName,
+				startConfig.ID,
+				startConfig.CgroupPath,
+				startConfig.Resources,
+				handler,
+				false,
+				func() error { return checkpointHandler.Restore(ctx, startConfig) },
+			)
+		} else {
 			return errord.ToGRPCf(
 				errord.ErrNotImplemented,
 				"runtime %q does not support checkpoint restore",
 				runtimeName,
 			)
 		}
-		err = h.withTransientFirecrackerCheckpointMemory(
-			ctx,
-			runtimeName,
-			startConfig.ID,
-			startConfig.CgroupPath,
-			startConfig.Resources,
-			handler,
-			false,
-			func() error { return checkpointHandler.Restore(ctx, startConfig) },
-		)
 	} else {
+		if err = h.verifyPreparedElasticLimits(startConfig, "start"); err != nil {
+			return err
+		}
 		err = handler.Start(ctx, startConfig)
 	}
 	if err != nil {
-=======
-	if err = h.verifyPreparedElasticLimits(startConfig, "start"); err != nil {
-		return err
-	}
-	if err = handler.Start(ctx, startConfig); err != nil {
->>>>>>> 72e95c4 (feat: add incarnation-checked resource resize and startup limit readback)
 		logrus.WithField(trace.ContextKeyTraceId, traceID).Errorf("runtime handler create sandbox failed: %v", err)
 		h.sandboxManager.CleanSandboxRoot(startConfig.ID)
 		return errord.ToGRPC(err)
@@ -339,6 +350,16 @@ func (h *sandboxService) deleteSandboxRuntime(ctx context.Context, sandboxID str
 		}
 	}()
 
+	if expected != "" {
+		receipt, readErr := h.readRetirement(sandboxID, expected)
+		if readErr != nil {
+			return readErr
+		}
+		if receipt != nil && receipt.Complete {
+			return nil
+		}
+	}
+
 	c, err := h.sandboxManager.Get(sandboxID)
 	if err != nil {
 		if errors.Is(err, errord.ErrNotFound) && expected == "" {
@@ -363,6 +384,12 @@ func (h *sandboxService) deleteSandboxRuntime(ctx context.Context, sandboxID str
 	resource, err := h.physicalResources(c.Metadata)
 	if err != nil {
 		return err
+	}
+
+	if expected != "" {
+		if err := h.writeRetirement(sandboxID, expected, false); err != nil {
+			return err
+		}
 	}
 
 	err = handler.Delete(ctx, sandboxID)
@@ -405,6 +432,21 @@ func (h *sandboxService) deleteSandboxRuntime(ctx context.Context, sandboxID str
 	}
 
 	h.sandboxManager.Delete(sandboxID)
+	if expected != "" {
+		root, err := util.JoinWithinRoot(filepath.Join(h.config.RootDir, "containers"), sandboxID)
+		if err != nil {
+			return err
+		}
+		if _, err := os.Lstat(root); !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("sandbox metadata retirement not confirmed: %v", err)
+		}
+		if err := syncRetirementDirectory(filepath.Dir(root)); err != nil {
+			return err
+		}
+		if err := h.writeRetirement(sandboxID, expected, true); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -1179,7 +1221,8 @@ func (h *sandboxService) Delete(ctx context.Context, request *runtime.DeleteRequ
 }
 
 // DeleteIfGeneration requires a physical identity match under the same lock as
-// Start/Resize/Delete. A missing record is unknown, not a receipt for this generation.
+// Start/Resize/Delete, or replays a completed durable receipt for that generation.
+// Missing sandbox state without such a receipt remains unknown.
 func (h *sandboxService) DeleteIfGeneration(ctx context.Context, request *runtime.DeleteIfGenerationRequest) (*runtime.DeleteIfGenerationResponse, error) {
 	if request == nil || request.ID == "" || request.ExpectedGeneration == "" || len(request.ExpectedGeneration) > 128 {
 		return nil, errord.ToGRPC(errord.ErrInvalidArgument)
@@ -1318,7 +1361,6 @@ func (h *sandboxService) createSandbox(
 		return &runtime.StartResponse{Code: -1, Message: err.Error()}, err
 	}
 	startReq := proto.Clone(request).(*runtime.StartRequest)
-<<<<<<< HEAD
 	checkpointDir := ""
 	var err error
 	if startReq.CheckpointInfo != nil {
@@ -1329,13 +1371,11 @@ func (h *sandboxService) createSandbox(
 			return &runtime.StartResponse{Code: -1, Message: err.Error()}, errord.ToGRPC(err)
 		}
 	}
-=======
 	// A caller cannot choose/reuse the physical resource incarnation.
 	if startReq.Labels == nil {
 		startReq.Labels = make(map[string]string)
 	}
 	startReq.Labels[resourceGenerationLabel] = uuid.NewString()
->>>>>>> 72e95c4 (feat: add incarnation-checked resource resize and startup limit readback)
 	if err := validateElasticResources(startReq, h.config, options.checkpointImage != ""); err != nil {
 		return &runtime.StartResponse{Code: -1, Message: err.Error()},
 			errord.ToGRPC(fmt.Errorf("%v: %w", err, errord.ErrInvalidArgument))
