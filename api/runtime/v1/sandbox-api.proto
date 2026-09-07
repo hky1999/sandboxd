@@ -524,6 +524,12 @@ message StatsResponse {
   uint64 cpu_kernel_ns = 5;
   // CPU usage in user mode in nanoseconds.
   uint64 cpu_user_ns = 6;
+  // Effective cgroup CPU quota/period in microseconds. Quota -1 is unlimited.
+  // A false known flag distinguishes unsupported/missing readings from zero.
+  int64 cpu_quota_usec = 7;
+  uint64 cpu_period_usec = 8;
+  bool cpu_limits_known = 9;
+
 }
 
 // ListAvailableRuntimesRequest requests the runtime classes currently available

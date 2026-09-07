@@ -482,6 +482,9 @@ func (h *sandboxService) Stats(ctx context.Context, request *runtime.StatsReques
 
 	return &runtime.StatsResponse{
 		CpuUsageNs:          cgroupStats.CPUUsageNanos,
+		CpuQuotaUsec:        cgroupStats.CPUQuotaUsec,
+		CpuPeriodUsec:       cgroupStats.CPUPeriodUsec,
+		CpuLimitsKnown:      cgroupStats.CPULimitsKnown,
 		CpuKernelNs:         cgroupStats.CPUKernelNanos,
 		CpuUserNs:           cgroupStats.CPUUserNanos,
 		MemoryUsageBytes:    cgroupStats.MemoryUsageBytes,
