@@ -18,11 +18,12 @@ import (
 
 	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
 	"github.com/inclusionAI/sandboxd/config"
+	"github.com/inclusionAI/sandboxd/internal/checkpoint"
 )
 
 // resourceLimitsFile is written into the checkpoint directory next to the
-// memory-state image. This sidecar is not yet integrity-bound to the manifest.
-const resourceLimitsFile = "resource-limits.json"
+// memory-state image. New publications bind its size and digest in the manifest.
+const resourceLimitsFile = checkpoint.ResourceLimitsName
 
 // resourceLimitsSnapshot records effective cgroup limits at checkpoint time.
 type resourceLimitsSnapshot struct {
@@ -92,6 +93,9 @@ func (h *sandboxService) captureResourceLimits(sandboxID, dir string) error {
 // taken before this change, or cgroup-less sandboxes) preserves legacy behavior
 // only for non-elastic requests. Elastic restore requires the saved policy.
 func applyCheckpointResourceLimits(startConfig *runtime.StartRequest, checkpointDir string) error {
+	if err := checkpoint.VerifyResourceLimitsAt(checkpointDir); err != nil {
+		return err
+	}
 	_, elastic := startConfig.Labels[elasticResourcesLabel]
 	data, err := os.ReadFile(filepath.Join(checkpointDir, resourceLimitsFile))
 	if err != nil {

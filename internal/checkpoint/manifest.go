@@ -19,14 +19,16 @@ const manifestVersion = 1
 // Manifest is the durable identity and integrity record published atomically
 // with a checkpoint image.
 type Manifest struct {
-	Version      int    `json:"version"`
-	CheckpointID string `json:"checkpointId"`
-	SourceID     string `json:"sourceId"`
-	Runtime      string `json:"runtime"`
-	RootfsSHA256 string `json:"rootfsSha256"`
-	LeaveRunning bool   `json:"leaveRunning,omitempty"`
-	ImageSHA256  string `json:"imageSha256"`
-	ImageSize    int64  `json:"imageSize"`
+	ResourceLimitsSHA256 string `json:"resourceLimitsSha256,omitempty"`
+	ResourceLimitsSize   int64  `json:"resourceLimitsSize,omitempty"`
+	Version              int    `json:"version"`
+	CheckpointID         string `json:"checkpointId"`
+	SourceID             string `json:"sourceId"`
+	Runtime              string `json:"runtime"`
+	RootfsSHA256         string `json:"rootfsSha256"`
+	LeaveRunning         bool   `json:"leaveRunning,omitempty"`
+	ImageSHA256          string `json:"imageSha256"`
+	ImageSize            int64  `json:"imageSize"`
 	// IncludeFilesystem marks a paired writable-layer artifact published in
 	// the FsArtifactDirName subdirectory next to the state image.
 	IncludeFilesystem bool   `json:"includeFilesystem,omitempty"`

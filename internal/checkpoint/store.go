@@ -33,8 +33,9 @@ import (
 )
 
 const (
-	ImageName    = "checkpoint.img"
-	ManifestName = "manifest.json"
+	ImageName          = "checkpoint.img"
+	ManifestName       = "manifest.json"
+	ResourceLimitsName = "resource-limits.json"
 	// FsArtifactDirName is the subdirectory inside a checkpoint directory
 	// that holds a paired writable-layer (runsc fscheckpoint) artifact.
 	FsArtifactDirName = "fs"
@@ -133,6 +134,16 @@ func PublishAt(directory string, source SourceIdentity, build func(string) error
 		manifest.FsImageSize = fsSize
 		manifest.FsImageSHA256 = fsDigest
 	}
+	resourcePath := filepath.Join(staging, ResourceLimitsName)
+	if _, err := os.Lstat(resourcePath); err == nil {
+		size, digest, err := inspectResourceLimits(resourcePath)
+		if err != nil {
+			return Fact{}, err
+		}
+		manifest.ResourceLimitsSize, manifest.ResourceLimitsSHA256 = size, digest
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return Fact{}, err
+	}
 	data, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {
 		return Fact{}, err
@@ -142,6 +153,9 @@ func PublishAt(directory string, source SourceIdentity, build func(string) error
 		return Fact{}, classifyIOError(err)
 	}
 	syncTargets := []string{stagingImage, stagingManifest, staging}
+	if manifest.ResourceLimitsSHA256 != "" {
+		syncTargets = append(syncTargets, resourcePath)
+	}
 	if source.IncludeFilesystem {
 		syncTargets = append(syncTargets, filepath.Join(staging, FsArtifactDirName))
 	}
@@ -180,6 +194,12 @@ func InspectAt(directory, checkpointID string) (Fact, error) {
 		fsSize, fsDigest, fsErr := inspectFsImage(filepath.Join(directory, FsArtifactDirName))
 		if fsErr != nil || fsSize != manifest.FsImageSize || fsDigest != manifest.FsImageSHA256 {
 			return Fact{}, fmt.Errorf("filesystem checkpoint integrity differs from manifest: %w", errord.ErrFailedPrecondition)
+		}
+	}
+	if manifest.ResourceLimitsSHA256 != "" {
+		size, digest, err := inspectResourceLimits(filepath.Join(directory, ResourceLimitsName))
+		if err != nil || size != manifest.ResourceLimitsSize || digest != manifest.ResourceLimitsSHA256 {
+			return Fact{}, fmt.Errorf("resource limits integrity differs from manifest: %w", errord.ErrFailedPrecondition)
 		}
 	}
 	return Fact{Paths: paths, Manifest: manifest}, nil
@@ -273,6 +293,14 @@ func validateSourceIdentity(checkpointID string, source SourceIdentity) error {
 }
 
 func validateManifest(checkpointID string, manifest Manifest) error {
+	if manifest.ResourceLimitsSHA256 != "" || manifest.ResourceLimitsSize != 0 {
+		if len(manifest.ResourceLimitsSHA256) != sha256.Size*2 || manifest.ResourceLimitsSize <= 0 || manifest.ResourceLimitsSize > 64<<10 {
+			return fmt.Errorf("resource limits manifest is invalid: %w", errord.ErrFailedPrecondition)
+		}
+		if _, err := hex.DecodeString(manifest.ResourceLimitsSHA256); err != nil {
+			return fmt.Errorf("resource limits digest is invalid: %w", errord.ErrFailedPrecondition)
+		}
+	}
 	if manifest.Version != manifestVersion || manifest.CheckpointID != checkpointID ||
 		manifest.SourceID == "" || manifest.Runtime == "" || manifest.ImageSize <= 0 {
 		return fmt.Errorf("checkpoint manifest identity is invalid: %w", errord.ErrFailedPrecondition)
@@ -449,4 +477,40 @@ func classifyIOError(err error) error {
 		return fmt.Errorf("%v: %w", err, errord.ErrResourceExhausted)
 	}
 	return err
+}
+
+// Resource policies are small bounded regular files, never symlink targets.
+func inspectResourceLimits(path string) (int64, string, error) {
+	info, err := os.Lstat(path)
+	if err != nil || !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > 64<<10 {
+		return 0, "", fmt.Errorf("resource limits must be a bounded regular file: %w", errord.ErrFailedPrecondition)
+	}
+	return inspectImage(path)
+}
+
+// VerifyResourceLimitsAt validates a published sidecar even on legacy restore
+// requests that omit the checkpoint identity. Old directories without a
+// manifest retain their legacy behavior; no image data is rehashed here.
+func VerifyResourceLimitsAt(directory string) error {
+	path := filepath.Join(directory, ManifestName)
+	if _, err := os.Lstat(path); errors.Is(err, os.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	manifest, err := readManifest(path)
+	if err != nil {
+		return err
+	}
+	if err := validateManifest(manifest.CheckpointID, manifest); err != nil {
+		return err
+	}
+	if manifest.ResourceLimitsSHA256 == "" {
+		return nil
+	}
+	size, digest, err := inspectResourceLimits(filepath.Join(directory, ResourceLimitsName))
+	if err != nil || size != manifest.ResourceLimitsSize || digest != manifest.ResourceLimitsSHA256 {
+		return fmt.Errorf("resource limits integrity differs from manifest: %w", errord.ErrFailedPrecondition)
+	}
+	return nil
 }
