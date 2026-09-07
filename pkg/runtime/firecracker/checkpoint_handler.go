@@ -415,9 +415,8 @@ func (handler *Handler) finishCheckpointedSandbox(
 	state firecrackerPersistedState,
 	sandboxID string,
 ) error {
-	handler.stopInstance(instance, true)
-	if firecrackerProcessMatches(state.PID, handler.binary, state.APIPath, state.ID) {
-		return fmt.Errorf("stop Firecracker sandbox %s after checkpoint", sandboxID)
+	if err := stopCheckpointProcess(state, handler.binary); err != nil {
+		return fmt.Errorf("stop Firecracker sandbox %s after checkpoint: %w", sandboxID, err)
 	}
 	instance.finish(runtimecore.Exit{ExitedAt: time.Now(), ExitCode: 0})
 	// stopInstance may already have marked a vanished process finished. Do

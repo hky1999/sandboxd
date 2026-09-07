@@ -88,6 +88,8 @@ same wait into the request path.
 
 For stop-and-copy, the best-effort memory writeback is queued after stopping the source VMM and attempting to persist its terminal runtime state, so explicit bulk writeback does not start ahead of that small state-file sync. Leave-running checkpoints retain their post-seal scheduling. Stop errors still propagate; queue saturation remains best effort, and this ordering does not prevent the kernel from independently writing dirty pages or strengthen power-loss durability.
 
+Stop-and-copy requires Linux pidfd support to confirm source process exit. A disappearing command line or executable is insufficient: these can disappear during exit teardown. Signals target the captured pidfd only while the source identity matches; an unrecognized process is never signalled. An existing process with unavailable identity must still reach pidfd exit readiness, otherwise checkpoint returns an error. pidfd open/poll failures also return errors rather than falling back to the weaker identity check. This confirms process exit, not immediate removal of a zombie's `/proc` directory, and does not strengthen the separate migration ownership protocol.
+
 Consecutive generations must use distinct `checkpoint_dir` values — sandboxd
 refuses to overwrite a directory that already holds a checkpoint. The
 incremental chain references the latest artifact's memory file directly, so a

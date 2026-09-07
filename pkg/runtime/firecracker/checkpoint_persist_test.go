@@ -20,6 +20,10 @@ func TestCheckpointWritebackObservesStoppedPersistedSource(t *testing.T) {
 				startCheckpointPersistenceChild(t, handler, instance)
 			}
 			before := instance.snapshot()
+			fd := -1
+			if live {
+				fd = checkpointTestPidfd(t, before.PID)
+			}
 			if err := handler.persistInstance(instance); err != nil {
 				t.Fatal(err)
 			}
@@ -30,7 +34,7 @@ func TestCheckpointWritebackObservesStoppedPersistedSource(t *testing.T) {
 				if err == nil && (path != memory || !disk.Exited || disk.ExitedAt == "" || disk.ExitCode != 0) {
 					err = fmt.Errorf("writeback preceded persisted exit: path=%s state=%+v", path, disk)
 				}
-				if err == nil && firecrackerProcessMatches(before.PID, handler.binary, before.APIPath, before.ID) {
+				if err == nil && fd >= 0 && !checkpointTestExitReady(t, fd) {
 					err = fmt.Errorf("writeback started before source stopped")
 				}
 				observed <- err
