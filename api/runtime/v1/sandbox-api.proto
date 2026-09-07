@@ -26,6 +26,9 @@ service SandboxService {
   rpc Checkpoint(CheckpointRequest) returns (CheckpointResponse) {}
   // Delete force-deletes a sandbox.
   rpc Delete(DeleteRequest) returns (DeleteResponse) {}
+  // DeleteIfGeneration retires one physical generation only when the sandbox
+  // still carries the expected server-assigned resource generation.
+  rpc DeleteIfGeneration(DeleteIfGenerationRequest) returns (DeleteIfGenerationResponse) {}
   // Wait waits for a sandbox to exit.
   rpc Wait(WaitRequest) returns (WaitResponse) {}
   // List lists sandboxes by filters.
@@ -283,6 +286,11 @@ message StartResponse {
   string message = 2;
   // ID is the unique sandbox ID.
   string id = 3;
+  // Field 4 stays unused so this field keeps the scheduler-compatible number.
+  // Physical incarnation assigned by the daemon when this sandbox was created.
+  // A caller-supplied label with the reserved generation key cannot choose or
+  // reuse this value.
+  string resource_generation = 5;
 }
 
 // CheckpointRequest describes a synchronous checkpoint operation.
@@ -318,6 +326,21 @@ message DeleteRequest {
 
 // DeleteResponse is returned after sandbox delete.
 message DeleteResponse {}
+
+// DeleteIfGenerationRequest retires exactly one physical incarnation.
+message DeleteIfGenerationRequest {
+  // ID is the sandbox ID.
+  string id = 1;
+  // ExpectedGeneration is the resource_generation returned by Start for the
+  // incarnation the caller intends to retire.
+  string expected_generation = 2;
+}
+
+// DeleteIfGenerationResponse confirms the retired incarnation.
+message DeleteIfGenerationResponse {
+  // RetiredGeneration repeats the retired expected_generation.
+  string retired_generation = 1;
+}
 
 // WaitRequest describes a sandbox wait request.
 message WaitRequest {

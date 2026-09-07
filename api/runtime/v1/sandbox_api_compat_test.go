@@ -17,17 +17,79 @@ package v1
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"slices"
 	"testing"
 
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protodesc"
+	"google.golang.org/protobuf/types/descriptorpb"
 )
 
 // TestV010WireContract pins the public protobuf descriptor while allowing
 // comments and generated-code details to change.
+//
+// The generation-conditional DeleteIfGeneration RPC and the
+// StartResponse.resource_generation identity field are validated and then
+// projected out before the frozen v0.1.0 hash comparison, so every other part
+// of the prior wire contract must remain byte-identical.
 func TestV010WireContract(t *testing.T) {
 	descriptor := protodesc.ToFileDescriptorProto(File_api_runtime_v1_sandbox_api_proto)
 	descriptor.SourceCodeInfo = nil
+	for _, message := range descriptor.MessageType {
+		if message.GetName() != "StartResponse" {
+			continue
+		}
+		if len(message.Field) != 4 {
+			t.Fatal("unexpected start identity extension")
+		}
+		field := message.Field[3]
+		if field.GetName() != "resource_generation" || field.GetNumber() != 5 || field.GetType() != descriptorpb.FieldDescriptorProto_TYPE_STRING || field.GetLabel() != descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL {
+			t.Fatal("unexpected start generation field")
+		}
+		message.Field = message.Field[:3]
+	}
+	newMessages := map[string][]string{
+		"DeleteIfGenerationRequest":  {"id", "expected_generation"},
+		"DeleteIfGenerationResponse": {"retired_generation"},
+	}
+	for _, message := range descriptor.MessageType {
+		names, added := newMessages[message.GetName()]
+		if !added {
+			continue
+		}
+		if len(message.Field) != len(names) || len(message.NestedType) != 0 || len(message.EnumType) != 0 {
+			t.Fatal("unexpected conditional delete message")
+		}
+		for i, name := range names {
+			f := message.Field[i]
+			if f.GetName() != name || f.GetNumber() != int32(i+1) || f.GetType() != descriptorpb.FieldDescriptorProto_TYPE_STRING || f.GetLabel() != descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL {
+				t.Fatal("unexpected conditional delete field")
+			}
+		}
+		delete(newMessages, message.GetName())
+	}
+	if len(newMessages) != 0 {
+		t.Fatal("missing conditional delete messages")
+	}
+	foundDelete := false
+	for _, service := range descriptor.Service {
+		service.Method = slices.DeleteFunc(service.Method, func(m *descriptorpb.MethodDescriptorProto) bool {
+			if m.GetName() != "DeleteIfGeneration" {
+				return false
+			}
+			if foundDelete || service.GetName() != "SandboxService" || m.GetInputType() != "."+descriptor.GetPackage()+".DeleteIfGenerationRequest" || m.GetOutputType() != "."+descriptor.GetPackage()+".DeleteIfGenerationResponse" || m.GetClientStreaming() || m.GetServerStreaming() {
+				t.Fatal("unexpected conditional delete RPC")
+			}
+			foundDelete = true
+			return true
+		})
+	}
+	if !foundDelete {
+		t.Fatal("missing conditional delete RPC")
+	}
+	descriptor.MessageType = slices.DeleteFunc(descriptor.MessageType, func(m *descriptorpb.DescriptorProto) bool {
+		return m.GetName() == "DeleteIfGenerationRequest" || m.GetName() == "DeleteIfGenerationResponse"
+	})
 	wire, err := proto.MarshalOptions{Deterministic: true}.Marshal(descriptor)
 	if err != nil {
 		t.Fatal(err)

@@ -42,6 +42,7 @@ import (
 	"github.com/inclusionAI/sandboxd/pkg/networkmanager/networkacl"
 	// The side-effect imports register the available NAT backends before
 	// InterfaceManager initialization while avoiding an import cycle.
+	"github.com/google/uuid"
 	"github.com/inclusionAI/sandboxd/pkg/checkpointcatalog"
 	_ "github.com/inclusionAI/sandboxd/pkg/networkmanager/bpfnat"
 	_ "github.com/inclusionAI/sandboxd/pkg/networkmanager/bridge"
@@ -99,6 +100,8 @@ type sandboxService struct {
 	ready                             atomic.Bool
 	recoveryReady                     atomic.Bool
 	deleteGroup                       singleflight.Group
+	resourceLocks                     physicalLocks
+	retirementMu                      sync.Mutex
 	aclMu                             sync.Mutex
 	checkpointMu                      sync.Mutex
 	checkpointing                     map[string]struct{}
@@ -249,7 +252,34 @@ func (h *sandboxService) startSandboxRuntime(
 	return nil
 }
 
-func (h *sandboxService) deleteSandboxRuntime(ctx context.Context, sandboxID string) (err error) {
+// deleteSandboxRuntime retires the sandbox's physical resources under the
+// per-ID physical lock shared with Start and Checkpoint. A non-empty expected
+// generation switches the flow to conditional retirement: the generation is
+// rechecked under the lock, a pending receipt is durably recorded before any
+// runtime effect, only a strict runtime delete (which proves it retired state
+// it found) may proceed, and a complete receipt is recorded only after the
+// sandbox state directory is confirmed gone. Legacy deletion keeps the
+// idempotent semantics: a missing sandbox is a successful no-op.
+func (h *sandboxService) deleteSandboxRuntime(ctx context.Context, sandboxID string, expectedGeneration ...string) (err error) {
+	expected := ""
+	if len(expectedGeneration) > 0 {
+		expected = expectedGeneration[0]
+	}
+	unlock, err := h.resourceLocks.acquire(ctx, sandboxID)
+	if err != nil {
+		return errord.ToGRPC(err)
+	}
+	defer unlock()
+
+	// Legacy deletion keeps its idempotent cleanup of stale DNAT rules —
+	// including for an already-missing sandbox — but now under the same
+	// physical lock as Start, so it cannot race a concurrent creation for
+	// this ID. Conditional retirement cleans DNAT only after its generation
+	// and strict-exit gates pass below.
+	if expected == "" && h.networkMgr != nil {
+		h.networkMgr.cleanupDnatRules(sandboxID)
+	}
+
 	traceID, spanID := trace.GetContextID(ctx)
 	start := time.Now()
 	defer func() {
@@ -260,12 +290,34 @@ func (h *sandboxService) deleteSandboxRuntime(ctx context.Context, sandboxID str
 		}
 	}()
 
-	c, err := h.sandboxManager.Get(sandboxID)
-	if err != nil {
-		if errors.Is(err, errord.ErrNotFound) {
+	if expected != "" {
+		receipt, readErr := h.readRetirement(sandboxID, expected)
+		if readErr != nil {
+			return readErr
+		}
+		if receipt != nil && receipt.Complete {
+			// Durable proof from a prior attempt: replay it without touching
+			// the current physical state.
 			return nil
 		}
+	}
+
+	c, err := h.sandboxManager.Get(sandboxID)
+	if err != nil {
+		if errors.Is(err, errord.ErrNotFound) && expected == "" {
+			return nil
+		}
+		// Conditional retirement: missing sandbox state without a complete
+		// receipt is an unknown outcome, never a retirement proof.
 		return errord.ToGRPC(err)
+	}
+
+	if expected != "" && (c.Metadata == nil ||
+		c.Metadata.Labels[resourceGenerationLabel] != expected) {
+		return errord.ToGRPCf(
+			errord.ErrFailedPrecondition,
+			"sandbox resource generation changed before delete",
+		)
 	}
 
 	if h.checkRuntime(c.Metadata.RuntimeHandler) != nil {
@@ -277,16 +329,48 @@ func (h *sandboxService) deleteSandboxRuntime(ctx context.Context, sandboxID str
 		return errord.ToGRPC(errord.ErrNotImplemented)
 	}
 
+	var strictDelete svc.StrictDeleteHandler
+	if expected != "" {
+		strictDelete, ok = handler.(svc.StrictDeleteHandler)
+		if !ok {
+			return errord.ToGRPCf(
+				errord.ErrNotImplemented,
+				"runtime %q does not support strict conditional delete",
+				c.Metadata.RuntimeHandler,
+			)
+		}
+	}
+
 	resource, err := h.sandboxManager.CollectResourceByID(sandboxID)
 	if err != nil {
 		return err
 	}
 
-	err = handler.Delete(ctx, sandboxID)
-	if err != nil && !errors.Is(err, errord.ErrNotFound) {
-		metrics.RecordRuntimeCallResult("delete", "failed", c.Metadata.RuntimeHandler)
-		logrus.WithField(trace.ContextKeyTraceId, traceID).Errorf("runtime handler force delete sandbox failed: %v", err)
-		return errord.ToGRPC(err)
+	if expected != "" {
+		// The pending receipt must be durable before the runtime can produce
+		// any effect, so a crash mid-delete leaves an explicitly unfinished
+		// record rather than silence.
+		if err := h.writeRetirement(sandboxID, expected, false); err != nil {
+			return err
+		}
+	}
+
+	if expected != "" {
+		// Strict delete: any error, including missing runtime state or an
+		// unbound/mismatched runtime generation, fails conditional
+		// retirement. Absence attests nothing.
+		if err = strictDelete.DeleteStrict(ctx, sandboxID, expected); err != nil {
+			metrics.RecordRuntimeCallResult("delete", "failed", c.Metadata.RuntimeHandler)
+			logrus.WithField(trace.ContextKeyTraceId, traceID).Errorf("runtime handler strict delete sandbox failed: %v", err)
+			return errord.ToGRPC(err)
+		}
+	} else {
+		err = handler.Delete(ctx, sandboxID)
+		if err != nil && !errors.Is(err, errord.ErrNotFound) {
+			metrics.RecordRuntimeCallResult("delete", "failed", c.Metadata.RuntimeHandler)
+			logrus.WithField(trace.ContextKeyTraceId, traceID).Errorf("runtime handler force delete sandbox failed: %v", err)
+			return errord.ToGRPC(err)
+		}
 	}
 	metrics.RecordRuntimeCallResult("delete", "success", c.Metadata.RuntimeHandler)
 	if h.resourceMod != nil {
@@ -296,6 +380,12 @@ func (h *sandboxService) deleteSandboxRuntime(ctx context.Context, sandboxID str
 	}
 	if h.xpuMgr != nil {
 		h.xpuMgr.Release(sandboxID)
+	}
+	// Conditional retirement reaches network cleanup only now, after the
+	// generation and strict-exit gates passed; legacy deletion cleaned DNAT
+	// under the lock at the top of this function.
+	if expected != "" && h.networkMgr != nil {
+		h.networkMgr.cleanupDnatRules(sandboxID)
 	}
 
 	if err := h.deactivateStartNetwork(resource); err != nil {
@@ -318,21 +408,50 @@ func (h *sandboxService) deleteSandboxRuntime(ctx context.Context, sandboxID str
 	}
 
 	h.sandboxManager.Delete(sandboxID)
+	if expected != "" {
+		root, rootErr := util.JoinWithinRoot(
+			filepath.Join(h.config.RootDir, "containers"),
+			sandboxID,
+		)
+		if rootErr != nil {
+			return rootErr
+		}
+		// Manager.Delete is void and its disk cleanup can fail silently; the
+		// receipt attests a retired generation only when the state directory
+		// is confirmed absent.
+		if _, statErr := os.Lstat(root); !errors.Is(statErr, os.ErrNotExist) {
+			return fmt.Errorf(
+				"sandbox metadata retirement not confirmed for %s (lstat: %v)",
+				sandboxID,
+				statErr,
+			)
+		}
+		if err := syncRetirementDirectory(filepath.Dir(root)); err != nil {
+			return err
+		}
+		if err := h.writeRetirement(sandboxID, expected, true); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
 // deleteSandbox coalesces concurrent delete requests for the same sandbox.
 // Cleanup runs independently from the initiating caller's cancellation so a
 // timed-out RPC cannot leave a partially deleted sandbox for another caller to
-// release again.
-func (h *sandboxService) deleteSandbox(ctx context.Context, sandboxID string) error {
-	resultCh := h.deleteGroup.DoChan(sandboxID, func() (interface{}, error) {
+// release again, and every network or resource effect happens under the
+// per-ID physical lock inside deleteSandboxRuntime. Legacy and conditional
+// deletes, and different expected generations, use distinct coalescing keys:
+// a legacy request must never join or be joined by a conditional one.
+func (h *sandboxService) deleteSandbox(ctx context.Context, sandboxID string, expectedGeneration ...string) error {
+	expected := ""
+	if len(expectedGeneration) > 0 {
+		expected = expectedGeneration[0]
+	}
+	key, _ := json.Marshal([2]string{sandboxID, expected})
+	resultCh := h.deleteGroup.DoChan(string(key), func() (interface{}, error) {
 		cleanupCtx := context.WithoutCancel(ctx)
-
-		if h.networkMgr != nil {
-			h.networkMgr.cleanupDnatRules(sandboxID)
-		}
-		return nil, h.deleteSandboxRuntime(cleanupCtx, sandboxID)
+		return nil, h.deleteSandboxRuntime(cleanupCtx, sandboxID, expected)
 	})
 
 	select {
@@ -1013,6 +1132,21 @@ func (h *sandboxService) Delete(ctx context.Context, request *runtime.DeleteRequ
 	return response, err
 }
 
+// DeleteIfGeneration requires a physical identity match under the same lock as
+// Start/Checkpoint/Delete, or replays a completed durable receipt for that
+// generation. Missing sandbox state without such a receipt remains unknown and
+// is reported as an error, never as a retirement.
+func (h *sandboxService) DeleteIfGeneration(ctx context.Context, request *runtime.DeleteIfGenerationRequest) (*runtime.DeleteIfGenerationResponse, error) {
+	if request == nil || request.ID == "" ||
+		request.ExpectedGeneration == "" || len(request.ExpectedGeneration) > 128 {
+		return nil, errord.ToGRPC(errord.ErrInvalidArgument)
+	}
+	if err := h.deleteSandbox(ctx, request.ID, request.ExpectedGeneration); err != nil {
+		return nil, err
+	}
+	return &runtime.DeleteIfGenerationResponse{RetiredGeneration: request.ExpectedGeneration}, nil
+}
+
 func (h *sandboxService) SetNetworkPolicy(
 	_ context.Context,
 	request *runtime.SetNetworkPolicyRequest,
@@ -1127,6 +1261,9 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 		return &runtime.StartResponse{Code: -1, Message: err.Error()}, err
 	}
 	startReq := proto.Clone(request).(*runtime.StartRequest)
+	// The physical incarnation identity is daemon-owned: a caller-supplied
+	// label under the reserved key is replaced, never honored.
+	generation := assignResourceGeneration(startReq)
 	checkpointDir := ""
 	var err error
 	if startReq.CheckpointInfo != nil {
@@ -1309,6 +1446,15 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 		}, errord.ToGRPC(err)
 	}
 	startReq.SandboxID = sandboxID
+	// Serialize creation against checkpoint and (conditional or legacy) delete
+	// for this ID. The lock is held through the full rollback below, so a
+	// failed start cannot race a delete that reuses the reserved ID.
+	unlock, lockErr := h.resourceLocks.acquire(ctx, sandboxID)
+	if lockErr != nil {
+		h.sandboxManager.ReleaseID(sandboxID)
+		return nil, errord.ToGRPC(lockErr)
+	}
+	defer unlock()
 	startSucceeded := false
 	var preparedFilesystem *preparedFS
 	var preparedResources *preparedStartResources
@@ -1545,6 +1691,9 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 		ExtraConfig:             startReq.ExtraConfig,
 		EnableKVM:               extraConfig.EnableKVM,
 		CheckpointDir:           checkpointDir,
+		// The runtime binds the daemon-generated incarnation identity into
+		// its own persisted state, so strict deletes can verify it there.
+		ResourceGeneration: generation,
 	}
 	if err := h.startSandboxRuntime(ctx, startReq.Runtime, runtimeConfig); err != nil {
 		return &runtime.StartResponse{
@@ -1600,10 +1749,24 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 	})
 	startSucceeded = true
 	return &runtime.StartResponse{
-		Code:    0,
-		Message: "Succeed",
-		ID:      sandboxID,
+		Code:               0,
+		Message:            "Succeed",
+		ID:                 sandboxID,
+		ResourceGeneration: generation,
 	}, nil
+}
+
+// assignResourceGeneration installs a fresh daemon-owned physical incarnation
+// label on the start request and returns it. A caller-supplied value under the
+// reserved key is discarded: the client must not choose or reuse a sandbox's
+// physical identity.
+func assignResourceGeneration(request *runtime.StartRequest) string {
+	if request.Labels == nil {
+		request.Labels = make(map[string]string)
+	}
+	generation := uuid.NewString()
+	request.Labels[resourceGenerationLabel] = generation
+	return generation
 }
 
 func (h *sandboxService) Wait(ctx context.Context, request *runtime.WaitRequest) (*runtime.WaitResponse, error) {

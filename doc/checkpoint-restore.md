@@ -355,6 +355,27 @@ resume the source. The caller decides how to handle the source sandbox.
 sandboxd only cleans partial checkpoint output: it removes a leaf directory it
 created, or empties a caller-provided leaf directory while preserving it.
 
+## Conditional retirement (DeleteIfGeneration)
+
+Every successful `Start` assigns a daemon-owned physical incarnation identity and returns it as `StartResponse.resource_generation` (field 5; field 4 stays unused to keep the scheduler-compatible numbering). The identity is also visible as the reserved `akernel.scheduler/resource-generation` sandbox label. A caller-supplied label under that key is replaced, never honored, so a client can neither choose nor reuse a sandbox's physical incarnation. The same value is passed to the runtime as `StartConfig.ResourceGeneration` on both fresh starts and restores; Firecracker binds it into its own persisted instance state and syncs the containing directory (plus the parent entries of a freshly created state directory) so the runtime record of the incarnation survives crashes.
+
+`DeleteIfGeneration(id, expected_generation)` retires exactly that incarnation. It runs under the same per-ID physical lock as `Start` and `Checkpoint`, so creation, checkpoint, and deletion cannot interleave on one sandbox; `Start` holds the lock from ID reservation through its complete rollback, and the request timeout of a queued `Checkpoint` bounds its lock wait. Delete coalescing keys on `(id, expected_generation)`: a legacy `Delete` flight never joins a conditional one, and different expected generations do not share a flight.
+
+Conditional retirement passes this gate sequence, in order, all under the physical lock. Failures at the gates before the runtime is invoked (receipt replay, identity recheck, capability, pending-journal write) leave the sandbox exactly as it was; once the runtime strict delete has begun, failures are unknown or partial — the runtime may already have stopped the sandbox and cleanup may be half-complete — and the receipt stays pending, with later retries reporting an unknown outcome rather than success.
+
+1. A completed durable receipt for `(id, generation)` replays immediately as success — including across daemon restarts, because receipts live under `<root>/scheduler-retirements` in daemon-owned storage.
+2. Otherwise the live sandbox must exist and still carry the expected generation. A missing sandbox without a receipt, a changed generation, or an unreadable/corrupt receipt is an error, never a retirement proof: absence and pending states attest nothing.
+3. The runtime must provide strict conditional delete (`DeleteStrict`). Runtimes without it — currently every runtime except Firecracker — reject the RPC with `Unimplemented`.
+4. A pending receipt is durably recorded before the runtime is invoked, so a crash mid-delete leaves an explicitly unfinished record. A journal write failure aborts the delete before any physical effect.
+5. The runtime verifies the caller's expected generation against its own persisted incarnation identity — under the instance operation lock and before any state change, guest request, or signal — so the server's metadata label alone can never decide which physical state retires. A runtime record with no bound generation (written before this identity existed) is unsupported and rejected; a mismatch is rejected as a precondition failure without touching the recorded process or its artifacts; absent state is an error, because observing absence is not a retirement proof.
+6. After the runtime strict delete confirms the exit and full resource cleanup completes, the sandbox state directory is confirmed absent — manager cleanup can fail silently — and only then is the receipt marked complete.
+
+Network and resource side effects (including DNAT cleanup, for legacy and conditional deletes alike) happen only under the physical lock, and for conditional retirement only after the generation and strict-exit gates pass. Caller cancellation or timeout is an unknown outcome, not a failure verdict: cleanup continues detached from the caller's context, and the durable receipt decides later replays.
+
+A pending receipt after an interrupted attempt means the outcome is unknown, not that retirement failed. Resolution requires identity-aware reconciliation that inspects the receipt and the recorded generation — for example reissuing the same `DeleteIfGeneration` while the incarnation still matches, or an operator reconciling the specific generation. An unconditional legacy `Delete` must not be used as the reconciliation fallback: it can destroy a replacement incarnation that reused the ID and it produces no retirement proof, so cross-node tooling (cn-migrate) must keep treating this state as unknown rather than falling back.
+
+Not claimed by this mechanism: revoking a `Restore` that is already in flight under the same ID, complete ownership-transfer fencing, crash-cut power-loss durability of every intermediate artifact, or proving retirement of pre-generation sandboxes — sandboxes created before this identity exists carry no generation and are only deletable through legacy `Delete`.
+
 ## Restore through Start
 
 To restore, the caller sends a normal `StartRequest` for the target sandbox and

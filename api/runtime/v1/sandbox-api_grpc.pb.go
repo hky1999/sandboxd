@@ -36,6 +36,7 @@ const (
 	SandboxService_Start_FullMethodName                 = "/runtime.v1.SandboxService/Start"
 	SandboxService_Checkpoint_FullMethodName            = "/runtime.v1.SandboxService/Checkpoint"
 	SandboxService_Delete_FullMethodName                = "/runtime.v1.SandboxService/Delete"
+	SandboxService_DeleteIfGeneration_FullMethodName    = "/runtime.v1.SandboxService/DeleteIfGeneration"
 	SandboxService_Wait_FullMethodName                  = "/runtime.v1.SandboxService/Wait"
 	SandboxService_List_FullMethodName                  = "/runtime.v1.SandboxService/List"
 	SandboxService_Stats_FullMethodName                 = "/runtime.v1.SandboxService/Stats"
@@ -55,6 +56,9 @@ type SandboxServiceClient interface {
 	Checkpoint(ctx context.Context, in *CheckpointRequest, opts ...grpc.CallOption) (*CheckpointResponse, error)
 	// Delete force-deletes a sandbox.
 	Delete(ctx context.Context, in *DeleteRequest, opts ...grpc.CallOption) (*DeleteResponse, error)
+	// DeleteIfGeneration retires one physical generation only when the sandbox
+	// still carries the expected server-assigned resource generation.
+	DeleteIfGeneration(ctx context.Context, in *DeleteIfGenerationRequest, opts ...grpc.CallOption) (*DeleteIfGenerationResponse, error)
 	// Wait waits for a sandbox to exit.
 	Wait(ctx context.Context, in *WaitRequest, opts ...grpc.CallOption) (*WaitResponse, error)
 	// List lists sandboxes by filters.
@@ -99,6 +103,16 @@ func (c *sandboxServiceClient) Delete(ctx context.Context, in *DeleteRequest, op
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(DeleteResponse)
 	err := c.cc.Invoke(ctx, SandboxService_Delete_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *sandboxServiceClient) DeleteIfGeneration(ctx context.Context, in *DeleteIfGenerationRequest, opts ...grpc.CallOption) (*DeleteIfGenerationResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DeleteIfGenerationResponse)
+	err := c.cc.Invoke(ctx, SandboxService_DeleteIfGeneration_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -167,6 +181,9 @@ type SandboxServiceServer interface {
 	Checkpoint(context.Context, *CheckpointRequest) (*CheckpointResponse, error)
 	// Delete force-deletes a sandbox.
 	Delete(context.Context, *DeleteRequest) (*DeleteResponse, error)
+	// DeleteIfGeneration retires one physical generation only when the sandbox
+	// still carries the expected server-assigned resource generation.
+	DeleteIfGeneration(context.Context, *DeleteIfGenerationRequest) (*DeleteIfGenerationResponse, error)
 	// Wait waits for a sandbox to exit.
 	Wait(context.Context, *WaitRequest) (*WaitResponse, error)
 	// List lists sandboxes by filters.
@@ -195,6 +212,9 @@ func (UnimplementedSandboxServiceServer) Checkpoint(context.Context, *Checkpoint
 }
 func (UnimplementedSandboxServiceServer) Delete(context.Context, *DeleteRequest) (*DeleteResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Delete not implemented")
+}
+func (UnimplementedSandboxServiceServer) DeleteIfGeneration(context.Context, *DeleteIfGenerationRequest) (*DeleteIfGenerationResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method DeleteIfGeneration not implemented")
 }
 func (UnimplementedSandboxServiceServer) Wait(context.Context, *WaitRequest) (*WaitResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Wait not implemented")
@@ -282,6 +302,24 @@ func _SandboxService_Delete_Handler(srv interface{}, ctx context.Context, dec fu
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(SandboxServiceServer).Delete(ctx, req.(*DeleteRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SandboxService_DeleteIfGeneration_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DeleteIfGenerationRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SandboxServiceServer).DeleteIfGeneration(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SandboxService_DeleteIfGeneration_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SandboxServiceServer).DeleteIfGeneration(ctx, req.(*DeleteIfGenerationRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -394,6 +432,10 @@ var SandboxService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Delete",
 			Handler:    _SandboxService_Delete_Handler,
+		},
+		{
+			MethodName: "DeleteIfGeneration",
+			Handler:    _SandboxService_DeleteIfGeneration_Handler,
 		},
 		{
 			MethodName: "Wait",

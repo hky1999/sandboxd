@@ -52,6 +52,39 @@ func (h *sandboxService) Checkpoint(
 		)
 	}
 
+	// Fail fast on an in-flight checkpoint before waiting for the physical
+	// lock, so a duplicate request is rejected instead of queueing behind the
+	// operation it duplicates.
+	if !h.beginCheckpoint(request.ID) {
+		return nil, errord.ToGRPCf(
+			errord.ErrFailedPrecondition,
+			"checkpoint is already in progress for sandbox %s",
+			request.ID,
+		)
+	}
+	defer h.finishCheckpoint(request.ID)
+
+	// The request timeout bounds the whole operation, including the queue
+	// wait for the physical lock: a caller that cannot be cancelled (for
+	// example a Background RPC) must not queue indefinitely behind a
+	// long-running delete or start for the same ID.
+	checkpointCtx, cancel := context.WithTimeout(
+		ctx,
+		time.Duration(request.TimeoutSeconds)*time.Second,
+	)
+	defer cancel()
+
+	// Serialize the physical checkpoint against start and delete for this ID.
+	// The source state checks and the runtime checkpoint itself run under the
+	// lock, so a concurrent delete cannot retire the sandbox mid-checkpoint.
+	// A queue timeout returns before any output directory is allocated or the
+	// runtime is invoked.
+	unlock, lockErr := h.resourceLocks.acquire(checkpointCtx, request.ID)
+	if lockErr != nil {
+		return nil, errord.ToGRPC(lockErr)
+	}
+	defer unlock()
+
 	sandbox, err := h.sandboxManager.Get(request.ID)
 	if err != nil {
 		return nil, errord.ToGRPC(err)
@@ -83,25 +116,12 @@ func (h *sandboxService) Checkpoint(
 			sandbox.Metadata.RuntimeHandler,
 		)
 	}
-	if !h.beginCheckpoint(request.ID) {
-		return nil, errord.ToGRPCf(
-			errord.ErrFailedPrecondition,
-			"checkpoint is already in progress for sandbox %s",
-			request.ID,
-		)
-	}
-	defer h.finishCheckpoint(request.ID)
 
 	directory, err := prepareCheckpointOutputDirectory(request.CheckpointDir)
 	if err != nil {
 		return nil, errord.ToGRPC(err)
 	}
 
-	checkpointCtx, cancel := context.WithTimeout(
-		ctx,
-		time.Duration(request.TimeoutSeconds)*time.Second,
-	)
-	defer cancel()
 	cgroupPath := ""
 	var resources *runtime.LinuxSandboxResources
 	if sandbox.Metadata.RuntimeHandler == config.RuntimeNameFirecracker {
