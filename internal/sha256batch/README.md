@@ -1,6 +1,6 @@
 # Synchronous checkpoint SHA-256 batches
 
-`Sum256` accepts up to 16 independent messages, computes ordinary SHA-256, and returns synchronously without retaining input references. It has fixed scratch space, no worker goroutines, and a standard-library fallback. Production publication is not yet wired to this package.
+`Sum256` accepts up to 16 independent messages, computes ordinary SHA-256, and returns synchronously without retaining input references. It has fixed scratch space, no worker goroutines, and a standard-library fallback. Packed publication uses this package only with the experimental `cn-publish -pack-batch-hash` option (`Options.PackBatchHash`), which defaults to false. Hash microbenchmarks do not establish full publication latency improvements.
 
 The compression assembly and round constants are derived from `github.com/minio/sha256-simd` **v1.0.1** (module sum `h1:6kaan5IFmwTNynnKKpDHe6FWHohJOHhCPchzK49dzMM=`). The assembly instruction body is unchanged. Its Go build constraint and provenance comment were updated. The synchronous padding, bounded mask windows, API, and feature guard are new. The asynchronous upstream server is not included. No linkname or dependency on an unexported upstream Go symbol is used.
 
