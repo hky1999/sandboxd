@@ -656,3 +656,7 @@ The AKernel fork now establishes or reopens the soft-dirty window after a succes
 UFFD fetches bind legacy HTTP Range requests to the page-source lifecycle context, with a 60-second client timeout per request. Retry backoff and waits for an existing chunk or digest leader respond to source cancellation. Canceling a waiter does not close the leader completion channel or mark bytes fetched. This does not add a timeout to local filesystem I/O or change the prefetch budget/default policy.
 
 UFFD source cancellation also applies to ordinary v1 digest-object HTTP GETs, including reads blocked after response headers. These requests retain the shared client and its 60-second timeout; cancellation does not publish an incomplete chunk into the verified cache. This complements legacy Range and packed-range cancellation and does not make local filesystem I/O interruptible.
+
+### Firecracker VMM diagnostic logging
+
+`plugin.runtime.firecracker.vmm_log_level` optionally sets the native VMM startup `--level` argument for both create and restore. An empty value preserves the VMM default; supported values are Off, Trace, Debug, Info, Warn/Warning and Error (case insensitive). Debug/Trace can affect measured timing and must be recorded with benchmark configuration. Configure the actual Firecracker executable, not a shell wrapper: runtime ownership checks require both argv[0] and /proc/PID/exe to match the configured binary. Log configuration does not change checkpoint format or relax those checks.

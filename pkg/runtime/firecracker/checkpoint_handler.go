@@ -841,11 +841,7 @@ func (handler *Handler) Restore(
 		return err
 	}
 	defer stderr.Close()
-	command := exec.Command(
-		handler.binary,
-		"--api-sock", apiPath,
-		"--id", startConfig.ID,
-	)
+	command := handler.vmmCommand(apiPath, startConfig.ID)
 	command.Dir = stateDir
 	command.Stdout = stdout
 	command.Stderr = stderr

@@ -183,6 +183,9 @@ type RuncConfig struct {
 
 // FirecrackerConfig contains immutable guest boot artifacts and VM defaults.
 type FirecrackerConfig struct {
+	// VMMLogLevel optionally selects the native Firecracker startup log level.
+	VMMLogLevel string `toml:"vmm_log_level" json:"vmmLogLevel,omitempty"`
+
 	// CheckpointConcurrency bounds node-wide checkpoint and restore operations.
 	// Zero retains the historical single-operation limit; explicit values are 1..8.
 	CheckpointConcurrency int `toml:"checkpoint_concurrency" json:"checkpointConcurrency"`

@@ -217,6 +217,7 @@ func (instance *firecrackerInstance) shouldPersist() bool {
 // Handler manages the Firecracker microVM lifecycle.
 type Handler struct {
 	binary       string
+	vmmLogLevel  string
 	sandboxRoot  string
 	storageRoot  string
 	runtimeRoot  string
@@ -344,6 +345,9 @@ func NewHandler(
 	loader runtimecore.OciLoader,
 ) (*Handler, error) {
 	firecrackerConfig := cfg.RuntimeConfig.Firecracker
+	if err := validateVMMLogLevel(firecrackerConfig.VMMLogLevel); err != nil {
+		return nil, err
+	}
 	applyFirecrackerDefaults(&firecrackerConfig)
 	if firecrackerConfig.UffdPersistWorkers < 0 || firecrackerConfig.UffdPersistWorkers > 64 {
 		return nil, errors.New("uffd_persist_workers must be 0 (handler default) or 1-64")
@@ -402,6 +406,7 @@ func NewHandler(
 	}
 	handler := &Handler{
 		binary:                 binary,
+		vmmLogLevel:            firecrackerConfig.VMMLogLevel,
 		sandboxRoot:            sandboxRoot,
 		storageRoot:            storageRoot,
 		runtimeRoot:            firecrackerproto.HostRuntimeRoot,
@@ -633,11 +638,7 @@ func (handler *Handler) Start(
 	}
 	defer stderr.Close()
 
-	command := exec.Command(
-		handler.binary,
-		"--api-sock", apiPath,
-		"--id", startConfig.ID,
-	)
+	command := handler.vmmCommand(apiPath, startConfig.ID)
 	command.Dir = stateDir
 	command.Stdout = stdout
 	command.Stderr = stderr
