@@ -640,3 +640,9 @@ Local chunk-mode restore uses the same complete-file verification engine as back
 ### Local verification scheduling
 
 Local memory chunk verification uses a separate, cancellable single-scan gate per Firecracker handler. It retains full content verification and the existing one-scan CPU/buffer bound, while materialized remote checkpoints can verify their other components without waiting for that local memory scan. This does not increase local scan concurrency or change digest requirements, artifact representation, or the legacy component cache identity policy. Non-memory component cache access remains serialized; this change is not a general deadline guarantee for every restore phase.
+
+### Node checkpoint/restore concurrency
+
+`plugin.runtime.firecracker.checkpoint_concurrency` limits simultaneous Firecracker checkpoint and restore operations across the node. Omitted or `0` retains the historical limit of one; explicit values `1` through `8` are accepted. The gate is initialized once from the node configuration; changing the limit requires restarting the daemon. Invalid values fail C/R admission. Waiting requests honor context cancellation, and releasing a slot is idempotent. This is a concurrency bound, not a fair queue or a throughput guarantee.
+
+Restore and the existing cgroup-v1 checkpoint path still reserve transient memory atomically and fail if node capacity is insufficient; increasing concurrency does not bypass that reservation or the managed cgroup checks. The cgroup-v2 checkpoint path retains its existing temporary cgroup behavior without an additional memory reservation, so operators must budget simultaneous snapshot/page-cache pressure before increasing the limit. The default is unchanged pending concurrent KVM validation. Local memory content scans retain their independent single-scan gate; runtime component verification and source ownership requirements are unchanged.

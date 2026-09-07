@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"sync"
 
 	"github.com/containerd/cgroups/v3"
 	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
@@ -147,9 +148,9 @@ func (h *sandboxService) withTransientFirecrackerCheckpointMemory(
 			headroom,
 		)
 	}
+	defer releaseReservation()
 	if raiseLimit {
 		if err := h.cgroupMgr.Prepare(cgroupPath, expandedResources); err != nil {
-			releaseReservation()
 			return fmt.Errorf("raise Firecracker checkpoint cgroup memory limit: %w", err)
 		}
 	}
@@ -157,7 +158,6 @@ func (h *sandboxService) withTransientFirecrackerCheckpointMemory(
 	// Keep the expanded host limit after the operation. Firecracker's guest
 	// memory remains fixed, while the extra cgroup space holds VMM overhead and
 	// reclaimable checkpoint page cache without risking a post-resume OOM.
-	releaseReservation()
 	return operationErr
 }
 
@@ -191,16 +191,32 @@ func shouldRaiseFirecrackerCheckpointMemoryLimit(
 func (h *sandboxService) acquireFirecrackerCheckpointMemorySlot(
 	ctx context.Context,
 ) (func(), error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	h.firecrackerCheckpointMemorySlotMu.Lock()
 	if h.firecrackerCheckpointMemorySlot == nil {
-		h.firecrackerCheckpointMemorySlot = make(chan struct{}, 1)
+		concurrency := 1
+		if h.config.Firecracker.CheckpointConcurrency != 0 {
+			concurrency = h.config.Firecracker.CheckpointConcurrency
+		}
+		if concurrency < 1 || concurrency > 8 {
+			h.firecrackerCheckpointMemorySlotMu.Unlock()
+			return nil, fmt.Errorf("Firecracker checkpoint_concurrency must be between 1 and 8 (0 defaults to 1), got %d", concurrency)
+		}
+		h.firecrackerCheckpointMemorySlot = make(chan struct{}, concurrency)
 	}
 	slot := h.firecrackerCheckpointMemorySlot
 	h.firecrackerCheckpointMemorySlotMu.Unlock()
 
 	select {
 	case slot <- struct{}{}:
-		return func() { <-slot }, nil
+		if err := ctx.Err(); err != nil {
+			<-slot
+			return nil, err
+		}
+		var once sync.Once
+		return func() { once.Do(func() { <-slot }) }, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}

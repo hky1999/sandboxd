@@ -183,6 +183,10 @@ type RuncConfig struct {
 
 // FirecrackerConfig contains immutable guest boot artifacts and VM defaults.
 type FirecrackerConfig struct {
+	// CheckpointConcurrency bounds node-wide checkpoint and restore operations.
+	// Zero retains the historical single-operation limit; explicit values are 1..8.
+	CheckpointConcurrency int `toml:"checkpoint_concurrency" json:"checkpointConcurrency"`
+
 	KernelImagePath         string `toml:"kernel_image_path" json:"kernelImagePath"`
 	InitrdPath              string `toml:"initrd_path" json:"initrdPath"`
 	KernelArgs              string `toml:"kernel_args" json:"kernelArgs"`
