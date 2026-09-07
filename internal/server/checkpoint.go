@@ -311,6 +311,7 @@ func (h *sandboxService) restoreCheckpoint(
 	}
 	return &runtime.StartResponse{
 		ID: startConfig.SandboxID, Ports: clonePorts(physical.Metadata.Ports),
+		ResourceGeneration: physical.Metadata.Labels[resourceGenerationLabel],
 	}, nil
 }
 
@@ -391,8 +392,9 @@ func (h *sandboxService) existingRestorePhysicalFact(
 		return nil, true, err
 	}
 	return &runtime.StartResponse{
-		ID:    metadata.ID,
-		Ports: clonePorts(metadata.Ports),
+		ID:                 metadata.ID,
+		Ports:              clonePorts(metadata.Ports),
+		ResourceGeneration: metadata.Labels[resourceGenerationLabel],
 	}, true, nil
 }
 

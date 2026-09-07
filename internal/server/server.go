@@ -1876,10 +1876,11 @@ func (h *sandboxService) createSandbox(
 	})
 	startSucceeded = true
 	return &runtime.StartResponse{
-		Code:    0,
-		Message: "Succeed",
-		ID:      sandboxID,
-		Ports:   clonePorts(startReq.Ports),
+		Code:               0,
+		Message:            "Succeed",
+		ID:                 sandboxID,
+		Ports:              clonePorts(startReq.Ports),
+		ResourceGeneration: metadata.Labels[resourceGenerationLabel],
 	}, nil
 }
 

@@ -263,6 +263,8 @@ message StartResponse {
   string id = 3;
   // Ports contains the concrete host/container mappings committed by sandboxd.
   repeated string ports = 4;
+  // Physical incarnation assigned by the daemon when this sandbox was created.
+  string resource_generation = 5;
 }
 
 // CheckpointRequest describes a synchronous sandbox checkpoint request.

@@ -1469,9 +1469,11 @@ type StartResponse struct {
 	// ID is the unique sandbox ID.
 	ID string `protobuf:"bytes,3,opt,name=id,proto3" json:"id,omitempty"`
 	// Ports contains the concrete host/container mappings committed by sandboxd.
-	Ports         []string `protobuf:"bytes,4,rep,name=ports,proto3" json:"ports,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Ports []string `protobuf:"bytes,4,rep,name=ports,proto3" json:"ports,omitempty"`
+	// Physical incarnation assigned by the daemon when this sandbox was created.
+	ResourceGeneration string `protobuf:"bytes,5,opt,name=resource_generation,json=resourceGeneration,proto3" json:"resource_generation,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *StartResponse) Reset() {
@@ -1530,6 +1532,13 @@ func (x *StartResponse) GetPorts() []string {
 		return x.Ports
 	}
 	return nil
+}
+
+func (x *StartResponse) GetResourceGeneration() string {
+	if x != nil {
+		return x.ResourceGeneration
+	}
+	return ""
 }
 
 // CheckpointRequest describes a synchronous sandbox checkpoint request.
@@ -3704,12 +3713,13 @@ const file_api_runtime_v1_sandbox_api_proto_rawDesc = "" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\x1a?\n" +
 	"\x11MetricLabelsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"c\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x94\x01\n" +
 	"\rStartResponse\x12\x12\n" +
 	"\x04code\x18\x01 \x01(\x05R\x04code\x12\x18\n" +
 	"\amessage\x18\x02 \x01(\tR\amessage\x12\x0e\n" +
 	"\x02id\x18\x03 \x01(\tR\x02id\x12\x14\n" +
-	"\x05ports\x18\x04 \x03(\tR\x05ports\"\x94\x02\n" +
+	"\x05ports\x18\x04 \x03(\tR\x05ports\x12/\n" +
+	"\x13resource_generation\x18\x05 \x01(\tR\x12resourceGeneration\"\x94\x02\n" +
 	"\x11CheckpointRequest\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12%\n" +
 	"\x0echeckpoint_dir\x18\x02 \x01(\tR\rcheckpointDir\x12\x18\n" +

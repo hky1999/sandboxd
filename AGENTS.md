@@ -101,3 +101,10 @@ physical resource lock and returns that generation only after successful cleanup
 Do not fall back to legacy `Delete` when this RPC is unavailable or rejected.
 A missing sandbox returns NotFound; it is not a deletion receipt for a requested
 generation. Legacy Delete retains its existing unconditional semantics.
+
+generation. Legacy Delete retains its existing unconditional semantics.
+
+Successful Start and Restore responses include `resource_generation` from the
+published physical metadata. Preserve this creation-time identity for subsequent
+conditional deletion; querying an ID later must not silently adopt a replacement
+sandbox's generation. Restore replay returns the existing physical generation.

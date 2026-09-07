@@ -199,3 +199,8 @@ legacy unconditional deletion cannot lend its success to a conditional caller.
 Caller cancellation does not cancel an already running cleanup. Lost replies,
 missing records and controller restart require authoritative reconciliation;
 this RPC alone does not provide a durable deletion receipt journal.
+
+Successful Start and Restore responses include `resource_generation` from the
+published physical metadata. Preserve this creation-time identity for subsequent
+conditional deletion; querying an ID later must not silently adopt a replacement
+sandbox's generation. Restore replay returns the existing physical generation.

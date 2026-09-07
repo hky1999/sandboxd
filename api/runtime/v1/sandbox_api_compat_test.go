@@ -38,6 +38,19 @@ import (
 func TestV010WireContract(t *testing.T) {
 	descriptor := protodesc.ToFileDescriptorProto(File_api_runtime_v1_sandbox_api_proto)
 	descriptor.SourceCodeInfo = nil
+	for _, message := range descriptor.MessageType {
+		if message.GetName() != "StartResponse" {
+			continue
+		}
+		if len(message.Field) != 5 {
+			t.Fatal("unexpected start identity extension")
+		}
+		field := message.Field[4]
+		if field.GetName() != "resource_generation" || field.GetNumber() != 5 || field.GetType() != descriptorpb.FieldDescriptorProto_TYPE_STRING || field.GetLabel() != descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL {
+			t.Fatal("unexpected start generation field")
+		}
+		message.Field = message.Field[:4]
+	}
 	// Validate then project only this additive conditional-delete contract.
 	newMessages := map[string][]string{
 		"DeleteIfGenerationRequest":  {"id", "expected_generation"},
