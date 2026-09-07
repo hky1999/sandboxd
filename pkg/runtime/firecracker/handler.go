@@ -252,6 +252,7 @@ type Handler struct {
 	// enables the three-tier chain.
 	checkpointMode string
 	sparseFull     bool
+	skipUnchanged  bool
 
 	// shrinkBeforeCheckpoint gates the pre-pause guest page-cache drop;
 	// see FirecrackerConfig.ShrinkBeforeCheckpoint for why it is off by
@@ -420,6 +421,7 @@ func NewHandler(
 		shrinkBeforeCheckpoint: firecrackerConfig.ShrinkBeforeCheckpoint,
 		checkpointMode:         firecrackerConfig.CheckpointMode,
 		sparseFull:             firecrackerConfig.SparseFull,
+		skipUnchanged:          firecrackerConfig.SkipUnchanged,
 		checkpointWriteback:    newCheckpointWritebackScheduler(),
 		memBackend:             firecrackerConfig.MemBackend,
 		uffdHandlerBin:         firecrackerConfig.UffdHandlerBin,

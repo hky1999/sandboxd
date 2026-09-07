@@ -345,3 +345,32 @@ func TestSparseFullRequestOptIn(t *testing.T) {
 		})
 	}
 }
+
+func TestSkipUnchangedRequestOptIn(t *testing.T) {
+	for _, typ := range []string{"Full", "Diff", "Incremental", "SoftDirty"} {
+		for _, enabled := range []bool{false, true} {
+			calls := 0
+			api := &firecrackerAPI{client: &http.Client{Transport: roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+				calls++
+				defer r.Body.Close()
+				var body map[string]any
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Fatal(err)
+				}
+				value, present := body["skip_unchanged"]
+				if present != enabled || (present && value != true) {
+					t.Fatalf("unexpected opt-in: %+v", body)
+				}
+				if body["deferred_sync"] != true || body["snapshot_type"] != typ {
+					t.Fatalf("changed contract: %+v", body)
+				}
+				return &http.Response{StatusCode: http.StatusNoContent, Body: http.NoBody}, nil
+			})}}
+			err := api.createSnapshotWithMemoryOptions(context.Background(), "state", "memory", typ, false, enabled)
+			invalid := enabled && typ != "Incremental" && typ != "SoftDirty"
+			if (err != nil) != invalid || (invalid && calls != 0) || (!invalid && calls != 1) {
+				t.Fatalf("type=%s enabled=%v err=%v calls=%d", typ, enabled, err, calls)
+			}
+		}
+	}
+}
