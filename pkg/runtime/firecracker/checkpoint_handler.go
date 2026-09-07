@@ -323,12 +323,10 @@ func (handler *Handler) Checkpoint(
 	tFinalized := time.Now()
 	updateSealedCheckpointLineage(ctx, instance, files.Memory, manifest, config.LeaveRunning)
 	tAdopted := time.Now()
-	// Persist the continuation base or invalidated lineage. A persist failure
-	// does not fail the sealed artifact, and it cannot corrupt a later generation: recovery never
-	// trusts a pre-restart lineage (recoverState marks it lost and forces
-	// the next checkpoint to Full), so a stale durable state only costs one
-	// Full snapshot after the eventual restart.
-	if err := handler.persistInstance(instance); err != nil {
+	// The continuation base is process-local authority: recovery always
+	// invalidates it. Avoid a state-file sync for that change alone, while
+	// preserving persistence if a lifecycle field changed during checkpoint.
+	if err := handler.persistCheckpointChanges(instance, state); err != nil {
 		logrus.Warnf(
 			"firecracker: persist checkpoint lineage for %s failed (recovery forces a Full snapshot after the next daemon restart): %v",
 			sandboxID, err,
@@ -380,6 +378,23 @@ func (handler *Handler) Checkpoint(
 	return nil
 }
 
+// persistCheckpointChanges does not write a state file solely to update the
+// volatile ledger association. Create/configure/restore, exit and recovery
+// retain their ordinary persistence paths. In particular, an exit racing this
+// comparison has its own lifecycle writer; this is not asynchronous persistence.
+func (handler *Handler) persistCheckpointChanges(instance *firecrackerInstance, before firecrackerPersistedState) error {
+	after := instance.snapshot()
+	for _, state := range []*firecrackerPersistedState{&before, &after} {
+		state.BaseMemoryPath = ""
+		state.BaseMemoryIncremental = false
+		state.BaseMemoryLineageLost = false
+	}
+	if before == after {
+		return nil
+	}
+	return handler.persistInstance(instance)
+}
+
 func (handler *Handler) finishCheckpointedSandbox(
 	instance *firecrackerInstance,
 	state firecrackerPersistedState,
@@ -389,7 +404,10 @@ func (handler *Handler) finishCheckpointedSandbox(
 	if firecrackerProcessMatches(state.PID, handler.binary, state.APIPath, state.ID) {
 		return fmt.Errorf("stop Firecracker sandbox %s after checkpoint", sandboxID)
 	}
-	if instance.finish(runtimecore.Exit{ExitedAt: time.Now(), ExitCode: 0}) && instance.shouldPersist() {
+	instance.finish(runtimecore.Exit{ExitedAt: time.Now(), ExitCode: 0})
+	// stopInstance may already have marked a vanished process finished. Do
+	// not depend on winning doneOnce to persist its terminal state here.
+	if instance.shouldPersist() {
 		if err := handler.persistInstance(instance); err != nil {
 			logrus.Warnf("firecracker: persist checkpoint exit state for %s: %v", sandboxID, err)
 		}
