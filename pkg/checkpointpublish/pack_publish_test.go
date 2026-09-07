@@ -115,17 +115,19 @@ func assertPackedBytes(t *testing.T, store *chunkstore.Local, id string, want []
 
 func TestPackPublishBaselineRetryAndMissingPack(t *testing.T) {
 	for _, identity := range []string{"", checkpointchunks.PackIdentityChunks} {
-		t.Run("identity="+identity, func(t *testing.T) { packPublishBaselineRetryAndMissingPack(t, identity) })
+		for _, skip := range []bool{false, true} {
+			t.Run(fmt.Sprintf("identity=%s/skip=%t", identity, skip), func(t *testing.T) { packPublishBaselineRetryAndMissingPack(t, identity, skip) })
+		}
 	}
 }
-func packPublishBaselineRetryAndMissingPack(t *testing.T, identity string) {
+func packPublishBaselineRetryAndMissingPack(t *testing.T, identity string, skip bool) {
 	ctx := context.Background()
 	data := packData(4, 4096)
 	source := packSource(t, data, 4096)
 	root := t.TempDir()
 	store, _ := chunkstore.NewLocal(root)
 	before, _ := os.ReadFile(filepath.Join(source, "chunks.json"))
-	opts := Options{PackIdentity: identity, Workers: 4, PackBytes: 8192}
+	opts := Options{PackSkipChunkProbe: skip, PackIdentity: identity, Workers: 4, PackBytes: 8192}
 	first, err := RunWithOptions(ctx, source, "base", store, "local", opts)
 	if err != nil {
 		t.Fatal(err)
@@ -199,17 +201,19 @@ func (s *packFailureStore) PutKey(ctx context.Context, key string, r io.Reader) 
 }
 func TestPackFailureBeforeIndexAndResumption(t *testing.T) {
 	for _, identity := range []string{"", checkpointchunks.PackIdentityChunks} {
-		t.Run("identity="+identity, func(t *testing.T) { packFailureBeforeIndexAndResumption(t, identity) })
+		for _, skip := range []bool{false, true} {
+			t.Run(fmt.Sprintf("identity=%s/skip=%t", identity, skip), func(t *testing.T) { packFailureBeforeIndexAndResumption(t, identity, skip) })
+		}
 	}
 }
-func packFailureBeforeIndexAndResumption(t *testing.T, identity string) {
+func packFailureBeforeIndexAndResumption(t *testing.T, identity string, skip bool) {
 	ctx := context.Background()
 	data := packData(6, 4096)
 	source := packSource(t, data, 4096)
 	local, _ := chunkstore.NewLocal(t.TempDir())
 	store := &packFailureStore{Local: local}
 	store.fail.Store(true)
-	opts := Options{PackIdentity: identity, Workers: 1, PackBytes: 8192}
+	opts := Options{PackSkipChunkProbe: skip, PackIdentity: identity, Workers: 1, PackBytes: 8192}
 	if _, err := RunWithOptions(ctx, source, "retry", store, "local", opts); err == nil {
 		t.Fatal("failure ignored")
 	}

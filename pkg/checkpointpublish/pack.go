@@ -296,7 +296,7 @@ func runPacked(ctx context.Context, dir, id string, store chunkstore.Store, m *c
 			}
 		}
 		present := c.Digest == checkpointchunks.ZeroChunkDigest(int(length))
-		if !present && !reuse {
+		if !present && !reuse && !opts.PackSkipChunkProbe {
 			var err error
 			present, err = store.Has(ctx, c.Digest)
 			if err != nil {
