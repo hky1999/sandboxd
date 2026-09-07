@@ -22,6 +22,8 @@ import (
 	"unsafe"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/inclusionAI/sandboxd/pkg/checkpointchunks"
 )
 
 // Exercise the real kernel's partial-copy/EEXIST contract, including a guest
@@ -33,11 +35,15 @@ func TestForwardCopyPreservesResidentPage(t *testing.T) {
 		if cached {
 			name = "verified-cache"
 		}
-		t.Run(name, func(t *testing.T) { testForwardCopy(t, cached) })
+		t.Run(name, func(t *testing.T) { testForwardCopy(t, cached, false) })
 	}
 }
 
-func testForwardCopy(t *testing.T, cached bool) {
+func TestForwardZeroPreservesResidentPage(t *testing.T) {
+	testForwardCopy(t, false, true)
+}
+
+func testForwardCopy(t *testing.T, cached, zero bool) {
 	if os.Getpagesize() != 4096 {
 		t.Skip("requires 4KiB pages")
 	}
@@ -65,7 +71,9 @@ func testForwardCopy(t *testing.T, cached bool) {
 	}
 	data := make([]byte, len(memory))
 	for i := range data {
-		data[i] = byte(i*131 + (i/4096)*17)
+		if !zero {
+			data[i] = byte(i*131 + (i/4096)*17)
+		}
 	}
 	f, err := os.CreateTemp(t.TempDir(), "memory")
 	if err != nil {
@@ -79,6 +87,20 @@ func testForwardCopy(t *testing.T, cached bool) {
 	if cached {
 		s.chunk = 256 << 10 // CLI hint differs from the effective source chunk
 		s.source = &pageSource{cache: f, chunk: 8 * 4096, fetched: map[uint64]struct{}{0: {}, 1: {}}}
+	}
+	if zero {
+		if reg[3]&(1<<4) == 0 {
+			t.Skip("range does not support ZEROPAGE")
+		}
+		s.zeroPage = true
+		s.source = &pageSource{chunk: 8 * 4096, chunkManifest: &checkpointchunks.Manifest{
+			Version: 1, File: "memory", FileSize: int64(len(memory)), ChunkBytes: 8 * 4096, ChunkCount: 2,
+			Entries: []checkpointchunks.Chunk{{Offset: 0, Digest: checkpointchunks.ZeroChunkDigest(8 * 4096)}, {Offset: 8 * 4096, Digest: checkpointchunks.ZeroChunkDigest(8 * 4096)}},
+		}}
+		done, err := s.tryZeroPage(s.regions[0], 2*4096, 4096, base+2*4096)
+		if err != nil || !done {
+			t.Fatalf("real ZEROPAGE done=%v err=%v", done, err)
+		}
 	}
 	// Default fills only page 2; a later guest write must survive all COPYs.
 	if err = s.resolve(base + 2*4096); err != nil {
@@ -120,4 +142,50 @@ func testForwardCopy(t *testing.T, cached bool) {
 		t.Fatal("forward population changed guest data")
 	}
 	runtime.KeepAlive(memory)
+}
+
+// A bad descriptor makes accidental zero supply observable without risking
+// a blocked reader. Only authenticated, page-contained remote zero spans qualify.
+func TestZeroSupplyEligibilityAndFallback(t *testing.T) {
+	fixture := func() *faultServer {
+		return &faultServer{zeroPage: true, uffdFd: -1, source: &pageSource{chunk: 8192, chunkManifest: &checkpointchunks.Manifest{
+			FileSize: 8192, ChunkBytes: 8192, Entries: []checkpointchunks.Chunk{{Offset: 0, Digest: checkpointchunks.ZeroChunkDigest(8192)}},
+		}}}
+	}
+	for _, tc := range []struct {
+		name                  string
+		change                func(*faultServer)
+		off, length, pageSize uint64
+	}{
+		{"disabled", func(s *faultServer) { s.zeroPage = false }, 0, 4096, 4096},
+		{"local backing", func(s *faultServer) { s.source.file = os.Stdin }, 0, 4096, 4096},
+		{"unverified manifest", func(s *faultServer) { s.source.chunkManifest = nil }, 0, 4096, 4096},
+		{"nonzero digest", func(s *faultServer) { s.source.chunkManifest.Entries[0].Digest = "bad" }, 0, 4096, 4096},
+		{"crosses tail", func(s *faultServer) {}, 4096, 8192, 4096},
+		{"past end", func(s *faultServer) {}, 8192, 4096, 4096},
+		{"hugepage", func(s *faultServer) {}, 0, 4096, 2 << 20},
+		{"wrong grid", func(s *faultServer) { s.source.chunkManifest.Entries[0].Offset = 1 }, 0, 4096, 4096},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := fixture()
+			tc.change(s)
+			done, err := s.tryZeroPage(regionMapping{PageSize: tc.pageSize}, tc.off, tc.length, 0)
+			if done || err != nil {
+				t.Fatalf("ineligible range attempted ioctl: done=%v err=%v", done, err)
+			}
+		})
+	}
+	s := fixture()
+	if done, err := s.tryZeroPage(regionMapping{}, 0, 4096, 0); done || err == nil {
+		t.Fatalf("bad descriptor must fail: %v %v", done, err)
+	}
+	f, err := os.CreateTemp(t.TempDir(), "unsupported")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	s.uffdFd = int(f.Fd())
+	if done, err := s.tryZeroPage(regionMapping{}, 0, 4096, 0); done || err != nil {
+		t.Fatalf("ENOTTY must fall back: %v %v", done, err)
+	}
 }

@@ -57,6 +57,7 @@ const (
 const (
 	uffdioCopyNr = 0xC028AA03 // _IOWR(0xAA, 0x03, struct uffdio_copy) - 40 bytes
 	uffdioWakeNr = 0xC010AA05 // _IOWR(0xAA, 0x05, struct uffdio_range) - 16 bytes
+	uffdioZeroNr = 0xC020AA04 // _IOWR(0xAA, 0x04, struct uffdio_zeropage) - 32 bytes
 )
 
 const uffdMsgSize = 32 // event(8) + union(24)
@@ -74,6 +75,12 @@ type uffdioCopyArg struct {
 type uffdioRangeArg struct {
 	Start uint64
 	Len   uint64
+}
+
+type uffdioZeroArg struct {
+	Range uffdioRangeArg
+	Mode  uint64
+	Zero  int64
 }
 
 type chunkContentKey struct {
@@ -554,11 +561,46 @@ type faultServer struct {
 	regions   []regionMapping
 	chunk     uint64
 	copyBytes uint64 // opt-in forward population; zero keeps the 4KiB default
+	zeroPage  bool   // experimental manifest-proven zero supply, default off
 	uffdFd    int
 	source    *pageSource
 
 	mu     sync.Mutex
 	served uint64
+}
+
+// tryZeroPage returns false to use COPY when this range/kernel cannot supply
+// zero pages. No allocation heuristic or unverified short read authorizes it.
+func (s *faultServer) tryZeroPage(r regionMapping, off, length, dst uint64) (bool, error) {
+	if !s.zeroPage || s.source.file != nil || (r.PageSize != 0 && r.PageSize != 4096) {
+		return false, nil
+	}
+	m := s.source.chunkManifest
+	if m == nil || m.ChunkBytes <= 0 || length == 0 {
+		return false, nil
+	}
+	chunk := uint64(m.ChunkBytes)
+	index, within := off/chunk, off%chunk
+	zeroLength := s.source.zeroChunkLength(index)
+	if within >= zeroLength || length > zeroLength-within || m.Entries[index].Offset != int64(off-within) {
+		return false, nil
+	}
+	arg := uffdioZeroArg{Range: uffdioRangeArg{Start: dst, Len: length}}
+	_, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(s.uffdFd), uintptr(uffdioZeroNr), uintptr(unsafe.Pointer(&arg)))
+	if errno == 0 || errno == unix.EEXIST || (errno == unix.EAGAIN && arg.Zero >= 4096) {
+		// Partial progress resolves the first fault, not the untouched suffix.
+		return true, nil
+	}
+	switch errno {
+	case unix.EINVAL, unix.EOPNOTSUPP, unix.ENOTTY, unix.EAGAIN, unix.EINTR:
+		// COPY handles unsupported memory types and retries with no progress.
+		return false, nil
+	case unix.ENOSPC, unix.EFAULT:
+		// Match COPY's racing-remove behavior; a later fault retries.
+		return true, nil
+	default:
+		return false, fmt.Errorf("UFFDIO_ZEROPAGE addr=%#x len=%d: %w", dst, length, errno)
+	}
 }
 
 func (s *faultServer) resolve(addr uint64) error {
@@ -584,6 +626,15 @@ func (s *faultServer) resolve(addr uint64) error {
 				copyLen = pageBytes
 			}
 		}
+		dst := r.BaseHostVirtAddr + (off - r.Offset)
+		if done, err := s.tryZeroPage(r, off, copyLen, dst); err != nil {
+			return err
+		} else if done {
+			s.mu.Lock()
+			s.served++
+			s.mu.Unlock()
+			return nil
+		}
 		buf, err := s.resolveChunk(off, copyLen)
 		if err != nil {
 			return err
@@ -594,7 +645,6 @@ func (s *faultServer) resolve(addr uint64) error {
 		if uint64(len(buf)) > copyLen {
 			buf = buf[:copyLen] // trim to the requested forward span
 		}
-		dst := r.BaseHostVirtAddr + (off - r.Offset)
 		if os.Getenv("UFFD_TRACE") != "" {
 			head := 8
 			if len(buf) < head {
@@ -744,6 +794,7 @@ func main() {
 	chunkKB := flag.Uint("chunk-kb", 4, "remote fetch/cache chunk size in KiB (manifest may override)")
 	workers := flag.Int("workers", 8, "concurrent UFFDIO_COPY workers")
 	copyKB := flag.Int("copy-kb", 4, "forward UFFD population span in KiB (4..256, multiple of 4; experimental above 4)")
+	zeroPage := flag.Bool("zero-page", false, "experimentally supply manifest-proven zero chunks with UFFDIO_ZEROPAGE")
 	prefetch := flag.Int("prefetch", 4, "background chunk prefetch concurrency (0 = disabled)")
 	prefetchBudgetMB := flag.Int("prefetch-budget-mb", 0, "cap background prefetch to this many MiB (0 = walk the whole artifact)")
 	persistWorkers := flag.Int("persist-workers", persistenceWorkers, "background persistent cache IO workers (1-64)")
@@ -838,6 +889,7 @@ func main() {
 	s := &faultServer{
 		regions:   regions,
 		copyBytes: uint64(*copyKB) << 10,
+		zeroPage:  *zeroPage,
 		chunk:     chunk,
 		uffdFd:    fd,
 		source:    source,
