@@ -21,11 +21,12 @@ import (
 )
 
 // resourceLimitsFile is written into the checkpoint directory next to the
-// memory-state image.
+// memory-state image. This sidecar is not yet integrity-bound to the manifest.
 const resourceLimitsFile = "resource-limits.json"
 
 // resourceLimitsSnapshot records effective cgroup limits at checkpoint time.
 type resourceLimitsSnapshot struct {
+	ElasticPolicy    string `json:"elastic_policy,omitempty"`
 	CPUQuotaUsec     int64  `json:"cpu_quota_usec,omitempty"`
 	CPUPeriodUsec    uint64 `json:"cpu_period_usec,omitempty"`
 	CPULimitsKnown   bool   `json:"cpu_limits_known,omitempty"`
@@ -33,14 +34,18 @@ type resourceLimitsSnapshot struct {
 }
 
 // captureResourceLimits reads the sandbox's effective cgroup limits and
-// writes the sidecar into dir. Missing cgroup manager/path is not fatal —
-// the restore simply falls back to the request's own resources.
+// writes the sidecar into dir. Elastic sandboxes require complete cgroup data;
+// older non-elastic requests retain their historical fallback behavior.
 func (h *sandboxService) captureResourceLimits(sandboxID, dir string) error {
 	current, err := h.sandboxManager.Get(sandboxID)
 	if err != nil {
 		return fmt.Errorf("capture resource limits: get sandbox %s: %w", sandboxID, err)
 	}
+	policy := current.Metadata.GetLabels()[elasticResourcesLabel]
 	if h.cgroupMgr == nil {
+		if policy != "" {
+			return fmt.Errorf("elastic checkpoint requires cgroup statistics")
+		}
 		return nil
 	}
 	resource, err := h.physicalResources(current.Metadata)
@@ -49,13 +54,32 @@ func (h *sandboxService) captureResourceLimits(sandboxID, dir string) error {
 	}
 	cgroupPath, ok := resource.Resources[config.ResourceNameCgroup]
 	if !ok || cgroupPath == "" {
+		if policy != "" {
+			return fmt.Errorf("elastic checkpoint requires a cgroup path")
+		}
 		return nil
 	}
 	stats, err := h.cgroupMgr.Stats(cgroupPath)
 	if err != nil {
 		return fmt.Errorf("capture resource limits: stat cgroup %s: %w", cgroupPath, err)
 	}
-	snapshot := resourceLimitsSnapshot{MemoryLimitBytes: stats.MemoryLimitBytes, CPUQuotaUsec: stats.CPUQuotaUsec, CPUPeriodUsec: stats.CPUPeriodUsec, CPULimitsKnown: stats.CPULimitsKnown}
+	if policy != "" && (!stats.CPULimitsKnown || stats.CPUQuotaUsec <= 0 || stats.CPUPeriodUsec == 0 || stats.MemoryLimitBytes < 1024*1024) {
+		return fmt.Errorf("elastic checkpoint requires known finite resource limits")
+	}
+	if policy != "" {
+		captured := &runtime.StartRequest{
+			Runtime: config.RuntimeNameRunsc,
+			Labels:  map[string]string{elasticResourcesLabel: policy},
+			Resources: map[string]float64{
+				"CPU":    1000 * float64(stats.CPUQuotaUsec) / float64(stats.CPUPeriodUsec),
+				"Memory": float64(stats.MemoryLimitBytes) / (1024 * 1024),
+			},
+		}
+		if err := validateElasticResources(captured, h.config, true); err != nil {
+			return fmt.Errorf("cannot checkpoint elastic limits outside policy: %w", err)
+		}
+	}
+	snapshot := resourceLimitsSnapshot{ElasticPolicy: policy, MemoryLimitBytes: stats.MemoryLimitBytes, CPUQuotaUsec: stats.CPUQuotaUsec, CPUPeriodUsec: stats.CPUPeriodUsec, CPULimitsKnown: stats.CPULimitsKnown}
 	data, err := json.Marshal(snapshot)
 	if err != nil {
 		return err
@@ -65,15 +89,34 @@ func (h *sandboxService) captureResourceLimits(sandboxID, dir string) error {
 
 // applyCheckpointResourceLimits overrides the restore request's resources
 // with the limits snapshotted at checkpoint time. No sidecar (checkpoints
-// taken before this change, or cgroup-less sandboxes) = unchanged behavior.
-func applyCheckpointResourceLimits(startConfig *runtime.StartRequest, checkpointDir string) {
+// taken before this change, or cgroup-less sandboxes) preserves legacy behavior
+// only for non-elastic requests. Elastic restore requires the saved policy.
+func applyCheckpointResourceLimits(startConfig *runtime.StartRequest, checkpointDir string) error {
+	_, elastic := startConfig.Labels[elasticResourcesLabel]
 	data, err := os.ReadFile(filepath.Join(checkpointDir, resourceLimitsFile))
 	if err != nil {
-		return
+		if elastic {
+			return fmt.Errorf("elastic restore requires resource limits sidecar: %w", err)
+		}
+		return nil
 	}
 	var snapshot resourceLimitsSnapshot
 	if err := json.Unmarshal(data, &snapshot); err != nil {
-		return
+		if elastic {
+			return fmt.Errorf("invalid elastic restore resource limits: %w", err)
+		}
+		return nil
+	}
+	if elastic || snapshot.ElasticPolicy != "" {
+		if snapshot.ElasticPolicy == "" || !snapshot.CPULimitsKnown || snapshot.CPUQuotaUsec <= 0 ||
+			snapshot.CPUPeriodUsec == 0 || snapshot.MemoryLimitBytes < 1024*1024 {
+			return fmt.Errorf("elastic restore requires saved policy and finite CPU/memory limits")
+		}
+		if startConfig.Labels == nil {
+			startConfig.Labels = make(map[string]string)
+		}
+		// The source's ceiling wins over a caller's newly supplied policy.
+		startConfig.Labels[elasticResourcesLabel] = snapshot.ElasticPolicy
 	}
 	// Apply each known finite limit independently. Old memory-only sidecars
 	// preserve their historical behavior; unknown CPU never becomes zero.
@@ -85,10 +128,11 @@ func applyCheckpointResourceLimits(startConfig *runtime.StartRequest, checkpoint
 	}
 	mb := float64(snapshot.MemoryLimitBytes) / (1024 * 1024)
 	if mb < 1 {
-		return
+		return nil
 	}
 	if startConfig.Resources == nil {
 		startConfig.Resources = make(map[string]float64)
 	}
 	startConfig.Resources["Memory"] = mb
+	return nil
 }

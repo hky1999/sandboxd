@@ -1254,6 +1254,10 @@ func (h *sandboxService) createSandbox(
 			return &runtime.StartResponse{Code: -1, Message: err.Error()}, errord.ToGRPC(err)
 		}
 	}
+	if err := validateElasticResources(startReq, h.config, options.checkpointImage != ""); err != nil {
+		return &runtime.StartResponse{Code: -1, Message: err.Error()},
+			errord.ToGRPC(fmt.Errorf("%v: %w", err, errord.ErrInvalidArgument))
+	}
 	if startReq.Runtime == "" {
 		startReq.Runtime = config.RuntimeNameRunsc
 	}

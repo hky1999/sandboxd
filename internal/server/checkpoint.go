@@ -219,7 +219,9 @@ func (h *sandboxService) Restore(
 			"legacy checkpoint image is missing or not a regular file: %w", errord.ErrFailedPrecondition))
 	}
 	// W7-P1.1: same resource-limit override as the managed path.
-	applyCheckpointResourceLimits(startConfig, checkpointDir)
+	if err := applyCheckpointResourceLimits(startConfig, checkpointDir); err != nil {
+		return nil, checkpointGRPCError(fmt.Errorf("%v: %w", err, errord.ErrFailedPrecondition))
+	}
 	response, err := h.createSandbox(ctx, startConfig, createOptions{checkpointImage: imagePath})
 	if err != nil {
 		return nil, checkpointGRPCError(err)
@@ -250,7 +252,9 @@ func (h *sandboxService) restoreCheckpoint(
 	// task-variant changes) over the caller's original booking. Missing
 	// sidecar keeps legacy behavior. Applied BEFORE the fingerprint so the
 	// restore identity covers the config actually applied.
-	applyCheckpointResourceLimits(startConfig, checkpointDir)
+	if err := applyCheckpointResourceLimits(startConfig, checkpointDir); err != nil {
+		return nil, checkpointGRPCError(fmt.Errorf("%v: %w", err, errord.ErrFailedPrecondition))
+	}
 	fingerprint, err := restoreFingerprint(startConfig, request.CheckpointID)
 	if err != nil {
 		return nil, checkpointGRPCError(err)
