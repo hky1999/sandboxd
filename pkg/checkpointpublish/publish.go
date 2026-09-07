@@ -214,6 +214,11 @@ func RunWithOptions(ctx context.Context, checkpointDir, id string, store chunkst
 	if opts.BaseID != "" && (opts.PackBytes == 0 || !validPackedID(opts.BaseID) || opts.BaseID == id) {
 		return Result{}, fmt.Errorf("pack base ID must be a distinct checkpoint ID with packing enabled")
 	}
+	claim, err := acquirePublishClaim(ctx, checkpointDir)
+	if err != nil {
+		return Result{}, err
+	}
+	defer claim.Close()
 	workers := opts.Workers
 	if workers == 0 {
 		workers = min(runtime.GOMAXPROCS(0), 8)
