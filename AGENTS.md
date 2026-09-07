@@ -128,3 +128,14 @@ captured generation before publication. In-flight fingerprints include source
 generation, and completion verifies the committed source identity again.
 The scheduler must preserve the original monitor identity across every async
 handoff and verify reply identity; this daemon API alone does not close F7.
+
+# Scheduler identity resolver
+
+The authenticated read-only resolver accepts either `/resolve?ip=<IPv4>` or
+`/resolve?instance_id=<trusted control-plane instance ID>`, exactly one value
+and no additional parameters. Instance lookup does not require an IP address.
+Both paths require a unique RUNNING sandbox with complete instance/runtime/
+sandbox/resource-generation identity, matching Stats generation, and an unchanged
+second List result. The response is a fresh observation, not a lease for future
+mutations. It contains no birth-resource proof; prepared elastic limits currently
+have log evidence only. Keep the separate resolver token out of trial artifacts.
