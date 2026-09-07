@@ -42,6 +42,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/inclusionAI/sandboxd/internal/sha256batch"
 	"github.com/inclusionAI/sandboxd/pkg/checkpointchunks"
 	"github.com/inclusionAI/sandboxd/pkg/chunkstore"
 )
@@ -367,21 +368,47 @@ func runPacked(ctx context.Context, dir, id string, store chunkstore.Store, m *c
 		if opts.PackIdentity == checkpointchunks.PackIdentityChunks {
 			parts = make([]checkpointchunks.PackPart, 0, len(job.chunks))
 		}
-		for _, c := range job.chunks {
-			n := int(min(int64(m.ChunkBytes), m.FileSize-c.Offset))
-			part := buf[offset : offset+n]
-			if _, err := memory.ReadAt(part, c.Offset); err != nil {
-				return fmt.Errorf("read packed chunk: %w", err)
-			}
-			sum := sha256.Sum256(part)
-			if hex.EncodeToString(sum[:]) != c.Digest {
-				return fmt.Errorf("source chunk %s changed before pack publication", c.Digest)
-			}
-			if opts.PackIdentity == checkpointchunks.PackIdentityChunks {
-				parts = append(parts, checkpointchunks.PackPart{Digest: c.Digest, Length: int64(n)})
-			}
-			offset += n
+		batchSize := 1
+		if opts.PackBatchHash {
+			batchSize = 16
 		}
+		for start := 0; start < len(job.chunks); start += batchSize {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			chunks := job.chunks[start:min(start+batchSize, len(job.chunks))]
+			var inputs [16][]byte
+			var sums [16][32]byte
+			for i, c := range chunks {
+				n := int(min(int64(m.ChunkBytes), m.FileSize-c.Offset))
+				part := buf[offset : offset+n]
+				if _, err := memory.ReadAt(part, c.Offset); err != nil {
+					return fmt.Errorf("read packed chunk: %w", err)
+				}
+				inputs[i] = part
+				offset += n
+			}
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if opts.PackBatchHash {
+				sha256batch.Sum256(inputs[:len(chunks)], &sums)
+			} else {
+				sums[0] = sha256.Sum256(inputs[0])
+			}
+			for i, c := range chunks {
+				if hex.EncodeToString(sums[i][:]) != c.Digest {
+					return fmt.Errorf("source chunk %s changed before pack publication", c.Digest)
+				}
+				if opts.PackIdentity == checkpointchunks.PackIdentityChunks {
+					parts = append(parts, checkpointchunks.PackPart{Digest: c.Digest, Length: int64(len(inputs[i]))})
+				}
+			}
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+		}
+
 		var digest string
 		if opts.PackIdentity == checkpointchunks.PackIdentityChunks {
 			var err error
