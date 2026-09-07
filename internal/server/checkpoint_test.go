@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
 	"github.com/inclusionAI/sandboxd/pkg/errord"
@@ -213,6 +214,42 @@ func TestCheckpointRejectsConcurrentOperation(t *testing.T) {
 	assert.Equal(t, codes.FailedPrecondition, status.Code(err))
 	close(release)
 	assert.NoError(t, <-firstResult)
+}
+
+func TestCheckpointQueueWaitBoundedByRequestTimeout(t *testing.T) {
+	handler := newCheckpointTestHandler()
+	service := newTestService(t, map[string]svc.Handler{"runsc": handler})
+	storeRunningSandbox(t, service, "sbox-queue-timeout", "runsc")
+
+	// Hold the physical lock so the checkpoint queues behind it, exactly as
+	// it would behind a long-running delete or start for the same ID.
+	unlock, err := service.resourceLocks.acquire(context.Background(), "sbox-queue-timeout")
+	require.NoError(t, err)
+	t.Cleanup(unlock)
+
+	done := make(chan error, 1)
+	directory := filepath.Join(t.TempDir(), "checkpoint")
+	go func() {
+		_, err := service.Checkpoint(context.Background(), &runtime.CheckpointRequest{
+			ID:             "sbox-queue-timeout",
+			CheckpointDir:  directory,
+			TimeoutSeconds: 1,
+		})
+		done <- err
+	}()
+
+	// The queue wait is part of the request's timeout budget: even with a
+	// Background caller context the RPC must return DeadlineExceeded on its
+	// own while the lock is still held, without runtime effects or output
+	// directory allocation.
+	select {
+	case err := <-done:
+		require.Equal(t, codes.DeadlineExceeded, status.Code(err))
+	case <-time.After(5 * time.Second):
+		t.Fatal("checkpoint queued indefinitely: TimeoutSeconds does not bound the physical-lock wait")
+	}
+	assert.NoDirExists(t, directory)
+	assert.Empty(t, handler.checkpoints)
 }
 
 func TestCheckpointValidatesRequestAndRuntime(t *testing.T) {

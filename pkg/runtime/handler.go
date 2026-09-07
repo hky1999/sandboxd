@@ -38,6 +38,20 @@ type CheckpointHandler interface {
 	Restore(context.Context, StartConfig) error
 }
 
+// StrictDeleteHandler is an optional capability implemented by runtimes whose
+// delete can prove it retired the runtime state of one exact physical
+// generation. DeleteStrict must compare expectedGeneration against the
+// runtime's own persisted incarnation identity before any state change,
+// guest request, or signal; it must fail when the runtime holds no state for
+// the sandbox (absence attests nothing) and when its state carries no bound
+// generation (pre-generation records support only legacy deletion), and a
+// mismatch must not touch the recorded process or its artifacts.
+// Conditional (generation-checked) deletion requires this capability;
+// runtimes without it keep only the legacy idempotent Delete.
+type StrictDeleteHandler interface {
+	DeleteStrict(ctx context.Context, sandboxID, expectedGeneration string) error
+}
+
 // CheckpointRestoreCapabilities describes the optional application-facing
 // handoff interface exposed inside a restored sandbox. Empty paths mean the
 // runtime supports transparent checkpoint/restore without application help.
@@ -101,6 +115,11 @@ type StartConfig struct {
 	ExtraConfig             string
 	EnableKVM               bool
 	CheckpointDir           string
+	// ResourceGeneration is the daemon-assigned physical incarnation
+	// identity for this sandbox. The server generates it on every Start
+	// (including restores) and runtimes that support generation-checked
+	// deletion bind it into their own persisted state.
+	ResourceGeneration string
 }
 
 // SpecUpdates contains provider-resolved OCI changes. Device providers use

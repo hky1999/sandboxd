@@ -36,6 +36,7 @@ import (
 	"github.com/inclusionAI/sandboxd/config"
 	"github.com/inclusionAI/sandboxd/internal/firecrackerproto"
 	"github.com/inclusionAI/sandboxd/internal/util"
+	"github.com/inclusionAI/sandboxd/pkg/errord"
 	runtimecore "github.com/inclusionAI/sandboxd/pkg/runtime"
 	runtimecommon "github.com/inclusionAI/sandboxd/pkg/runtime/internal/common"
 	"github.com/sirupsen/logrus"
@@ -76,6 +77,12 @@ type firecrackerPersistedState struct {
 	VsockPath   string `json:"vsock_path"`
 	OverlayPath string `json:"overlay_path"`
 	CreatedAt   string `json:"created_at"`
+	// Generation is the daemon-assigned physical incarnation identity bound
+	// into this state at Start/restore time (StartConfig.ResourceGeneration).
+	// Strict deletes compare it under operationMu before any state change or
+	// signal; an empty value marks a pre-generation record, which supports
+	// only legacy deletion.
+	Generation string `json:"generation,omitempty"`
 	// MemoryMiB is the guest memory size in MiB, recorded so incremental
 	// checkpoints can preallocate or clone a full-size base memory file.
 	MemoryMiB uint32 `json:"memory_mib,omitempty"`
@@ -591,6 +598,19 @@ func (handler *Handler) Start(
 	if err := os.Mkdir(stateDir, 0700); err != nil {
 		return fmt.Errorf("create Firecracker state directory: %w", err)
 	}
+	// The state directory holds the persisted incarnation record; make the
+	// new directory entries (state dir and bundle dir) durable so a crash
+	// cannot orphan the state file persisted inside them.
+	if err := syncFirecrackerDirectory(bundlePath); err != nil {
+		return fmt.Errorf("sync Firecracker bundle directory %s: %w", bundlePath, err)
+	}
+	if err := syncFirecrackerDirectory(filepath.Dir(bundlePath)); err != nil {
+		return fmt.Errorf(
+			"sync Firecracker sandbox root %s: %w",
+			filepath.Dir(bundlePath),
+			err,
+		)
+	}
 	overlayLink := filepath.Join(stateDir, firecrackerCheckpointOverlayName)
 	if err := os.Symlink(overlayPath, overlayLink); err != nil {
 		return fmt.Errorf(
@@ -660,6 +680,7 @@ func (handler *Handler) Start(
 			APIPath:     apiPath,
 			VsockPath:   vsockPath,
 			OverlayPath: overlayPath,
+			Generation:  startConfig.ResourceGeneration,
 			CreatedAt:   time.Now().Format(time.RFC3339Nano),
 		},
 		done: make(chan struct{}),
@@ -814,9 +835,34 @@ func (handler *Handler) machineSize(
 }
 
 func (handler *Handler) Delete(ctx context.Context, sandboxID string) error {
+	return handler.delete(ctx, sandboxID, "", false)
+}
+
+// DeleteStrict retires the sandbox through the same exit-gated flow as
+// Delete, but only the incarnation whose persisted generation matches
+// expectedGeneration, and it never converts an absent state into success.
+// The comparison runs under instance.operationMu against the runtime's own
+// persisted identity before any state change, guest request, or signal:
+// the server's metadata label alone cannot prove which incarnation this
+// state belongs to. A record with no bound generation (written before this
+// identity existed) is unsupported; a mismatch or an absent state returns an
+// error without touching the recorded process or artifacts. A nil result
+// proves the runtime found matching state and confirmed its exit.
+func (handler *Handler) DeleteStrict(ctx context.Context, sandboxID, expectedGeneration string) error {
+	return handler.delete(ctx, sandboxID, expectedGeneration, true)
+}
+
+func (handler *Handler) delete(ctx context.Context, sandboxID, expectedGeneration string, strict bool) error {
 	instance, err := handler.lookupInstance(sandboxID)
 	if err != nil {
 		if os.IsNotExist(err) {
+			if strict {
+				return fmt.Errorf(
+					"firecracker sandbox %s has no runtime state to retire: %w",
+					sandboxID,
+					errord.ErrNotFound,
+				)
+			}
 			// No in-memory instance and no persisted state: legacy idempotent
 			// delete. This nil observes absence; it does not prove that any
 			// persistent generation of the sandbox retired.
@@ -826,8 +872,29 @@ func (handler *Handler) Delete(ctx context.Context, sandboxID string) error {
 	}
 	instance.operationMu.Lock()
 	defer instance.operationMu.Unlock()
-	instance.markDeleting()
 	state := instance.snapshot()
+	if strict {
+		// The runtime's own persisted identity is authoritative, and the
+		// check must precede markDeleting and every guest request or signal
+		// so a rejected delete leaves the incarnation fully intact.
+		if state.Generation == "" {
+			return fmt.Errorf(
+				"firecracker sandbox %s state carries no resource generation; strict delete unsupported: %w",
+				sandboxID,
+				errord.ErrFailedPrecondition,
+			)
+		}
+		if state.Generation != expectedGeneration {
+			return fmt.Errorf(
+				"firecracker sandbox %s state generation %q does not match expected %q: %w",
+				sandboxID,
+				state.Generation,
+				expectedGeneration,
+				errord.ErrFailedPrecondition,
+			)
+		}
+	}
+	instance.markDeleting()
 	if firecrackerProcessMatches(state.PID, handler.binary, state.APIPath, state.ID) {
 		shutdownCtx, cancel := context.WithTimeout(
 			context.WithoutCancel(ctx),
@@ -1119,7 +1186,30 @@ func (handler *Handler) persistInstance(
 	if err := util.AtomicWriteFile(path, data, 0600); err != nil {
 		return fmt.Errorf("persist Firecracker state %s: %w", path, err)
 	}
+	// The state file is the incarnation record strict deletes compare
+	// against, so its rename must be durable: sync the containing directory.
+	// The parent entries of a freshly created state directory are synced at
+	// its creation site below.
+	if err := syncFirecrackerDirectory(filepath.Dir(path)); err != nil {
+		return fmt.Errorf(
+			"sync Firecracker state directory %s: %w",
+			filepath.Dir(path),
+			err,
+		)
+	}
 	return nil
+}
+
+// syncFirecrackerDirectory flushes one directory's entries so creations and
+// renames inside it survive a crash. It is the local counterpart of the
+// state-file fsync in util.AtomicWriteFile; the shared util stays untouched.
+func syncFirecrackerDirectory(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return f.Sync()
 }
 
 func readFirecrackerState(bundlePath string) (firecrackerPersistedState, error) {
