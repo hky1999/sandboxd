@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -50,10 +51,13 @@ func TestApplyCheckpointResourceLimits(t *testing.T) {
 	assert.Equal(t, float64(6144), req2.Resources["Memory"])
 }
 
-// W7-P1.2: a park leftover (exited sandbox with a never-restored record) is
-// dropped instead of failing the restore with a replay conflict.
-func TestExistingRestorePhysicalFact_ParkLeftoverDropped(t *testing.T) {
-	s := newTestService(t, map[string]svc.Handler{"runsc": svc.NewFakeRuntimeHandler()})
+// W7-P1.2, revised: the read-only lookup neither deletes a park leftover nor
+// lets it replay. An EXITED record with a foreign restore identity is only
+// reported as a cleanup candidate; deletion is deferred to the verified
+// cleanup admission, so the record and its runtime are retained here.
+func TestExistingRestorePhysicalFact_ParkLeftoverRetainedReadonly(t *testing.T) {
+	handler := &recordingDeleteHandler{FakeRuntimeHandler: svc.NewFakeRuntimeHandler()}
+	s := newTestService(t, map[string]svc.Handler{"runsc": handler})
 	const id = "sbox-park-leftover"
 	assert.NoError(t, s.sandboxManager.StoreMetadata(id, &runtime.SandboxMetadata{
 		ID:             id,
@@ -61,22 +65,20 @@ func TestExistingRestorePhysicalFact_ParkLeftoverDropped(t *testing.T) {
 		PhysicalPhase:  runtime.SandboxPhysicalPhase_SANDBOX_PHYSICAL_PHASE_COMMITTED,
 	}))
 	assert.NoError(t, s.sandboxManager.SetExit(id, 0, time.Now().Format(time.RFC3339Nano), false))
-	// the synchronous cleanup reads the sandbox's OCI spec; stage a minimal one
-	specDir := filepath.Join(s.config.RootDir, "containers", id)
-	assert.NoError(t, os.MkdirAll(specDir, 0o755))
-	assert.NoError(t, os.WriteFile(filepath.Join(specDir, "config.json"),
-		[]byte(`{"ociVersion":"1.0.2","process":{"args":["/init"]},"root":{"path":"rootfs"},"linux":{}}`), 0o644))
 
 	identity := &runtime.RestoreIdentity{CheckpointID: "ckpt-1", RequestSha256: "abc"}
-	_, found, err := s.existingRestorePhysicalFact(context.Background(), &runtime.StartRequest{SandboxID: id}, identity)
-	assert.NoError(t, err)
-	assert.False(t, found, "park leftover must not be treated as a replay")
+	resp, found, err := s.existingRestorePhysicalFact(context.Background(), &runtime.StartRequest{SandboxID: id}, identity)
+	assert.ErrorIs(t, err, errRestoreParkedSourceCandidate)
+	assert.True(t, found)
+	assert.Nil(t, resp, "a cleanup candidate must not be answered with a live fact")
+	assert.Zero(t, handler.calls, "the read-only lookup must not delete")
 	_, gerr := s.sandboxManager.Get(id)
-	assert.Error(t, gerr, "stale record should be deleted")
+	assert.NoError(t, gerr, "the parked record must stay for verified cleanup")
 }
 
-// W7-P1.2: an idempotent replay (same restore identity) still returns the
-// existing physical fact.
+// W7-P1.2: an idempotent replay (same restore identity on a live sandbox)
+// still returns the existing physical fact. RUNNING is staged as an explicit
+// durable status, not the load-time default for a missing status file.
 func TestExistingRestorePhysicalFact_IdempotentReplay(t *testing.T) {
 	s := newTestService(t, map[string]svc.Handler{"runsc": svc.NewFakeRuntimeHandler()})
 	const id = "sbox-restored"
@@ -87,8 +89,9 @@ func TestExistingRestorePhysicalFact_IdempotentReplay(t *testing.T) {
 		PhysicalPhase:   runtime.SandboxPhysicalPhase_SANDBOX_PHYSICAL_PHASE_COMMITTED,
 		RestoreIdentity: identity,
 	}))
-	resp, found, err := s.existingRestorePhysicalFact(
-		context.Background(), &runtime.StartRequest{SandboxID: id, Runtime: "runsc"},
+	markSandboxRunning(t, s, id)
+	resp, found, err := s.existingRestorePhysicalFact(context.Background(),
+		&runtime.StartRequest{SandboxID: id, Runtime: "runsc"},
 		proto.Clone(identity).(*runtime.RestoreIdentity))
 	assert.NoError(t, err)
 	assert.True(t, found)
@@ -105,9 +108,12 @@ func TestExistingRestorePhysicalFact_LiveSandboxRefused(t *testing.T) {
 		RuntimeHandler: "runsc",
 		PhysicalPhase:  runtime.SandboxPhysicalPhase_SANDBOX_PHYSICAL_PHASE_COMMITTED,
 	}))
+	markSandboxRunning(t, s, id)
 	identity := &runtime.RestoreIdentity{CheckpointID: "ckpt-1", RequestSha256: "abc"}
 	_, found, err := s.existingRestorePhysicalFact(context.Background(), &runtime.StartRequest{SandboxID: id}, identity)
 	assert.Error(t, err)
+	assert.False(t, errors.Is(err, errRestoreParkedSourceCandidate),
+		"a live sandbox is never a cleanup candidate")
 	assert.True(t, found)
 }
 

@@ -331,10 +331,19 @@ func (h *sandboxService) restoreCheckpoint(
 	restoreIdentity := &runtime.RestoreIdentity{
 		CheckpointID: request.CheckpointID, RequestSha256: fingerprint,
 	}
-	if existing, found, existingErr := h.existingRestorePhysicalFact(ctx, startConfig, restoreIdentity); found || existingErr != nil {
-		if existingErr != nil {
+	// The lookup is read only. A matching RUNNING record replays without
+	// requiring the artifact — an already-restored sandbox stays a valid
+	// replay after its checkpoint artifact has been garbage collected.
+	// Everything else fails here; a possible park leftover is only marked as
+	// a candidate, and the actual cleanup waits for the verified admission
+	// below, so an identity comparison alone can never authorize a delete.
+	parkedCandidate := false
+	if existing, found, existingErr := h.existingRestorePhysicalFact(ctx, startConfig, restoreIdentity); existingErr != nil {
+		if !errors.Is(existingErr, errRestoreParkedSourceCandidate) {
 			return nil, checkpointGRPCError(existingErr)
 		}
+		parkedCandidate = true
+	} else if found {
 		return existing, nil
 	}
 	imagePath, err := verifyExternalCheckpoint(checkpointDir, request.ExpectedSize, request.ExpectedSha256)
@@ -342,8 +351,11 @@ func (h *sandboxService) restoreCheckpoint(
 		return nil, checkpointGRPCError(err)
 	}
 	// A checkpoint published with a filesystem artifact must restore it;
-	// silently dropping the writable layer would rewind workload state.
-	if _, err := checkpoint.InspectAt(checkpointDir, request.CheckpointID); err != nil {
+	// silently dropping the writable layer would rewind workload state. The
+	// committed fact is also the identity evidence the verified park cleanup
+	// admits against — an invalid manifest or digest must never reach a Delete.
+	fact, err := checkpoint.InspectAt(checkpointDir, request.CheckpointID)
+	if err != nil {
 		return nil, checkpointGRPCError(err)
 	}
 	if startConfig.Runtime != config.RuntimeNameRunsc {
@@ -353,6 +365,14 @@ func (h *sandboxService) restoreCheckpoint(
 	releaseOperation, ok := h.acquireCheckpointOperation()
 	if !ok {
 		return nil, checkpointGRPCError(fmt.Errorf("sandbox service is shutting down: %w", errord.ErrUnavailable))
+	}
+	if parkedCandidate {
+		// Conditional deletion continues independently of the RPC caller.
+		// Keep the admitted operation alive until that cleanup actually settles.
+		if err := h.cleanupVerifiedParkedSource(context.WithoutCancel(ctx), startConfig, request.CheckpointID, fact); err != nil {
+			releaseOperation()
+			return nil, checkpointGRPCError(err)
+		}
 	}
 	attempt, execute, err := h.checkpointState.BeginRestore(startConfig.SandboxID, fingerprint)
 	if err != nil {
@@ -382,6 +402,19 @@ func (h *sandboxService) restoreCheckpoint(
 	}, nil
 }
 
+// errRestoreParkedSourceCandidate marks a COMMITTED, genuinely EXITED physical
+// record under the restore target ID whose restore identity differs from this
+// request — the shape of a park (checkpoint leaveRunning=false) leftover. The
+// sentinel itself authorizes no mutation: restoreCheckpoint must admit the
+// candidate through cleanupVerifiedParkedSource, which re-observes the record
+// and verifies the committed artifact fact, source identity, generation and
+// EXITED state before the generation-conditional delete.
+var errRestoreParkedSourceCandidate = errors.New("sandbox is a parked-source cleanup candidate")
+
+// existingRestorePhysicalFact is a READ-ONLY lookup of the physical record
+// under the restore target ID. It never mutates: a park leftover is only
+// reported through errRestoreParkedSourceCandidate for the verified cleanup
+// admission, and no identity or state combination grants a delete here.
 func (h *sandboxService) existingRestorePhysicalFact(
 	ctx context.Context,
 	request *runtime.StartRequest,
@@ -397,8 +430,8 @@ func (h *sandboxService) existingRestorePhysicalFact(
 		}
 		return nil, true, err
 	}
-	if physical == nil || physical.Metadata == nil {
-		return nil, true, fmt.Errorf("sandbox %s physical metadata is incomplete: %w",
+	if physical == nil || physical.Metadata == nil || physical.Status == nil {
+		return nil, true, fmt.Errorf("sandbox %s physical record is incomplete: %w",
 			request.SandboxID, errord.ErrFailedPrecondition)
 	}
 	metadata := physical.Metadata
@@ -406,44 +439,35 @@ func (h *sandboxService) existingRestorePhysicalFact(
 		return nil, true, fmt.Errorf("sandbox %s physical record is not committed: %w",
 			request.SandboxID, errord.ErrFailedPrecondition)
 	}
-	// A park (checkpoint with leaveRunning=false) exits the sandbox but leaves
-	// its physical record in place until the deferred destroy cleanup removes
-	// it; a restore landing inside that window used to fail here with a replay
-	// conflict (variable 26-45s+ window, orchestrators had to retry).
-	//
-	// Any EXITED sandbox whose record identity differs from this request is a
-	// park leftover — from the FIRST cycle (RestoreIdentity nil, plain create)
-	// or any LATER cycle (identity from the previous restore; the new park
-	// produces a fresh checkpoint id). Only an identity EQUAL to the request
-	// is a genuine idempotent replay. A still-running sandbox keeps conflicting.
+	// A park (checkpoint with leaveRunning=false) exits the sandbox but keeps
+	// the physical record until cleanup removes it, and an in-flight destroy
+	// leaves the state UNKNOWN for a while. Only a live RUNNING sandbox with
+	// an EQUAL restore identity is a genuine idempotent replay: a non-RUNNING
+	// record is never answered with a live StartResponse, and UNKNOWN proves
+	// neither exit nor liveness, so it cannot even become a cleanup candidate.
 	state := physical.Status.Get().State()
 	identityMatches := expectedIdentity != nil && metadata.RestoreIdentity != nil &&
 		proto.Equal(metadata.RestoreIdentity, expectedIdentity)
-	// W8 (G3b arm-B finding): the endogenous monitor unparks SECONDS after the
-	// park (park frees memory -> ratio drops -> FIFO wake), landing inside the
-	// in-flight delete window where the record may not have reached EXITED yet
-	// (UNKNOWN). Any non-RUNNING sandbox with a non-matching identity is a park
-	// leftover — only a live RUNNING sandbox is a genuine conflict.
-	if expectedIdentity != nil && state != runtime.SandboxState_SANDBOX_STATE_RUNNING && !identityMatches {
-		// Complete the deferred destroy SYNCHRONOUSLY (runsc delete, fs,
-		// ACL, resources, record): a bare record drop let the subsequent
-		// create race the leftover container root ("filesystem state
-		// already exists", observed at +3s) and a concurrent YR retry then
-		// hit the half-written INTENT record as a replay conflict (observed
-		// at +5s). deleteSandbox coalesces with an in-flight destroy.
-		if err := h.deleteSandbox(ctx, request.SandboxID); err != nil {
-			return nil, true, fmt.Errorf("clean up parked sandbox %s before restore: %w",
-				request.SandboxID, err)
+	switch state {
+	case runtime.SandboxState_SANDBOX_STATE_RUNNING:
+		if !identityMatches {
+			return nil, true, fmt.Errorf("sandbox %s is RUNNING; cannot restore onto a live sandbox: %w",
+				request.SandboxID, errord.ErrFailedPrecondition)
 		}
-		return nil, false, nil
-	}
-	if expectedIdentity != nil && metadata.RestoreIdentity == nil && state == runtime.SandboxState_SANDBOX_STATE_RUNNING {
-		return nil, true, fmt.Errorf("sandbox %s is %s; cannot restore onto a live sandbox: %w",
-			request.SandboxID, state, errord.ErrFailedPrecondition)
-	}
-	if expectedIdentity == nil || !identityMatches {
-		return nil, true, fmt.Errorf("sandbox %s restore identity conflicts with replay: %w",
+	case runtime.SandboxState_SANDBOX_STATE_EXITED:
+		if !identityMatches {
+			if expectedIdentity == nil {
+				return nil, true, fmt.Errorf("sandbox %s is EXITED; cannot restore onto a non-running sandbox: %w",
+					request.SandboxID, errord.ErrFailedPrecondition)
+			}
+			return nil, true, fmt.Errorf("sandbox %s is EXITED with a different restore identity: %w",
+				request.SandboxID, errRestoreParkedSourceCandidate)
+		}
+		return nil, true, fmt.Errorf("sandbox %s is EXITED; matching restore identity is not a live replay: %w",
 			request.SandboxID, errord.ErrFailedPrecondition)
+	default:
+		return nil, true, fmt.Errorf("sandbox %s state is %s, which proves neither a live replay nor an exit: %w",
+			request.SandboxID, state, errord.ErrFailedPrecondition)
 	}
 	if metadata.RuntimeHandler != request.Runtime {
 		return nil, true, fmt.Errorf("sandbox %s runtime conflicts with restore replay: %w",
@@ -463,6 +487,62 @@ func (h *sandboxService) existingRestorePhysicalFact(
 		Ports:              clonePorts(metadata.Ports),
 		ResourceGeneration: metadata.Labels[resourceGenerationLabel],
 	}, true, nil
+}
+
+// cleanupVerifiedParkedSource deletes one VERIFIED park leftover so the
+// restore may recreate the target ID. Admission requires the committed
+// artifact fact of THIS request's checkpoint: a non-leave-running source with
+// a nonempty generation whose source ID is the restore target, a runtime
+// agreed by the artifact, the source metadata and the request, a COMMITTED
+// record still carrying that exact generation, and a genuinely EXITED state.
+// Legacy or generation-less artifacts, wrong sources, leave-running
+// checkpoints, UNKNOWN state, corrupt artifacts and replacement generations
+// are rejected WITHOUT any Delete. The delete is generation-conditional:
+// deleteSandbox rechecks the captured generation under the physical resource
+// lock and records the durable retirement receipt, so a replacement generation
+// that raced this observation survives. A completed receipt alone never
+// clears a replacement either — the subsequent create path rechecks the
+// physical state itself.
+func (h *sandboxService) cleanupVerifiedParkedSource(
+	ctx context.Context,
+	startConfig *runtime.StartRequest,
+	checkpointID string,
+	fact checkpoint.Fact,
+) error {
+	sandboxID := startConfig.SandboxID
+	manifest := fact.Manifest
+	if manifest.CheckpointID != checkpointID || manifest.SourceID != sandboxID ||
+		manifest.LeaveRunning || manifest.SourceGeneration == "" {
+		return fmt.Errorf("checkpoint %q is not a generation-bound park of sandbox %s: %w",
+			checkpointID, sandboxID, errord.ErrFailedPrecondition)
+	}
+	physical, err := h.sandboxManager.Get(sandboxID)
+	if err != nil {
+		return fmt.Errorf("re-observe parked source %s: %w", sandboxID, err)
+	}
+	if physical == nil || physical.Metadata == nil || physical.Status == nil ||
+		physical.Metadata.PhysicalPhase != runtime.SandboxPhysicalPhase_SANDBOX_PHYSICAL_PHASE_COMMITTED {
+		return fmt.Errorf("sandbox %s physical record is not committed: %w",
+			sandboxID, errord.ErrFailedPrecondition)
+	}
+	metadata := physical.Metadata
+	if state := physical.Status.Get().State(); state != runtime.SandboxState_SANDBOX_STATE_EXITED {
+		return fmt.Errorf("sandbox %s is %s; only a genuinely EXITED park can be cleaned: %w",
+			sandboxID, state, errord.ErrFailedPrecondition)
+	}
+	if manifest.Runtime != metadata.RuntimeHandler || manifest.Runtime != startConfig.Runtime {
+		return fmt.Errorf("sandbox %s runtime %q conflicts with parked checkpoint %q runtime %q: %w",
+			sandboxID, metadata.RuntimeHandler, checkpointID, manifest.Runtime, errord.ErrFailedPrecondition)
+	}
+	generation := metadata.Labels[resourceGenerationLabel]
+	if generation == "" || generation != manifest.SourceGeneration {
+		return fmt.Errorf("sandbox %s resource generation %q is not the parked source generation %q: %w",
+			sandboxID, generation, manifest.SourceGeneration, errord.ErrFailedPrecondition)
+	}
+	if err := h.deleteSandbox(ctx, sandboxID, generation); err != nil {
+		return fmt.Errorf("clean up verified parked sandbox %s before restore: %w", sandboxID, err)
+	}
+	return nil
 }
 
 func validateReplayPorts(sandboxID string, requested, physical []string) error {
