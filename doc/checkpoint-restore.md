@@ -461,6 +461,7 @@ directly; `"uffd"` hands page population to an external handler):
   fall back to the plain backing file. Each sandbox stages in its own
   cache file (`uffd-cache-<sandbox-id>`), so concurrent restores never
   share sparse caches.
+- Launch synchronization: sandboxd waits up to five seconds for the handler's listening socket to appear and never dials it, because the handler treats its first and only connection as Firecracker's handshake. A single `cmd.Wait` reaps the process and reports completion through a channel, so a handler that dies before publishing its socket — whether it exits normally or is killed by a signal — fails the restore promptly with an `exited early` error instead of stalling until the readiness deadline; the loop never reads the process state concurrently with that `Wait`. This contract covers launch only: the handler's overall exit path and fault fencing remain open work.
 
 ## Node-local checkpoint catalog
 
