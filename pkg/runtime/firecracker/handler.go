@@ -56,6 +56,16 @@ const (
 	firecrackerFlushTimeout = 2 * time.Second
 	firecrackerMinMemoryMiB = uint32(128)
 	firecrackerMaxVCPUs     = uint32(32)
+	// The uffd handler's listening socket lives beside the VMM sockets in the
+	// sandbox runtime directory; the persisted record binds this exact path.
+	firecrackerUffdSocketName = "uffd.sock"
+	// firecrackerUffdRecordVersion is the schema of firecrackerUffdRecord.
+	// Records carrying any other version are rejected, never reinterpreted.
+	firecrackerUffdRecordVersion = 1
+	// firecrackerUffdExitGrace is how long the uffd exit gate waits for the
+	// handler to leave by itself after the VMM is gone. The handler may be
+	// mid-write in its persistent cache, so the gate never signals it.
+	firecrackerUffdExitGrace = 2 * time.Second
 	// checkpoint_mode values: the conservative default and the incremental
 	// chain. An unset value normalizes to full.
 	firecrackerCheckpointModeFull        = "full"
@@ -106,9 +116,49 @@ type firecrackerPersistedState struct {
 	Exited                bool   `json:"exited,omitempty"`
 	ExitedAt              string `json:"exited_at,omitempty"`
 	ExitCode              int    `json:"exit_code,omitempty"`
+	// Uffd is the durable ownership record of the external page-fault handler
+	// a uffd restore launched. The zero record means no handler is tracked for
+	// this sandbox: a fresh Start, a file-backend restore, or a state written
+	// before this record existed. A legacy state without a record never gains
+	// the exit barrier — see the compatibility limitation in
+	// doc/checkpoint-restore.md.
+	Uffd firecrackerUffdRecord `json:"uffd"`
 }
 
+// firecrackerUffdRecord is the persisted identity of the external uffd
+// page-fault handler sandboxd launched for a restore. Ownership lives in this
+// record, never in a process-local cmd pointer: a restarted daemon (or any
+// later delete, rollback, or checkpoint stop) recognizes the exact kernel
+// process through PID + /proc starttime + boot id, which exec preserves, so
+// the record identifies both the gated shell and the handler it execs.
+type firecrackerUffdRecord struct {
+	// Version is the record schema version.
+	Version int `json:"version,omitempty"`
+	// Phase is "pending" from the durable launch intent until the handler is
+	// released, and "ready" once its socket is accepting and that fact is
+	// durable. A pending record may carry no process identity yet (intent
+	// only); a ready record always carries the full identity.
+	Phase string `json:"phase,omitempty"`
+	// PID is the kernel process id of the gated child; exec preserves it.
+	PID int `json:"pid,omitempty"`
+	// StartTime is /proc/<PID>/stat field 22 (clock ticks since boot), the
+	// birth identity that survives execve and disambiguates PID reuse.
+	StartTime uint64 `json:"start_time,omitempty"`
+	// BootID is /proc/sys/kernel/random/boot_id at launch time: a different
+	// current boot proves every process of the recorded boot is gone.
+	BootID string `json:"boot_id,omitempty"`
+	// Socket is the sandbox-derived uffd socket path the handler serves.
+	Socket string `json:"socket,omitempty"`
+}
+
+const (
+	firecrackerUffdPhasePending = "pending"
+	firecrackerUffdPhaseReady   = "ready"
+)
+
 type firecrackerInstance struct {
+	// Serialize snapshots and durable writes so an old snapshot cannot land last.
+	persistMu   sync.Mutex
 	baseProof   *verifiedBaseMemory // process-local; never recovered from persisted state
 	mu          sync.RWMutex
 	state       firecrackerPersistedState
@@ -134,6 +184,15 @@ func (instance *firecrackerInstance) markDeleting() {
 func (instance *firecrackerInstance) markConfigured() {
 	instance.mu.Lock()
 	instance.state.Configured = true
+	instance.mu.Unlock()
+}
+
+// setUffdRecord swaps the persisted uffd ownership record in memory only. The
+// caller owns making it durable; the mutex is never held across a write or a
+// wait.
+func (instance *firecrackerInstance) setUffdRecord(record firecrackerUffdRecord) {
+	instance.mu.Lock()
+	instance.state.Uffd = record
 	instance.mu.Unlock()
 }
 
@@ -1008,6 +1067,16 @@ func (handler *Handler) delete(ctx context.Context, sandboxID, expectedGeneratio
 	if err := stopFirecrackerProcessConfirmed(state, handler.binary); err != nil {
 		return fmt.Errorf("confirm Firecracker sandbox %s exit for delete: %w", sandboxID, err)
 	}
+	// UFFD exit gate: it runs after the VMM exit is confirmed (so a connected
+	// handler has seen its handshake drop and leaves by itself) and before any
+	// retirement below, because the state directory being removed carries the
+	// handler's cache and log. The gate never signals the handler.
+	if err := confirmFirecrackerUffdExit(state.Uffd); err != nil {
+		return fmt.Errorf(
+			"confirm Firecracker sandbox %s uffd handler exit for delete: %w",
+			sandboxID, err,
+		)
+	}
 	instance.finish(runtimecore.Exit{ExitedAt: time.Now(), ExitCode: state.ExitCode})
 	handler.mu.Lock()
 	delete(handler.instances, sandboxID)
@@ -1069,6 +1138,29 @@ func (handler *Handler) rollbackStartedInstance(
 			runtimecore.ErrStartCleanupPending, state.ID, joined,
 		), true
 	}
+	// The uffd handler gate runs after the VMM exit is confirmed and before
+	// the mapping is dropped and the deferred artifact cleanup is allowed
+	// through. A tracked handler that will not leave keeps the whole sandbox
+	// in cleanup-pending for reconciliation, exactly like the VMM above.
+	if err := confirmFirecrackerUffdExit(state.Uffd); err != nil {
+		joined := errors.Join(
+			original,
+			fmt.Errorf(
+				"confirm uffd handler exit for Firecracker sandbox %s after failed start: %w",
+				state.ID, err,
+			),
+		)
+		if persistErr := handler.persistInstance(instance); persistErr != nil {
+			joined = errors.Join(joined, fmt.Errorf(
+				"persist Firecracker sandbox %s identity after failed start: %w",
+				state.ID, persistErr,
+			))
+		}
+		return fmt.Errorf(
+			"%w: Firecracker sandbox %s uffd handler exit unconfirmed, instance and artifacts retained: %w",
+			runtimecore.ErrStartCleanupPending, state.ID, joined,
+		), true
+	}
 	instance.finish(runtimecore.Exit{ExitedAt: time.Now(), ExitCode: state.ExitCode})
 	handler.mu.Lock()
 	delete(handler.instances, state.ID)
@@ -1080,6 +1172,15 @@ func (handler *Handler) runtimeDirectory(sandboxID string) string {
 	return firecrackerproto.HostRuntimeDirectory(
 		handler.runtimeRoot,
 		sandboxID,
+	)
+}
+
+// uffdSocketPath is the sandbox-derived uffd handler socket binding: the
+// persisted ownership record must carry exactly this path.
+func (handler *Handler) uffdSocketPath(sandboxID string) string {
+	return filepath.Join(
+		handler.runtimeDirectory(sandboxID),
+		firecrackerUffdSocketName,
 	)
 }
 
@@ -1350,6 +1451,8 @@ func firecrackerHostExitCode(err error) int {
 func (handler *Handler) persistInstance(
 	instance *firecrackerInstance,
 ) error {
+	instance.persistMu.Lock()
+	defer instance.persistMu.Unlock()
 	state := instance.snapshot()
 	data, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
@@ -1461,6 +1564,25 @@ func (handler *Handler) validatePersistedState(
 				description,
 				paths[0],
 				paths[1],
+			)
+		}
+	}
+	// A tracked uffd handler must be recorded with a complete, self-consistent
+	// identity and the sandbox-derived socket binding; a record this runtime
+	// cannot interpret is never recovered as a claim about any process.
+	if !state.Uffd.isZero() {
+		if err := validateFirecrackerUffdRecord(state.Uffd); err != nil {
+			return fmt.Errorf(
+				"Firecracker state uffd record for %s: %w",
+				sandboxID, err,
+			)
+		}
+		if filepath.Clean(state.Uffd.Socket) !=
+			filepath.Clean(handler.uffdSocketPath(sandboxID)) {
+			return fmt.Errorf(
+				"Firecracker state uffd socket %q does not match %q",
+				state.Uffd.Socket,
+				handler.uffdSocketPath(sandboxID),
 			)
 		}
 	}
