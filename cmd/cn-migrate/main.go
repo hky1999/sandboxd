@@ -4,6 +4,11 @@
 // never receive its own workload back), materialize and restore there, and
 // only delete the source once the target is verified RUNNING.
 //
+// The run is pinned to one source incarnation: the generation captured from
+// a structured inspect before checkpointing names the incarnation in every
+// conditional operation, so a sandbox deleted and recreated on the source is
+// neither snapshotted nor retired by mistake.
+//
 // Node commands run through an executor template (-exec) so the CLI stays
 // decoupled from the cluster shape: "kubectl exec <pod> --" for the kind
 // test bed, an ssh wrapper for bare metal, or a direct runner when a
@@ -29,9 +34,20 @@ import (
 	"strings"
 	"time"
 
+	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
 	"github.com/inclusionAI/sandboxd/pkg/checkpointlocator"
 	"github.com/inclusionAI/sandboxd/pkg/checkpointpublish"
+	"google.golang.org/protobuf/encoding/protojson"
 )
+
+// sourceGenerationLabel is the daemon-owned physical incarnation identity
+// (assigned by Start, mirrored into sandbox labels). It is the value the
+// conditional CheckpointIfGeneration/DeleteIfGeneration preconditions compare.
+const sourceGenerationLabel = "akernel.scheduler/resource-generation"
+
+// maxSourceGenerationBytes is the common bound for checkpoint and retirement.
+// DeleteIfGeneration accepts at most 128 bytes, even though checkpoint accepts 256.
+const maxSourceGenerationBytes = 128
 
 type stepLog struct {
 	Step   string `json:"step"`
@@ -41,13 +57,14 @@ type stepLog struct {
 }
 
 type migrateReport struct {
-	Sandbox    string    `json:"sandbox"`
-	Source     string    `json:"source"`
-	Target     string    `json:"target,omitempty"`
-	Checkpoint string    `json:"checkpoint_dir"`
-	Steps      []stepLog `json:"steps"`
-	OK         bool      `json:"ok"`
-	Error      string    `json:"error,omitempty"`
+	Sandbox          string    `json:"sandbox"`
+	Source           string    `json:"source"`
+	Target           string    `json:"target,omitempty"`
+	Checkpoint       string    `json:"checkpoint_dir"`
+	SourceGeneration string    `json:"source_generation,omitempty"`
+	Steps            []stepLog `json:"steps"`
+	OK               bool      `json:"ok"`
+	Error            string    `json:"error,omitempty"`
 }
 
 func main() {
@@ -57,6 +74,7 @@ func main() {
 	storeSpec := flag.String("store", "", "chunk store spec (http://endpoint/bucket or directory)")
 	nodes := flag.String("nodes", "", "comma-separated node catalog addresses for placement")
 	to := flag.String("to", "", "preferred target node name (default: locator decides)")
+	srcGen := flag.String("source-generation", "", "require this source generation label (default: the value captured from source inspect)")
 	ckReq := flag.String("request-file", "/mnt/cn/ck/req.json", "StartRequest JSON for the restore")
 	bin := flag.String("bin", "/mnt/cn/bin", "per-node CLI binary directory")
 	wait := flag.Duration("wait", 180*time.Second, "per-step timeout")
@@ -82,6 +100,9 @@ func main() {
 		report.Error = detail
 		report.Steps = append(report.Steps, stepLog{Step: step, Detail: detail, Failed: true})
 		finish(report, *jsonOut, false)
+	}
+	if *srcGen != "" && (strings.TrimSpace(*srcGen) == "" || len(*srcGen) > maxSourceGenerationBytes) {
+		fail("arguments", "-source-generation must be non-blank and at most 128 bytes")
 	}
 	// run executes one node command; success is the exit status, not the
 	// output — several CLIs print nothing on success.
@@ -143,7 +164,7 @@ func main() {
 				report.Checkpoint + " and target " + report.Target +
 				" are preserved. Resolve the pending restore or the actual writer on the target first, then recover manually)"
 		case phaseTargetOwned:
-			detail += " (target verified RUNNING and owns the sandbox; no rollback — delete the lingering source copy manually to finish cleanup)"
+			detail += " (target verified RUNNING and owns the sandbox; no rollback — retry conditional retirement with the captured source generation to finish cleanup)"
 		}
 		fail(step, detail)
 	}
@@ -159,17 +180,42 @@ func main() {
 		fail("place", fmt.Sprintf("target -to %s equals the source node", *to))
 	}
 
-	// 2. Checkpoint it. --leave-running=false gives stop-and-copy
-	// semantics: the source freezes at the checkpoint instant, sandboxd
-	// finalizes it after the seal, and no post-checkpoint write can be
-	// lost or double-applied. A failed command does NOT prove the server
-	// never executed it (timeout, lost reply): probe the source before
-	// claiming anything about its state (F2).
+	// 2. Pin the incarnation this migration owns. The listing above is only
+	// an existence probe; the generation every later conditional operation
+	// names comes from a structured inspect of this one sandbox. A node (or
+	// CLI build) that cannot produce that identity fails here, before any
+	// checkpoint: a bare-ID checkpoint would snapshot whatever incarnation
+	// happens to hold the ID now.
+	if _, ok := run(*source, "inspect", *bin+"/sbox",
+		"--address", "/run/sandboxd/sandboxd.sock", "inspect", *sandbox); !ok {
+		fail("inspect", "source inspect failed — cannot pin the source generation; refusing to checkpoint")
+	}
+	generation, genErr := sourceGeneration(report.lastDetail(), *sandbox)
+	if genErr != nil {
+		fail("inspect", fmt.Sprintf("cannot pin the source generation: %v", genErr))
+	}
+	if *srcGen != "" && *srcGen != generation {
+		fail("inspect", fmt.Sprintf(
+			"source %s holds generation %q but -source-generation requires %q — the sandbox was replaced on the source; refusing to checkpoint the replacement",
+			*source, generation, *srcGen))
+	}
+	report.SourceGeneration = generation
+
+	// 3. Checkpoint it, conditionally on the pinned generation: the server
+	// refuses a replaced incarnation before allocating any checkpoint
+	// output, so this run can never seal an incarnation it did not name.
+	// --leave-running=false gives stop-and-copy semantics: the source
+	// freezes at the checkpoint instant, sandboxd finalizes it after the
+	// seal, and no post-checkpoint write can be lost or double-applied. A
+	// failed command does NOT prove the server never executed it (timeout,
+	// lost reply): probe the source before claiming anything about its
+	// state (F2).
 	if _, ok := run(*source, "checkpoint", *bin+"/checkpoint-restore",
 		"--action", "checkpoint", "--socket", "/run/sandboxd/sandboxd.sock",
 		"--request-file", *ckReq, "--sandbox-id", *sandbox,
 		"--checkpoint-dir", report.Checkpoint, "--compress=false",
-		"--leave-running=false"); !ok {
+		"--leave-running=false",
+		"--expected-generation", report.SourceGeneration); !ok {
 		if out, ok2 := run(*source, "probe-source", *bin+"/sbox",
 			"--address", "/run/sandboxd/sandboxd.sock", "list"); ok2 &&
 			listHasRunningSandbox(out, *sandbox) {
@@ -180,14 +226,14 @@ func main() {
 	}
 	phase = phaseSourceOwned
 
-	// 3. Publish on the source node (paths are node-local; the executor
+	// 4. Publish on the source node (paths are node-local; the executor
 	// runs cn-publish where the checkpoint landed, idempotent either way).
 	if _, ok := run(*source, "publish", *bin+"/cn-publish",
 		"-checkpoint-dir", report.Checkpoint, "-store", *storeSpec); !ok {
 		failPastCheckpoint("publish", "cn-publish failed on source")
 	}
 
-	// 4. Place: federate node records, decide with the source excluded.
+	// 5. Place: federate node records, decide with the source excluded.
 	nodeRecords, fetchErrs := checkpointlocator.FetchAll(context.Background(), strings.Split(*nodes, ","))
 	_ = fetchErrs
 	// The compat tuple comes from a catalog that lists the checkpoint —
@@ -231,7 +277,7 @@ func main() {
 	}
 	report.Target = placement.NodeID
 
-	// 5. Materialize + restore on the target.
+	// 6. Materialize + restore on the target.
 	if _, ok := run(placement.NodeID, "materialize", *bin+"/cn-fetch",
 		"-into", report.Checkpoint, "-id", dirBase(report.Checkpoint), "-store", *storeSpec); !ok {
 		failPastCheckpoint("materialize", "cn-fetch failed on target")
@@ -250,7 +296,7 @@ func main() {
 		failPastCheckpoint("restore", "restore failed on target")
 	}
 
-	// 6. Verify RUNNING on the target before declaring success. Parse the
+	// 7. Verify RUNNING on the target before declaring success. Parse the
 	// tab-separated listing instead of substring matching: a plain
 	// strings.Contains would also match longer IDs sharing a prefix.
 	verified := false
@@ -271,20 +317,22 @@ func main() {
 	// and no later failure may resurrect the source (F2).
 	phase = phaseTargetOwned
 
-	// 7. Retire the source copy. With --leave-running=false the source was
-	// already finalized at checkpoint time; the explicit delete is kept as
-	// an idempotent confirmation and its failure is fatal — a lingering
-	// copy would be a second writer.
-	if _, ok := run(*source, "delete-source", *bin+"/sbox",
-		"--address", "/run/sandboxd/sandboxd.sock", "delete", *sandbox); !ok {
-		if out, ok2 := run(*source, "confirm-source-gone", *bin+"/sbox",
-			"--address", "/run/sandboxd/sandboxd.sock", "list"); ok2 &&
-			!listHasSandbox(out, *sandbox) {
-			// Already retired by the checkpoint — acceptable.
-		} else {
-			failPastCheckpoint("delete-source",
-				"source delete failed and the sandbox still lists on the source — resolve manually to avoid dual writers")
-		}
+	// 8. Retire the source copy. With --leave-running=false the source was
+	// already finalized at checkpoint time; the conditional delete remains
+	// as an idempotent confirmation — a completed retirement receipt for
+	// the pinned generation replays as success. Its failure is fatal
+	// (source-cleanup-pending): a lingering copy would be a second writer.
+	// There is deliberately no fallback. An unconditional sbox delete could
+	// retire a replacement incarnation that reused the ID, and an empty
+	// listing is an absence observation, not a retirement proof — neither
+	// may substitute for the generation-scoped receipt.
+	if _, ok := run(*source, "delete-source", *bin+"/checkpoint-restore",
+		"--action", "delete", "--socket", "/run/sandboxd/sandboxd.sock",
+		"--sandbox-id", *sandbox,
+		"--expected-generation", report.SourceGeneration); !ok {
+		failPastCheckpoint("delete-source",
+			"source-cleanup-pending: conditional retirement of generation "+report.SourceGeneration+
+				" failed — retry the same generation-scoped delete (a completed receipt replays) or reconcile the receipt manually; an unconditional delete must not be used")
 	}
 	report.OK = true
 	finish(report, *jsonOut, true)
@@ -297,17 +345,43 @@ func (r *migrateReport) lastDetail() string {
 	return r.Steps[len(r.Steps)-1].Detail
 }
 
-// listHasSandbox parses the tab-separated `sbox list` output and reports
-// whether the sandbox ID appears as an exact ID column value.
-func listHasSandbox(listOutput, sandboxID string) bool {
-	return sandboxListState(listOutput, sandboxID) != ""
-}
-
 // listHasRunningSandbox additionally requires the row to report the
 // SANDBOX_STATE_RUNNING state, so a half-created or exited sandbox cannot
 // pass verification.
 func listHasRunningSandbox(listOutput, sandboxID string) bool {
 	return sandboxListState(listOutput, sandboxID) == "SANDBOX_STATE_RUNNING"
+}
+
+// sourceGeneration reads one complete `sbox inspect` result — the marshaled
+// runtime.SandboxStatus of exactly one sandbox — and returns the incarnation
+// identity (akernel.scheduler/resource-generation label) the migration will
+// checkpoint and later retire.
+//
+// The whole trimmed output must parse as that single JSON value: strict
+// protojson rejects free text around the document, trailing content, and
+// unknown fields, so a warning line or a scraped fragment fails instead of
+// being guessed at. Every shape sbox emits for the state field is accepted —
+// the enum name string, its number, or omission, since
+// SANDBOX_STATE_RUNNING is the proto3 zero value and encoding/json omits it.
+func sourceGeneration(inspectOutput, sandboxID string) (string, error) {
+	var status runtime.SandboxStatus
+	if err := (protojson.UnmarshalOptions{DiscardUnknown: false}).Unmarshal([]byte(inspectOutput), &status); err != nil {
+		return "", fmt.Errorf("parse SandboxStatus JSON: %w", err)
+	}
+	if status.ID != sandboxID {
+		return "", fmt.Errorf("inspected id %q does not match the migrated sandbox %q", status.ID, sandboxID)
+	}
+	if status.State != runtime.SandboxState_SANDBOX_STATE_RUNNING {
+		return "", fmt.Errorf("inspected state %s is not SANDBOX_STATE_RUNNING", status.State)
+	}
+	generation := status.Labels[sourceGenerationLabel]
+	if strings.TrimSpace(generation) == "" {
+		return "", fmt.Errorf("no non-blank %q label — a pre-generation source node cannot be migrated safely", sourceGenerationLabel)
+	}
+	if len(generation) > maxSourceGenerationBytes {
+		return "", fmt.Errorf("%q label is %d bytes, over the %d-byte bound", sourceGenerationLabel, len(generation), maxSourceGenerationBytes)
+	}
+	return generation, nil
 }
 
 // sandboxListState returns the STATUS column of the row whose ID column
