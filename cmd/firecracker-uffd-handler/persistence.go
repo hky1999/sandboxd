@@ -156,3 +156,13 @@ func persistCacheExtent(cache *os.File, local string, job persistRef) error {
 	}
 	return os.Rename(tmp.Name(), path)
 }
+
+// waitPersistence is the process-exit barrier, never a fault-path operation.
+// stopPersistence prevents new workers and drops unstarted rebuildable cache
+// work. A writer already in filesystem IO is joined without holding the source
+// lock; the runtime must retain ownership if process exit cannot be confirmed.
+func (src *pageSource) waitPersistence() {
+	if p := src.stopPersistence(); p != nil {
+		p.wg.Wait()
+	}
+}

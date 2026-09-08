@@ -809,6 +809,143 @@ func materializedMarkerPresent(dir string) bool {
 	return !os.IsNotExist(err)
 }
 
+// uffdPollTimeoutMs bounds a single uffd wait. It is a fallback cadence for
+// re-checking stop, not the shutdown latency: shutdown interrupts the wait
+// through the cancellation wake descriptor below, so the timeout keeps its
+// old value instead of being shortened.
+const uffdPollTimeoutMs = 500
+
+// cancelWake turns shutdown into readability on a polled descriptor. The uffd
+// itself cannot report the VMM disappearing (see recvHandshake), and poll
+// cannot watch a Go channel, so the fault loop polls the uffd together with
+// this eventfd and shutdown writes it before any teardown that could block:
+// a poll blocked on the uffd then returns immediately instead of sleeping out
+// the timeout above.
+//
+// Ownership: the wait loop owns the descriptor and is the only side allowed
+// to close it, after its final poll has returned. wake may be called from any
+// goroutine at any time; it never writes after close — both take the same
+// mutex and close latches first — so a descriptor number recycled by an
+// unrelated open can never receive a stale wake write.
+type cancelWake struct {
+	mu     sync.Mutex
+	fd     int
+	closed bool
+}
+
+func newCancelWake() (*cancelWake, error) {
+	fd, err := unix.Eventfd(0, unix.EFD_CLOEXEC|unix.EFD_NONBLOCK)
+	if err != nil {
+		return nil, err
+	}
+	return &cancelWake{fd: fd}, nil
+}
+
+// pollFd returns the descriptor to include in the fault loop's poll set.
+func (w *cancelWake) pollFd() unix.PollFd {
+	return unix.PollFd{Fd: int32(w.fd), Events: unix.POLLIN}
+}
+
+// wake makes the descriptor readable until drained or closed. Repeated calls
+// (repeated shutdown attempts) only add to the counter; saturation returns
+// EAGAIN while leaving the descriptor readable, which is all wake promises.
+// Best effort: if a write fails some other way, the poll timeout above still
+// bounds how long the loop stays unaware of shutdown.
+func (w *cancelWake) wake() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return
+	}
+	var one [8]byte
+	binary.NativeEndian.PutUint64(one[:], 1)
+	for {
+		_, err := unix.Write(w.fd, one[:])
+		if err != unix.EINTR {
+			return
+		}
+	}
+}
+
+// drain resets readiness so a wake that is not followed by a closed stop
+// cannot spin the wait loop on an already-readable descriptor. Reading an
+// idle nonblocking eventfd returns EAGAIN, which is the desired outcome.
+func (w *cancelWake) drain() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return
+	}
+	var buf [8]byte
+	for {
+		_, err := unix.Read(w.fd, buf[:])
+		if err != unix.EINTR {
+			return
+		}
+	}
+}
+
+// close is idempotent: a second close must not shut a descriptor number that
+// has since been recycled by an unrelated open.
+func (w *cancelWake) close() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return
+	}
+	w.closed = true
+	unix.Close(w.fd)
+}
+
+// pollUffdOrCancel waits for uffd readiness, uffd hangup, or a shutdown wake.
+// EINTR is returned unwrapped so the caller retries the wait; a zero return
+// with no flags is the timeout fallback, preserving the old single-descriptor
+// poll semantics with only the wake descriptor added.
+func pollUffdOrCancel(uffdFd int, wake *cancelWake, timeoutMs int) (cancelWoke, uffdReady, uffdHungUp bool, err error) {
+	fds := []unix.PollFd{{Fd: int32(uffdFd), Events: unix.POLLIN}, wake.pollFd()}
+	if _, err := unix.Poll(fds, timeoutMs); err != nil {
+		return false, false, false, err
+	}
+	if fds[0].Revents&unix.POLLNVAL != 0 || fds[1].Revents&unix.POLLNVAL != 0 {
+		return false, false, false, unix.EBADF
+	}
+	if fds[1].Revents&unix.POLLIN != 0 {
+		// Shutdown closes stop before waking (runShutdown), so the caller's
+		// stop check exits; draining keeps a wake without a closed stop —
+		// only reachable from tests — from spinning on readability.
+		wake.drain()
+		cancelWoke = true
+	}
+	if fds[0].Revents&(unix.POLLHUP|unix.POLLERR) != 0 {
+		uffdHungUp = true
+	}
+	if fds[0].Revents&unix.POLLIN != 0 {
+		uffdReady = true
+	}
+	return cancelWoke, uffdReady, uffdHungUp, nil
+}
+
+// sourceStopper is the teardown half of shutdown. Splitting it out keeps
+// runShutdown's ordering — wake before the potentially blocking persistence
+// stop — directly testable without a live pageSource.
+type sourceStopper interface {
+	stopPersistence() *chunkPersister
+}
+
+// runShutdown performs the handler teardown exactly once. Order matters:
+// close(stop) makes the woken loop exit rather than re-poll, wake interrupts
+// any poll blocked on the uffd BEFORE the steps below it may block, and the
+// source cancel plus persistence stop keep their original sequence so fault
+// workers and persister workers still observe the same shutdown.
+func runShutdown(once *sync.Once, stop chan struct{}, wake *cancelWake, cancelSource context.CancelFunc, src sourceStopper) {
+	once.Do(func() {
+		close(stop)
+		wake.wake()
+		cancelSource()
+		src.stopPersistence()
+	})
+}
+
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	sockPath := flag.String("sock", "", "unix socket path Firecracker will connect to")
@@ -933,14 +1070,19 @@ func main() {
 
 	faults := make(chan uint64, 4096)
 	var wg sync.WaitGroup
+	var background sync.WaitGroup
 	stop := make(chan struct{})
+	// Explicit cancellation wake: the fault loop below polls the uffd
+	// together with this descriptor so shutdown interrupts a blocked wait
+	// immediately instead of sleeping out uffdPollTimeoutMs after VMM EOF.
+	wake, err := newCancelWake()
+	if err != nil {
+		log.Fatalf("create cancel wake: %v", err)
+	}
+	defer wake.close()
 	var stopOnce sync.Once
 	shutdown := func() {
-		stopOnce.Do(func() {
-			close(stop)
-			cancelSource()
-			source.stopPersistence()
-		})
+		runShutdown(&stopOnce, stop, wake, cancelSource, source)
 	}
 
 	// The VMM never writes after the handshake, so a read-side EOF on the
@@ -949,7 +1091,9 @@ func main() {
 	// instead of lingering as an orphan. The uffd descriptor cannot signal
 	// this: after the VMM exits this handler holds the last reference, and
 	// userfaultfd never reports HUP to its own holder.
+	background.Add(1)
 	go func() {
+		defer background.Done()
 		buf := make([]byte, 1)
 		for {
 			if _, err := vmmConn.Read(buf); err != nil {
@@ -972,7 +1116,9 @@ func main() {
 	// chunk moves at most once, faults wait on the same cancelable completion channel.
 	if *prefetch > 0 && (source.remote != "" || source.chunkStore != "") &&
 		os.Getenv("UFFD_NO_BULK") == "" {
+		background.Add(1)
 		go func() {
+			defer background.Done()
 			// Walk at the granularity the artifact actually uses: a chunk
 			// manifest overrides the flag's chunk size, and counting with
 			// the stale flag would over- or under-fetch at non-default
@@ -1032,7 +1178,9 @@ func main() {
 	// Fault counters for observability; printed on exit and every 10s while
 	// faults are in flight.
 	tick := time.NewTicker(10 * time.Second)
+	background.Add(1)
 	go func() {
+		defer background.Done()
 		var last uint64
 		for {
 			select {
@@ -1053,21 +1201,25 @@ func main() {
 
 	msg := make([]byte, uffdMsgSize)
 	for {
-		fds := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}}
-		n, err := unix.Poll(fds, 500)
-		if err != nil && err != unix.EINTR {
-			log.Fatalf("poll uffd: %v", err)
+		woke, ready, hungUp, perr := pollUffdOrCancel(fd, wake, uffdPollTimeoutMs)
+		if perr != nil {
+			if perr == unix.EINTR {
+				continue
+			}
+			log.Fatalf("poll uffd: %v", perr)
 		}
 		select {
 		case <-stop:
 			goto done
 		default:
 		}
-		if n == 0 {
-			continue
-		}
-		if fds[0].Revents&(unix.POLLHUP|unix.POLLERR) != 0 {
+		if hungUp {
 			break // Firecracker is gone.
+		}
+		if woke || !ready {
+			// Cancel wake (stop is closed — handled above, and the helper
+			// drained the descriptor) or the timeout fallback: wait again.
+			continue
 		}
 		for {
 			got, err := unix.Read(fd, msg)
@@ -1104,8 +1256,14 @@ func main() {
 	}
 done:
 	shutdown()
+	// Unblock the EOF watcher even when shutdown came from the uffd.
+	_ = vmmConn.Close()
 	close(faults)
 	wg.Wait()
+	background.Wait()
+	// Pending cache entries are disposable; already-started writes must
+	// finish before the process claims that all its work has stopped.
+	source.waitPersistence()
 	s.mu.Lock()
 	total := s.served
 	s.mu.Unlock()

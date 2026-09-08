@@ -162,3 +162,56 @@ func TestPersistVerifiedCacheExtent(t *testing.T) {
 		t.Fatal("failed read left persistent artifacts")
 	}
 }
+
+func TestPersistenceExitWaitsForActiveWriterAndDropsPending(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	var calls atomic.Int64
+	p := newChunkPersister(2, 1, func(persistRef) error {
+		calls.Add(1)
+		close(entered)
+		<-release
+		return nil
+	})
+	src := &pageSource{persister: p}
+	t.Cleanup(func() { once.Do(func() { close(release) }); src.waitPersistence() })
+	if !p.enqueue(persistRef{digest: "active"}) {
+		t.Fatal("enqueue active")
+	}
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("writer did not start")
+	}
+	if !p.enqueue(persistRef{digest: "pending"}) {
+		t.Fatal("enqueue pending")
+	}
+	stopped := make(chan struct{})
+	go func() { src.stopPersistence(); close(stopped) }()
+	select {
+	case <-stopped:
+	case <-time.After(time.Second):
+		t.Fatal("stop blocked on cache IO")
+	}
+	done := make(chan struct{})
+	go func() { src.waitPersistence(); close(done) }()
+	select {
+	case <-done:
+		t.Fatal("exit barrier passed active write")
+	case <-time.After(20 * time.Millisecond):
+	}
+	once.Do(func() { close(release) })
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("writer exit was not joined")
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("pending cache work ran: %d writes", calls.Load())
+	}
+	if p.enqueue(persistRef{}) {
+		t.Fatal("stopped persister accepted work")
+	}
+	src.waitPersistence()
+}
