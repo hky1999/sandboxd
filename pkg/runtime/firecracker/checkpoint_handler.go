@@ -1215,7 +1215,16 @@ func (handler *Handler) launchUffdHandler(sandboxID, sockPath, backingPath, stat
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start uffd handler: %w", err)
 	}
-	go func() { _ = cmd.Wait() }() //nolint:errcheck // exit status surfaces in its log
+	// cmd.Wait stays the single reaper and the sole writer of the process
+	// state; the readiness loop below learns about exits through waitDone
+	// instead of reading that state unsynchronized. Signal deaths never
+	// count as Exited(), so polling the state would also stall them to the
+	// full deadline.
+	waitDone := make(chan struct{}, 1)
+	go func() {
+		_ = cmd.Wait() //nolint:errcheck // exit status surfaces in its log
+		waitDone <- struct{}{}
+	}()
 	// Wait for the handler's listening socket without dialing it: the
 	// handler treats its first and only connection as Firecracker's
 	// handshake, so a liveness probe connection would be mistaken for the
@@ -1225,10 +1234,11 @@ func (handler *Handler) launchUffdHandler(sandboxID, sockPath, backingPath, stat
 		if _, err := os.Stat(sockPath); err == nil {
 			return nil
 		}
-		if cmd.ProcessState != nil && cmd.ProcessState.Exited() {
+		select {
+		case <-waitDone:
 			return fmt.Errorf("uffd handler exited early for %s", sandboxID)
+		case <-time.After(50 * time.Millisecond):
 		}
-		time.Sleep(50 * time.Millisecond)
 	}
 	return fmt.Errorf("uffd handler socket %s never appeared", sockPath)
 }
