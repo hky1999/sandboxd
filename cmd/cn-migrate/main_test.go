@@ -54,6 +54,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -109,6 +110,17 @@ func executorMain(stateDir, node string, args []string) {
 		}
 		return ""
 	}
+	// controlExists / controlValue read the test's staged node-state files.
+	controlExists := func(name string) bool {
+		_, err := os.Stat(filepath.Join(stateDir, name))
+		return err == nil
+	}
+	controlValue := func(name, fallback string) string {
+		if raw, err := os.ReadFile(filepath.Join(stateDir, name)); err == nil {
+			return strings.TrimSpace(string(raw))
+		}
+		return fallback
+	}
 	// relayPendingRestore hands a target restore over to the test's node
 	// stand-in, which accepts it and suspends it independently of this
 	// process. It returns false only when no URL is staged; once relayed it
@@ -146,7 +158,11 @@ func executorMain(stateDir, node string, args []string) {
 		os.Stdout.WriteString("ID STATUS RUNTIME\nsbox-x SANDBOX_STATE_RUNNING firecracker\n")
 	case has("inspect"):
 		if node != "S" {
-			os.Exit(1) // only the source holds the sandbox
+			// The target's inspect answers with the incarnation the restore
+			// operation created — the receipt's birth generation — unless a
+			// test replaced the target sandbox after the restore.
+			os.Stdout.WriteString(targetInspectJSON(stateDir))
+			os.Exit(0)
 		}
 		os.Stdout.WriteString(inspectJSON(stateDir))
 		if raw, err := os.ReadFile(filepath.Join(stateDir, "replace-after-inspect")); err == nil {
@@ -157,6 +173,9 @@ func executorMain(stateDir, node string, args []string) {
 	case has("--action"):
 		switch value("--action") {
 		case "checkpoint":
+			if controlExists("fail-checkpoint") {
+				os.Exit(1) // the command fails; whether the server executed it is unknowable
+			}
 			expected := value("--expected-generation")
 			if expected == "" {
 				_ = os.WriteFile(filepath.Join(stateDir, "bare-checkpoint"), nil, 0o600)
@@ -176,7 +195,93 @@ func executorMain(stateDir, node string, args []string) {
 				_ = os.WriteFile(filepath.Join(stateDir, "source-generation"),
 					bytes.TrimSpace(raw), 0o600)
 			}
+		case "checkpoint-root":
+			// The read-only identity action. The source answers only once a
+			// checkpoint sealed; the target answers only once an artifact
+			// landed (the fetch below records its root).
+			dir := value("--checkpoint-dir")
+			if dir == "" || !strings.HasPrefix(dir, "/") {
+				os.Exit(2)
+			}
+			if controlExists("root-unreadable") {
+				os.Exit(1)
+			}
+			digest := ""
+			if node == "S" {
+				if !controlExists("checkpoint-id") {
+					os.Exit(1) // nothing sealed at that directory
+				}
+				digest = sourceRootDigest(stateDir)
+			} else if raw, err := os.ReadFile(filepath.Join(stateDir, "target-root-digest")); err == nil {
+				digest = strings.TrimSpace(string(raw))
+			} else {
+				os.Exit(1) // no materialized artifact at the destination
+			}
+			identity := map[string]string{"root": digest, "scheme": "v2:manifest+sidecar-roots"}
+			if requestPath := value("--request-file"); requestPath != "" {
+				data, err := os.ReadFile(requestPath)
+				if err != nil {
+					os.Exit(1)
+				}
+				identity["request_sha256"] = testSHA(data)
+			}
+			_ = json.NewEncoder(os.Stdout).Encode(identity)
+			os.Exit(0)
+		case "get-start-operation":
+			operation := value("--operation-id")
+			if operation == "" || !strings.HasPrefix(operation, "migrate-") {
+				os.Exit(2)
+			}
+			switch state := controlValue("operation-state", "notfound"); state {
+			case "notfound":
+				fmt.Fprintf(os.Stderr, "start operation %s is unknown\n", operation)
+				os.Exit(exitCodeOperationNotFound) // the structured absence signal
+			case "succeeded", "running", "unknown", "failed":
+				generation := ""
+				if state == "succeeded" {
+					generation = targetGenerationValue(stateDir)
+				}
+				fmt.Println(operationReceiptJSON(operation, "sbox-x", state, generation))
+				os.Exit(0)
+			default:
+				fmt.Println("executor exploded")
+				os.Exit(1) // an ambiguous query failure
+			}
 		case "restore":
+			if operation := value("--operation-id"); operation != "" {
+				if controlExists("reject-operation-conflict") {
+					os.Exit(1)
+				}
+				// Operation-mode restore (the resumable CLI): the node
+				// records the durable start operation exactly as the daemon
+				// would — the birth generation is assigned at admission and
+				// returned by the receipt — and binds it to the pinned root.
+				if !strings.HasPrefix(operation, "migrate-") ||
+					value("--expected-root-digest") != sourceRootDigest(stateDir) ||
+					value("--checkpoint-dir") == "" || value("--request-file") == "" {
+					_ = os.WriteFile(filepath.Join(stateDir, "bad-operation-restore"), nil, 0o600)
+					os.Exit(1)
+				}
+				if controlValue("operation-state", "") == "succeeded" {
+					fmt.Println(operationReceiptJSON(operation, "sbox-x", "succeeded", targetGenerationValue(stateDir)))
+					os.Exit(0) // same accepted operation replays without creating a target
+				}
+				created, err := os.OpenFile(filepath.Join(stateDir, "target-creations"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+				if err != nil {
+					os.Exit(2)
+				}
+				_, _ = created.Write([]byte("x"))
+				_ = created.Close()
+				birth := controlValue("target-birth-generation", "t1")
+				_ = os.WriteFile(filepath.Join(stateDir, "target-generation"), []byte(birth), 0o600)
+				_ = os.WriteFile(filepath.Join(stateDir, "operation-state"), []byte("succeeded"), 0o600)
+				_ = os.WriteFile(filepath.Join(stateDir, "target-running"), nil, 0o600)
+				if controlExists("lose-restore-reply") {
+					os.Exit(1) // the node committed; the reply never reached the CLI
+				}
+				fmt.Println(operationReceiptJSON(operation, "sbox-x", "succeeded", birth))
+				os.Exit(0)
+			}
 			if node == "T" {
 				if !relayPendingRestore() {
 					_ = os.WriteFile(filepath.Join(stateDir, "target-running"), nil, 0o600)
@@ -204,6 +309,14 @@ func executorMain(stateDir, node string, args []string) {
 		if _, err := os.Stat(filepath.Join(stateDir, "fail-publish")); err == nil {
 			os.Exit(1) // publish keeps failing on the source
 		}
+	case filepath.Base(args[0]) == "cn-fetch":
+		if controlExists("fail-fetch") {
+			os.Exit(1)
+		}
+		// The artifact lands on the target carrying the source's content
+		// root, which a later checkpoint-root read observes.
+		_ = os.WriteFile(filepath.Join(stateDir, "target-root-digest"),
+			[]byte(sourceRootDigest(stateDir)), 0o600)
 	case has("delete"):
 		// Any bare `sbox ... delete` reaching the node is a cn-migrate
 		// regression: retirement only ever goes through the conditional
