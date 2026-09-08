@@ -14,10 +14,7 @@ There is no separate restore RPC. Restore is a form of sandbox creation, so it
 uses the normal `Start` path to allocate the target sandbox's filesystem,
 network, cgroup, and other resources.
 
-sandboxd coordinates the runtime operation and cleans partial output. It does
-not manage checkpoint names, catalogs, storage, transfer, retention, or
-compatibility negotiation. The caller chooses the checkpoint directory and
-owns a successful artifact.
+sandboxd coordinates the runtime operation and cleans partial output produced before the runtime checkpoint call is entered; once that call is entered, a failed, timed-out, or cancelled checkpoint retains the output directory and reports an unknown outcome (see "Source and failure semantics"). It does not manage checkpoint names, catalogs, storage, transfer, retention, or compatibility negotiation. The caller chooses the checkpoint directory and owns a successful artifact.
 
 `ListAvailableRuntimes` reports checkpoint/restore support for each initialized
 runtime handler. A supporting runtime may also advertise guest-visible
@@ -362,10 +359,7 @@ One management-plane resource boundary is closed as a prerequisite slice of that
 
 Reconciliation of a retained sandbox must stay identity-based against the runtime's own record — a generation-matched strict retirement where that state still exists. A recorded process that is not a verified owned incarnation is never authorization to signal it, and the public `DeleteIfGeneration` additionally depends on server metadata that a failed start may never have written or that the server rollback above may already have erased, so it is not guaranteed to work for a retained sandbox; a foreign recorded process is an operator incident requiring out-of-band verification, not a documented self-service cleanup path.
 
-On failure, sandboxd returns an error and does not force-delete, stop, or
-resume the source. The caller decides how to handle the source sandbox.
-sandboxd only cleans partial checkpoint output: it removes a leaf directory it
-created, or empties a caller-provided leaf directory while preserving it.
+On failure, sandboxd returns an error and does not independently stop, resume, or delete the source. Before the runtime checkpoint call is entered, sandboxd cleans the output allocated for the attempt: it removes a newly created leaf, or preserves a caller-provided leaf while clearing its contents. After entry, sandboxd preserves the output directory on every error, timeout, or cancellation and reports the outcome as unknown. The runtime may have sealed an artifact and stopped the source before a later step, such as UFFD exit confirmation, failed. This retention policy applies to the service layer; it does not undo partial-file cleanup performed inside the runtime. Retained files are not proof of a successful checkpoint. The caller must reconcile the operation, source identity, and artifact integrity before restoring or issuing another checkpoint; merely choosing a different output directory does not resolve the original operation.
 
 ## Start intents (durable in-flight start journal)
 
