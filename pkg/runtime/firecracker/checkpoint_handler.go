@@ -22,7 +22,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -418,6 +417,16 @@ func (handler *Handler) finishCheckpointedSandbox(
 ) error {
 	if err := stopFirecrackerProcessConfirmed(state, handler.binary); err != nil {
 		return fmt.Errorf("stop Firecracker sandbox %s after checkpoint: %w", sandboxID, err)
+	}
+	// The uffd gate runs after the VMM stop is confirmed (a connected handler
+	// then leaves by itself) and before the sandbox is finished: a handler
+	// whose exit stays unconfirmed keeps the instance and its artifacts for a
+	// later reconciliation instead of declaring the stop complete.
+	if err := confirmFirecrackerUffdExit(state.Uffd); err != nil {
+		return fmt.Errorf(
+			"confirm uffd handler exit for Firecracker sandbox %s after checkpoint: %w",
+			sandboxID, err,
+		)
 	}
 	instance.finish(runtimecore.Exit{ExitedAt: time.Now(), ExitCode: 0})
 	// stopInstance may already have marked a vanished process finished. Do
@@ -1101,9 +1110,9 @@ func (handler *Handler) Restore(ctx context.Context,
 	// it before loadSnapshot so it is listening when Firecracker connects.
 	memBackendType, memBackendPath := "", checkpointFiles.Memory
 	if handler.memBackend == "uffd" {
-		uffdSock := filepath.Join(filepath.Dir(apiPath), "uffd.sock")
+		uffdSock := filepath.Join(filepath.Dir(apiPath), firecrackerUffdSocketName)
 		if err := handler.launchUffdHandler(
-			startConfig.ID, uffdSock, checkpointFiles.Memory, stateDir,
+			instance, startConfig.ID, uffdSock, checkpointFiles.Memory, stateDir,
 		); err != nil {
 			return fmt.Errorf("launch uffd handler for %s: %w", startConfig.ID, err)
 		}
@@ -1176,12 +1185,30 @@ func (handler *Handler) Restore(ctx context.Context,
 	return nil
 }
 
-// launchUffdHandler starts the external page-fault handler for a uffd restore
-// and waits until its socket is accepting. The handler is a separate process
-// by design: sandboxd never serves faults itself, and a handler crash takes
-// down only its VM, not the daemon. The handler exits by itself once the VMM
-// disconnects, so no explicit lifecycle tracking is kept here.
-func (handler *Handler) launchUffdHandler(sandboxID, sockPath, backingPath, stateDir string) error {
+// launchUffdHandler starts the external page-fault handler for a uffd
+// restore and returns only after the handler's socket is accepting AND its
+// kernel identity is durable in the sandbox state. The handler is a separate
+// process by design: sandboxd never serves faults itself, and a handler crash
+// takes down only its VM, not the daemon. Ownership is a persisted-record
+// contract, never a process-local cmd pointer:
+//
+//   - the launch intent is persisted before any child exists, so a crash can
+//     never leave an untracked handler behind;
+//   - the child is a /bin/sh that reads one permit line from its stdin pipe
+//     before exec'ing the handler — EOF or a wrong token exits it, so a
+//     daemon that dies before the identity is persisted takes the pipe with
+//     it and the handler never runs;
+//   - the parent captures the child's PID, /proc starttime and boot id and
+//     fsyncs them into the state file BEFORE writing the permit: after that
+//     point any cleanup — this daemon or a restarted one, reaper or not —
+//     can recognize the exact process (gated shell or executed handler; exec
+//     preserves PID and starttime) through confirmFirecrackerUffdExit;
+//   - the handler exits by itself once the VMM disconnects, so this path
+//     never signals it.
+func (handler *Handler) launchUffdHandler(
+	instance *firecrackerInstance,
+	sandboxID, sockPath, backingPath, stateDir string,
+) error {
 	bin := handler.uffdHandlerBin
 	if bin == "" {
 		self, err := os.Executable()
@@ -1245,35 +1272,95 @@ func (handler *Handler) launchUffdHandler(sandboxID, sockPath, backingPath, stat
 	if handler.uffdPersistWorkers > 0 {
 		args = append(args, "-persist-workers", strconv.Itoa(handler.uffdPersistWorkers))
 	}
-	cmd := exec.Command(bin, args...)
-	cmd.Dir = stateDir
-	cmd.Stdout = logFile
-	cmd.Stderr = logFile
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("start uffd handler: %w", err)
+	// Durable launch intent before any child can exist. A crash from here on
+	// leaves a record that names this launch; a failure below that proves no
+	// child remains clears it again so retirement is not blocked.
+	intent := firecrackerUffdRecord{
+		Version: firecrackerUffdRecordVersion,
+		Phase:   firecrackerUffdPhasePending,
+		Socket:  sockPath,
 	}
-	// cmd.Wait stays the single reaper and the sole writer of the process
-	// state; the readiness loop below learns about exits through waitDone
-	// instead of reading that state unsynchronized. Signal deaths never
-	// count as Exited(), so polling the state would also stall them to the
-	// full deadline.
-	waitDone := make(chan struct{}, 1)
-	go func() {
-		_ = cmd.Wait() //nolint:errcheck // exit status surfaces in its log
-		waitDone <- struct{}{}
-	}()
+	instance.setUffdRecord(intent)
+	if err := handler.persistInstance(instance); err != nil {
+		// No child exists yet; dropping the in-memory record matches the
+		// unchanged state on disk.
+		instance.setUffdRecord(firecrackerUffdRecord{})
+		return fmt.Errorf("persist uffd launch intent for %s: %w", sandboxID, err)
+	}
+	child, err := startGatedUffdChild(bin, args, stateDir, logFile)
+	if err != nil {
+		joined := fmt.Errorf("start gated uffd handler for %s: %w", sandboxID, err)
+		if child != nil {
+			select {
+			case <-child.waitDone:
+			default:
+				return joined // Keep intent when the gated child exit is unconfirmed.
+			}
+		}
+		instance.setUffdRecord(firecrackerUffdRecord{})
+		if persistErr := handler.persistInstance(instance); persistErr != nil {
+			joined = errors.Join(joined, fmt.Errorf(
+				"clear uffd launch intent for %s: %w", sandboxID, persistErr,
+			))
+		}
+		return joined
+	}
+	// Kernel identity of the spawned child, durable BEFORE the gate opens.
+	identity := intent
+	identity.PID = child.pid
+	identity.StartTime = child.startTime
+	identity.BootID = child.bootID
+	instance.setUffdRecord(identity)
+	if err := handler.persistInstance(instance); err != nil {
+		// The permit is never sent: the child sees EOF on the closed gate and
+		// exits without executing. Prove that exit through the reaper this
+		// process owns while it still can, then drop the record; an exit that
+		// cannot be proven keeps the identity for a cleanup-pending
+		// reconciliation.
+		child.holdPermit()
+		joined := fmt.Errorf("persist uffd handler identity for %s: %w", sandboxID, err)
+		if child.waitExit(firecrackerUffdExitGrace) {
+			instance.setUffdRecord(firecrackerUffdRecord{})
+			if persistErr := handler.persistInstance(instance); persistErr != nil {
+				joined = errors.Join(joined, fmt.Errorf(
+					"clear uffd launch intent for %s: %w", sandboxID, persistErr,
+				))
+			}
+			return joined
+		}
+		return errors.Join(joined, errors.New(
+			"gated uffd child did not exit after the withheld permit",
+		))
+	}
+	// Identity durable: release the gate. exec preserves PID and starttime,
+	// so the identity persisted above remains the handler's.
+	if err := child.releasePermit(); err != nil {
+		return fmt.Errorf("release uffd gate for %s: %w", sandboxID, err)
+	}
 	// Wait for the handler's listening socket without dialing it: the
 	// handler treats its first and only connection as Firecracker's
 	// handshake, so a liveness probe connection would be mistaken for the
-	// VMM and tear the handler down.
+	// VMM and tear the handler down. Exits arrive through the single
+	// cmd.Wait reaper's completion channel, never by reading the process
+	// state unsynchronized; signal deaths report just as promptly.
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		if _, err := os.Stat(sockPath); err == nil {
+			ready := identity
+			ready.Phase = firecrackerUffdPhaseReady
+			instance.setUffdRecord(ready)
+			// The readiness phase must be durable before socket readiness can
+			// return: a caller acting on a ready handler relies on the record
+			// that gates its retirement.
+			if err := handler.persistInstance(instance); err != nil {
+				return fmt.Errorf(
+					"persist uffd handler readiness for %s: %w", sandboxID, err,
+				)
+			}
 			return nil
 		}
 		select {
-		case <-waitDone:
+		case <-child.waitDone:
 			return fmt.Errorf("uffd handler exited early for %s", sandboxID)
 		case <-time.After(50 * time.Millisecond):
 		}

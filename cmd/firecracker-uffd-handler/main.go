@@ -7,8 +7,9 @@
 // descriptor via SCM_RIGHTS. Each pagefault event is resolved by copying
 // chunk bytes from the backing file into the guest memory with UFFDIO_COPY.
 //
-// The handler exits when Firecracker disconnects (VM stopped) or the uffd
-// descriptor is hung up.
+// The handler exits when Firecracker disconnects (VM stopped), the uffd
+// descriptor is hung up, or SIGTERM arrives: termination runs the same
+// shutdown path and joins its workers instead of exiting abruptly.
 package main
 
 import (
@@ -25,6 +26,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -731,14 +733,22 @@ func (s *faultServer) wake(start, length uint64) {
 }
 
 // recvHandshake accepts Firecracker's connection and decodes the JSON mapping
-// table plus the uffd descriptor passed via SCM_RIGHTS.
-// recvHandshake accepts Firecracker's connection and decodes the JSON mapping
 // table plus the uffd descriptor passed via SCM_RIGHTS. The connection is
 // returned OPEN: Firecracker never sends more data on it, so a read-side EOF
 // is the reliable signal that the VMM process is gone — the uffd descriptor
 // itself cannot provide one, because this handler holds the last reference
 // after the VMM exits and userfaultfd never polls HUP for its holder.
-func recvHandshake(l net.Listener) ([]regionMapping, int, *net.UnixConn, error) {
+//
+// Cancellation is bounded: ctx closes the listening socket to unblock Accept
+// and closes the accepted connection to unblock an incomplete ReadMsgUnix —
+// neither syscall can wait on a context. Every rejection path closes the
+// accepted connection, and a handshake that raced cancellation is never
+// handed out as live. The kernel installs any SCM_RIGHTS descriptors the
+// moment the read returns, so descriptors this handler does not consume are
+// closed instead of leaking until process exit.
+func recvHandshake(ctx context.Context, l net.Listener) ([]regionMapping, int, *net.UnixConn, error) {
+	unblockAccept := context.AfterFunc(ctx, func() { _ = l.Close() })
+	defer unblockAccept()
 	conn, err := l.Accept()
 	if err != nil {
 		return nil, -1, nil, fmt.Errorf("accept: %w", err)
@@ -748,30 +758,64 @@ func recvHandshake(l net.Listener) ([]regionMapping, int, *net.UnixConn, error) 
 		conn.Close()
 		return nil, -1, nil, errors.New("unexpected connection type")
 	}
+	// fail closes the accepted connection on every rejection below; the
+	// callback above may already be closing it after a lost stop race, which
+	// is idempotent.
+	fail := func(err error) ([]regionMapping, int, *net.UnixConn, error) {
+		_ = c.Close()
+		return nil, -1, nil, err
+	}
 	buf := make([]byte, 4096)
 	oob := make([]byte, 128)
-	n, oobn, _, _, err := c.ReadMsgUnix(buf, oob)
-	if err != nil {
-		return nil, -1, nil, fmt.Errorf("read handshake: %w", err)
+	unblockRead := context.AfterFunc(ctx, func() { _ = c.Close() })
+	n, oobn, flags, _, readErr := c.ReadMsgUnix(buf, oob)
+	// SCM_RIGHTS descriptors are installed before ReadMsgUnix returns. Own
+	// every received fd before taking cancellation or payload-error branches.
+	var received []int
+	kept := -1
+	defer func() {
+		for _, fd := range received {
+			if fd != kept {
+				_ = unix.Close(fd)
+			}
+		}
+	}()
+	cmsgs, controlErr := unix.ParseSocketControlMessage(oob[:oobn])
+	if controlErr == nil {
+		for _, cm := range cmsgs {
+			if cm.Header.Level != unix.SOL_SOCKET || cm.Header.Type != unix.SCM_RIGHTS {
+				continue
+			}
+			fds, err := unix.ParseUnixRights(&cm)
+			if err != nil {
+				controlErr = err
+				break
+			}
+			received = append(received, fds...)
+		}
+	}
+	stoppedCallback := unblockRead()
+	if !stoppedCallback || ctx.Err() != nil {
+		return fail(fmt.Errorf("handshake canceled: %w", ctx.Err()))
+	}
+	if readErr != nil {
+		return fail(fmt.Errorf("read handshake: %w", readErr))
+	}
+	if flags&(unix.MSG_TRUNC|unix.MSG_CTRUNC) != 0 {
+		return fail(errors.New("truncated handshake or descriptor message"))
+	}
+	if controlErr != nil {
+		return fail(fmt.Errorf("parse control message: %w", controlErr))
 	}
 	var regions []regionMapping
 	if err := json.Unmarshal(buf[:n], &regions); err != nil {
-		return nil, -1, nil, fmt.Errorf("decode mappings %q: %w", string(buf[:n]), err)
+		return fail(fmt.Errorf("decode mappings %q: %w", string(buf[:n]), err))
 	}
-	cmsgs, err := unix.ParseSocketControlMessage(oob[:oobn])
-	if err != nil {
-		return nil, -1, nil, fmt.Errorf("parse control message: %w", err)
+	if len(received) == 0 {
+		return fail(errors.New("handshake carried no file descriptor"))
 	}
-	for _, cm := range cmsgs {
-		if cm.Header.Type == unix.SCM_RIGHTS {
-			fds, err := unix.ParseUnixRights(&cm)
-			if err != nil || len(fds) == 0 {
-				return nil, -1, nil, fmt.Errorf("parse SCM_RIGHTS: %v", err)
-			}
-			return regions, fds[0], c, nil
-		}
-	}
-	return nil, -1, nil, errors.New("handshake carried no file descriptor")
+	kept = received[0]
+	return regions, kept, c, nil
 }
 
 // fileFullyAllocated reports whether path is a regular file whose allocated
@@ -946,6 +990,19 @@ func runShutdown(once *sync.Once, stop chan struct{}, wake *cancelWake, cancelSo
 	})
 }
 
+// startupCanceled reports whether err is the result of termination being
+// requested during startup and, if so, logs an ordinary-exit line. main uses
+// it to return instead of log.Fatal: a canceled startup must still run its
+// deferred cleanup (socket path removal, context and signal-notifier
+// release), which log.Fatal skips by exiting the process immediately.
+func startupCanceled(sigCtx context.Context, err error) bool {
+	if sigCtx.Err() == nil {
+		return false
+	}
+	log.Printf("handler startup canceled: %v", err)
+	return true
+}
+
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	sockPath := flag.String("sock", "", "unix socket path Firecracker will connect to")
@@ -973,12 +1030,21 @@ func main() {
 	if *sockPath == "" || (*backingPath == "" && *remoteURL == "") {
 		log.Fatal("-sock plus -backing or -remote is required")
 	}
+	// Termination is part of the protocol with the runtime that owns this
+	// handler: SIGTERM can arrive before the VMM ever connects (a cancelled
+	// ownership handover) or at any point while serving. The notifier is
+	// installed before the socket is published so no signal can beat it and
+	// fall back to the default fatal disposition; every blocking wait below
+	// is unblocked through sigCtx instead.
+	sigCtx, stopSignals := signal.NotifyContext(context.Background(), syscall.SIGTERM)
+	defer stopSignals()
 	os.Remove(*sockPath)
 	l, err := net.Listen("unix", *sockPath)
 	if err != nil {
 		log.Fatalf("bind %s: %v", *sockPath, err)
 	}
 	defer os.Remove(*sockPath)
+	defer l.Close()
 
 	// Remote mode stages chunks in a sparse local cache. The bulk download
 	// runs after the handshake (below) concurrently with fault serving: a
@@ -986,7 +1052,10 @@ func main() {
 	// treats partially written chunks as misses so faults never race the
 	// writer (see readCache).
 	chunk := uint64(*chunkKB) << 10
-	sourceCtx, cancelSource := context.WithCancel(context.Background())
+	// The source context derives from the signal context so termination also
+	// aborts in-flight artifact fetches, while the serving shutdown path
+	// below still cancels the source on its own (VMM EOF, uffd hangup).
+	sourceCtx, cancelSource := context.WithCancel(sigCtx)
 	defer cancelSource()
 	source := &pageSource{
 		ctx:                    sourceCtx,
@@ -1010,6 +1079,11 @@ func main() {
 	} else if *chunkStorePath != "" {
 		local, err := openLocalMemoryBacking(sourceCtx, *backingPath)
 		if err != nil {
+			// The verification context derives from sigCtx, so termination
+			// surfaces here as an ordinary canceled exit.
+			if startupCanceled(sigCtx, err) {
+				return
+			}
 			log.Fatalf("verify local backing: %v", err)
 		}
 		if local != nil {
@@ -1039,6 +1113,9 @@ func main() {
 	} else {
 		file, err := openLocalMemoryBacking(sourceCtx, *backingPath)
 		if err != nil {
+			if startupCanceled(sigCtx, err) {
+				return
+			}
 			log.Fatalf("verify local backing: %v", err)
 		}
 		if file == nil {
@@ -1046,11 +1123,18 @@ func main() {
 		}
 		source.file = file
 	}
-	regions, fd, vmmConn, err := recvHandshake(l)
+	regions, fd, vmmConn, err := recvHandshake(sigCtx, l)
+	// The handshake connection is the protocol's only client; stop accepting.
+	// The close is idempotent with the cancellation hook inside recvHandshake.
+	_ = l.Close()
 	if err != nil {
+		if startupCanceled(sigCtx, err) {
+			return
+		}
 		log.Fatalf("handshake: %v", err)
 	}
 	defer vmmConn.Close()
+	defer unix.Close(fd)
 	s := &faultServer{
 		regions:   regions,
 		copyBytes: uint64(*copyKB) << 10,
@@ -1103,6 +1187,24 @@ func main() {
 			}
 			// Any unexpected inbound byte is ignored; the protocol has no
 			// further messages.
+		}
+	}()
+
+	// Termination after the handshake takes the same shutdown path as the VMM
+	// EOF above — stop, wake, cancel the source, stop persistence — so the
+	// joins below still run instead of the default signal fatality. The
+	// watcher shares the background group but also exits on stop, which an
+	// EOF-triggered shutdown closes: the exit must never wait on a signal
+	// that never arrives, and shutdown itself only signals and never joins,
+	// so the watcher cannot deadlock against the exit it triggers.
+	background.Add(1)
+	go func() {
+		defer background.Done()
+		select {
+		case <-sigCtx.Done():
+			log.Printf("termination signal received; shutting down")
+			shutdown()
+		case <-stop:
 		}
 	}()
 
