@@ -48,6 +48,7 @@ type options struct {
 	compress                 bool
 	leaveRunning             bool
 	snapshotType             string
+	expectedGeneration       string
 	stdout                   string
 	stderr                   string
 	workloadCmd              string
@@ -93,6 +94,9 @@ func main() {
 	flag.BoolVar(&value.leaveRunning, "leave-running", true, "leave source running")
 	flag.StringVar(&value.snapshotType, "snapshot-type", "",
 		"checkpoint flavor: empty (auto), Full, Incremental, or SoftDirty")
+	flag.StringVar(&value.expectedGeneration, "expected-generation", "",
+		"resource_generation the checkpointed or deleted sandbox must still be on "+
+			"(empty keeps the unconditional checkpoint/delete RPCs)")
 	flag.StringVar(&value.workloadCmd, "workload-cmd", "",
 		"override the built-in start workload command (template warmup hooks)")
 	flag.Var(&value.mounts, "mount",
@@ -106,8 +110,14 @@ func main() {
 }
 
 func run(value options) error {
+	if value.expectedGeneration != "" && value.action != "checkpoint" && value.action != "delete" {
+		return errors.New("--expected-generation is only valid for checkpoint and delete")
+	}
 	if value.socket == "" {
 		return errors.New("--socket is required")
+	}
+	if err := validateExpectedGeneration(value.expectedGeneration); err != nil {
+		return err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), value.timeout)
 	defer cancel()
@@ -145,6 +155,9 @@ func start(
 	client runtime.SandboxServiceClient,
 	value options,
 ) error {
+	if value.expectedGeneration != "" {
+		return errors.New("--expected-generation is only valid for checkpoint and delete")
+	}
 	if value.rootfs == "" || value.sandboxID == "" {
 		return errors.New("--rootfs and --sandbox-id are required for start")
 	}
@@ -267,16 +280,53 @@ func checkpoint(
 	if value.checkpointTimeoutSeconds == 0 || value.checkpointTimeoutSeconds > uint(^uint32(0)) {
 		return errors.New("--checkpoint-timeout-seconds must fit in a non-zero uint32")
 	}
-	_, err := client.Checkpoint(ctx, &runtime.CheckpointRequest{
+	if err := validateExpectedGeneration(value.expectedGeneration); err != nil {
+		return err
+	}
+	request := &runtime.CheckpointRequest{
 		ID:             value.sandboxID,
 		CheckpointDir:  value.checkpointDir,
 		TimeoutSeconds: uint32(value.checkpointTimeoutSeconds),
 		Compress:       value.compress,
 		LeaveRunning:   value.leaveRunning,
 		SnapshotType:   value.snapshotType,
-	})
-	if err != nil {
+	}
+	if value.expectedGeneration == "" {
+		if _, err := client.Checkpoint(ctx, request); err != nil {
+			return fmt.Errorf("checkpoint: %w", err)
+		}
+		return nil
+	}
+	// The generation precondition must hold atomically with the checkpoint:
+	// falling back to the unconditional RPC would snapshot an incarnation the
+	// caller no longer owns, so every failure — Unimplemented included — is
+	// fatal.
+	if _, err := client.CheckpointIfGeneration(ctx, &runtime.CheckpointIfGenerationRequest{
+		Checkpoint:         request,
+		ExpectedGeneration: value.expectedGeneration,
+	}); err != nil {
 		return fmt.Errorf("checkpoint: %w", err)
+	}
+	return nil
+}
+
+// maxExpectedGenerationLength bounds --expected-generation so a mistyped
+// flag (a file path, say) cannot reach the service as a generation label.
+const maxExpectedGenerationLength = 256
+
+// validateExpectedGeneration accepts the unset value that keeps the legacy
+// unconditional RPCs and rejects labels the service compares verbatim:
+// blank strings and oversized ones. The helpers re-run this check so direct
+// callers (tests included) stay as safe as the CLI.
+func validateExpectedGeneration(value string) error {
+	if value == "" {
+		return nil
+	}
+	if strings.TrimSpace(value) == "" {
+		return errors.New("--expected-generation must not be blank")
+	}
+	if len(value) > maxExpectedGenerationLength {
+		return fmt.Errorf("--expected-generation must be at most %d bytes", maxExpectedGenerationLength)
 	}
 	return nil
 }
@@ -286,6 +336,9 @@ func restore(
 	client runtime.SandboxServiceClient,
 	value options,
 ) error {
+	if value.expectedGeneration != "" {
+		return errors.New("--expected-generation is only valid for checkpoint and delete")
+	}
 	if value.targetID == "" || value.checkpointDir == "" {
 		return errors.New("--target-id and --checkpoint-dir are required for restore")
 	}
@@ -315,9 +368,11 @@ func restore(
 	return nil
 }
 
-// deleteSandbox releases a sandbox through the normal Delete RPC, cleaning
-// its runtime state and writable layer — the acceptance counterpart to
-// checkpoint/restore (previously only reachable through the sbox CLI).
+// deleteSandbox releases a sandbox, cleaning its runtime state and writable
+// layer — the acceptance counterpart to checkpoint/restore (previously only
+// reachable through the sbox CLI). With --expected-generation set it retires
+// exactly that incarnation through DeleteIfGeneration and verifies the
+// receipt.
 func deleteSandbox(
 	ctx context.Context,
 	client runtime.SandboxServiceClient,
@@ -326,10 +381,33 @@ func deleteSandbox(
 	if value.sandboxID == "" {
 		return errors.New("--sandbox-id is required for delete")
 	}
-	if _, err := client.Delete(ctx, &runtime.DeleteRequest{
-		ID: value.sandboxID,
-	}); err != nil {
+	if err := validateExpectedGeneration(value.expectedGeneration); err != nil {
+		return err
+	}
+	if value.expectedGeneration == "" {
+		if _, err := client.Delete(ctx, &runtime.DeleteRequest{
+			ID: value.sandboxID,
+		}); err != nil {
+			return fmt.Errorf("delete: %w", err)
+		}
+		return nil
+	}
+	// Conditional retirement is the point of the flag: never fall back to
+	// the unconditional Delete, whatever the failure (Unimplemented included)
+	// — that would retire an incarnation the caller did not name.
+	response, err := client.DeleteIfGeneration(ctx, &runtime.DeleteIfGenerationRequest{
+		ID:                 value.sandboxID,
+		ExpectedGeneration: value.expectedGeneration,
+	})
+	if err != nil {
 		return fmt.Errorf("delete: %w", err)
+	}
+	if response.GetRetiredGeneration() != value.expectedGeneration {
+		return fmt.Errorf(
+			"delete: retired generation %q does not match expected %q",
+			response.GetRetiredGeneration(),
+			value.expectedGeneration,
+		)
 	}
 	return nil
 }
