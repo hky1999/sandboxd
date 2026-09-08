@@ -1794,3 +1794,68 @@ func newTestManager(t *testing.T) *Manager {
 	})
 	return mgr
 }
+
+// ClosePreserving must keep the mounts a retained start still owns: the
+// preserved image's mount record and container entry survive with no unmount
+// attempt, while non-preserved images follow the original shutdown unmount.
+func TestClosePreservingKeepsRetainedStartMounts(t *testing.T) {
+	mgr := newTestManager(t)
+
+	preservedURL := "registry.example/retained:latest"
+	releasedURL := "registry.example/normal:latest"
+	preservedPath := filepath.Join(mgr.mountsDir, "retained", "merged")
+	releasedPath := filepath.Join(mgr.mountsDir, "normal", "merged")
+	for _, mount := range []struct {
+		url, id, path string
+	}{
+		{preservedURL, "retained", preservedPath},
+		{releasedURL, "normal", releasedPath},
+	} {
+		if err := mgr.store.putMount(&OciMountRecord{
+			ImageURL:  mount.url,
+			MountID:   mount.id,
+			MountPath: mount.path,
+		}); err != nil {
+			t.Fatalf("put mount %s: %v", mount.url, err)
+		}
+		mgr.containers[mount.url] = &ContainerInfo{
+			MountID:   mount.id,
+			ImageURL:  mount.url,
+			MountPath: mount.path,
+		}
+	}
+
+	var unmounted []string
+	mgr.unmountFn = func(target string) error {
+		unmounted = append(unmounted, target)
+		return nil
+	}
+
+	if err := mgr.ClosePreserving(map[string]bool{preservedURL: true}); err != nil {
+		t.Fatalf("ClosePreserving() error: %v", err)
+	}
+
+	if len(unmounted) != 1 || unmounted[0] != releasedPath {
+		t.Fatalf("unmounted = %v, want only %s", unmounted, releasedPath)
+	}
+	if _, still := mgr.containers[preservedURL]; !still {
+		t.Fatal("preserved image's container entry was dropped")
+	}
+	if _, still := mgr.containers[releasedURL]; still {
+		t.Fatal("released image's container entry survived its unmount")
+	}
+	// ClosePreserving closes the store; reopen it to inspect the records.
+	reopened, err := openMetadataStore(filepath.Join(mgr.root, "metadata.db"))
+	if err != nil {
+		t.Fatalf("reopen metadata store: %v", err)
+	}
+	defer reopened.close()
+	kept, err := reopened.getMount(preservedURL)
+	if err != nil || kept == nil {
+		t.Fatalf("preserved mount record must survive: record=%v err=%v", kept, err)
+	}
+	gone, err := reopened.getMount(releasedURL)
+	if err != nil || gone != nil {
+		t.Fatalf("released mount record must be deleted: record=%v err=%v", gone, err)
+	}
+}

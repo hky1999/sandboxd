@@ -827,6 +827,15 @@ func (m *Manager) UnmountImageWithContext(ctx context.Context, imageURL string) 
 
 // Close stops background workers and releases resources.
 func (m *Manager) Close() error {
+	return m.ClosePreserving(nil)
+}
+
+// ClosePreserving is Close with a preserve set of image URLs whose mounts
+// must survive the shutdown: they still back retained starts whose runtime
+// state is undetermined, and unmounting them here would destroy the very
+// mounts the filesystem layer deliberately kept. Preserved mounts keep their
+// records so the next daemon start recovers them.
+func (m *Manager) ClosePreserving(preserveImages map[string]bool) error {
 	m.layerPoolMu.Lock()
 	m.stopOnce.Do(func() {
 		close(m.stopCh)
@@ -842,6 +851,10 @@ func (m *Manager) Close() error {
 	m.mutex.Unlock()
 
 	for _, imageURL := range images {
+		if preserveImages[imageURL] {
+			logrus.Infof("oci manager: preserve retained-start image mount %s", imageURL)
+			continue
+		}
 		if err := m.UnmountImage(imageURL); err != nil {
 			logrus.Warnf("failed to unmount image %s during shutdown: %v", imageURL, err)
 		}

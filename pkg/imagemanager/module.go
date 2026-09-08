@@ -153,13 +153,24 @@ func (m *Module) ReconcileRecoveredDaemons() error {
 // to mount_records.db) and the OCI manager (releases overlay mounts). It
 // is safe to call multiple times; only the first call performs work.
 func (m *Module) Stop() {
+	m.StopPreserving(nil)
+}
+
+// StopPreserving is Stop with a preserve set of OCI image URLs whose mounts
+// belong to retained starts and must not be unmounted at shutdown. The
+// distillfs worker still stops — its mount records persist and the next
+// daemon start reconciles them — but OCI overlay mounts backing a pending
+// intent stay exactly where the filesystem layer left them.
+func (m *Module) StopPreserving(preserveImages map[string]bool) {
 	m.closedOnce.Do(func() {
 		m.healthy.Store(false)
 		if m.worker != nil {
 			m.worker.Close()
 		}
 		if m.ociMgr != nil {
-			m.ociMgr.Close()
+			if err := m.ociMgr.ClosePreserving(preserveImages); err != nil {
+				logrus.Warnf("oci manager shutdown: %v", err)
+			}
 		}
 	})
 }

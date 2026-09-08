@@ -917,6 +917,16 @@ func (handler *Handler) Delete(ctx context.Context, sandboxID string) error {
 	return handler.delete(ctx, sandboxID, "", false)
 }
 
+// StartFailureCleanupProven reports the Firecracker failed-start contract:
+// Start and Restore roll a spawned VMM back through the exit gate themselves,
+// so an error that does not join runtimecore.ErrStartCleanupPending means the
+// runtime already confirmed the process exit and cleaned (or durably
+// retained) its own state. Failures from before the VMM is spawned behave the
+// same way: everything is cleaned before the plain error returns.
+func (handler *Handler) StartFailureCleanupProven() bool {
+	return true
+}
+
 // DeleteStrict retires the sandbox through the same exit-gated flow as
 // Delete, but only the incarnation whose persisted generation matches
 // expectedGeneration, and it never converts an absent state into success.

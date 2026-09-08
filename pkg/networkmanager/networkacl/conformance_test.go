@@ -495,7 +495,7 @@ func (f *aclConformanceFixture) restart(t *testing.T) {
 	require.NoError(t, manager.Restore(map[string]Binding{
 		f.binding.SandboxID:     f.binding,
 		f.peerBinding.SandboxID: f.peerBinding,
-	}))
+	}, nil))
 }
 
 func (f *aclConformanceFixture) assertTCP(t *testing.T, destination net.IP, port int, want bool) {

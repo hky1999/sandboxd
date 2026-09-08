@@ -69,7 +69,7 @@ func TestInterfaceCleanupIncludesLeasedInterfaces(t *testing.T) {
 	)
 	defer patch.Reset()
 
-	assert.NoError(t, m.cleanup())
+	assert.NoError(t, m.cleanup(nil))
 	assert.ElementsMatch(t, []string{"pv.ac1100ad", "pv.ac1100ae"}, destroyed)
 }
 
@@ -80,14 +80,14 @@ func TestInterfaceCleanup(t *testing.T) {
 	})
 	defer destroyDeviceFailedPatch.Reset()
 
-	m.cleanup()
+	m.cleanup(nil)
 
 	destroyDeviceSuccessPatch := gomonkey.ApplyPrivateMethod(m, "destroyDevice", func(*InterfaceManager, net.Interface) error {
 		return nil
 	})
 	defer destroyDeviceSuccessPatch.Reset()
 
-	m.cleanup()
+	m.cleanup(nil)
 }
 
 func TestInterfaceCleanup_IgnoresResourceWithoutInterface(t *testing.T) {
@@ -103,7 +103,7 @@ func TestInterfaceCleanup_IgnoresResourceWithoutInterface(t *testing.T) {
 	}).ToString())
 
 	assert.NotPanics(t, func() {
-		m.cleanup()
+		m.cleanup(nil)
 	})
 }
 
@@ -826,4 +826,134 @@ func deviceCIDR(ip string, ones int) *net.IPNet {
 		IP:   net.ParseIP(ip),
 		Mask: net.CIDRMask(ones, 32),
 	}
+}
+
+// A preserved lease must keep the network infrastructure it depends on: the
+// SNAT rules and the owned bridge survive a preserving shutdown. This is the
+// in-tree bridge of the 0051 checker counterexample (preserved lease +
+// destroyed SNAT/bridge) with an added control arm.
+func TestShutDownPreservingKeepsNetworkInfrastructure(t *testing.T) {
+	newManager := func(nat *cleanupNetworkManager, links *fakeLinkOperations) *InterfaceManager {
+		m := &InterfaceManager{
+			interfaces:      util.New(""),
+			usingInterfaces: cmap.New[struct{}](),
+			idleIp:          util.New(""),
+			IpRange:         "172.30.252.1/22",
+			bridgeLink:      links.link,
+			linkOps:         links,
+			natBackend:      "preserve-infra-test",
+			stopCh:          make(chan struct{}),
+			runDoneCh:       nil,
+			storeDoneCh:     nil,
+		}
+		NetworkManagers[m.natBackend] = nat
+		return m
+	}
+	resource := (&NetResource{
+		Interface:    &net.Interface{Name: "tap-preserve0051", Index: 43},
+		Ip:           net.ParseIP("172.30.252.2"),
+		EndpointType: "tap",
+	}).ToString()
+
+	t.Run("preserved lease keeps SNAT and bridge", func(t *testing.T) {
+		nat := &cleanupNetworkManager{}
+		bridge := &netlink.Bridge{LinkAttrs: netlink.LinkAttrs{Name: BridgeName, Index: 42}}
+		links := &fakeLinkOperations{link: bridge}
+		m := newManager(nat, links)
+		t.Cleanup(func() { delete(NetworkManagers, m.natBackend) })
+		m.usingInterfaces.Set(resource, struct{}{})
+
+		require.NoError(t, m.ShutDownPreserving(map[string]struct{}{resource: {}}))
+		assert.True(t, m.usingInterfaces.Has(resource), "the preserved lease stays active")
+		assert.Empty(t, nat.cleanedRanges, "SNAT rules must survive for a preserved lease")
+		assert.Nil(t, links.deleted, "the owned bridge must survive for a preserved lease")
+	})
+
+	t.Run("empty preserve set keeps the original cleanup", func(t *testing.T) {
+		nat := &cleanupNetworkManager{}
+		bridge := &netlink.Bridge{LinkAttrs: netlink.LinkAttrs{Name: BridgeName, Index: 42}}
+		links := &fakeLinkOperations{link: bridge}
+		m := newManager(nat, links)
+		t.Cleanup(func() { delete(NetworkManagers, m.natBackend) })
+
+		require.NoError(t, m.ShutDownPreserving(nil))
+		assert.Equal(t, []string{"172.30.252.1/22"}, nat.cleanedRanges)
+		assert.Same(t, bridge, links.deleted)
+	})
+}
+
+// staticDirEntry adapts a fixed name to os.DirEntry for namespace listings.
+type staticDirEntry struct{ name string }
+
+func (d staticDirEntry) Name() string               { return d.name }
+func (d staticDirEntry) IsDir() bool                { return true }
+func (d staticDirEntry) Type() os.FileMode          { return os.ModeDir }
+func (d staticDirEntry) Info() (os.FileInfo, error) { return nil, os.ErrNotExist }
+
+// A pending start intent protects an ephemeral (runc) lease exactly where the
+// missing-metadata recovery path would destroy it: the device, the namespace,
+// and the durable active lease all survive; without the predicate the
+// historical destruction runs unchanged.
+func TestLoadPreservesPendingIntentEphemeralLease(t *testing.T) {
+	resource := (&NetResource{
+		Interface: &net.Interface{Name: config.PeerVethPrefix + "0a580002"},
+		Ip:        net.ParseIP("10.88.0.2"),
+		Mask:      net.CIDRMask(16, 32),
+		Gateway:   net.ParseIP("10.88.0.1"),
+		Type:      "bridge",
+		NetNSPath: "/var/run/netns/runc-sbox-pending",
+		Lifecycle: InterfaceLifecycleEphemeral,
+	}).ToString()
+
+	newManager := func(links *fakeLinkOperations, deletedNetNS *string, preserve func(string) bool) *InterfaceManager {
+		m := &InterfaceManager{
+			IpRange:           "10.88.0.1/16",
+			BridgeIp:          net.ParseIP("10.88.0.1"),
+			mask:              net.CIDRMask(16, 32),
+			sandboxRoot:       t.TempDir(),
+			interfaces:        util.New(""),
+			usingInterfaces:   cmap.New[struct{}](),
+			idleIp:            util.New(""),
+			linkOps:           links,
+			preserveEphemeral: preserve,
+			listLinks: func() ([]net.Interface, error) {
+				return []net.Interface{{Name: config.HostVethPrefix + "0a580002"}}, nil
+			},
+			listNetNS: func() ([]os.DirEntry, error) {
+				return []os.DirEntry{staticDirEntry{name: "runc-sbox-pending"}}, nil
+			},
+			deleteNetNS: func(path string) error {
+				*deletedNetNS = path
+				return nil
+			},
+		}
+		m.usingInterfaces.Set(resource, struct{}{})
+		return m
+	}
+
+	t.Run("pending intent keeps the lease", func(t *testing.T) {
+		host := &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: config.HostVethPrefix + "0a580002"}}
+		links := &fakeLinkOperations{link: host}
+		var deletedNetNS string
+		m := newManager(links, &deletedNetNS, func(id string) bool { return id == "sbox-pending" })
+
+		require.NoError(t, m.load(sets.New("10.88.0.2")))
+		assert.True(t, m.usingInterfaces.Has(resource), "the pending intent's lease must survive")
+		assert.Nil(t, links.deleted, "the pending intent's host veth must survive")
+		assert.Empty(t, deletedNetNS, "the pending intent's namespace must survive")
+		assert.False(t, m.idleIp.Has("10.88.0.2"), "the protected IP must not become allocatable")
+	})
+
+	t.Run("without the predicate the historical cleanup runs", func(t *testing.T) {
+		host := &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: config.HostVethPrefix + "0a580002"}}
+		links := &fakeLinkOperations{link: host}
+		var deletedNetNS string
+		m := newManager(links, &deletedNetNS, nil)
+
+		require.NoError(t, m.load(sets.New("10.88.0.2")))
+		assert.False(t, m.usingInterfaces.Has(resource))
+		assert.Same(t, host, links.deleted)
+		assert.Equal(t, "/var/run/netns/runc-sbox-pending", deletedNetNS)
+		assert.True(t, m.idleIp.Has("10.88.0.2"))
+	})
 }

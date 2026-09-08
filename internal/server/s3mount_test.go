@@ -196,7 +196,7 @@ func TestS3MountManager_CleanupAll(t *testing.T) {
 	}
 
 	// Call the actual cleanup method
-	mgr.cleanupAllS3Unmounts()
+	mgr.cleanupAllS3Unmounts(nil)
 
 	if len(mgr.entries) != 0 {
 		t.Fatalf("expected 0 entries after cleanup, got %d", len(mgr.entries))
@@ -532,7 +532,7 @@ func TestOciMountManager_CleanupAll(t *testing.T) {
 	}
 
 	// Call the actual cleanup method
-	mgr.cleanupAllOciUnmounts()
+	mgr.cleanupAllOciUnmounts(nil)
 
 	if len(mgr.entries) != 0 {
 		t.Fatalf("expected 0 entries after cleanup, got %d", len(mgr.entries))
@@ -687,7 +687,7 @@ func TestS3MountManager_CleanupAllInvalidKey(t *testing.T) {
 	mgr.mu.Unlock()
 
 	// Should not panic
-	mgr.cleanupAllS3Unmounts()
+	mgr.cleanupAllS3Unmounts(nil)
 
 	// Only the valid key should have been unmounted
 	calls := tracker.getUnmountCalls()

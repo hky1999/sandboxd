@@ -145,3 +145,43 @@ func TestScaleStorageBytes(t *testing.T) {
 		})
 	}
 }
+
+// StopPreserving must skip the destructive filestore cleanup (umount plus
+// backing-image removal) while a retained start still owns writable layers
+// in it, and keep the original cleanup otherwise.
+func TestStopPreservingSkipsFilestoreCleanupForRetainedStarts(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "filestore")
+	m := NewModule(dir, "1G", false, 1)
+	m.ensureMount = func(string, string, bool, *loopdevice.Manager) (*loopdevice.Device, error) {
+		return nil, nil
+	}
+	cleanups := 0
+	m.cleanupMount = func(string, bool, *loopdevice.Device) error {
+		cleanups++
+		return nil
+	}
+	if err := m.Start(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := m.StopPreserving(true); err != nil {
+		t.Fatalf("StopPreserving(true) error: %v", err)
+	}
+	if cleanups != 0 {
+		t.Fatalf("preserve mode ran the destructive cleanup %d time(s)", cleanups)
+	}
+	if m.Healthy() {
+		t.Fatal("module must still report unhealthy after Stop")
+	}
+
+	// Without preservation the historical cleanup runs.
+	if err := m.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.StopPreserving(false); err != nil {
+		t.Fatalf("StopPreserving(false) error: %v", err)
+	}
+	if cleanups != 1 {
+		t.Fatalf("normal Stop must run the cleanup exactly once, got %d", cleanups)
+	}
+}

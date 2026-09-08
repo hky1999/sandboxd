@@ -179,7 +179,11 @@ func (m *s3MountManager) unmountS3(cfg *runtime.S3Config) error {
 
 // cleanupAllS3Unmounts unmounts all remaining S3 mounts.
 // Called during shutdown.
-func (m *s3MountManager) cleanupAllS3Unmounts() {
+// cleanupAllS3Unmounts unmounts every remaining S3 mount at daemon exit.
+// Keys in the preserve set belong to retained starts and keep their mounts:
+// the persisted filesystem state still references them and restart recovery
+// re-acquires them.
+func (m *s3MountManager) cleanupAllS3Unmounts(preserve map[string]bool) {
 	m.mu.Lock()
 	entries := make(map[string]*imageMountEntry, len(m.entries))
 	for k, v := range m.entries {
@@ -189,6 +193,10 @@ func (m *s3MountManager) cleanupAllS3Unmounts() {
 	m.mu.Unlock()
 
 	for key, entry := range entries {
+		if preserve[key] {
+			logrus.Infof("s3mount: preserve retained-start mount refcount=%d at %s", entry.refcount, entry.path)
+			continue
+		}
 		parts := strings.Split(key, "\x00")
 		if len(parts) != 3 {
 			logrus.Warnf("s3mount: invalid key format, skipping: %q", key)
@@ -307,7 +315,9 @@ func (m *ociMountManager) unmountOCI(imageURL string) error {
 
 // cleanupAllOciUnmounts unmounts all remaining OCI image mounts.
 // Called during shutdown.
-func (m *ociMountManager) cleanupAllOciUnmounts() {
+// cleanupAllOciUnmounts unmounts every remaining OCI mount at daemon exit.
+// URLs in the preserve set belong to retained starts and keep their mounts.
+func (m *ociMountManager) cleanupAllOciUnmounts(preserve map[string]bool) {
 	m.mu.Lock()
 	entries := make(map[string]*imageMountEntry, len(m.entries))
 	for k, v := range m.entries {
@@ -317,6 +327,10 @@ func (m *ociMountManager) cleanupAllOciUnmounts() {
 	m.mu.Unlock()
 
 	for key, entry := range entries {
+		if preserve[key] {
+			logrus.Infof("ocimount: preserve retained-start mount refcount=%d at %s", entry.refcount, entry.path)
+			continue
+		}
 		logrus.Infof("ocimount: cleanup remaining mount refcount=%d at %s", entry.refcount, entry.path)
 		if err := m.unmountF(key); err != nil {
 			logrus.Warnf("ocimount: cleanup failed for %s: %v", key, err)

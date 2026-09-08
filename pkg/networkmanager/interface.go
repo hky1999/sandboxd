@@ -58,6 +58,10 @@ type InterfaceManager struct {
 	natBackend  string
 	sysctlRoot  string
 	sandboxRoot string
+	// preserveEphemeral marks sandbox IDs whose ephemeral leases are protected
+	// by pending start intents; load() must not destroy their devices or
+	// namespaces even when the sandbox metadata is missing.
+	preserveEphemeral func(id string) bool
 
 	mask net.IPMask
 
@@ -214,6 +218,19 @@ type storedInterfaceIDs struct {
 func (m *InterfaceManager) CacheSizeLimit() int { return m.cacheSize }
 
 func (m *InterfaceManager) ShutDown() error {
+	return m.ShutDownPreserving(nil)
+}
+
+// ShutDownPreserving is ShutDown with a preserve set of network-resource
+// identities whose leased devices must survive the shutdown: they belong to
+// retained starts with undetermined runtime state. Preserved devices are
+// neither destroyed nor dropped from the persisted active set, so the next
+// start recovers them as leased instead of handing the same endpoint to a
+// second sandbox. Preserving a lease also preserves the infrastructure it
+// depends on: the SNAT rules and the owned bridge stay in place while any
+// lease is preserved, because a kept endpoint without its bridge and masquerade
+// is not a kept network. An empty preserve set keeps the original shutdown.
+func (m *InterfaceManager) ShutDownPreserving(preserve map[string]struct{}) error {
 	m.shutdownOnce.Do(func() {
 		// Wait for allocations and recycles that already entered the manager to
 		// finish before stopping the worker and taking the cleanup snapshot.
@@ -230,15 +247,29 @@ func (m *InterfaceManager) ShutDown() error {
 		if m.storeDoneCh != nil {
 			<-m.storeDoneCh
 		}
-		cleanupErr := m.cleanup()
-		m.usingInterfaces.Clear()
+		cleanupErr := m.cleanup(preserve)
+		for _, key := range m.usingInterfaces.Keys() {
+			if _, keep := preserve[key]; !keep {
+				m.usingInterfaces.Pop(key)
+			}
+		}
 		m.storeMark.Store(false)
 		if m.db != nil {
 			if err := m.store(); err != nil {
 				cleanupErr = errors.Join(cleanupErr, err)
 			}
 		}
-		m.shutdownError = errors.Join(cleanupErr, m.cleanupNetworkInfrastructure())
+		if len(preserve) > 0 {
+			// Intentional, not an error: the kept leases need the bridge and
+			// SNAT rules, and the next daemon start reconciles them.
+			logrus.Warnf(
+				"skip network infrastructure cleanup: %d preserved lease(s) still depend on the bridge and SNAT rules",
+				len(preserve),
+			)
+		} else {
+			cleanupErr = errors.Join(cleanupErr, m.cleanupNetworkInfrastructure())
+		}
+		m.shutdownError = cleanupErr
 	})
 	return m.shutdownError
 }
@@ -824,7 +855,8 @@ func (m *InterfaceManager) store() error {
 // cleanup removes both idle and still-leased TAP/veth endpoints. The server normally
 // releases all sandbox leases before this method runs, but including the using
 // set keeps a failed sandbox deletion from leaking sandbox network interfaces.
-func (m *InterfaceManager) cleanup() error {
+// Resources in the preserve set (retained starts) keep their devices.
+func (m *InterfaceManager) cleanup(preserve map[string]struct{}) error {
 	logrus.Debugf("start to cleanup interfaces")
 
 	interfaces := append(m.interfaces.List(), m.usingInterfaces.Keys()...)
@@ -832,6 +864,9 @@ func (m *InterfaceManager) cleanup() error {
 	var errs []error
 	for _, devStr := range interfaces {
 		if devStr == "" {
+			continue
+		}
+		if _, keep := preserve[devStr]; keep {
 			continue
 		}
 		dev, err := NewNetResource(devStr)
@@ -918,6 +953,34 @@ func NewInterfaceManager(
 	natBackend string,
 	sandboxRoots ...string,
 ) (*InterfaceManager, error) {
+	return newInterfaceManager(db, ipRange, size, cacheSize, natBackend, nil, sandboxRoots...)
+}
+
+// NewInterfaceManagerPreserving additionally accepts the predicate marking
+// sandbox IDs protected by pending start intents. Their ephemeral (runc)
+// leases survive recovery even without sandbox metadata: the pending intent,
+// not the metadata, is the durable proof those endpoints are still owned.
+func NewInterfaceManagerPreserving(
+	db store.DbStore,
+	ipRange string,
+	size int,
+	cacheSize int,
+	natBackend string,
+	preserveEphemeral func(id string) bool,
+	sandboxRoots ...string,
+) (*InterfaceManager, error) {
+	return newInterfaceManager(db, ipRange, size, cacheSize, natBackend, preserveEphemeral, sandboxRoots...)
+}
+
+func newInterfaceManager(
+	db store.DbStore,
+	ipRange string,
+	size int,
+	cacheSize int,
+	natBackend string,
+	preserveEphemeral func(id string) bool,
+	sandboxRoots ...string,
+) (*InterfaceManager, error) {
 	// load using id from db
 	idData, err := db.LoadRaw(config.BridgeIpBucket)
 	if err != nil && !errord.IsNotFound(err) {
@@ -975,23 +1038,24 @@ func NewInterfaceManager(
 		sandboxRoot = sandboxRoots[0]
 	}
 	manager := &InterfaceManager{
-		db:              db,
-		cacheSize:       cacheSize,
-		idleIp:          util.New[string](""),
-		size:            size,
-		createReqs:      make(chan *createRequest, size),
-		IpRange:         ipRange,
-		BridgeIp:        gatewayIp,
-		interfaces:      util.New[string](""),
-		usingInterfaces: usingInterfaces,
-		bridgeLink:      bridgeLink,
-		natBackend:      natBackend,
-		sandboxRoot:     sandboxRoot,
-		mask:            mask,
-		storeMark:       atomic.Bool{},
-		stopCh:          make(chan struct{}),
-		runDoneCh:       make(chan struct{}),
-		storeDoneCh:     make(chan struct{}),
+		db:                db,
+		cacheSize:         cacheSize,
+		idleIp:            util.New[string](""),
+		size:              size,
+		createReqs:        make(chan *createRequest, size),
+		IpRange:           ipRange,
+		BridgeIp:          gatewayIp,
+		interfaces:        util.New[string](""),
+		usingInterfaces:   usingInterfaces,
+		bridgeLink:        bridgeLink,
+		natBackend:        natBackend,
+		sandboxRoot:       sandboxRoot,
+		preserveEphemeral: preserveEphemeral,
+		mask:              mask,
+		storeMark:         atomic.Bool{},
+		stopCh:            make(chan struct{}),
+		runDoneCh:         make(chan struct{}),
+		storeDoneCh:       make(chan struct{}),
 	}
 
 	if err = manager.load(ips); err != nil {
@@ -1001,7 +1065,7 @@ func NewInterfaceManager(
 		if manager.usingInterfaces.Count() != 0 {
 			return nil, err
 		}
-		cleanupErr := errors.Join(manager.cleanup(), manager.cleanupNetworkInfrastructure())
+		cleanupErr := errors.Join(manager.cleanup(nil), manager.cleanupNetworkInfrastructure())
 		if cleanupErr != nil {
 			return nil, errors.Join(err, fmt.Errorf("rollback network initialization: %w", cleanupErr))
 		}

@@ -70,6 +70,23 @@ type SandboxService interface {
 
 var _ SandboxService = &sandboxService{}
 
+// aclManager is the network ACL surface the service depends on. Production
+// binds *networkacl.Manager; recovery call-chain tests substitute a recording
+// implementation, because the real manager cannot be constructed without
+// kernel ACL state.
+type aclManager interface {
+	Register(binding networkacl.Binding, policy networkacl.Policy) error
+	// Restore reconciles persisted ACL state with the ownership recovery
+	// reconstructed: active bindings are re-applied, protected bindings
+	// (pending start intents) are verified and retained without re-applying.
+	Restore(active map[string]networkacl.Binding, protected map[string]networkacl.ProtectedBinding) error
+	SetPolicy(sandboxID string, policy networkacl.Policy) error
+	Remove(sandboxID string) error
+	Close() error
+}
+
+var _ aclManager = (*networkacl.Manager)(nil)
+
 // sandboxService implements SandboxService.
 type sandboxService struct {
 	// config is the sandbox service config
@@ -84,7 +101,7 @@ type sandboxService struct {
 	cgroupMgr    *cgroupmanager.CgroupManager
 	interfaceMgr *networkmanager.InterfaceManager
 	networkMgr   *networkManager
-	aclMgr       *networkacl.Manager
+	aclMgr       aclManager
 	resourceMod  *resourcemanager.Module
 	imageMod     *imagemanager.Module
 	imageSvc     imageapi.Service
@@ -97,10 +114,17 @@ type sandboxService struct {
 
 	fsMgr *fsManager
 
-	ready                             atomic.Bool
-	recoveryReady                     atomic.Bool
-	deleteGroup                       singleflight.Group
-	resourceLocks                     physicalLocks
+	ready         atomic.Bool
+	recoveryReady atomic.Bool
+	deleteGroup   singleflight.Group
+	resourceLocks physicalLocks
+	// startIntents is the durable in-flight start journal. It is loaded before
+	// sandbox/filesystem recovery and consulted by Start admission, Delete
+	// (legacy and conditional), and Checkpoint so a retained failed start can
+	// neither be restarted under the same ID nor be bypassed into cleanup.
+	startIntents *startIntentStore
+	// allocateStartResourceFn is an in-package test seam; production is nil.
+	allocateStartResourceFn           allocateStartResourceFunc
 	retirementMu                      sync.Mutex
 	aclMu                             sync.Mutex
 	checkpointMu                      sync.Mutex
@@ -184,11 +208,18 @@ func copyStringMap(in map[string]string) map[string]string {
 	return out
 }
 
+// startSandboxRuntime dispatches one runtime Start or Restore. The returned
+// invoked flag reports whether the runtime call was reached at all: an error
+// with invoked=false (capability or cgroup preparation) cannot have left a
+// runtime process behind, while invoked=true failures carry whatever exit
+// information the runtime's own contract provides. The error is returned raw
+// — no sandbox-root cleanup and no gRPC conversion — because the management
+// plane decides rollback versus retention from the error chain.
 func (h *sandboxService) startSandboxRuntime(
 	ctx context.Context,
 	runtimeName string,
 	startConfig svc.StartConfig,
-) (err error) {
+) (invoked bool, err error) {
 	traceID, spanID := trace.GetContextID(ctx)
 	start := time.Now()
 	defer func() {
@@ -199,34 +230,34 @@ func (h *sandboxService) startSandboxRuntime(
 
 	if err = h.checkRuntime(runtimeName); err != nil {
 		logrus.WithField(trace.ContextKeyTraceId, traceID).Errorf("check runtime failed: %v", err)
-		return fmt.Errorf("runtime %q is not available: %w", runtimeName, err)
+		return false, fmt.Errorf("runtime %q is not available: %w", runtimeName, err)
 	}
 
 	handler, ok := h.serviceHandler.Get(runtimeName)
 	if !ok {
-		return errord.ToGRPC(errord.ErrNotImplemented)
+		return false, fmt.Errorf("runtime %q: %w", runtimeName, errord.ErrNotImplemented)
 	}
 
 	if startConfig.CgroupPath != "" {
 		if h.cgroupMgr == nil {
-			return errors.New("cgroup manager is not configured")
+			return false, errors.New("cgroup manager is not configured")
 		}
 		hostResources := startConfig.Resources
 		if provider, ok := handler.(svc.HostResourcesProvider); ok {
 			hostResources = provider.HostResources(startConfig.Resources)
 		}
 		if err = h.cgroupMgr.Prepare(startConfig.CgroupPath, hostResources); err != nil {
-			return fmt.Errorf("prepare cgroup %s: %w", startConfig.CgroupPath, err)
+			return false, fmt.Errorf("prepare cgroup %s: %w", startConfig.CgroupPath, err)
 		}
 	}
 
+	invoked = true
 	if startConfig.CheckpointDir != "" {
 		checkpointHandler, ok := handler.(svc.CheckpointHandler)
 		if !ok {
-			return errord.ToGRPCf(
-				errord.ErrNotImplemented,
-				"runtime %q does not support checkpoint restore",
-				runtimeName,
+			return false, fmt.Errorf(
+				"runtime %q does not support checkpoint restore: %w",
+				runtimeName, errord.ErrNotImplemented,
 			)
 		}
 		err = h.withTransientFirecrackerCheckpointMemory(
@@ -243,13 +274,16 @@ func (h *sandboxService) startSandboxRuntime(
 		err = handler.Start(ctx, startConfig)
 	}
 	if err != nil {
+		// The error crosses no boundary here: the management plane must see
+		// the raw runtime failure — including runtime.ErrStartCleanupPending —
+		// to decide between rollback and retention, and the sandbox root it
+		// allocated stays untouched until that decision is made.
 		logrus.WithField(trace.ContextKeyTraceId, traceID).Errorf("runtime handler create sandbox failed: %v", err)
-		h.sandboxManager.CleanSandboxRoot(startConfig.ID)
-		return errord.ToGRPC(err)
+		return true, err
 	}
 
 	logrus.WithField(trace.ContextKeyTraceId, traceID).Infof("StartSandbox %s success, traceID: %v, spanId: %v, cost: %v", startConfig.ID, traceID, spanID, time.Since(start).String())
-	return nil
+	return true, nil
 }
 
 // deleteSandboxRuntime retires the sandbox's physical resources under the
@@ -270,6 +304,19 @@ func (h *sandboxService) deleteSandboxRuntime(ctx context.Context, sandboxID str
 		return errord.ToGRPC(err)
 	}
 	defer unlock()
+
+	// A pending start intent owns the ID with undetermined runtime state.
+	// Neither legacy nor conditional deletion may bypass that protection:
+	// legacy deletion would otherwise report success for an ID whose retained
+	// incarnation still exists, and its DNAT cleanup would mutate the
+	// retained sandbox's rules.
+	if h.startIntents.Pending(sandboxID) {
+		return errord.ToGRPCf(
+			errord.ErrFailedPrecondition,
+			"sandbox %s is protected by a pending start intent; reconcile the retained start before deletion",
+			sandboxID,
+		)
+	}
 
 	// Legacy deletion keeps its idempotent cleanup of stale DNAT rules —
 	// including for an already-missing sandbox — but now under the same
@@ -612,7 +659,13 @@ func (h *sandboxService) Shutdown() {
 
 	}
 
-	h.fsMgr.Shutdown()
+	// A retained start's filesystem ownership and network leases survive the
+	// shutdown: the persisted fs state keeps them, and the interface manager
+	// keeps their leased devices recorded as active so restart recovery
+	// re-acquires instead of destroying them. ACL close, image-module drain,
+	// and volume unmount below still tear their layers down for everything;
+	// that boundary is documented in doc/checkpoint-restore.md.
+	h.fsMgr.Shutdown(h.startIntents.Pending)
 
 	// 2. Stop sandbox manager (stops event loop + monitors).
 	h.sandboxManager.Stop()
@@ -629,7 +682,7 @@ func (h *sandboxService) Shutdown() {
 		}
 	}
 	if h.interfaceMgr != nil {
-		if err := h.interfaceMgr.ShutDown(); err != nil {
+		if err := h.interfaceMgr.ShutDownPreserving(preservedInterfaceResources(h.startIntents)); err != nil {
 			logrus.Warnf("shutdown: failed to stop interface manager: %v", err)
 		}
 	}
@@ -642,13 +695,17 @@ func (h *sandboxService) Shutdown() {
 	//                    watcher; safe to call even when Start was a no-op
 	//   VolumeMgr     -> unmounts the bounded filestore
 	if h.imageMod != nil {
-		h.imageMod.Stop()
+		// Retained starts keep their OCI mounts: the image layer must not
+		// unmount what the filesystem layer deliberately preserved.
+		h.imageMod.StopPreserving(preservedOCIImages(h.startIntents))
 	}
 	if h.resourceMod != nil {
 		h.resourceMod.Stop()
 	}
 	if h.volumeMgr != nil {
-		if err := h.volumeMgr.Stop(); err != nil {
+		// Retained starts keep the bounded filestore mounted and its backing
+		// image intact; the next daemon start adopts the mount.
+		if err := h.volumeMgr.StopPreserving(len(h.startIntents.List()) > 0); err != nil {
 			logrus.Warnf("shutdown: failed to unmount filestore: %v", err)
 		}
 	}
@@ -690,6 +747,13 @@ func (h *sandboxService) RegisterServer(server *grpc.Server) {
 // Without this, a recreated pod that reuses a hostPath volume would inherit
 // the previous pod's registrations, sandbox OCI bundles, and bbolt
 // buckets, causing register-with-same-name to silently no-op.
+//
+// A changed or missing stamp is not evidence that the previous pod's runtimes
+// exited, so the wipe is refused outright while any start-intent record
+// exists: those records protect undetermined runtime incarnations, and
+// clearing them (or the state they reference) without a retirement proof
+// would silently release retained objects. An empty journal keeps the
+// historical behavior.
 func resetStateIfPodChanged(storeDir, rootDir, imageManagerRoot string) error {
 	current, err := os.Hostname()
 	if err != nil {
@@ -700,13 +764,37 @@ func resetStateIfPodChanged(storeDir, rootDir, imageManagerRoot string) error {
 		return nil
 	}
 
+	intentEntries, err := os.ReadDir(filepath.Join(rootDir, startIntentsDirName))
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("read start intent journal before pod reset: %w", err)
+	}
+	records := 0
+	for _, entry := range intentEntries {
+		if strings.HasPrefix(entry.Name(), ".intent-") {
+			continue
+		}
+		if _, ok := startIntentFileID(entry.Name()); ok {
+			records++
+		}
+	}
+	if records > 0 {
+		return fmt.Errorf(
+			"pod identity changed (hostname=%q) but %d start-intent record(s) protect undetermined "+
+				"runtime incarnations; reconcile the retained starts before the state reset",
+			current, records,
+		)
+	}
+
 	logrus.Infof("pod identity changed (hostname=%q): wiping persisted state in %s, %s, %s", current, storeDir, rootDir, imageManagerRoot)
 	if err := os.RemoveAll(storeDir); err != nil {
 		return fmt.Errorf("remove storeDir %s: %w", storeDir, err)
 	}
 	// "containers" is the established on-disk directory name used by the
-	// sandbox manager and runsc handler for state recovery.
-	for _, sub := range []string{"containers"} {
+	// sandbox manager and runsc handler for state recovery. The start-intent
+	// journal describes state that this same wipe removes (sandbox metadata,
+	// resource leases), so it is wiped with it rather than left protecting
+	// IDs whose referenced state no longer exists.
+	for _, sub := range []string{"containers", startIntentsDirName} {
 		p := filepath.Join(rootDir, sub)
 		if err := os.RemoveAll(p); err != nil {
 			return fmt.Errorf("remove %s: %w", p, err)
@@ -813,6 +901,19 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 	if err := os.MkdirAll(sandboxRoot, 0755); err != nil {
 		return nil, fmt.Errorf("create sandbox root: %w", err)
 	}
+
+	// The start-intent journal loads before any resource module or recovery
+	// pass runs: a pending intent must be known before a manager could
+	// destroy retained state, and a corrupt or contradictory record must fail
+	// this startup before construction defers tear anything down. A prepared
+	// intent is satisfied only by sandbox metadata carrying the same
+	// daemon-assigned generation.
+	var startIntents *startIntentStore
+	startIntents, err = loadStartIntents(cfg.RootDir, readSandboxMetadataIdentity(cfg.RootDir))
+	if err != nil {
+		return nil, fmt.Errorf("load start intents: %w", err)
+	}
+
 	xpuMgr := xpumanager.New(
 		cfg.RuntimeConfig.RuntimeBinary[config.RuntimeNameRunsc],
 		sandboxRoot,
@@ -911,7 +1012,7 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 	// resource-manager's OTel collector still pushing metrics.
 	defer func() {
 		if retErr != nil {
-			imgMod.Stop()
+			imgMod.StopPreserving(preservedOCIImages(startIntents))
 		}
 	}()
 	imgSvc := imgMod.Service()
@@ -927,6 +1028,7 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 		imageSvc:                          imgSvc,
 		resourceMod:                       nodeResMod,
 		xpuMgr:                            xpuMgr,
+		startIntents:                      startIntents,
 	}
 
 	// VolumeManager comes up before runtime handlers. An ordinary directory is
@@ -943,7 +1045,7 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 	}
 	defer func() {
 		if retErr != nil {
-			if vErr := s.volumeMgr.Stop(); vErr != nil {
+			if vErr := s.volumeMgr.StopPreserving(len(startIntents.List()) > 0); vErr != nil {
 				logrus.Warnf("init rollback: volumemanager Stop failed: %v", vErr)
 			}
 		}
@@ -987,12 +1089,16 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 
 	var interfaceMgr *networkmanager.InterfaceManager
 	if cfg.InterfaceCacheSize > 0 {
-		interfaceMgr, err = networkmanager.NewInterfaceManager(
+		// The already-loaded start-intent journal protects pending IDs here:
+		// recovery must not destroy an ephemeral lease whose sandbox metadata
+		// is missing precisely because its start is retained.
+		interfaceMgr, err = networkmanager.NewInterfaceManagerPreserving(
 			s.store,
 			cfg.IPRange,
 			maxSandboxLimit,
 			cfg.InterfaceCacheSize,
 			cfg.NatBackend,
+			startIntents.Pending,
 			sandboxRoot,
 		)
 		if err != nil {
@@ -1002,7 +1108,9 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 		metrics.RecordResourceGauge("interface", float64(interfaceMgr.CacheSizeLimit()))
 		defer func() {
 			if retErr != nil {
-				_ = interfaceMgr.ShutDown()
+				// Startup failed after the journal loaded: retained starts
+				// keep their leased devices here too.
+				_ = interfaceMgr.ShutDownPreserving(preservedInterfaceResources(startIntents))
 			}
 		}()
 	}
@@ -1040,12 +1148,20 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 
 	healthChan := make(chan bool)
 
+	// The start-intent journal is already loaded (before any module was
+	// constructed). Here the recovery it gates runs before the sandbox
+	// manager reads containers/, so a pending intent's directory without
+	// metadata is preserved instead of being moved to the recycle bin that
+	// housekeeping empties.
+	pendingIntents := startIntents.List()
+
 	if s.sandboxManager, err = sandbox.NewManager(
 		cfg.RootDir,
 		s.serviceHandler,
 		healthChan,
 		cgroupMgr,
 		maxSandboxLimit,
+		sandbox.WithPreservedSandboxRoots(startIntents.Pending),
 	); err != nil {
 		return nil, err
 	}
@@ -1053,18 +1169,30 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 		nodeResMod.SetSandboxMetricsSource(s.sandboxManager)
 		s.sandboxManager.OnSandboxStopped = nodeResMod.MarkSandboxStopped
 	}
+	// Pending intents block their IDs: the same ID must not start a second
+	// incarnation while the retained one is unreconciled. They count against
+	// the admission ceiling, and exhausting it is a hard startup failure. An
+	// already-reserved ID means the recovered sandbox (the ambiguous
+	// prepared-plus-metadata crash state) holds the reservation — that blocks
+	// reuse exactly as well, so it is not an error.
+	for _, record := range pendingIntents {
+		if _, resErr := s.sandboxManager.ReserveID(record.SandboxID); resErr != nil &&
+			!errors.Is(resErr, errord.ErrAlreadyExists) {
+			return nil, fmt.Errorf("reserve pending start intent %s: %w", record.SandboxID, resErr)
+		}
+	}
 	if err := s.fsMgr.Restore(func(sandboxID string) bool {
-		_, getErr := s.sandboxManager.Get(sandboxID)
-		return getErr == nil
+		if _, getErr := s.sandboxManager.Get(sandboxID); getErr == nil {
+			return true
+		}
+		// A pending start still owns its committed filesystem references;
+		// recovery must not reclaim them as an orphan's.
+		return s.startIntents.Pending(sandboxID)
 	}); err != nil {
 		return nil, fmt.Errorf("restore sandbox filesystem state: %w", err)
 	}
 	if s.aclMgr != nil {
-		bindings, bindErr := s.activeACLBindings()
-		if bindErr != nil {
-			return nil, bindErr
-		}
-		if err := s.aclMgr.Restore(bindings); err != nil {
+		if err := s.restoreNetworkACL(); err != nil {
 			return nil, fmt.Errorf("restore network ACL state: %w", err)
 		}
 	}
@@ -1079,8 +1207,30 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 	return s, nil
 }
 
-func (h *sandboxService) activeACLBindings() (map[string]networkacl.Binding, error) {
-	bindings := make(map[string]networkacl.Binding)
+// restoreNetworkACL reconciles persisted ACL state with everything recovery
+// re-established as owning a network endpoint: running sandboxes and pending
+// start intents. Failures are definite errors — no destructive reconciliation
+// may run on contradictory or missing ownership evidence.
+func (h *sandboxService) restoreNetworkACL() error {
+	bindings, protected, err := h.aclRecoveryOwnership()
+	if err != nil {
+		return err
+	}
+	return h.aclMgr.Restore(bindings, protected)
+}
+
+// aclRecoveryOwnership reconstructs the complete network ACL ownership after
+// recovery. Bindings holds every owner whose endpoint must survive the ACL
+// restore: active sandboxes and pending start intents alike. Protected marks
+// the pending subset — starts whose outcome is unknown — whose ACL entries
+// must be verified against the durable network resource and retained, never
+// re-applied as a normal active sandbox nor reconciled as orphans.
+func (h *sandboxService) aclRecoveryOwnership() (
+	bindings map[string]networkacl.Binding,
+	protected map[string]networkacl.ProtectedBinding,
+	err error,
+) {
+	bindings = make(map[string]networkacl.Binding)
 	for _, current := range h.sandboxManager.List() {
 		if current == nil || current.Metadata == nil {
 			continue
@@ -1091,18 +1241,18 @@ func (h *sandboxService) activeACLBindings() (map[string]networkacl.Binding, err
 		sandboxID := current.Metadata.ID
 		resources, err := h.sandboxManager.CollectResourceByID(sandboxID)
 		if err != nil {
-			return nil, fmt.Errorf("collect network resource for sandbox %s: %w", sandboxID, err)
+			return nil, nil, fmt.Errorf("collect network resource for sandbox %s: %w", sandboxID, err)
 		}
 		encoded, ok := resources.Resources[config.ResourceNameInterface]
 		if !ok {
-			return nil, fmt.Errorf("sandbox %s has no network resource", sandboxID)
+			return nil, nil, fmt.Errorf("sandbox %s has no network resource", sandboxID)
 		}
 		network, err := networkmanager.NewNetResource(encoded)
 		if err != nil {
-			return nil, fmt.Errorf("decode network resource for sandbox %s: %w", sandboxID, err)
+			return nil, nil, fmt.Errorf("decode network resource for sandbox %s: %w", sandboxID, err)
 		}
 		if network.Interface == nil || network.Interface.Name == "" {
-			return nil, fmt.Errorf("sandbox %s network endpoint is missing", sandboxID)
+			return nil, nil, fmt.Errorf("sandbox %s network endpoint is missing", sandboxID)
 		}
 		bindings[sandboxID] = networkacl.Binding{
 			SandboxID: sandboxID,
@@ -1110,7 +1260,91 @@ func (h *sandboxService) activeACLBindings() (map[string]networkacl.Binding, err
 			HostVeth:  network.Interface.Name,
 		}
 	}
-	return bindings, nil
+	protected, err = pendingACLOwnership(h.startIntents.List(), bindings)
+	if err != nil {
+		return nil, nil, err
+	}
+	for sandboxID, owner := range protected {
+		bindings[sandboxID] = owner.Binding
+	}
+	return bindings, protected, nil
+}
+
+// activeACLBindings returns every network owner that must survive ACL
+// recovery — running sandboxes and pending start intents alike. It is the
+// union view of aclRecoveryOwnership; the ACL restore itself additionally
+// receives the protected subset.
+func (h *sandboxService) activeACLBindings() (map[string]networkacl.Binding, error) {
+	bindings, _, err := h.aclRecoveryOwnership()
+	return bindings, err
+}
+
+// pendingACLOwnership derives the protected ACL ownership of pending start
+// intents from their durable network resource leases. A retained start owns
+// its interface lease, so its ACL entry must survive recovery; the resource
+// identity (IP, host endpoint, ifindex) is the only acceptable proof, and a
+// record that is missing, undecodable, or contradictory is a definite error —
+// never a guess by ID or a silently skipped protection. A pending intent
+// whose ID also carries an active sandbox (the ambiguous crash state between
+// metadata persistence and the committed handover) must describe the very
+// same lease from both views; the pending protection then applies.
+func pendingACLOwnership(
+	records []startIntentRecord,
+	active map[string]networkacl.Binding,
+) (map[string]networkacl.ProtectedBinding, error) {
+	protected := make(map[string]networkacl.ProtectedBinding)
+	for _, record := range records {
+		if record.Runtime == config.RuntimeNameRunc {
+			// runc starts never register ACL state — Start refuses a policy
+			// for them — so a retained runc start owns nothing to protect.
+			continue
+		}
+		encoded := record.Resources[config.ResourceNameInterface]
+		if encoded == "" {
+			return nil, fmt.Errorf(
+				"pending start intent %s (generation %s, phase %s) records no network resource lease",
+				record.SandboxID, record.Generation, record.Phase,
+			)
+		}
+		network, err := networkmanager.NewNetResource(encoded)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"decode network resource for pending start intent %s: %w", record.SandboxID, err,
+			)
+		}
+		if network.Interface == nil || network.Interface.Name == "" ||
+			network.Ip == nil || network.Ip.To4() == nil || network.Interface.Index == 0 {
+			return nil, fmt.Errorf(
+				"pending start intent %s network endpoint identity is incomplete", record.SandboxID,
+			)
+		}
+		owner := networkacl.ProtectedBinding{
+			Binding: networkacl.Binding{
+				SandboxID: record.SandboxID,
+				IP:        network.Ip,
+				HostVeth:  network.Interface.Name,
+			},
+			IfIndex: network.Interface.Index,
+		}
+		if binding, alsoActive := active[record.SandboxID]; alsoActive {
+			if binding.HostVeth != owner.HostVeth || !binding.IP.Equal(owner.IP) {
+				return nil, fmt.Errorf(
+					"active network resource for sandbox %s (ip %s, host endpoint %s) contradicts its pending start intent (ip %s, host endpoint %s)",
+					record.SandboxID, binding.IP, binding.HostVeth, owner.IP, owner.HostVeth,
+				)
+			}
+		}
+		for otherID, other := range protected {
+			if other.IP.Equal(owner.IP) || other.HostVeth == owner.HostVeth {
+				return nil, fmt.Errorf(
+					"pending start intents %s and %s both claim network endpoint %s/%s",
+					otherID, record.SandboxID, owner.IP, owner.HostVeth,
+				)
+			}
+		}
+		protected[record.SandboxID] = owner
+	}
+	return protected, nil
 }
 
 func validateRuntimeFilestore(runtimeConfig config.RuntimeConfig) error {
@@ -1438,6 +1672,15 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 		}
 	}
 
+	// A retained failed start still owns its ID; restarting under the same ID
+	// could produce a second incarnation of an undetermined runtime state.
+	if startReq.SandboxID != "" && h.startIntents.Pending(startReq.SandboxID) {
+		err := fmt.Errorf(
+			"sandbox %s is protected by a pending start intent; reconcile the retained start first: %w",
+			startReq.SandboxID, errord.ErrFailedPrecondition,
+		)
+		return &runtime.StartResponse{Code: -1, Message: err.Error()}, errord.ToGRPC(err)
+	}
 	sandboxID, err := h.sandboxManager.ReserveID(startReq.SandboxID)
 	if err != nil {
 		return &runtime.StartResponse{
@@ -1460,42 +1703,137 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 	var preparedResources *preparedStartResources
 	var sandboxFiles *preparedSandboxFiles
 	var filesystemCommitted bool
+	var runtimeCalled bool
 	var runtimeStarted bool
+	var runtimeStartErr error
+	var startIntentRecord *startIntentRecord
 	var dnatConfigured bool
 	var aclAttempted bool
 	var aclRegistered bool
 	var xpuAcquired bool
+	// retained keeps every start reference in place — runtime state, ID,
+	// network/cgroup leases, filesystem ownership, DNAT, ACL, sandbox files —
+	// when the runtime's exit or a release step could not be proven. The
+	// durable intent record is moved to the retained phase so a restart and
+	// the reconciliation tooling can see why the ID is blocked. Failures from
+	// before the intent existed have no durable anchor and no unknown runtime
+	// state; they keep the legacy best-effort rollback and return false.
+	retained := false
+	retain := func(reason error) bool {
+		if startIntentRecord == nil {
+			logrus.Warnf("rollback step failed for sandbox %s before the start intent existed: %v", sandboxID, reason)
+			return false
+		}
+		retained = true
+		logrus.Errorf(
+			"retain sandbox %s after failed start (generation %s): %v; ID, resources, and filesystem stay reserved until reconciliation",
+			sandboxID, generation, reason,
+		)
+		if err := h.startIntents.retain(sandboxID, startIntentRecord, reason.Error()); err != nil {
+			logrus.Errorf("persist retained start intent for sandbox %s: %v", sandboxID, err)
+		}
+		return true
+	}
 	defer func() {
-		if startSucceeded {
+		if startSucceeded || retained {
 			return
 		}
-		if runtimeStarted {
-			cleanupCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-			if handler, ok := h.serviceHandler.Get(startReq.Runtime); ok {
-				if err := handler.Delete(cleanupCtx, sandboxID); err != nil {
-					logrus.Warnf("rollback runtime for sandbox %s: %v", sandboxID, err)
-				} else {
-					h.sandboxManager.CleanSandboxRoot(sandboxID)
+		// Runtime disposition comes first: nothing else may be released until
+		// the runtime side of this start is proven gone.
+		if runtimeCalled {
+			handler, _ := h.serviceHandler.Get(startReq.Runtime)
+			if runtimeStartErr != nil && errors.Is(runtimeStartErr, svc.ErrStartCleanupPending) {
+				// The runtime itself retained the instance and its artifacts;
+				// signalling it again is forbidden. Everything stays.
+				if retain(fmt.Errorf(
+					"runtime retained sandbox after failed start: %v", runtimeStartErr,
+				)) {
+					return
 				}
 			}
-			cancel()
+			if handler != nil {
+				cleanupCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+				var proofErr error
+				if runtimeStarted {
+					// The runtime reported success and then a later step
+					// failed; releasing references now would orphan a live
+					// process, so retirement requires the generation-checked
+					// strict delete proof.
+					strict, ok := handler.(svc.StrictDeleteHandler)
+					if !ok {
+						cancel()
+						if retain(fmt.Errorf(
+							"runtime %q cannot prove exit by generation after start succeeded",
+							startReq.Runtime,
+						)) {
+							return
+						}
+					} else {
+						proofErr = strict.DeleteStrict(cleanupCtx, sandboxID, generation)
+						if proofErr == nil {
+							// The generation-checked proof retired exactly
+							// this incarnation, so its sandbox directory may
+							// go too.
+							h.sandboxManager.CleanSandboxRoot(sandboxID)
+						}
+					}
+				} else {
+					// A failed start: only the runtime's own failure contract
+					// can prove its side. A participating runtime's plain
+					// error already confirmed the exit and cleaned its state;
+					// any other runtime's failure — including its legacy
+					// Delete's idempotent nil — proves nothing, so the start
+					// is retained for reconciliation instead of unwound.
+					// The prover's plain error covers only the artifacts THIS
+					// call created; it is not authorization to wipe the whole
+					// containers/<id> directory, which may still hold a
+					// pre-existing same-ID incarnation's state. This start's
+					// own artifacts (sandbox files, leases, filesystem
+					// ownership) are released by the steps below.
+					prover, ok := handler.(svc.StartFailureCleanupProver)
+					if !ok || !prover.StartFailureCleanupProven() {
+						cancel()
+						if retain(fmt.Errorf(
+							"runtime %q has no proven failed-start cleanup contract; outcome unknown",
+							startReq.Runtime,
+						)) {
+							return
+						}
+					}
+				}
+				cancel()
+				if proofErr != nil {
+					if retain(fmt.Errorf(
+						"runtime exit for sandbox %s not confirmed: %w", sandboxID, proofErr,
+					)) {
+						return
+					}
+				}
+			}
 		}
 		if dnatConfigured {
 			h.networkMgr.cleanupDnatRules(sandboxID)
 		}
 		if preparedResources != nil {
 			if err := h.deactivateStartNetwork(preparedResources.OccupiedResource); err != nil {
-				logrus.Warnf("deactivate network endpoint while rolling back sandbox %s: %v", sandboxID, err)
+				if retain(fmt.Errorf(
+					"deactivate network endpoint while rolling back sandbox %s: %w", sandboxID, err,
+				)) {
+					return
+				}
 			}
 		}
 		aclCleanupFailed := aclAttempted && !aclRegistered
 		if aclAttempted && h.aclMgr != nil {
 			h.aclMu.Lock()
-			if err := h.aclMgr.Remove(sandboxID); err != nil {
-				logrus.Warnf("rollback network ACL for sandbox %s: %v", sandboxID, err)
+			aclErr := h.aclMgr.Remove(sandboxID)
+			h.aclMu.Unlock()
+			if aclErr != nil {
+				if retain(fmt.Errorf("rollback network ACL for sandbox %s: %w", sandboxID, aclErr)) {
+					return
+				}
 				aclCleanupFailed = true
 			}
-			h.aclMu.Unlock()
 		}
 		if aclCleanupFailed && preparedResources != nil {
 			resource := preparedResources.Resources[config.ResourceNameInterface]
@@ -1514,14 +1852,22 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 		}
 		if filesystemCommitted {
 			if err := h.fsMgr.Release(sandboxID); err != nil {
-				logrus.Warnf("rollback filesystem state for sandbox %s: %v", sandboxID, err)
+				if retain(fmt.Errorf(
+					"rollback filesystem state for sandbox %s: %w", sandboxID, err,
+				)) {
+					return
+				}
 			}
 		} else if preparedFilesystem != nil {
 			preparedFilesystem.Rollback()
 		}
 		if preparedResources != nil {
 			if err := h.releaseStartResources(preparedResources.OccupiedResource); err != nil {
-				logrus.Warnf("rollback resources for sandbox %s: %v", sandboxID, err)
+				if retain(fmt.Errorf(
+					"rollback resources for sandbox %s: %w", sandboxID, err,
+				)) {
+					return
+				}
 			}
 		}
 		if xpuAcquired && h.xpuMgr != nil {
@@ -1529,6 +1875,19 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 		}
 		if sandboxFiles != nil {
 			sandboxFiles.Rollback()
+		}
+		// The rollback is fully proven; the intent record may be dropped only
+		// durably, and only then may the ID return to the pool. A record whose
+		// removal fails keeps the ID blocked — after a restart it shows up as
+		// a pending intent again.
+		if startIntentRecord != nil {
+			if err := h.startIntents.clear(sandboxID); err != nil {
+				logrus.Errorf(
+					"clear start intent for sandbox %s after confirmed rollback: %v; ID stays reserved",
+					sandboxID, err,
+				)
+				return
+			}
 		}
 		h.sandboxManager.ReleaseID(sandboxID)
 	}()
@@ -1695,12 +2054,49 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 		// its own persisted state, so strict deletes can verify it there.
 		ResourceGeneration: generation,
 	}
-	if err := h.startSandboxRuntime(ctx, startReq.Runtime, runtimeConfig); err != nil {
+	// Commit the prepared filesystem references and persist the start intent
+	// before the runtime can spawn anything. From the intent's durable write
+	// onward, an unknown outcome keeps the ID, resource leases, and
+	// filesystem ownership reserved; recovery treats the ID as existing, so
+	// its committed filesystem state is never reclaimed as an orphan's.
+	if err := h.fsMgr.Commit(sandboxID, preparedFilesystem); err != nil {
 		return &runtime.StartResponse{
 			Code:    -1,
-			Message: fmt.Sprintf("Failed to start: %v", err),
-			ID:      "",
+			Message: fmt.Sprintf("Failed to commit filesystem state: %v", err),
 		}, err
+	}
+	filesystemCommitted = true
+	startIntentRecord = h.buildStartIntent(sandboxID, generation, startReq.Runtime, preparedResources, preparedFilesystem)
+	if err := h.startIntents.begin(startIntentRecord); err != nil {
+		// The write's outcome may be indeterminate; only a confirmed record
+		// removal makes the pre-runtime rollback below safe to release.
+		if clearErr := h.startIntents.clear(sandboxID); clearErr != nil {
+			retain(fmt.Errorf(
+				"persist start intent for sandbox %s failed (%v) and the record's removal also failed (%v)",
+				sandboxID, err, clearErr,
+			))
+		}
+		return &runtime.StartResponse{
+			Code:    -1,
+			Message: fmt.Sprintf("Failed to persist start intent: %v", err),
+		}, errord.ToGRPC(fmt.Errorf("persist start intent for sandbox %s: %w", sandboxID, err))
+	}
+
+	// Set before the dispatch so a panic inside it still runs the runtime
+	// disposition; a normal return replaces the flag with the accurate value
+	// reported by startSandboxRuntime.
+	runtimeCalled = true
+	var runtimeInvoked bool
+	runtimeInvoked, runtimeStartErr = h.startSandboxRuntime(ctx, startReq.Runtime, runtimeConfig)
+	runtimeCalled = runtimeInvoked
+	if runtimeStartErr != nil {
+		// The raw runtime error reaches the RPC boundary unchanged in content;
+		// the retention decision above has already used its error chain.
+		return &runtime.StartResponse{
+			Code:    -1,
+			Message: fmt.Sprintf("Failed to start: %v", runtimeStartErr),
+			ID:      "",
+		}, errord.ToGRPC(runtimeStartErr)
 	}
 	runtimeStarted = true
 
@@ -1721,13 +2117,6 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 		dnatConfigured = true
 	}
 
-	if err := h.fsMgr.Commit(sandboxID, preparedFilesystem); err != nil {
-		return &runtime.StartResponse{
-			Code:    -1,
-			Message: fmt.Sprintf("Failed to commit filesystem state: %v", err),
-		}, err
-	}
-	filesystemCommitted = true
 	metadata := &runtime.SandboxMetadata{
 		ID:             sandboxID,
 		RuntimeHandler: startReq.Runtime,
@@ -1742,11 +2131,44 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 			Message: fmt.Sprintf("Failed to persist sandbox metadata: %v", err),
 		}, err
 	}
+	// The sandbox exists and runs from the manager's perspective once its
+	// metadata is durable, so the monitor event is published regardless of
+	// how the journal handover below resolves.
 	h.sandboxManager.ReceiveEvent(sandbox.Event{
 		Type:      sandbox.EventTypeCreate,
 		MetaData:  metadata,
 		SandboxID: sandboxID,
 	})
+	// The start has now succeeded on every durable axis — runtime, filesystem
+	// commit, sandbox metadata — so the intent records the committed phase,
+	// the success linearization point only recovery may take over against
+	// fully matching metadata identity. A committed write that fails leaves
+	// the outcome unproven on disk: the running instance is never rolled back
+	// or auto-revoked, everything the start owns stays protected (the ID, the
+	// resources, the committed filesystem ownership, and the original
+	// prepared record), and the RPC must report the unknown completion
+	// instead of success. A failure here means the committed write itself
+	// could not be made durable; a committed record whose later removal
+	// failed is NOT an error — complete reports that handover as done and
+	// recovery takes the leftover committed record over.
+	if err := h.startIntents.complete(sandboxID, startIntentRecord); err != nil {
+		retained = true
+		logrus.Errorf(
+			"persist committed start intent for sandbox %s failed (%v): completion outcome unknown; "+
+				"the sandbox stays running, and the ID, resources, and original prepared record stay "+
+				"protected until reconciliation",
+			sandboxID, err,
+		)
+		return &runtime.StartResponse{
+				Code:               -1,
+				Message:            fmt.Sprintf("sandbox %s is running, but recording its start completion failed (%v); the ID stays protected until reconciliation", sandboxID, err),
+				ID:                 sandboxID,
+				ResourceGeneration: generation,
+			}, errord.ToGRPC(fmt.Errorf(
+				"record committed start intent for sandbox %s: completion outcome unknown: %w",
+				sandboxID, err,
+			))
+	}
 	startSucceeded = true
 	return &runtime.StartResponse{
 		Code:               0,
@@ -1767,6 +2189,47 @@ func assignResourceGeneration(request *runtime.StartRequest) string {
 	generation := uuid.NewString()
 	request.Labels[resourceGenerationLabel] = generation
 	return generation
+}
+
+// buildStartIntent snapshots the durable ownership a start has secured for the
+// runtime invocation: the daemon-generated identity, the allocated resource
+// leases, and the committed filesystem references. The record deliberately
+// lists only what was handed to this preparation — allocations that crashed
+// before the intent write are bounded by the resource managers' own durable
+// leases, not by this record.
+func (h *sandboxService) buildStartIntent(
+	sandboxID, generation, runtimeName string,
+	resources *preparedStartResources,
+	filesystem *preparedFS,
+) *startIntentRecord {
+	record := &startIntentRecord{
+		SandboxID:  sandboxID,
+		Generation: generation,
+		Runtime:    runtimeName,
+	}
+	if resources != nil {
+		record.Resources = make(map[string]string, len(resources.Resources))
+		for name, value := range resources.Resources {
+			if value == "" {
+				// An empty value is not a lease identity; record only the
+				// resources this start actually owns.
+				continue
+			}
+			record.Resources[name] = value
+		}
+	}
+	if filesystem != nil {
+		if state, err := stateFromPrepared(filesystem); err == nil {
+			record.Filesystem = &startIntentFilesystem{
+				Rootfs: state.Rootfs,
+				S3:     state.S3,
+				OCI:    state.OCI,
+			}
+		} else {
+			logrus.Warnf("encode filesystem ownership for start intent %s: %v", sandboxID, err)
+		}
+	}
+	return record
 }
 
 func (h *sandboxService) Wait(ctx context.Context, request *runtime.WaitRequest) (*runtime.WaitResponse, error) {

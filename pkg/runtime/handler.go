@@ -71,6 +71,20 @@ type StrictDeleteHandler interface {
 	DeleteStrict(ctx context.Context, sandboxID, expectedGeneration string) error
 }
 
+// StartFailureCleanupProver is an optional capability implemented by runtimes
+// with an explicit failed-start contract. Such a runtime, when Start or
+// Restore returns an error that does not join ErrStartCleanupPending, has
+// already confirmed the exit of every process it spawned and either removed
+// its own state or retained it behind the sentinel; the plain error is then a
+// positive statement that the caller may release the resources it allocated
+// for the start. A runtime without this capability proves nothing by failing:
+// absence of the sentinel is not evidence, a legacy Delete's idempotent nil
+// is not an exit proof, and such failed starts must be retained for
+// reconciliation instead of unwound.
+type StartFailureCleanupProver interface {
+	StartFailureCleanupProven() bool
+}
+
 // CheckpointRestoreCapabilities describes the optional application-facing
 // handoff interface exposed inside a restored sandbox. Empty paths mean the
 // runtime supports transparent checkpoint/restore without application help.
