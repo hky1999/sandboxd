@@ -204,3 +204,25 @@ Do not discard records merely to unblock a full journal. Export/history
 consumption and safe archival/reclamation still require implementation.
 These observations do not measure an instantaneous whole-lifetime CPU peak;
 read memory peaks only when memory_peak_known is true.
+
+# Managed restore completion ownership
+
+The checkpoint coordinator may publish immutable completion bytes through
+CompleteWithResult; each successful WaitResult returns a private copy. Legacy
+checkpoint Complete remains payload-free. Completion is first-wins and only
+the owning coordinator/attempt can release its in-flight lock keys.
+
+Managed restore preserves the actual createSandbox StartResponse as the attempt
+result. After waiting, it checks the current record under the physical resource
+lock against that original generation, restore identity, runtime, labels and
+ports. A same-identity replacement generation, missing/uncommitted/non-running
+record or missing result cannot become a successful response. The pre-dispatch
+replay also uses the physical lock and requires a nonempty generation. These
+lookups never clean up a sandbox and do not nest locks across creation or waits.
+
+This is in-process result ownership, not durable operation fencing. The
+coordinator still drops completed entries and physical metadata can be deleted.
+Also, LoadStatus currently defaults missing status files to RUNNING: cache state
+is not authoritative runtime liveness. F8 still requires a read-only runtime
+query, persistent operation identity across controller/node restarts, delayed
+request fencing after retirement and authoritative budget reconciliation.

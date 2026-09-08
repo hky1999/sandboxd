@@ -388,18 +388,23 @@ func (h *sandboxService) restoreCheckpoint(
 	} else {
 		releaseOperation()
 	}
-	if err := attempt.Wait(ctx); err != nil {
+	// The response is owned by this attempt's completion payload, never by a
+	// fresh Get: whatever physical record sits under the ID after the wait is
+	// revalidated against the original createSandbox result, and a missing or
+	// replaced record fails instead of being silently adopted.
+	result, err := attempt.WaitResult(ctx)
+	if err != nil {
 		return nil, checkpointGRPCError(err)
 	}
-	physical, err := h.sandboxManager.Get(startConfig.SandboxID)
-	if err != nil || physical.Metadata == nil {
-		return nil, checkpointGRPCError(fmt.Errorf(
-			"restored sandbox physical fact is missing: %w", errord.ErrFailedPrecondition))
+	original, err := decodeRestoreResult(startConfig.SandboxID, result)
+	if err != nil {
+		return nil, checkpointGRPCError(err)
 	}
-	return &runtime.StartResponse{
-		ID: startConfig.SandboxID, Ports: clonePorts(physical.Metadata.Ports),
-		ResourceGeneration: physical.Metadata.Labels[resourceGenerationLabel],
-	}, nil
+	response, err := h.validateRestoredPhysicalFact(ctx, startConfig, restoreIdentity, original)
+	if err != nil {
+		return nil, checkpointGRPCError(err)
+	}
+	return response, nil
 }
 
 // errRestoreParkedSourceCandidate marks a COMMITTED, genuinely EXITED physical
@@ -412,11 +417,34 @@ func (h *sandboxService) restoreCheckpoint(
 var errRestoreParkedSourceCandidate = errors.New("sandbox is a parked-source cleanup candidate")
 
 // existingRestorePhysicalFact is a READ-ONLY lookup of the physical record
-// under the restore target ID. It never mutates: a park leftover is only
-// reported through errRestoreParkedSourceCandidate for the verified cleanup
-// admission, and no identity or state combination grants a delete here.
+// under the restore target ID, taken under that ID's physical resource lock
+// so it cannot interleave with create, delete or checkpoint mutations. It
+// never mutates: a park leftover is only reported through
+// errRestoreParkedSourceCandidate for the verified cleanup admission, and no
+// identity or state combination grants a delete here.
 func (h *sandboxService) existingRestorePhysicalFact(
 	ctx context.Context,
+	request *runtime.StartRequest,
+	expectedIdentity *runtime.RestoreIdentity,
+) (*runtime.StartResponse, bool, error) {
+	if request == nil || request.SandboxID == "" {
+		return nil, false, nil
+	}
+	unlock, err := h.resourceLocks.acquire(ctx, request.SandboxID)
+	if err != nil {
+		return nil, true, err
+	}
+	defer unlock()
+	return h.existingRestorePhysicalFactLocked(request, expectedIdentity)
+}
+
+// existingRestorePhysicalFactLocked is the lock-held core of the replay
+// lookup. The caller must already hold the target ID's physical resource
+// lock — the post-wait revalidation reuses it without double locking. It
+// never mutates and answers success only for a COMMITTED, RUNNING record with
+// a nonempty generation under exactly the requested ID; the reply is
+// immutable, with cloned ports.
+func (h *sandboxService) existingRestorePhysicalFactLocked(
 	request *runtime.StartRequest,
 	expectedIdentity *runtime.RestoreIdentity,
 ) (*runtime.StartResponse, bool, error) {
@@ -469,6 +497,18 @@ func (h *sandboxService) existingRestorePhysicalFact(
 		return nil, true, fmt.Errorf("sandbox %s state is %s, which proves neither a live replay nor an exit: %w",
 			request.SandboxID, state, errord.ErrFailedPrecondition)
 	}
+	// A replay answer must describe exactly the requested incarnation: the
+	// stored ID and a nonempty resource generation, so a caller can never be
+	// handed another sandbox's or a generation-less record's identity.
+	if metadata.ID != request.SandboxID {
+		return nil, true, fmt.Errorf("sandbox %s physical record describes ID %q: %w",
+			request.SandboxID, metadata.ID, errord.ErrFailedPrecondition)
+	}
+	generation := metadata.Labels[resourceGenerationLabel]
+	if generation == "" {
+		return nil, true, fmt.Errorf("sandbox %s physical record carries no resource generation: %w",
+			request.SandboxID, errord.ErrFailedPrecondition)
+	}
 	if metadata.RuntimeHandler != request.Runtime {
 		return nil, true, fmt.Errorf("sandbox %s runtime conflicts with restore replay: %w",
 			request.SandboxID, errord.ErrFailedPrecondition)
@@ -485,8 +525,77 @@ func (h *sandboxService) existingRestorePhysicalFact(
 	return &runtime.StartResponse{
 		ID:                 metadata.ID,
 		Ports:              clonePorts(metadata.Ports),
-		ResourceGeneration: metadata.Labels[resourceGenerationLabel],
+		ResourceGeneration: generation,
 	}, true, nil
+}
+
+// validateRestoredPhysicalFact re-observes the physical record under the
+// restore target's resource lock after the coordinated attempt completed, and
+// answers only with the ORIGINAL createSandbox result: the current record
+// must still be the exact incarnation this attempt created — matching restore
+// identity, generation, runtime, labels and ports. A missing, replaced,
+// exited or UNKNOWN record fails with no cleanup and no response, and a later
+// generation is never silently adopted even when it carries an equal
+// RestoreIdentity. The lock is acquired here only, never held across the
+// attempt wait or creation.
+func (h *sandboxService) validateRestoredPhysicalFact(
+	ctx context.Context,
+	startConfig *runtime.StartRequest,
+	restoreIdentity *runtime.RestoreIdentity,
+	original *runtime.StartResponse,
+) (*runtime.StartResponse, error) {
+	unlock, err := h.resourceLocks.acquire(ctx, startConfig.SandboxID)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	current, found, factErr := h.existingRestorePhysicalFactLocked(startConfig, restoreIdentity)
+	if factErr != nil {
+		// A parked candidate is meaningful only before dispatch. The reply
+		// path never admits cleanup and reports a failed identity check.
+		if errors.Is(factErr, errRestoreParkedSourceCandidate) {
+			return nil, fmt.Errorf("completed restore no longer owns its physical record: %w", errord.ErrFailedPrecondition)
+		}
+		return nil, factErr
+	}
+	if !found {
+		return nil, fmt.Errorf("restored sandbox %s physical record is missing: %w",
+			startConfig.SandboxID, errord.ErrNotFound)
+	}
+	if current.ResourceGeneration != original.ResourceGeneration {
+		return nil, fmt.Errorf(
+			"sandbox %s generation %q is not this restore's completed result %q: %w",
+			startConfig.SandboxID, current.ResourceGeneration, original.ResourceGeneration,
+			errord.ErrFailedPrecondition)
+	}
+	if err := validateReplayPorts(startConfig.SandboxID, original.Ports, current.Ports); err != nil {
+		return nil, err
+	}
+	// Return the attempt's own completion — cloned, ports included — not a
+	// fresh observation: the response identity stays owned by the restore
+	// that produced it.
+	replay := proto.Clone(original).(*runtime.StartResponse)
+	replay.Ports = clonePorts(original.Ports)
+	return replay, nil
+}
+
+// decodeRestoreResult reconstructs the completion payload owned by one
+// restore attempt. A missing, malformed or foreign success payload can never
+// be turned into a success.
+func decodeRestoreResult(sandboxID string, encoded []byte) (*runtime.StartResponse, error) {
+	if len(encoded) == 0 {
+		return nil, fmt.Errorf("restore of sandbox %s completed without a result: %w",
+			sandboxID, errord.ErrFailedPrecondition)
+	}
+	original := &runtime.StartResponse{}
+	if err := proto.Unmarshal(encoded, original); err != nil {
+		return nil, fmt.Errorf("decode restore result of sandbox %s: %w", sandboxID, err)
+	}
+	if original.ID != sandboxID || original.ResourceGeneration == "" || original.Code != 0 {
+		return nil, fmt.Errorf("restore result does not describe sandbox %s: %w",
+			sandboxID, errord.ErrFailedPrecondition)
+	}
+	return original, nil
 }
 
 // cleanupVerifiedParkedSource deletes one VERIFIED park leftover so the
@@ -568,18 +677,37 @@ func (h *sandboxService) executeRestore(
 	restoreIdentity *runtime.RestoreIdentity,
 	attempt *checkpointstate.Attempt,
 ) {
-	err := h.restorePhysicalSandbox(ctx, imagePath, startConfig, restoreIdentity)
-	h.checkpointState.Complete(attempt, err)
+	response, err := h.restorePhysicalSandbox(ctx, imagePath, startConfig, restoreIdentity)
+	if err != nil {
+		h.checkpointState.Complete(attempt, err)
+		return
+	}
+	// Only a completion that actually describes this restore's incarnation
+	// may become a success; nil or malformed responses complete as errors.
+	if response == nil || response.ID != startConfig.SandboxID ||
+		response.ResourceGeneration == "" || response.Code != 0 {
+		h.checkpointState.Complete(attempt, fmt.Errorf(
+			"restore completion does not describe sandbox %s: %w",
+			startConfig.SandboxID, errord.ErrFailedPrecondition))
+		return
+	}
+	encoded, err := proto.Marshal(response)
+	if err != nil {
+		h.checkpointState.Complete(attempt, fmt.Errorf(
+			"serialize restore result of sandbox %s: %w", startConfig.SandboxID, err))
+		return
+	}
+	h.checkpointState.CompleteWithResult(attempt, encoded, nil)
 }
 
 func (h *sandboxService) restorePhysicalSandbox(
 	ctx context.Context, imagePath string, startConfig *runtime.StartRequest,
 	restoreIdentity *runtime.RestoreIdentity,
-) error {
+) (*runtime.StartResponse, error) {
 	if err := h.reconcileRestoreIntent(ctx, startConfig, restoreIdentity); err != nil {
-		return err
+		return nil, err
 	}
-	_, err := h.createSandbox(ctx, startConfig, createOptions{
+	response, err := h.createSandbox(ctx, startConfig, createOptions{
 		checkpointImage: imagePath,
 		restoreIdentity: restoreIdentity,
 		onReserved: func(_ *runtime.StartRequest, sandboxID string) error {
@@ -590,7 +718,10 @@ func (h *sandboxService) restorePhysicalSandbox(
 			return nil
 		},
 	})
-	return err
+	if err != nil {
+		return nil, err
+	}
+	return response, nil
 }
 
 func normalizeRestoreConfig(input *runtime.StartRequest) (*runtime.StartRequest, error) {

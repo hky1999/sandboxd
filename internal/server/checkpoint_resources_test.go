@@ -88,6 +88,7 @@ func TestExistingRestorePhysicalFact_IdempotentReplay(t *testing.T) {
 		RuntimeHandler:  "runsc",
 		PhysicalPhase:   runtime.SandboxPhysicalPhase_SANDBOX_PHYSICAL_PHASE_COMMITTED,
 		RestoreIdentity: identity,
+		Labels:          map[string]string{resourceGenerationLabel: "restored-generation"},
 	}))
 	markSandboxRunning(t, s, id)
 	resp, found, err := s.existingRestorePhysicalFact(context.Background(),
@@ -95,7 +96,9 @@ func TestExistingRestorePhysicalFact_IdempotentReplay(t *testing.T) {
 		proto.Clone(identity).(*runtime.RestoreIdentity))
 	assert.NoError(t, err)
 	assert.True(t, found)
-	assert.NotNil(t, resp)
+	if assert.NotNil(t, resp) {
+		assert.Equal(t, "restored-generation", resp.ResourceGeneration)
+	}
 }
 
 // W7-P1.2: a live sandbox with a never-restored record refuses the restore

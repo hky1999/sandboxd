@@ -36,6 +36,12 @@ type Attempt struct {
 	fingerprint  string
 	done         chan struct{}
 	err          error
+	// result is the immutable payload of a successful completion. It is
+	// copied into the attempt under the coordinator lock before done closes
+	// and is never mutated afterwards, so no later writer — the completing
+	// caller or a waiter holding a returned copy — can change what another
+	// waiter observes.
+	result []byte
 }
 
 func (a *Attempt) Wait(ctx context.Context) error {
@@ -45,6 +51,21 @@ func (a *Attempt) Wait(ctx context.Context) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+// WaitResult waits like Wait and, for a successful completion, returns a
+// private copy of the published payload. Errors and cancellations carry no
+// result; writes to the returned slice cannot affect other waiters.
+func (a *Attempt) WaitResult(ctx context.Context) ([]byte, error) {
+	if err := a.Wait(ctx); err != nil {
+		return nil, err
+	}
+	if len(a.result) == 0 {
+		return nil, nil
+	}
+	result := make([]byte, len(a.result))
+	copy(result, a.result)
+	return result, nil
 }
 
 type Coordinator struct {
@@ -133,7 +154,18 @@ func (c *Coordinator) begin(
 	return attempt, true, nil
 }
 
+// Complete ends an attempt without a payload; checkpoint callers keep this
+// nil-result form.
 func (c *Coordinator) Complete(attempt *Attempt, err error) {
+	c.CompleteWithResult(attempt, nil, err)
+}
+
+// CompleteWithResult ends an attempt and, on success, publishes result as the
+// attempt's immutable payload: the bytes are copied before done closes and
+// before the attempt's lock keys are released. Only the first completion of
+// an attempt owned by this coordinator publishes anything — later, stale or
+// foreign completions are ignored, and lock deletion is unchanged.
+func (c *Coordinator) CompleteWithResult(attempt *Attempt, result []byte, err error) {
 	if attempt == nil || attempt.coordinator != c {
 		return
 	}
@@ -149,6 +181,10 @@ func (c *Coordinator) Complete(attempt *Attempt, err error) {
 		}
 	}
 	attempt.err = err
+	if err == nil && len(result) > 0 {
+		attempt.result = make([]byte, len(result))
+		copy(attempt.result, result)
+	}
 	close(attempt.done)
 }
 
