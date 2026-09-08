@@ -31,6 +31,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -62,6 +63,9 @@ type migrateReport struct {
 	Target           string    `json:"target,omitempty"`
 	Checkpoint       string    `json:"checkpoint_dir"`
 	SourceGeneration string    `json:"source_generation,omitempty"`
+	MigrationID      string    `json:"migration_id,omitempty"`
+	Journal          string    `json:"journal,omitempty"`
+	Stage            string    `json:"stage,omitempty"`
 	Steps            []stepLog `json:"steps"`
 	OK               bool      `json:"ok"`
 	Error            string    `json:"error,omitempty"`
@@ -75,6 +79,8 @@ func main() {
 	nodes := flag.String("nodes", "", "comma-separated node catalog addresses for placement")
 	to := flag.String("to", "", "preferred target node name (default: locator decides)")
 	srcGen := flag.String("source-generation", "", "require this source generation label (default: the value captured from source inspect)")
+	journalPath := flag.String("journal", "", "durable migration journal file (absolute path; paired with -migration-id it enables the resumable mode)")
+	migrationID := flag.String("migration-id", "", "stable migration identity for the resumable mode (paired with -journal; derives the checkpoint directory and target operation ID)")
 	ckReq := flag.String("request-file", "/mnt/cn/ck/req.json", "StartRequest JSON for the restore")
 	bin := flag.String("bin", "/mnt/cn/bin", "per-node CLI binary directory")
 	wait := flag.Duration("wait", 180*time.Second, "per-step timeout")
@@ -101,8 +107,51 @@ func main() {
 		report.Steps = append(report.Steps, stepLog{Step: step, Detail: detail, Failed: true})
 		finish(report, *jsonOut, false)
 	}
+	var emptyProgressFlag string
+	flag.Visit(func(f *flag.Flag) {
+		if (f.Name == "journal" && *journalPath == "") || (f.Name == "migration-id" && *migrationID == "") {
+			emptyProgressFlag = f.Name
+		}
+	})
+	if emptyProgressFlag != "" {
+		fail("arguments", "explicit -"+emptyProgressFlag+" must not be empty")
+	}
 	if *srcGen != "" && (strings.TrimSpace(*srcGen) == "" || len(*srcGen) > maxSourceGenerationBytes) {
 		fail("arguments", "-source-generation must be non-blank and at most 128 bytes")
+	}
+	// The resumable mode is opt-in through the explicit, paired flags. Every
+	// derived-identity rule is enforced here, before any node command: an
+	// invalid pair must never reach a node, because the first side effect
+	// would already be naming a migration identity.
+	if (*journalPath == "") != (*migrationID == "") {
+		fail("arguments", "-journal and -migration-id must be passed together to enable the resumable migration mode")
+	}
+	if *journalPath != "" {
+		if !filepath.IsAbs(*journalPath) {
+			fail("arguments", "-journal must be an absolute path")
+		}
+		if err := validateMigrationID(*migrationID); err != nil {
+			fail("arguments", err.Error())
+		}
+		if *to == *source {
+			fail("arguments", fmt.Sprintf("target -to %s equals the source node", *to))
+		}
+		runResumableMigration(resumableConfig{
+			sandbox:     *sandbox,
+			source:      *source,
+			execTpl:     *execTpl,
+			storeSpec:   *storeSpec,
+			nodes:       *nodes,
+			to:          *to,
+			srcGen:      *srcGen,
+			ckReq:       *ckReq,
+			bin:         *bin,
+			wait:        *wait,
+			jsonOut:     *jsonOut,
+			journalPath: *journalPath,
+			migrationID: *migrationID,
+		})
+		return
 	}
 	// run executes one node command; success is the exit status, not the
 	// output — several CLIs print nothing on success.

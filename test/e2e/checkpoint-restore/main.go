@@ -16,18 +16,25 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
 	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
+	"github.com/inclusionAI/sandboxd/pkg/checkpointroot"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	gstatus "google.golang.org/grpc/status"
 	"google.golang.org/protobuf/encoding/protojson"
 )
 
@@ -54,6 +61,8 @@ type options struct {
 	operationIDSet           bool
 	expectedRootDigest       string
 	expectedRootDigestSet    bool
+	expectedRequestDigest    string
+	expectedRequestDigestSet bool
 	stdout                   string
 	stderr                   string
 	workloadCmd              string
@@ -82,7 +91,7 @@ func parseFlags(args []string, errorOutput io.Writer) (options, error) {
 	flags := flag.NewFlagSet("checkpoint-restore", flag.ContinueOnError)
 	flags.SetOutput(errorOutput)
 	flags.StringVar(&value.action, "action", "",
-		"start, checkpoint, restore, delete, or get-start-operation")
+		"start, checkpoint, restore, delete, get-start-operation, or checkpoint-root")
 	flags.StringVar(&value.socket, "socket", "", "sandboxd Unix socket")
 	flags.StringVar(&value.runtime, "runtime", "runsc", "runtime handler")
 	flags.StringVar(&value.stdout, "stdout", "/var/log/sandboxd/checkpoint-workload.stdout", "sandbox console output path")
@@ -118,6 +127,11 @@ func parseFlags(args []string, errorOutput io.Writer) (options, error) {
 		"hex sha-256 over the entire checkpoint content root "+
 			"(the shared checksum algorithm, scheme v2; required for "+
 			"restore with --operation-id)")
+	flags.StringVar(&value.expectedRequestDigest, "expected-request-digest", "",
+		"hex sha-256 over the exact --request-file bytes a resumable "+
+			"restore must replay (optional pin for restore with "+
+			"--operation-id; compared against the bytes actually read, "+
+			"before any RPC)")
 	flags.StringVar(&value.workloadCmd, "workload-cmd", "",
 		"override the built-in start workload command (template warmup hooks)")
 	flag.Var(&value.mounts, "mount",
@@ -132,8 +146,32 @@ func main() {
 	}
 	if err := run(value); err != nil {
 		fmt.Fprintf(os.Stderr, "checkpoint-restore: %v\n", err)
-		os.Exit(1)
+		os.Exit(runExitCode(err))
 	}
+}
+
+// exitOperationNotFound is the process exit code answering a
+// get-start-operation query whose operation record does not exist. It is the
+// structured not-found signal for callers driving this CLI as a subprocess:
+// they key on the exit code (or parse stdout), never on error text, so an
+// ambiguous transport failure can fail closed instead of being mistaken for
+// an absent record.
+const exitOperationNotFound = 3
+
+// errOperationNotFound marks a get-start-operation reply whose record is
+// absent on the server (gRPC NotFound). It stays distinct from every other
+// query failure so runExitCode can map exactly this condition to
+// exitOperationNotFound.
+var errOperationNotFound = errors.New("start operation not found")
+
+// runExitCode maps a run error onto the process exit code. The generic
+// failure stays 1; the structured operation-not-found answer of a
+// get-start-operation query is exitOperationNotFound.
+func runExitCode(err error) int {
+	if errors.Is(err, errOperationNotFound) {
+		return exitOperationNotFound
+	}
+	return 1
 }
 
 // validateOptions rejects every flag misuse — unknown actions, action/flag
@@ -142,9 +180,12 @@ func main() {
 // connection to sandboxd.
 func validateOptions(value options) error {
 	switch value.action {
-	case "start", "checkpoint", "restore", "delete", "get-start-operation":
+	case "start", "checkpoint", "restore", "delete", "get-start-operation", "checkpoint-root":
 	default:
-		return errors.New("--action must be start, checkpoint, restore, delete, or get-start-operation")
+		return errors.New("--action must be start, checkpoint, restore, delete, get-start-operation, or checkpoint-root")
+	}
+	if value.action == "checkpoint-root" {
+		return validateCheckpointRootOptions(value)
 	}
 	if value.expectedGeneration != "" && value.action != "checkpoint" && value.action != "delete" {
 		return errors.New("--expected-generation is only valid for checkpoint and delete")
@@ -158,9 +199,128 @@ func validateOptions(value options) error {
 	return validateOperationFlags(value)
 }
 
+// validateCheckpointRootOptions enforces the read-only contract of
+// --action checkpoint-root: the action takes --checkpoint-dir and optionally
+// --request-file (whose bytes it only hashes). Everything else — the daemon
+// socket included — is a conflicted invocation rather than a default to
+// honor, so the action can never silently become a daemon RPC or carry a
+// start payload.
+func validateCheckpointRootOptions(value options) error {
+	if value.checkpointDir == "" {
+		return errors.New("--checkpoint-dir is required for checkpoint-root")
+	}
+	if !filepath.IsAbs(value.checkpointDir) {
+		return errors.New("--checkpoint-dir must be absolute for checkpoint-root")
+	}
+	if value.requestFile != "" && !filepath.IsAbs(value.requestFile) {
+		return errors.New("--request-file must be absolute for checkpoint-root")
+	}
+	if value.socket != "" || value.operationIDSet || value.expectedRootDigestSet ||
+		value.expectedRequestDigestSet || value.expectedGeneration != "" ||
+		value.sandboxID != "" || value.targetID != "" ||
+		value.rootfs != "" || value.snapshotType != "" || value.workloadCmd != "" {
+		return errors.New("--action checkpoint-root takes only --checkpoint-dir and " +
+			"--request-file (no socket, no payload, no operation flags)")
+	}
+	return nil
+}
+
+// checkpointRootOutput is the strict stdout contract of the checkpoint-root
+// action: one JSON object with exactly the keys root and scheme — plus
+// request_sha256 exactly when --request-file was passed — and nothing else,
+// so a caller can reject mixed or partial output instead of guessing.
+type checkpointRootOutput struct {
+	Root          string `json:"root"`
+	Scheme        string `json:"scheme"`
+	RequestSHA256 string `json:"request_sha256,omitempty"`
+}
+
+// maxRequestFileBytes is the fixed metadata bound on the request file the
+// checkpoint-root action may hash: a StartRequest document is tiny, so a
+// file beyond this bound is a mistyped path, not a request.
+const maxRequestFileBytes = 1 << 20
+
+// checkpointRoot derives and prints the content-root identity of a local
+// checkpoint directory. It is deliberately offline: no socket is dialed, the
+// action reads only the sealed manifest and the chunk sidecars (metadata,
+// never artifact payloads) through the shared checkpointroot.Bind — the one
+// algorithm the server's admission and the runtime's restore boundary use —
+// and it modifies nothing in the directory. With --request-file it also
+// hashes the exact request bytes (one bounded read) and appends
+// request_sha256, so an orchestrator can pin the restore request content in
+// the same roundtrip that pins the artifact root.
+func checkpointRoot(value options) error {
+	binding, err := checkpointroot.Bind(value.checkpointDir)
+	if err != nil {
+		return fmt.Errorf("checkpoint-root: %w", err)
+	}
+	output := checkpointRootOutput{
+		Root:   binding.RootDigest,
+		Scheme: binding.Scheme,
+	}
+	if value.requestFile != "" {
+		digest, err := hashRequestFileBounded(value.requestFile)
+		if err != nil {
+			return fmt.Errorf("checkpoint-root: %w", err)
+		}
+		output.RequestSHA256 = digest
+	}
+	encoded, err := json.Marshal(output)
+	if err != nil {
+		return err
+	}
+	fmt.Println(string(encoded))
+	return nil
+}
+
+// hashRequestFileBounded hashes the exact request-file bytes in one bounded
+// read: the stat refuses a non-regular or oversized file before any byte is
+// buffered, and the read itself is limit-bounded so growth between the stat
+// and the read cannot force an unbounded buffer.
+func hashRequestFileBounded(path string) (string, error) {
+	data, err := readRequestFileBounded(path)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+func readRequestFileBounded(path string) ([]byte, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("request file %s is not a regular file", path)
+	}
+	if info.Size() > maxRequestFileBytes {
+		return nil, fmt.Errorf("request file %s exceeds the %d-byte bound", path, maxRequestFileBytes)
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, maxRequestFileBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > maxRequestFileBytes {
+		return nil, fmt.Errorf("request file %s exceeds the %d-byte bound while reading", path, maxRequestFileBytes)
+	}
+	return data, nil
+}
+
 func run(value options) error {
 	if err := validateOptions(value); err != nil {
 		return err
+	}
+	// The read-only identity action never opens a connection: it answers
+	// from the local directory alone, so it must be dispatched before the
+	// dial and must stay unreachable past it.
+	if value.action == "checkpoint-root" {
+		return checkpointRoot(value)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), value.timeout)
 	defer cancel()
@@ -191,7 +351,7 @@ func run(value options) error {
 	case "get-start-operation":
 		return getStartOperation(ctx, client, value)
 	default:
-		return errors.New("--action must be start, checkpoint, restore, delete, or get-start-operation")
+		return errors.New("--action must be start, checkpoint, restore, delete, get-start-operation, or checkpoint-root")
 	}
 }
 
@@ -465,6 +625,34 @@ func validateExpectedRootDigest(digest string) error {
 	return nil
 }
 
+// validateExpectedRequestDigest accepts exactly 64 hex characters — the
+// encoded sha-256 over the exact request-file bytes — and passes them through
+// verbatim; the CLI remains the authority on whether the pinned digest
+// matches the bytes it actually reads and sends.
+func validateExpectedRequestDigest(digest string) error {
+	if digest == "" {
+		return nil
+	}
+	if len(digest) != 64 {
+		return errors.New("--expected-request-digest must be exactly 64 hex characters")
+	}
+	for index := 0; index < len(digest); index++ {
+		character := digest[index]
+		switch {
+		case character >= '0' && character <= '9',
+			character >= 'a' && character <= 'f',
+			character >= 'A' && character <= 'F':
+		default:
+			return fmt.Errorf(
+				"--expected-request-digest contains non-hex character %q at byte %d",
+				character,
+				index,
+			)
+		}
+	}
+	return nil
+}
+
 // validateOperationFlags enforces the persistent-operation flag contract:
 // explicitly passed but empty new flags fail rather than silently selecting
 // the legacy path, only the right actions accept --operation-id,
@@ -485,6 +673,22 @@ func validateOperationFlags(value options) error {
 	if value.expectedRootDigest != "" &&
 		(value.action != "restore" || value.operationID == "") {
 		return errors.New("--expected-root-digest is only valid for restore with --operation-id")
+	}
+	// The request-content pin is optional (a caller may not have one), but an
+	// explicitly passed one is intent: empty or malformed values fail here,
+	// before the socket is dialed, instead of silently restoring unpinned
+	// bytes under the same operation ID.
+	if value.expectedRequestDigestSet && value.expectedRequestDigest == "" {
+		return errors.New("--expected-request-digest must not be empty")
+	}
+	if value.expectedRequestDigest != "" &&
+		(value.action != "restore" || value.operationID == "") {
+		return errors.New("--expected-request-digest is only valid for restore with --operation-id")
+	}
+	if value.expectedRequestDigest != "" {
+		if err := validateExpectedRequestDigest(value.expectedRequestDigest); err != nil {
+			return err
+		}
 	}
 	if value.operationID == "" {
 		if value.action == "get-start-operation" {
@@ -541,7 +745,7 @@ func restore(
 	if value.requestFile == "" {
 		return errors.New("--request-file is required for restore")
 	}
-	request, err := loadRestoreRequest(value)
+	request, _, err := loadRestoreRequest(value)
 	if err != nil {
 		return err
 	}
@@ -558,20 +762,25 @@ func restore(
 
 // loadRestoreRequest replays the persisted StartRequest under the restore
 // target ID and checkpoint directory, the shared prefix of both restore modes.
-func loadRestoreRequest(value options) (*runtime.StartRequest, error) {
-	data, err := os.ReadFile(value.requestFile)
+// It also returns the hex sha-256 over the exact bytes it just read — one
+// read, one hash — so an operation-mode caller compares the pinned request
+// digest against the very bytes that were parsed and sent, never a second
+// independent read of the file.
+func loadRestoreRequest(value options) (*runtime.StartRequest, string, error) {
+	data, err := readRequestFileBounded(value.requestFile)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	request := new(runtime.StartRequest)
 	if err := (protojson.UnmarshalOptions{DiscardUnknown: false}).Unmarshal(data, request); err != nil {
-		return nil, err
+		return nil, "", err
 	}
+	sum := sha256.Sum256(data)
 	request.SandboxID = value.targetID
 	request.CheckpointInfo = &runtime.CheckpointInfo{
 		CheckpointDir: value.checkpointDir,
 	}
-	return request, nil
+	return request, hex.EncodeToString(sum[:]), nil
 }
 
 // startWithOperation runs the persistent start mode. The legacy Start RPC is
@@ -607,7 +816,12 @@ func startWithOperation(
 // restoreWithOperation runs the persistent restore mode. Unlike the legacy
 // restore it requires the caller to pin the artifact root digest: the
 // operation must bind to the content it restores, not just a path. The CLI
-// never invents an operation ID or digest on the caller's behalf.
+// never invents an operation ID or digest on the caller's behalf. An optional
+// --expected-request-digest additionally pins the request bytes: it is
+// compared against the hash of the SAME bytes loadRestoreRequest just parsed
+// — one read, hashed once — and any mismatch fails BEFORE the
+// StartWithOperation RPC, so a request file mutated at the same path can
+// never ride the operation identity.
 func restoreWithOperation(
 	ctx context.Context,
 	client runtime.SandboxServiceClient,
@@ -624,9 +838,18 @@ func restoreWithOperation(
 	if err := validateExpectedRootDigest(value.expectedRootDigest); err != nil {
 		return err
 	}
-	request, err := loadRestoreRequest(value)
+	if err := validateExpectedRequestDigest(value.expectedRequestDigest); err != nil {
+		return err
+	}
+	request, requestDigest, err := loadRestoreRequest(value)
 	if err != nil {
 		return err
+	}
+	if value.expectedRequestDigest != "" && requestDigest != value.expectedRequestDigest {
+		return fmt.Errorf(
+			"restore: request file %s hashes to %s but --expected-request-digest pins %s — the request content changed at this path; refusing to issue operation %q",
+			value.requestFile, requestDigest, value.expectedRequestDigest, value.operationID,
+		)
 	}
 	status, err := client.StartWithOperation(ctx, &runtime.StartWithOperationRequest{
 		OperationID: value.operationID,
@@ -664,6 +887,15 @@ func getStartOperation(
 		OperationID: value.operationID,
 	})
 	if err != nil {
+		// Absence is the one answer callers may act on (a NotFound record
+		// proves the operation was never admitted, so the same operation may
+		// be re-issued). Mark exactly the gRPC NotFound status with the
+		// structured sentinel; every other failure — Unimplemented, a
+		// transport error, a deadline — stays a plain error so subprocess
+		// callers fail closed instead of grepping stderr for "not found".
+		if gstatus.Code(err) == codes.NotFound {
+			return fmt.Errorf("get-start-operation: %w: %w", errOperationNotFound, err)
+		}
 		return fmt.Errorf("get-start-operation: %w", err)
 	}
 	if status == nil {
