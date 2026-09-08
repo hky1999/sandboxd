@@ -210,6 +210,14 @@ func (h *sandboxService) checkpoint(
 			resources = sandbox.Status.Get().Resources
 		}
 	}
+	// runtimeCheckpointEntered flips immediately before the runtime checkpoint
+	// call inside the memory-wrapper callback, and marks the boundary for the
+	// output directory: past this point the runtime may have sealed artifacts
+	// that a later step of its own can still fail (Firecracker seals and stops
+	// the VMM before confirming the uffd handler exit). The callback always
+	// runs synchronously on this goroutine, so the flag is written before
+	// withTransientFirecrackerCheckpointMemory returns and read only after it.
+	runtimeCheckpointEntered := false
 	err = h.withTransientFirecrackerCheckpointMemory(
 		checkpointCtx,
 		sandbox.Metadata.RuntimeHandler,
@@ -219,6 +227,7 @@ func (h *sandboxService) checkpoint(
 		handler,
 		true,
 		func() error {
+			runtimeCheckpointEntered = true
 			return checkpointHandler.Checkpoint(checkpointCtx, svc.CheckpointConfig{
 				ID:           request.ID,
 				Directory:    directory.path,
@@ -233,8 +242,30 @@ func (h *sandboxService) checkpoint(
 		if checkpointCtx.Err() != nil {
 			err = checkpointCtx.Err()
 		}
+		if runtimeCheckpointEntered {
+			// The runtime checkpoint was entered, so this error proves
+			// nothing about the artifacts: the runtime may already have
+			// sealed a complete, restorable checkpoint and stopped the
+			// source before its own finishing steps failed. Removing the
+			// output here could destroy sealed artifacts, so the directory
+			// is kept for inspection or manual restore and the error must
+			// report the unknown outcome. The decision never consults the
+			// manifest or the source state: neither is a success proof.
+			return nil, errord.ToGRPC(fmt.Errorf(
+				"checkpoint sandbox %s failed; checkpoint outcome is unknown and artifacts are retained in %s; "+
+					"source sandbox state is not guaranteed: %w",
+				request.ID,
+				directory.path,
+				err,
+			))
+		}
+		// The runtime was never invoked, so no artifact can exist: only this
+		// attempt's partial output is cleaned. cleanup removes a leaf created
+		// for this attempt and empties a caller-provided leaf while
+		// preserving the directory itself.
 		operationErr := fmt.Errorf(
-			"checkpoint sandbox %s failed; source sandbox state is not guaranteed: %w",
+			"checkpoint sandbox %s failed before the runtime checkpoint was entered; "+
+				"source sandbox state is not guaranteed: %w",
 			request.ID,
 			err,
 		)

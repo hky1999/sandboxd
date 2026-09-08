@@ -17,6 +17,7 @@ package server
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -24,6 +25,7 @@ import (
 	"time"
 
 	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
+	"github.com/inclusionAI/sandboxd/config"
 	"github.com/inclusionAI/sandboxd/pkg/errord"
 	svc "github.com/inclusionAI/sandboxd/pkg/runtime"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
@@ -128,7 +130,12 @@ func TestCheckpointForwardsRequest(t *testing.T) {
 	assert.Zero(t, handler.deleteCalls)
 }
 
-func TestCheckpointFailureCleansResidualsWithoutDeletingSource(t *testing.T) {
+// TestCheckpointFailureAfterRuntimeEntryRetainsArtifactsWithoutDeletingSource
+// pins the retention boundary: once the runtime checkpoint call has been
+// entered, a returned error proves nothing about what the runtime already
+// wrote, so the output directory is kept and the error reports the unknown
+// outcome instead of silently deleting potentially sealed artifacts.
+func TestCheckpointFailureAfterRuntimeEntryRetainsArtifactsWithoutDeletingSource(t *testing.T) {
 	handler := newCheckpointTestHandler()
 	handler.checkpointFn = func(_ context.Context, config svc.CheckpointConfig) error {
 		require.NoError(t, os.WriteFile(
@@ -150,14 +157,14 @@ func TestCheckpointFailureCleansResidualsWithoutDeletingSource(t *testing.T) {
 		LeaveRunning:   true,
 	})
 	require.Error(t, err)
+	assert.ErrorContains(t, err, "checkpoint outcome is unknown")
+	assert.ErrorContains(t, err, fmt.Sprintf("artifacts are retained in %s", directory))
 	assert.ErrorContains(t, err, "source sandbox state is not guaranteed")
-	entries, readErr := os.ReadDir(directory)
-	require.NoError(t, readErr)
-	assert.Empty(t, entries)
+	assert.FileExists(t, filepath.Join(directory, "partial"))
 	assert.Zero(t, handler.deleteCalls)
 }
 
-func TestCheckpointTimeoutCleansCreatedDirectory(t *testing.T) {
+func TestCheckpointTimeoutAfterRuntimeEntryRetainsCreatedDirectory(t *testing.T) {
 	handler := newCheckpointTestHandler()
 	handler.checkpointFn = func(ctx context.Context, config svc.CheckpointConfig) error {
 		require.NoError(t, os.WriteFile(
@@ -179,8 +186,170 @@ func TestCheckpointTimeoutCleansCreatedDirectory(t *testing.T) {
 	})
 	require.Error(t, err)
 	assert.Equal(t, codes.DeadlineExceeded, status.Code(err))
-	assert.NoDirExists(t, directory)
+	assert.ErrorContains(t, err, "checkpoint outcome is unknown")
+	assert.ErrorContains(t, err, fmt.Sprintf("artifacts are retained in %s", directory))
+	// The leaf sandboxd created for this attempt is kept, not removed: the
+	// runtime was entered, so even a timeout cannot prove the artifacts
+	// incomplete.
+	assert.DirExists(t, directory)
+	assert.FileExists(t, filepath.Join(directory, "partial"))
 	assert.Zero(t, handler.deleteCalls)
+}
+
+// TestCheckpointSealedArtifactsRetainedWhenRuntimeFinishingFails reproduces
+// the Firecracker shape of the retention bug: a mock runtime writes artifact-shaped
+// files, then returns a finishing error. This checks server retention, not
+// the validity of the mock files as a real Firecracker checkpoint.
+func TestCheckpointSealedArtifactsRetainedWhenRuntimeFinishingFails(t *testing.T) {
+	handler := newCheckpointTestHandler()
+	handler.checkpointFn = func(_ context.Context, config svc.CheckpointConfig) error {
+		sealed := map[string]string{
+			"vmstate":       "state",
+			"memory":        "pages",
+			"overlay.ext4":  "overlay",
+			"manifest.json": `{"layout":2}`,
+		}
+		for name, content := range sealed {
+			require.NoError(t, os.WriteFile(
+				filepath.Join(config.Directory, name),
+				[]byte(content),
+				0600,
+			))
+		}
+		return errors.New(
+			"confirm uffd handler exit for Firecracker sandbox sbox-sealed after checkpoint: unconfirmed",
+		)
+	}
+	service := newTestService(t, map[string]svc.Handler{"runsc": handler})
+	storeRunningSandbox(t, service, "sbox-sealed", "runsc")
+	directory := filepath.Join(t.TempDir(), "checkpoint")
+
+	_, err := service.Checkpoint(context.Background(), &runtime.CheckpointRequest{
+		ID:             "sbox-sealed",
+		CheckpointDir:  directory,
+		TimeoutSeconds: 5,
+		LeaveRunning:   false,
+	})
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "confirm uffd handler exit")
+	assert.ErrorContains(t, err, "checkpoint outcome is unknown")
+	assert.ErrorContains(t, err, fmt.Sprintf("artifacts are retained in %s", directory))
+	for _, name := range []string{"vmstate", "memory", "overlay.ext4", "manifest.json"} {
+		assert.FileExists(t, filepath.Join(directory, name))
+	}
+	assert.Zero(t, handler.deleteCalls)
+}
+
+// TestCheckpointCallerCancellationAfterRuntimeEntryRetainsArtifacts keeps the
+// directory on caller cancellation as on every other post-entry failure: a
+// cancelled wait is an unknown outcome, never a verdict on the artifacts.
+func TestCheckpointCallerCancellationAfterRuntimeEntryRetainsArtifacts(t *testing.T) {
+	handler := newCheckpointTestHandler()
+	entered := make(chan struct{})
+	handler.checkpointFn = func(ctx context.Context, config svc.CheckpointConfig) error {
+		require.NoError(t, os.WriteFile(
+			filepath.Join(config.Directory, "partial"),
+			[]byte("partial"),
+			0600,
+		))
+		close(entered)
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	service := newTestService(t, map[string]svc.Handler{"runsc": handler})
+	storeRunningSandbox(t, service, "sbox-cancelled", "runsc")
+	directory := filepath.Join(t.TempDir(), "checkpoint")
+
+	callerCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := service.Checkpoint(callerCtx, &runtime.CheckpointRequest{
+			ID:             "sbox-cancelled",
+			CheckpointDir:  directory,
+			TimeoutSeconds: 60,
+		})
+		done <- err
+	}()
+	<-entered
+	cancel()
+
+	select {
+	case err := <-done:
+		require.Error(t, err)
+		assert.Equal(t, codes.Canceled, status.Code(err))
+		assert.ErrorContains(t, err, "checkpoint outcome is unknown")
+		assert.ErrorContains(t, err, fmt.Sprintf("artifacts are retained in %s", directory))
+		assert.DirExists(t, directory)
+		assert.FileExists(t, filepath.Join(directory, "partial"))
+	case <-time.After(10 * time.Second):
+		t.Fatal("checkpoint did not return after caller cancellation")
+	}
+	assert.Zero(t, handler.deleteCalls)
+}
+
+// TestCheckpointFailureBeforeRuntimeEntryCleansOutputWithoutCallingRuntime
+// pins the other side of the boundary: admission and gating failures that
+// never reach the runtime handler cannot have produced artifacts, so the
+// output allocated for this attempt is cleaned up — a leaf sandboxd created
+// is removed, a caller-provided leaf is emptied but never deleted itself —
+// and the runtime handler is never invoked.
+func TestCheckpointFailureBeforeRuntimeEntryCleansOutputWithoutCallingRuntime(t *testing.T) {
+	t.Run("resource collection failure removes created leaf", func(t *testing.T) {
+		handler := newCheckpointTestHandler()
+		service := newTestService(t, map[string]svc.Handler{
+			config.RuntimeNameFirecracker: handler,
+		})
+		// No sandbox spec is persisted, so collecting the Firecracker cgroup
+		// resource fails after the output leaf was created but before the
+		// runtime handler is invoked.
+		storeRunningSandbox(t, service, "sbox-fc-nospec", config.RuntimeNameFirecracker)
+		directory := filepath.Join(t.TempDir(), "checkpoint")
+
+		_, err := service.Checkpoint(context.Background(), &runtime.CheckpointRequest{
+			ID:             "sbox-fc-nospec",
+			CheckpointDir:  directory,
+			TimeoutSeconds: 5,
+		})
+		require.Error(t, err)
+		assert.NoDirExists(t, directory)
+		assert.Empty(t, handler.checkpoints)
+	})
+
+	t.Run("memory slot gate failure empties caller leaf without deleting it", func(t *testing.T) {
+		handler := newCheckpointTestHandler()
+		service := newTestService(t, map[string]svc.Handler{
+			config.RuntimeNameFirecracker: handler,
+		})
+		storeRunningSandbox(t, service, "sbox-fc-slot", config.RuntimeNameFirecracker)
+		// A readable spec passes resource collection; the out-of-range
+		// concurrency setting then fails the node-wide checkpoint memory
+		// slot gate before the runtime handler is invoked.
+		require.NoError(t, os.WriteFile(
+			filepath.Join(service.config.RootDir, "containers", "sbox-fc-slot", config.SandboxSpecFile),
+			[]byte(`{"ociVersion":"1.1.0","linux":{}}`),
+			0600,
+		))
+		service.config.Firecracker.CheckpointConcurrency = 9
+		directory := filepath.Join(t.TempDir(), "checkpoint")
+		require.NoError(t, os.Mkdir(directory, 0700))
+
+		_, err := service.Checkpoint(context.Background(), &runtime.CheckpointRequest{
+			ID:             "sbox-fc-slot",
+			CheckpointDir:  directory,
+			TimeoutSeconds: 5,
+		})
+		require.Error(t, err)
+		assert.ErrorContains(t, err, "checkpoint_concurrency must be between 1 and 8")
+		assert.ErrorContains(t, err, "before the runtime checkpoint was entered")
+		// The caller's own leaf directory survives; only this attempt's
+		// residuals are removed from it.
+		assert.DirExists(t, directory)
+		entries, readErr := os.ReadDir(directory)
+		require.NoError(t, readErr)
+		assert.Empty(t, entries)
+		assert.Empty(t, handler.checkpoints)
+	})
 }
 
 func TestCheckpointRejectsConcurrentOperation(t *testing.T) {
