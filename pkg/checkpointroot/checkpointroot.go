@@ -199,7 +199,15 @@ func bindFromView(dir string, manifestRaw []byte) (*Binding, error) {
 		if name == manifestName || !isSidecarName(name) {
 			continue
 		}
-		sidecar, err := checkpointchunks.LoadNamedBounded(dir, name, checkpointchunks.MaxManifestBytes)
+		var sidecar *checkpointchunks.Manifest
+		var err error
+		if name == checkpointchunks.ManifestName {
+			// Materialized memory keeps its validated packed transport metadata.
+			// Physical pack placement does not change the logical content root.
+			sidecar, err = checkpointchunks.LoadTransport(dir)
+		} else {
+			sidecar, err = checkpointchunks.LoadNamedBounded(dir, name, checkpointchunks.MaxManifestBytes)
+		}
 		if err != nil {
 			return nil, fmt.Errorf("load checkpoint sidecar %s in %s: %w: %v", name, dir, ErrUnverifiable, err)
 		}

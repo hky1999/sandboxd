@@ -20,8 +20,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"os"
-	"path/filepath"
 	"sort"
 )
 
@@ -96,11 +94,7 @@ func PackRootDigest(parts []PackPart) (string, error) {
 // LoadTransport is for consumers that implement both CAS and packed reads.
 // Load and LoadNamed deliberately continue to reject transport versions 2 and 3.
 func LoadTransport(dir string) (*Manifest, error) {
-	raw, err := os.ReadFile(filepath.Join(dir, ManifestName))
-	if err != nil {
-		return nil, err
-	}
-	return DecodeTransport(raw)
+	return loadNamedBounded(dir, ManifestName, MaxManifestBytes, true)
 }
 
 func DecodeTransport(raw []byte) (*Manifest, error) { return decodeManifest(raw, true) }
