@@ -35,7 +35,20 @@ package main
 //     the test release the request so the restore commits late on the
 //     target — the CLI must issue NO source rollback and NO target delete
 //     around the unknown outcome, leaving the late-committed target as the
-//     only writer (the source was finalized at checkpoint time).
+//     only writer (the source was finalized at checkpoint time);
+//
+//   - the source incarnation is pinned by a structured inspect: a missing
+//     generation label, or an optional -source-generation that does not
+//     match the captured label, stops the run before any checkpoint side
+//     effect;
+//
+//   - the checkpoint and the source retirement are conditional on the
+//     pinned generation — the fake node decides their side effects from the
+//     --expected-generation it actually receives, so an incarnation
+//     replaced between checkpoint and retirement is never snapshotted or
+//     retired by the stale value, and a failed conditional retirement is
+//     terminal (source-cleanup-pending): no bare sbox delete, no
+//     empty-listing fallback, no rollback of the running target.
 
 import (
 	"bytes"
@@ -52,6 +65,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
 )
 
 func TestExecutorHelper(t *testing.T) {
@@ -129,12 +144,38 @@ func executorMain(stateDir, node string, args []string) {
 			}
 		}
 		os.Stdout.WriteString("ID STATUS RUNTIME\nsbox-x SANDBOX_STATE_RUNNING firecracker\n")
+	case has("inspect"):
+		if node != "S" {
+			os.Exit(1) // only the source holds the sandbox
+		}
+		os.Stdout.WriteString(inspectJSON(stateDir))
+		if raw, err := os.ReadFile(filepath.Join(stateDir, "replace-after-inspect")); err == nil {
+			if err := os.WriteFile(filepath.Join(stateDir, "source-generation"), raw, 0o600); err != nil {
+				os.Exit(2)
+			}
+		}
 	case has("--action"):
 		switch value("--action") {
 		case "checkpoint":
+			expected := value("--expected-generation")
+			if expected == "" {
+				_ = os.WriteFile(filepath.Join(stateDir, "bare-checkpoint"), nil, 0o600)
+				os.Exit(1) // an unconditional checkpoint would snapshot an unnamed incarnation
+			}
+			if expected != liveGeneration(stateDir) {
+				_ = os.WriteFile(filepath.Join(stateDir, "checkpoint-refused"), nil, 0o600)
+				os.Exit(1) // FailedPrecondition: the pinned incarnation is gone
+			}
 			_ = os.WriteFile(filepath.Join(stateDir, "stopped"), nil, 0o600)
 			_ = os.WriteFile(filepath.Join(stateDir, "checkpoint-id"),
 				[]byte(filepath.Base(value("--checkpoint-dir"))), 0o600)
+			// Optional replacement staged by a test: after the checkpoint
+			// seals, another actor retires that incarnation and starts a
+			// fresh one under the same ID on the source.
+			if raw, err := os.ReadFile(filepath.Join(stateDir, "replace-source")); err == nil {
+				_ = os.WriteFile(filepath.Join(stateDir, "source-generation"),
+					bytes.TrimSpace(raw), 0o600)
+			}
 		case "restore":
 			if node == "T" {
 				if !relayPendingRestore() {
@@ -143,16 +184,67 @@ func executorMain(stateDir, node string, args []string) {
 			} else {
 				_ = os.WriteFile(filepath.Join(stateDir, "source-rollback-running"), nil, 0o600)
 			}
+		case "delete":
+			expected := value("--expected-generation")
+			if expected == "" {
+				_ = os.WriteFile(filepath.Join(stateDir, "bare-delete"), nil, 0o600)
+				os.Exit(1) // a bare-ID delete could retire a replacement incarnation
+			}
+			if _, err := os.Stat(filepath.Join(stateDir, "fail-retire")); err == nil {
+				os.Exit(1) // conditional retirement keeps failing on the source
+			}
+			if expected != liveGeneration(stateDir) {
+				_ = os.WriteFile(filepath.Join(stateDir, "retire-refused"),
+					[]byte(liveGeneration(stateDir)), 0o600)
+				os.Exit(1) // FailedPrecondition: the incarnation was replaced
+			}
+			_ = os.WriteFile(filepath.Join(stateDir, "source-retired"), nil, 0o600)
 		}
 	case filepath.Base(args[0]) == "cn-publish":
 		if _, err := os.Stat(filepath.Join(stateDir, "fail-publish")); err == nil {
 			os.Exit(1) // publish keeps failing on the source
 		}
 	case has("delete"):
-		if node == "S" {
-			os.Exit(1) // cleanup keeps failing on the source
-		}
+		// Any bare `sbox ... delete` reaching the node is a cn-migrate
+		// regression: retirement only ever goes through the conditional
+		// checkpoint-restore path above. Fail and leave a marker.
+		_ = os.WriteFile(filepath.Join(stateDir, "sbox-delete"), nil, 0o600)
+		os.Exit(1)
 	}
+}
+
+// liveGeneration returns the incarnation label the fake source node holds
+// for the sandbox, seeding it with g1 on first use so a later replacement
+// (the replace-source control) can flip it.
+func liveGeneration(stateDir string) string {
+	path := filepath.Join(stateDir, "source-generation")
+	if raw, err := os.ReadFile(path); err == nil {
+		return strings.TrimSpace(string(raw))
+	}
+	_ = os.WriteFile(path, []byte("g1"), 0o600)
+	return "g1"
+}
+
+// inspectJSON renders the sandbox exactly the way `sbox inspect` does:
+// encoding/json over the generated runtime.SandboxStatus, whose
+// omitempty drops the proto3-zero RUNNING state field entirely. A staged
+// no-label control models a pre-generation node that carries no incarnation
+// identity at all.
+func inspectJSON(stateDir string) string {
+	labels := map[string]string{sourceGenerationLabel: liveGeneration(stateDir)}
+	if _, err := os.Stat(filepath.Join(stateDir, "no-label")); err == nil {
+		labels = nil
+	}
+	status := &runtime.SandboxStatus{
+		ID:     "sbox-x",
+		State:  runtime.SandboxState_SANDBOX_STATE_RUNNING,
+		Labels: labels,
+	}
+	encoded, err := json.MarshalIndent(status, "", " ")
+	if err != nil {
+		return ""
+	}
+	return string(encoded) + "\n"
 }
 
 func TestMigrateTargetOwnedNeverRollsBack(t *testing.T) {
@@ -160,6 +252,9 @@ func TestMigrateTargetOwnedNeverRollsBack(t *testing.T) {
 		t.Skip("orchestration test builds and re-executes the CLI")
 	}
 	state := t.TempDir()
+	if err := os.WriteFile(filepath.Join(state, "fail-retire"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
 	// The catalog stand-in mirrors the probe that reproduced the defect:
 	// one node record for T and a checkpoint entry that follows whatever
 	// checkpoint ID the executor observed.
@@ -194,7 +289,7 @@ func TestMigrateTargetOwnedNeverRollsBack(t *testing.T) {
 		"-store", "fake",
 		"-nodes", catalog.URL,
 		"-json")
-	cmd.Env = append(os.Environ(), "CN_MIGRATE_EXECUTOR=1", "GOCACHE="+os.Getenv("GOCACHE"))
+	cmd.Env = append(os.Environ(), "CN_MIGRATE_EXECUTOR=1", "GORACE="+os.Getenv("GORACE")+" atexit_sleep_ms=0", "GOCACHE="+os.Getenv("GOCACHE"))
 	out, _ := cmd.CombinedOutput()
 	report := string(out)
 
@@ -207,22 +302,33 @@ func TestMigrateTargetOwnedNeverRollsBack(t *testing.T) {
 	if !strings.Contains(report, "no rollback") {
 		t.Fatalf("report does not state the ownership decision\n%s", report)
 	}
+	if !strings.Contains(report, "source-cleanup-pending") {
+		t.Fatalf("report does not name the lingering cleanup state\n%s", report)
+	}
 	calls, _ := os.ReadFile(filepath.Join(state, "calls"))
 	for _, line := range strings.Split(string(calls), "\n") {
 		if strings.Contains(line, "rollback-restore") && strings.Contains(line, "\"S\"") {
 			t.Fatalf("F2 regression: rollback-restore command sent to the source\n%s", report)
 		}
 	}
+	// The retirement failed and stayed failed: the exact command sequence
+	// ends with the one conditional delete — no bare sbox delete, no empty
+	// listing offered as a retirement proof, no retry loop.
+	assertCallSequence(t, state, []string{
+		"S:list", "S:inspect", "S:checkpoint", "S:publish",
+		"T:fetch", "T:restore", "T:list", "S:delete",
+	}, report)
 }
 
 // cliReport is the subset of cn-migrate's -json report the orchestration
 // tests assert on.
 type cliReport struct {
-	Sandbox    string `json:"sandbox"`
-	Source     string `json:"source"`
-	Target     string `json:"target"`
-	Checkpoint string `json:"checkpoint_dir"`
-	Steps      []struct {
+	Sandbox          string `json:"sandbox"`
+	Source           string `json:"source"`
+	Target           string `json:"target"`
+	Checkpoint       string `json:"checkpoint_dir"`
+	SourceGeneration string `json:"source_generation"`
+	Steps            []struct {
 		Step   string `json:"step"`
 		Detail string `json:"detail"`
 		TookMs int64  `json:"took_ms"`
@@ -273,14 +379,15 @@ func catalogStandIn(t *testing.T, state string) string {
 
 // runMigrate executes the real CLI through the executor-helper template,
 // captures its -json report, and echoes the report plus every recorded node
-// command into the test log.
-func runMigrate(t *testing.T, bin, state, nodes string, wait time.Duration) (int, cliReport, string) {
+// command into the test log. Extra flags (e.g. -source-generation) are
+// appended after the fixed ones.
+func runMigrate(t *testing.T, bin, state, nodes string, wait time.Duration, extra ...string) (int, cliReport, string) {
 	t.Helper()
 	executor := os.Args[0]
 	tpl := executor + " -test.run=TestExecutorHelper -- " + state + " {node}"
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, bin,
+	args := []string{
 		"-sandbox", "sbox-x", "-source", "S",
 		"-exec", tpl,
 		"-store", "fake",
@@ -288,8 +395,11 @@ func runMigrate(t *testing.T, bin, state, nodes string, wait time.Duration) (int
 		"-request-file", filepath.Join(state, "req.json"),
 		"-bin", filepath.Join(state, "fakebin"),
 		"-wait", wait.String(),
-		"-json")
-	cmd.Env = append(os.Environ(), "CN_MIGRATE_EXECUTOR=1", "GOCACHE="+os.Getenv("GOCACHE"))
+	}
+	args = append(args, extra...)
+	args = append(args, "-json")
+	cmd := exec.CommandContext(ctx, bin, args...)
+	cmd.Env = append(os.Environ(), "CN_MIGRATE_EXECUTOR=1", "GORACE="+os.Getenv("GORACE")+" atexit_sleep_ms=0", "GOCACHE="+os.Getenv("GOCACHE"))
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -356,7 +466,9 @@ func callSeq(calls []nodeCall) []string {
 		switch filepath.Base(strings.Fields(c.argv)[0]) {
 		case "sbox":
 			if hasToken(c.argv, "delete") {
-				class = "delete"
+				class = "bare-delete" // a bare-ID delete; cn-migrate must never issue one
+			} else if hasToken(c.argv, "inspect") {
+				class = "inspect"
 			} else if hasToken(c.argv, "list") {
 				class = "list"
 			}
@@ -365,6 +477,8 @@ func callSeq(calls []nodeCall) []string {
 				class = "restore"
 			} else if hasToken(c.argv, "checkpoint") {
 				class = "checkpoint"
+			} else if hasToken(c.argv, "delete") {
+				class = "delete" // the conditional, receipt-gated retirement
 			}
 		case "cn-publish":
 			class = "publish"
@@ -413,7 +527,7 @@ func TestMigratePublishFailureRollsBackSource(t *testing.T) {
 	for _, s := range report.Steps {
 		got = append(got, step{s.Step, s.Failed})
 	}
-	want := []step{{"list", false}, {"checkpoint", false}, {"publish", true}, {"rollback-restore", false}, {"publish", true}}
+	want := []step{{"list", false}, {"inspect", false}, {"checkpoint", false}, {"publish", true}, {"rollback-restore", false}, {"publish", true}}
 	if !slices.EqualFunc(got, want, func(a, b step) bool { return a == b }) {
 		t.Fatalf("report steps = %v, want %v\n%s", got, want, stdout)
 	}
@@ -427,7 +541,7 @@ func TestMigratePublishFailureRollsBackSource(t *testing.T) {
 		t.Fatalf("target was started in a pre-restore failure scenario\n%s", stdout)
 	}
 	// The target was never asked for anything: no fetch, no restore, no delete.
-	assertCallSequence(t, state, []string{"S:list", "S:checkpoint", "S:publish", "S:restore"}, stdout)
+	assertCallSequence(t, state, []string{"S:list", "S:inspect", "S:checkpoint", "S:publish", "S:restore"}, stdout)
 }
 
 // TestMigrateRestoreUnknownOutcomeContainsLateCommit drives the 0020 P0
@@ -490,6 +604,8 @@ func TestMigrateRestoreUnknownOutcomeContainsLateCommit(t *testing.T) {
 	}
 	nodes := catalogStandIn(t, state)
 
+	// The helper disables only race-detector exit sleep, preserving this
+	// original one-second RPC timeout under race instrumentation.
 	code, report, stdout := runMigrate(t, buildCnMigrate(t), state, nodes, time.Second)
 
 	// The suspended request must have been accepted before the CLI moved on.
@@ -510,23 +626,23 @@ func TestMigrateRestoreUnknownOutcomeContainsLateCommit(t *testing.T) {
 	for _, s := range report.Steps {
 		got = append(got, step{s.Step, s.Failed})
 	}
-	// list, checkpoint, publish, materialize, the killed restore, and
-	// fail()'s 0ms summary line — nothing else may run.
-	want := []step{{"list", false}, {"checkpoint", false}, {"publish", false}, {"materialize", false}, {"restore", true}, {"restore", true}}
+	// list, inspect, checkpoint, publish, materialize, the killed restore,
+	// and fail()'s 0ms summary line — nothing else may run.
+	want := []step{{"list", false}, {"inspect", false}, {"checkpoint", false}, {"publish", false}, {"materialize", false}, {"restore", true}, {"restore", true}}
 	if !slices.EqualFunc(got, want, func(a, b step) bool { return a == b }) {
 		t.Fatalf("report steps = %v, want %v (no fence-target/confirm-fenced/rollback-restore may appear)\n%s", got, want, stdout)
 	}
-	for _, banned := range []string{"fence-target", "confirm-fenced", "rollback-restore", "verify", "delete-source"} {
+	for _, banned := range []string{"fence-target", "confirm-fenced", "rollback-restore", "verify", "delete-source", "confirm-source-gone"} {
 		for _, s := range report.Steps {
 			if s.Step == banned {
 				t.Fatalf("compensation command %q issued around an unknown target outcome\n%s", banned, stdout)
 			}
 		}
 	}
-	// First restore line = the executor command killed by -wait 1s; the
+	// First restore line = the executor command killed by the 1s -wait; the
 	// trailing line is fail()'s summary (0ms, detail == report.error).
-	if took := report.Steps[4].TookMs; report.Steps[4].Failed && (took < 950 || took > 2000) {
-		t.Fatalf("restore step took_ms = %d, want the 1s -wait kill (950–2000ms)\n%s", took, stdout)
+	if took := report.Steps[5].TookMs; report.Steps[5].Failed && (took < 950 || took > 2000) {
+		t.Fatalf("restore step took_ms = %d, want the 1s -wait kill (4900–6500ms)\n%s", took, stdout)
 	}
 	if last := report.Steps[len(report.Steps)-1]; last.TookMs != 0 || last.Detail != report.Error {
 		t.Fatalf("trailing report line is not the fail() summary: %+v\n%s", last, stdout)
@@ -562,5 +678,264 @@ func TestMigrateRestoreUnknownOutcomeContainsLateCommit(t *testing.T) {
 	}
 	// Command-level proof: the target saw only fetch + the hanging restore —
 	// no fence delete; the source saw no restore (no rollback).
-	assertCallSequence(t, state, []string{"S:list", "S:checkpoint", "S:publish", "T:fetch", "T:restore"}, stdout)
+	assertCallSequence(t, state, []string{"S:list", "S:inspect", "S:checkpoint", "S:publish", "T:fetch", "T:restore"}, stdout)
+}
+
+// TestSourceGenerationParsing pins the inspect parser: every JSON shape
+// `sbox inspect` emits for a RUNNING sandbox yields the generation, and
+// every identity, label, or syntax deviation fails closed.
+func TestSourceGenerationParsing(t *testing.T) {
+	labelled := func(state, gen string) string {
+		if state != "" {
+			state = "," + state
+		}
+		return `{"id":"sbox-x"` + state + `,"labels":{"` + sourceGenerationLabel + `":"` + gen + `"}}`
+	}
+	ok := []struct{ name, in, want string }{
+		{"maximum retirement generation", labelled(`"state":0`, strings.Repeat("g", 128)), strings.Repeat("g", 128)},
+		{"numeric state", labelled(`"state":0`, "g1"), "g1"},
+		{"omitted state is the proto3 zero RUNNING", labelled(``, "gen-2"), "gen-2"},
+		{"state as its enum name string", labelled(`"state":"SANDBOX_STATE_RUNNING"`, "g3"), "g3"},
+		{"other encoding/json fields present", `{"id":"sbox-x","command":["sh","-c","id"],"runtime":"firecracker","state":0,"started_at":1756000000,"labels":{"k":"v","` +
+			sourceGenerationLabel + `":"g4"},"resources":null}`, "g4"},
+	}
+	for _, tc := range ok {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := sourceGeneration(tc.in, "sbox-x")
+			if err != nil {
+				t.Fatalf("sourceGeneration(%s) = %v, want %q", tc.in, err, tc.want)
+			}
+			if got != tc.want {
+				t.Fatalf("sourceGeneration(%s) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+	bad := []struct{ name, in, wantErr string }{
+		{"wrong id", `{"id":"sbox-y","labels":{"` + sourceGenerationLabel + `":"g1"}}`, "does not match"},
+		{"exited state", labelled(`"state":1`, "g1"), "not SANDBOX_STATE_RUNNING"},
+		{"exited state by name", labelled(`"state":"SANDBOX_STATE_EXITED"`, "g1"), "not SANDBOX_STATE_RUNNING"},
+		{"missing generation label", `{"id":"sbox-x","state":0}`, "resource-generation"},
+		{"blank generation label", labelled(`"state":0`, "  "), "resource-generation"},
+		{"oversized generation label", labelled(`"state":0`, strings.Repeat("g", 129)), "128"},
+		{"free text around the json", "warn: degraded\n" + labelled(`"state":0`, "g1"), "parse SandboxStatus"},
+		{"trailing content", labelled(`"state":0`, "g1") + " {}", "parse SandboxStatus"},
+		{"unknown field", `{"id":"sbox-x","bogus":1,"labels":{"` + sourceGenerationLabel + `":"g1"}}`, "parse SandboxStatus"},
+		{"empty output", "", "parse SandboxStatus"},
+	}
+	for _, tc := range bad {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := sourceGeneration(tc.in, "sbox-x")
+			if err == nil {
+				t.Fatalf("sourceGeneration(%s) = %q, want an error mentioning %q", tc.in, got, tc.wantErr)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("sourceGeneration(%s) error = %v, want it to mention %q", tc.in, err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// TestMigrateStopsWhenGenerationCannotBePinned drives the pre-checkpoint
+// gate through the real CLI: a source without the generation label (an old
+// node) and an explicit -source-generation that does not match the captured
+// incarnation both stop the run at the inspect step — before any checkpoint
+// side effect, publish, or target command.
+func TestMigrateStopsWhenGenerationCannotBePinned(t *testing.T) {
+	if testing.Short() {
+		t.Skip("orchestration test builds and re-executes the CLI")
+	}
+	scenarios := []struct {
+		name      string
+		stage     func(t *testing.T, state string)
+		extraArgs []string
+		wantErr   string
+	}{
+		{
+			name:  "pre-generation source node carries no label",
+			stage: func(t *testing.T, state string) { stageMarker(t, state, "no-label") },
+			// The staged marker content is irrelevant; only presence matters.
+			wantErr: "resource-generation",
+		},
+		{
+			name: "stale -source-generation",
+			stage: func(t *testing.T, state string) {
+				if err := os.WriteFile(filepath.Join(state, "source-generation"), []byte("g-live"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+			extraArgs: []string{"-source-generation", "g-stale"},
+			wantErr:   "-source-generation",
+		},
+	}
+	for _, tc := range scenarios {
+		t.Run(tc.name, func(t *testing.T) {
+			state := t.TempDir()
+			tc.stage(t, state)
+			nodes := catalogStandIn(t, state)
+
+			code, report, stdout := runMigrate(t, buildCnMigrate(t), state, nodes, 10*time.Second, tc.extraArgs...)
+
+			if code != 1 {
+				t.Fatalf("exit code = %d, want 1\n%s", code, stdout)
+			}
+			if report.OK || report.SourceGeneration != "" {
+				t.Fatalf("run pinned or claimed success without a usable source generation\n%s", stdout)
+			}
+			if !strings.Contains(report.Error, tc.wantErr) {
+				t.Fatalf("report error %q does not name the generation gate (%q)\n%s", report.Error, tc.wantErr, stdout)
+			}
+			// Stopped before the checkpoint: nothing was sealed, nothing
+			// was published, and the target was never contacted.
+			assertCallSequence(t, state, []string{"S:list", "S:inspect"}, stdout)
+			if _, err := os.Stat(filepath.Join(state, "checkpoint-id")); err == nil {
+				t.Fatalf("checkpoint side effect despite an unpinnable source generation\n%s", stdout)
+			}
+			if _, err := os.Stat(filepath.Join(state, "stopped")); err == nil {
+				t.Fatalf("source finalized despite an unpinnable source generation\n%s", stdout)
+			}
+		})
+	}
+}
+
+// TestMigrateSourceReplacedBeforeRetirementFailsClosed stages the source
+// replacement between checkpoint and retirement: the pinned g1 incarnation
+// is sealed and the target restores and verifies RUNNING, then another actor
+// retires g1 and starts a fresh g2 incarnation under the same ID. The
+// conditional retirement of g1 must be refused by the node (the fake node
+// decides from the --expected-generation it actually receives) and the CLI
+// must contain that failure: source-cleanup-pending, no rollback of the
+// running target, no bare sbox delete, and no empty-listing fallback.
+func TestMigrateSourceReplacedBeforeRetirementFailsClosed(t *testing.T) {
+	if testing.Short() {
+		t.Skip("orchestration test builds and re-executes the CLI")
+	}
+	state := t.TempDir()
+	if err := os.WriteFile(filepath.Join(state, "replace-source"), []byte("g2"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	nodes := catalogStandIn(t, state)
+
+	code, report, stdout := runMigrate(t, buildCnMigrate(t), state, nodes, 10*time.Second)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1\n%s", code, stdout)
+	}
+	if report.OK {
+		t.Fatalf("report claims success with an unresolved source cleanup\n%s", stdout)
+	}
+	if report.SourceGeneration != "g1" {
+		t.Fatalf("run did not pin the captured generation: %q\n%s", report.SourceGeneration, stdout)
+	}
+	if !strings.Contains(report.Error, "source-cleanup-pending") {
+		t.Fatalf("report does not name the source-cleanup-pending state\n%s", stdout)
+	}
+	if _, err := os.Stat(filepath.Join(state, "target-running")); err != nil {
+		t.Fatalf("scenario setup: target never ran\n%s", stdout)
+	}
+	if _, err := os.Stat(filepath.Join(state, "source-rollback-running")); err == nil {
+		t.Fatalf("F2 regression: source rolled back next to a verified RUNNING target\n%s", stdout)
+	}
+	// The node refused the stale retirement against the live g2 and no
+	// retirement side effect landed — the replacement incarnation survives.
+	if raw, err := os.ReadFile(filepath.Join(state, "retire-refused")); err != nil || strings.TrimSpace(string(raw)) != "g2" {
+		t.Fatalf("conditional retirement did not compare against the live generation g2: %v %q\n%s", err, string(raw), stdout)
+	}
+	if _, err := os.Stat(filepath.Join(state, "source-retired")); err == nil {
+		t.Fatalf("a retirement side effect reached the source despite the generation mismatch\n%s", stdout)
+	}
+	// Exactly one conditional delete and nothing after it: the sequence
+	// itself rules out a bare delete, a listing fallback, and a rollback.
+	assertCallSequence(t, state, []string{
+		"S:list", "S:inspect", "S:checkpoint", "S:publish",
+		"T:fetch", "T:restore", "T:list", "S:delete",
+	}, stdout)
+}
+
+// TestMigrateMatchedGenerationRetiresSource is the positive control for the
+// generation discipline: with the pinned generation live on the source, the
+// conditional checkpoint and the receipt-gated conditional retirement both
+// succeed and the run reports success.
+func TestMigrateMatchedGenerationRetiresSource(t *testing.T) {
+	if testing.Short() {
+		t.Skip("orchestration test builds and re-executes the CLI")
+	}
+	state := t.TempDir()
+	nodes := catalogStandIn(t, state)
+
+	code, report, stdout := runMigrate(t, buildCnMigrate(t), state, nodes, 10*time.Second)
+
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0\n%s", code, stdout)
+	}
+	if !report.OK {
+		t.Fatalf("report does not claim success\n%s", stdout)
+	}
+	if report.SourceGeneration != "g1" {
+		t.Fatalf("report pinned generation %q, want g1\n%s", report.SourceGeneration, stdout)
+	}
+	if _, err := os.Stat(filepath.Join(state, "source-retired")); err != nil {
+		t.Fatalf("conditional retirement did not retire the pinned generation\n%s", stdout)
+	}
+	for _, marker := range []string{"retire-refused", "checkpoint-refused", "bare-delete", "bare-checkpoint", "sbox-delete"} {
+		if _, err := os.Stat(filepath.Join(state, marker)); err == nil {
+			t.Fatalf("node recorded %s — cn-migrate issued an unconditional or mismatched command\n%s", marker, stdout)
+		}
+	}
+	assertCallSequence(t, state, []string{
+		"S:list", "S:inspect", "S:checkpoint", "S:publish",
+		"T:fetch", "T:restore", "T:list", "S:delete",
+	}, stdout)
+}
+
+// stageMarker drops an empty control file the fake node executor looks for.
+func stageMarker(t *testing.T, state, name string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(state, name), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The source changes after inspection but before admission. The executor
+// checks the live generation before recording any checkpoint side effect.
+func TestMigrateSourceReplacedBeforeCheckpoint(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds and re-executes CLI")
+	}
+	state := t.TempDir()
+	if err := os.WriteFile(filepath.Join(state, "replace-after-inspect"), []byte("g2"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	code, report, out := runMigrate(t, buildCnMigrate(t), state, catalogStandIn(t, state), 10*time.Second)
+	if code != 1 || report.OK || report.SourceGeneration != "g1" {
+		t.Fatalf("unexpected result: %s", out)
+	}
+	assertCallSequence(t, state, []string{"S:list", "S:inspect", "S:checkpoint", "S:list"}, out)
+	if liveGeneration(state) != "g2" {
+		t.Fatal("replacement mutated")
+	}
+	if _, err := os.Stat(filepath.Join(state, "checkpoint-refused")); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"stopped", "checkpoint-id", "target-running", "source-rollback-running", "source-retired"} {
+		if _, err := os.Stat(filepath.Join(state, name)); !os.IsNotExist(err) {
+			t.Fatalf("unexpected side effect %s: %v", name, err)
+		}
+	}
+}
+
+func TestMigrateRejectsInvalidGenerationBeforeNodeCommands(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds and re-executes CLI")
+	}
+	bin := buildCnMigrate(t)
+	for _, gen := range []string{"  ", strings.Repeat("g", 129)} {
+		state := t.TempDir()
+		// Empty call log lets the normal helper assert that no executor ran.
+		stageMarker(t, state, "calls")
+		code, report, out := runMigrate(t, bin, state, "http://127.0.0.1:1", time.Second, "-source-generation", gen)
+		if code != 1 || report.OK || !strings.Contains(report.Error, "128 bytes") {
+			t.Fatalf("unexpected result: %s", out)
+		}
+		assertCallSequence(t, state, nil, out)
+	}
 }
