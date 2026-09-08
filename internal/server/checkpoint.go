@@ -39,6 +39,55 @@ func (h *sandboxService) Checkpoint(
 	ctx context.Context,
 	request *runtime.CheckpointRequest,
 ) (*runtime.CheckpointResponse, error) {
+	return h.checkpoint(ctx, request, "")
+}
+
+// CheckpointIfGeneration checkpoints the source sandbox only while it still
+// carries the caller's expected server-assigned resource generation. The
+// expectation is validated inside the shared checkpoint path while the
+// per-ID physical lock is held — never by a separate Get followed by an
+// unguarded checkpoint — so a stale or missing generation is rejected before
+// the output directory is allocated or the runtime handler is invoked. This
+// is an admission precondition, not a durable migration transaction: it
+// neither fences later requests nor publishes a persistent receipt.
+func (h *sandboxService) CheckpointIfGeneration(
+	ctx context.Context,
+	request *runtime.CheckpointIfGenerationRequest,
+) (*runtime.CheckpointResponse, error) {
+	if request == nil {
+		return nil, errord.ToGRPCf(errord.ErrInvalidArgument, "checkpoint request is nil")
+	}
+	if request.Checkpoint == nil {
+		return nil, errord.ToGRPCf(
+			errord.ErrInvalidArgument,
+			"checkpoint request is required",
+		)
+	}
+	if strings.TrimSpace(request.ExpectedGeneration) == "" {
+		return nil, errord.ToGRPCf(
+			errord.ErrInvalidArgument,
+			"expected_generation is required",
+		)
+	}
+	if len(request.ExpectedGeneration) > 256 {
+		return nil, errord.ToGRPCf(
+			errord.ErrInvalidArgument,
+			"expected_generation exceeds 256 bytes",
+		)
+	}
+	return h.checkpoint(ctx, request.Checkpoint, request.ExpectedGeneration)
+}
+
+// checkpoint is the shared implementation of the legacy and conditional RPCs.
+// An empty expectedGeneration keeps the legacy unconditional semantics; when
+// set, the sandbox's current resource generation must equal it exactly (the
+// value is never trimmed), checked after the metadata is read under the
+// physical lock and before any checkpoint side effect.
+func (h *sandboxService) checkpoint(
+	ctx context.Context,
+	request *runtime.CheckpointRequest,
+	expectedGeneration string,
+) (*runtime.CheckpointResponse, error) {
 	if request == nil {
 		return nil, errord.ToGRPCf(errord.ErrInvalidArgument, "checkpoint request is nil")
 	}
@@ -104,6 +153,20 @@ func (h *sandboxService) Checkpoint(
 		return nil, errord.ToGRPCf(
 			errord.ErrFailedPrecondition,
 			"sandbox %s has no runtime metadata",
+			request.ID,
+		)
+	}
+
+	// Conditional checkpoint admission: the incarnation identity is compared
+	// while the physical lock is held, from the just-read metadata, and before
+	// the output directory is allocated or any handler is invoked. A missing
+	// or changed label is a hard rejection with zero side effects; the exact
+	// string is used, without trimming the caller's expectation.
+	if expectedGeneration != "" &&
+		sandbox.Metadata.Labels[resourceGenerationLabel] != expectedGeneration {
+		return nil, errord.ToGRPCf(
+			errord.ErrFailedPrecondition,
+			"sandbox %s resource generation changed before checkpoint",
 			request.ID,
 		)
 	}

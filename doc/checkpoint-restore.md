@@ -7,7 +7,7 @@ directory and starting a new sandbox from that checkpoint.
 
 The API has two operations:
 
-1. `SandboxService.Checkpoint` checkpoints an existing sandbox.
+1. `SandboxService.Checkpoint` checkpoints an existing sandbox; `CheckpointIfGeneration` additionally binds the operation to a server-assigned physical generation.
 2. The existing `Start` RPC restores a sandbox when `checkpoint_info` is set.
 
 There is no separate restore RPC. Restore is a form of sandbox creation, so it
@@ -27,6 +27,10 @@ the `Checkpoint` and restore `Start` RPCs remain authoritative and validate the
 runtime again when they execute.
 
 ## Checkpoint API
+
+`CheckpointIfGeneration` takes a nested `CheckpointRequest` and a nonempty `expected_generation` of at most 256 bytes, obtained from the original `StartResponse.resource_generation`. The daemon compares this value exactly with the current incarnation while holding the same per-ID physical lock used by Start and Delete. A missing or changed generation returns `FailedPrecondition` before allocating the checkpoint output directory or invoking the runtime. A request queued behind a replacement checks the replacement metadata after acquiring the lock. Pending start intents remain protected.
+
+This is a separate RPC: older servers return `Unimplemented`, and callers requiring this precondition must not fall back to unconditional `Checkpoint`. Legacy `Checkpoint` retains its existing behavior. The conditional RPC does not provide durable operation replay, cross-node fencing, or proof that a timed-out checkpoint did not execute; a migration controller must still reconcile an unknown outcome.
 
 `CheckpointRequest` contains:
 
