@@ -85,6 +85,17 @@ func (h *sandboxService) Checkpoint(
 	}
 	defer unlock()
 
+	// A pending start intent means the ID's runtime state is undetermined;
+	// checkpointing must not touch it. Refuse explicitly instead of failing
+	// on the missing sandbox metadata below.
+	if h.startIntents.Pending(request.ID) {
+		return nil, errord.ToGRPCf(
+			errord.ErrFailedPrecondition,
+			"sandbox %s is protected by a pending start intent; reconcile the retained start first",
+			request.ID,
+		)
+	}
+
 	sandbox, err := h.sandboxManager.Get(request.ID)
 	if err != nil {
 		return nil, errord.ToGRPC(err)

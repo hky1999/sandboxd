@@ -30,17 +30,26 @@ type preparedStartResources struct {
 	network   *networkmanager.NetResource
 }
 
+// allocateStartResourceFn is an in-package test seam substituting the resource
+// pools with simulated leases so the full Start entry can run against a fake
+// runtime; production leaves it nil and always uses allocateStartResource.
+type allocateStartResourceFunc func(runtimeName, sandboxID, name string) (string, *networkmanager.NetResource, error)
+
 func (h *sandboxService) prepareStartResources(runtimeName, sandboxID string) (*preparedStartResources, error) {
 	required, err := requiredStartResources(runtimeName, h.config.DisableCgroup)
 	if err != nil {
 		return nil, err
+	}
+	allocate := h.allocateStartResourceFn
+	if allocate == nil {
+		allocate = h.allocateStartResource
 	}
 
 	resultCh := make(chan resourceResult, len(required))
 	for _, name := range required {
 		name := name
 		go func() {
-			value, network, err := h.allocateStartResource(runtimeName, sandboxID, name)
+			value, network, err := allocate(runtimeName, sandboxID, name)
 			resultCh <- resourceResult{name: name, value: value, network: network, err: err}
 		}()
 	}
@@ -146,6 +155,10 @@ func (h *sandboxService) deactivateStartNetwork(resources sandbox.OccupiedResour
 func (h *sandboxService) releaseStartResources(resources sandbox.OccupiedResource) error {
 	var errs []error
 	for name, value := range resources.Resources {
+		if value == "" {
+			// An empty value never identified a lease; nothing to release.
+			continue
+		}
 		if err := h.releaseStartResource(name, value); err != nil {
 			errs = append(errs, fmt.Errorf("release resource %s[%s] failed: %w", name, value, err))
 			continue

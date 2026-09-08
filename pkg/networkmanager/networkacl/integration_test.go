@@ -643,7 +643,7 @@ func TestIntegrationManagerLifecycle(t *testing.T) {
 		"sandbox-1": {
 			SandboxID: "sandbox-1", IP: net.ParseIP("10.88.0.2"), HostVeth: "acltest0",
 		},
-	}))
+	}, nil))
 	assertACLFilterCount(t, host, 2)
 	assert.Equal(t, uint64(2), manager.entries["sandbox-1"].Generation)
 	var restoredPolicy policyV2Value
@@ -811,7 +811,7 @@ func TestIntegrationCleanupIntentRetriesAfterLinkReuse(t *testing.T) {
 	require.NoError(t, netlink.FilterReplace(foreign))
 	assertNamedFilterCount(t, replacement, netlink.HANDLE_MIN_INGRESS, "foreign_filter", 1)
 
-	require.NoError(t, manager.Restore(map[string]Binding{}))
+	require.NoError(t, manager.Restore(map[string]Binding{}, nil))
 	assertNamedFilterCount(t, replacement, netlink.HANDLE_MIN_INGRESS, "foreign_filter", 1)
 	raw, err = stateStore.LoadRaw(stateStoreKey)
 	require.NoError(t, err)
@@ -846,7 +846,7 @@ func TestIntegrationRestorePreservesOrphanWhenKernelCleanupFails(t *testing.T) {
 	// a particular netlink error. Restore must keep the orphan both in memory
 	// and in the store so a later startup can retry.
 	require.NoError(t, manager.objects.LegacyRules.Close())
-	require.Error(t, manager.Restore(map[string]Binding{}))
+	require.Error(t, manager.Restore(map[string]Binding{}, nil))
 
 	manager.mu.RLock()
 	orphan, exists := manager.entries["orphan"]
@@ -861,6 +861,72 @@ func TestIntegrationRestorePreservesOrphanWhenKernelCleanupFails(t *testing.T) {
 	stored, exists := state.Entries["orphan"]
 	require.True(t, exists)
 	assert.True(t, stored.Orphaned)
+}
+
+// TestIntegrationRestoreProtectsPendingStartEntry closes the restart gap for a
+// retained failed start: the entry the start registered must survive the next
+// daemon's Restore — neither re-applied as an active sandbox nor reconciled as
+// an orphan — while its TC filters keep enforcing the original policy. Only
+// after the pending intent is reconciled away (its ID leaves both maps) does
+// the ordinary orphan pass clean it.
+func TestIntegrationRestoreProtectsPendingStartEntry(t *testing.T) {
+	require.NoError(t, ensureBPFFS())
+	_ = os.RemoveAll(pinRoot)
+	veth := &netlink.Veth{
+		LinkAttrs: netlink.LinkAttrs{Name: "aclpend0"},
+		PeerName:  "aclpend1",
+	}
+	require.NoError(t, netlink.LinkAdd(veth))
+	defer func() {
+		if link, err := netlink.LinkByName("aclpend0"); err == nil {
+			_ = netlink.LinkDel(link)
+		}
+	}()
+	host, err := netlink.LinkByName("aclpend0")
+	require.NoError(t, err)
+	require.NoError(t, netlink.LinkSetUp(host))
+
+	stateStore := store.NewMockStore()
+	manager, err := New(Config{
+		BridgeIP: net.ParseIP("10.88.0.1"), Store: stateStore,
+		DisableProxy: true,
+	})
+	require.NoError(t, err)
+	policy := Policy{Traffic: &TrafficPolicy{DefaultAction: actionDeny}}
+	require.NoError(t, manager.Register(Binding{
+		SandboxID: "pending-1", IP: net.ParseIP("10.88.0.2"), HostVeth: "aclpend0",
+	}, policy))
+	generation := manager.entries["pending-1"].Generation
+	require.NoError(t, manager.Close())
+	assertACLFilterCount(t, host, 2)
+
+	restarted, err := New(Config{
+		BridgeIP: net.ParseIP("10.88.0.1"), Store: stateStore,
+		DisableProxy: true,
+	})
+	require.NoError(t, err)
+	manager = restarted
+	defer manager.Close()
+	require.NoError(t, manager.Restore(nil, map[string]ProtectedBinding{
+		"pending-1": {
+			Binding: Binding{
+				SandboxID: "pending-1", IP: net.ParseIP("10.88.0.2"), HostVeth: "aclpend0",
+			},
+			IfIndex: host.Attrs().Index,
+		},
+	}))
+	assertACLFilterCount(t, host, 2)
+	retained, exists := manager.entries["pending-1"]
+	require.True(t, exists)
+	assert.False(t, retained.Orphaned)
+	assert.Equal(t, generation, retained.Generation, "protection must not re-apply or bump the policy generation")
+
+	// The retained start was reconciled away: with the ID absent from both
+	// maps the entry is a plain orphan and the ordinary cleanup applies.
+	require.NoError(t, manager.Restore(map[string]Binding{}, nil))
+	assertACLFilterCount(t, host, 0)
+	_, exists = manager.entries["pending-1"]
+	assert.False(t, exists)
 }
 
 func assertACLFilterCount(t *testing.T, link netlink.Link, expected int) {
