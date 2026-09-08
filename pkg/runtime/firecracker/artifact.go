@@ -442,8 +442,13 @@ type checkpointDigestCache struct {
 	// restore can proceed while local memory is being verified.
 	memoryOnce sync.Once
 	memoryGate chan struct{}
-	mu         sync.Mutex
-	entries    map[string]cachedCheckpointDigest
+	// Overlay sidecar content scans carry their own bound, decoupled from
+	// the memory gate: one restore's memory verification must not queue
+	// another restore's overlay verification behind it.
+	overlayOnce sync.Once
+	overlayGate chan struct{}
+	mu          sync.Mutex
+	entries     map[string]cachedCheckpointDigest
 	// hashes counts component hashes performed; it exists so tests can
 	// observe cache hits without timing.
 	hashes int
@@ -454,7 +459,9 @@ const checkpointDigestCacheMaxEntries = 1024
 // verifyFirecrackerCheckpointDigests compares the components on disk against
 // the digests the manifest recorded, hashing only components whose file
 // identity is not already cached. Components without a recorded digest
-// (memory, by design) are skipped.
+// (the overlay, by design) are skipped — except an overlay whose chunk
+// sidecar is present, whose actual bytes are verified through
+// verifyFirecrackerCheckpointOverlayChunks regardless of manifest fields.
 func (cache *checkpointDigestCache) verifyFirecrackerCheckpointDigests(
 	ctx context.Context,
 	artifact *firecrackerCheckpointArtifact,
@@ -487,6 +494,13 @@ func (cache *checkpointDigestCache) verifyFirecrackerCheckpointDigests(
 		if err := cache.verifyFirecrackerCheckpointMemoryChunks(ctx, artifact); err != nil {
 			return err
 		}
+	}
+	// The manifest records no overlay digest by policy, but a present
+	// overlay chunk sidecar is a content advertisement a restore must honor
+	// rather than skip for lacking a manifest field. A missing sidecar keeps
+	// the legacy undigested-overlay semantics.
+	if err := cache.verifyFirecrackerCheckpointOverlayChunks(ctx, artifact); err != nil {
+		return err
 	}
 	// Only the memoized components share this lock. Memory chunks above
 	// are always content-verified and never access the cache map.
