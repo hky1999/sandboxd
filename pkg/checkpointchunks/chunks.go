@@ -191,6 +191,10 @@ const MaxManifestBytes = 32 << 20
 // by the stat so a file growing between the check and the read cannot force
 // an unbounded allocation.
 func LoadNamedBounded(dir, name string, limit int64) (*Manifest, error) {
+	return loadNamedBounded(dir, name, limit, false)
+}
+
+func loadNamedBounded(dir, name string, limit int64, transport bool) (*Manifest, error) {
 	path := filepath.Join(dir, name)
 	info, err := os.Lstat(path)
 	if err != nil {
@@ -214,7 +218,7 @@ func LoadNamedBounded(dir, name string, limit int64) (*Manifest, error) {
 	if int64(len(raw)) > limit {
 		return nil, fmt.Errorf("chunk manifest %s exceeds the %d-byte bound while reading", name, limit)
 	}
-	return decodeManifest(raw, false)
+	return decodeManifest(raw, transport)
 }
 
 // LoadNamed reads a sidecar under an explicit file name (the overlay's
