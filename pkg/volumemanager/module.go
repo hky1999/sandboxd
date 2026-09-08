@@ -101,11 +101,29 @@ func (m *Module) Start() error {
 
 // Stop tears down a bounded filestore. Ordinary directories are preserved.
 func (m *Module) Stop() error {
+	return m.StopPreserving(false)
+}
+
+// StopPreserving is Stop with a preserve flag for retained starts. The
+// normal cleanup unmounts the bounded filestore and then removes its backing
+// image — which still holds every pending start's writable layer — so a
+// retained start keeps the filestore mounted and the loop attached instead.
+// That state is exactly what the next daemon start adopts: ensureFilestoreMount
+// recovers an already-mounted filestore instead of recreating it.
+func (m *Module) StopPreserving(preserve bool) error {
 	if !m.started.Load() {
 		return nil
 	}
 	m.healthy.Store(false)
 	if m.Size == "" {
+		m.started.Store(false)
+		return nil
+	}
+	if preserve {
+		logrus.Warnf(
+			"volumemanager: keep filestore %s mounted and its image intact for retained start(s)",
+			m.FilestoreDir,
+		)
 		m.started.Store(false)
 		return nil
 	}

@@ -365,7 +365,9 @@ func TestStartSandboxRuntimeDispatchesRestore(t *testing.T) {
 		CheckpointDir: "/checkpoints/one",
 	}
 
-	require.NoError(t, service.startSandboxRuntime(context.Background(), "runsc", config))
+	invoked, err := service.startSandboxRuntime(context.Background(), "runsc", config)
+	require.NoError(t, err)
+	require.True(t, invoked)
 	require.Len(t, handler.restores, 1)
 	assert.Equal(t, config, handler.restores[0])
 	assert.Equal(t, "/checkpoints/one", handler.restoreDirs[0])
@@ -377,7 +379,9 @@ func TestStartSandboxRuntimeUsesStartWithoutCheckpoint(t *testing.T) {
 	service := buildServiceWithOptions(AddHandler("runsc", handler))
 	config := svc.StartConfig{ID: "sbox-started"}
 
-	require.NoError(t, service.startSandboxRuntime(context.Background(), "runsc", config))
+	invoked, err := service.startSandboxRuntime(context.Background(), "runsc", config)
+	require.NoError(t, err)
+	require.True(t, invoked)
 	require.Len(t, handler.starts, 1)
 	assert.Equal(t, config, handler.starts[0])
 	assert.Empty(t, handler.restores)
@@ -385,9 +389,15 @@ func TestStartSandboxRuntimeUsesStartWithoutCheckpoint(t *testing.T) {
 
 func TestStartSandboxRuntimeRejectsUnsupportedRestore(t *testing.T) {
 	service := buildServiceWithOptions(AddHandler("runc", svc.NewFakeRuntimeHandler()))
-	err := service.startSandboxRuntime(context.Background(), "runc", svc.StartConfig{
+	invoked, err := service.startSandboxRuntime(context.Background(), "runc", svc.StartConfig{
 		ID:            "sbox-restored",
 		CheckpointDir: "/checkpoints/one",
 	})
-	assert.Equal(t, codes.Unimplemented, status.Code(err))
+	// The runtime dispatch layer keeps the raw error chain for the
+	// management plane; gRPC conversion happens only at the RPC boundary, and
+	// reports that the runtime call was never reached.
+	require.Error(t, err)
+	require.False(t, invoked)
+	assert.ErrorIs(t, err, errord.ErrNotImplemented)
+	assert.Equal(t, codes.Unimplemented, status.Code(errord.ToGRPC(err)))
 }

@@ -89,6 +89,24 @@ type Manager struct {
 	// isHousekeepingRunning prevents overlapping runtime/disk reconciliation
 	// passes when one pass lasts longer than the periodic interval.
 	isHousekeepingRunning atomic.Bool
+
+	// preserveRoot marks IDs whose containers/<id> directory must survive
+	// metadata-recovery recycling because a pending start intent still owns
+	// the contents (retained runtime state, sandbox files).
+	preserveRoot func(id string) bool
+}
+
+// ManagerOption customizes Manager construction.
+type ManagerOption func(*Manager)
+
+// WithPreservedSandboxRoots keeps containers/<id> directories whose IDs match
+// the predicate out of the recycle bin when they have no metadata: the start
+// that created them is still pending reconciliation and its retained state
+// must not be destroyed by recovery.
+func WithPreservedSandboxRoots(predicate func(id string) bool) ManagerOption {
+	return func(m *Manager) {
+		m.preserveRoot = predicate
+	}
 }
 
 // exitNotifier is a one-shot broadcast channel used to wake up any number of
@@ -112,6 +130,7 @@ func NewManager(
 	healthChan chan bool,
 	cgroupMgr *cgroupmanager.CgroupManager,
 	maxSandboxNum int,
+	opts ...ManagerOption,
 ) (*Manager, error) {
 	// prepare recycle bin
 	if err := util.Os().MkdirAll(filepath.Join(root, config.RecycleBin), 0755); err != nil {
@@ -136,6 +155,9 @@ func NewManager(
 		stopChan:        make(chan struct{}),
 		healthChan:      healthChan,
 		maxSandboxNum:   maxSandboxNum,
+	}
+	for _, opt := range opts {
+		opt(m)
 	}
 
 	if err := m.loadSandboxes(); err != nil {
@@ -378,6 +400,17 @@ func (m *Manager) loadSandbox(sandboxRoot string) (*Sandbox, error) {
 	if err != nil {
 		// mv sandbox root to m.root/RecycleBin if not exist
 		if os.IsNotExist(err) {
+			id := filepath.Base(sandboxRoot)
+			if m.preserveRoot != nil && m.preserveRoot(id) {
+				// A pending start intent still owns this directory (retained
+				// runtime state or sandbox files); recycling it would destroy
+				// state the intent deliberately kept for reconciliation.
+				logrus.Warnf(
+					"sandbox %s root %s has no metadata but is protected by a pending start intent; keep for reconciliation",
+					id, sandboxRoot,
+				)
+				return nil, err
+			}
 			if err2 := os.Rename(sandboxRoot, filepath.Join(m.recyclePath, filepath.Base(sandboxRoot))); err2 != nil {
 				logrus.Warnf("move sandbox %s to recycle bin failed: %v", sandboxRoot, err2)
 			}
