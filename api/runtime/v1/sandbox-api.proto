@@ -24,6 +24,11 @@ service SandboxService {
   rpc Start(StartRequest) returns (StartResponse) {}
   // Checkpoint saves a running sandbox into a caller-owned directory.
   rpc Checkpoint(CheckpointRequest) returns (CheckpointResponse) {}
+  // CheckpointIfGeneration checkpoints only the physical incarnation that
+  // still carries the expected server-assigned resource generation. Old
+  // servers that predate the RPC return Unimplemented; callers must not
+  // fall back to the unconditional Checkpoint.
+  rpc CheckpointIfGeneration(CheckpointIfGenerationRequest) returns (CheckpointResponse) {}
   // Delete force-deletes a sandbox.
   rpc Delete(DeleteRequest) returns (DeleteResponse) {}
   // DeleteIfGeneration retires one physical generation only when the sandbox
@@ -314,6 +319,16 @@ message CheckpointRequest {
 
 // CheckpointResponse is empty after the checkpoint artifact is complete.
 message CheckpointResponse {}
+
+// CheckpointIfGenerationRequest checkpoints one exact physical incarnation.
+message CheckpointIfGenerationRequest {
+  // Checkpoint is the checkpoint command for the source sandbox.
+  CheckpointRequest checkpoint = 1;
+  // ExpectedGeneration is the resource_generation returned by Start for the
+  // incarnation the caller intends to checkpoint. It is compared as an exact
+  // string against the sandbox's current generation label, without trimming.
+  string expected_generation = 2;
+}
 
 // DeleteRequest describes a force-delete request.
 message DeleteRequest {

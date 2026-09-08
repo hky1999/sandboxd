@@ -48,6 +48,46 @@ func TestV010WireContract(t *testing.T) {
 		}
 		message.Field = message.Field[:3]
 	}
+	// Validate the additive conditional checkpoint API, then project it out.
+	// Keep the frozen legacy descriptor hash unchanged.
+	foundCheckpointRequest := false
+	for _, message := range descriptor.MessageType {
+		if message.GetName() != "CheckpointIfGenerationRequest" {
+			continue
+		}
+		if foundCheckpointRequest || len(message.Field) != 2 || len(message.NestedType) != 0 || len(message.EnumType) != 0 || len(message.OneofDecl) != 0 || len(message.Extension) != 0 || len(message.ReservedRange) != 0 || len(message.ReservedName) != 0 {
+			t.Fatal("unexpected conditional checkpoint message")
+		}
+		foundCheckpointRequest = true
+		for i, f := range message.Field {
+			name, kind, typeName := "expected_generation", descriptorpb.FieldDescriptorProto_TYPE_STRING, ""
+			if i == 0 {
+				name, kind, typeName = "checkpoint", descriptorpb.FieldDescriptorProto_TYPE_MESSAGE, "."+descriptor.GetPackage()+".CheckpointRequest"
+			}
+			if f.GetName() != name || f.GetNumber() != int32(i+1) || f.GetType() != kind || f.GetTypeName() != typeName || f.GetLabel() != descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL || f.OneofIndex != nil || f.GetProto3Optional() {
+				t.Fatal("unexpected conditional checkpoint field")
+			}
+		}
+	}
+	if !foundCheckpointRequest {
+		t.Fatal("missing conditional checkpoint request")
+	}
+	foundCheckpointRPC := false
+	for _, service := range descriptor.Service {
+		service.Method = slices.DeleteFunc(service.Method, func(m *descriptorpb.MethodDescriptorProto) bool {
+			if m.GetName() != "CheckpointIfGeneration" {
+				return false
+			}
+			if foundCheckpointRPC || service.GetName() != "SandboxService" || m.GetInputType() != "."+descriptor.GetPackage()+".CheckpointIfGenerationRequest" || m.GetOutputType() != "."+descriptor.GetPackage()+".CheckpointResponse" || m.GetClientStreaming() || m.GetServerStreaming() {
+				t.Fatal("unexpected conditional checkpoint RPC")
+			}
+			foundCheckpointRPC = true
+			return true
+		})
+	}
+	if !foundCheckpointRPC {
+		t.Fatal("missing conditional checkpoint RPC")
+	}
 	newMessages := map[string][]string{
 		"DeleteIfGenerationRequest":  {"id", "expected_generation"},
 		"DeleteIfGenerationResponse": {"retired_generation"},
@@ -88,7 +128,7 @@ func TestV010WireContract(t *testing.T) {
 		t.Fatal("missing conditional delete RPC")
 	}
 	descriptor.MessageType = slices.DeleteFunc(descriptor.MessageType, func(m *descriptorpb.DescriptorProto) bool {
-		return m.GetName() == "DeleteIfGenerationRequest" || m.GetName() == "DeleteIfGenerationResponse"
+		return m.GetName() == "DeleteIfGenerationRequest" || m.GetName() == "DeleteIfGenerationResponse" || m.GetName() == "CheckpointIfGenerationRequest"
 	})
 	wire, err := proto.MarshalOptions{Deterministic: true}.Marshal(descriptor)
 	if err != nil {
