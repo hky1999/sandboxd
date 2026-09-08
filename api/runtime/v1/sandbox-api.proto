@@ -22,6 +22,16 @@ option go_package = "github.com/inclusionAI/sandboxd/api/runtime/v1;v1";
 service SandboxService {
   // Start creates and starts a sandbox.
   rpc Start(StartRequest) returns (StartResponse) {}
+  // StartWithOperation starts a sandbox under an explicit, persistent
+  // operation identity so a client that lost the reply can query or replay the
+  // original operation instead of blindly re-creating the sandbox. The
+  // operation record is node-local idempotency state; it is not a cross-node
+  // writer lease or fencing token. Old servers that predate the RPC return
+  // Unimplemented; callers must fail hard instead of falling back to Start.
+  rpc StartWithOperation(StartWithOperationRequest) returns (StartOperationStatus) {}
+  // GetStartOperation returns the durable state of one start operation. It
+  // never creates anything and never re-executes a past operation.
+  rpc GetStartOperation(GetStartOperationRequest) returns (StartOperationStatus) {}
   // Checkpoint saves a running sandbox into a caller-owned directory.
   rpc Checkpoint(CheckpointRequest) returns (CheckpointResponse) {}
   // CheckpointIfGeneration checkpoints only the physical incarnation that
@@ -296,6 +306,92 @@ message StartResponse {
   // A caller-supplied label with the reserved generation key cannot choose or
   // reuse this value.
   string resource_generation = 5;
+}
+
+// RestoreArtifactIdentity binds a restore start to checkpoint content, not
+// merely its directory path. New admissions verify the caller's expected root
+// against the sealed manifest and validated sidecar semantics. Replays resolve
+// the persisted operation record without re-reading retired artifact files.
+message RestoreArtifactIdentity {
+  // CheckpointDir is the caller-owned directory holding the runtime artifacts.
+  // It must equal start.checkpoint_info.checkpoint_dir exactly.
+  string checkpoint_dir = 1;
+  // ExpectedRootDigest is required for identified restore operations. It is
+  // the hex-encoded SHA-256 content root derived by pkg/checkpointroot from
+  // the sealed manifest and validated sidecar identities, not the hash of
+  // manifest.json alone. Admission and supported runtime restore both verify
+  // this pin; artifacts lacking a verifiable content root are rejected.
+  string expected_root_digest = 2;
+}
+
+// StartWithOperationRequest wraps one StartRequest with a persistent operation
+// identity. The legacy Start wire format and semantics are unchanged; this
+// wrapper adds only the operation binding.
+message StartWithOperationRequest {
+  // OperationID is the stable caller-chosen identifier of this start
+  // operation. It is the durable idempotency key: the daemon records it before
+  // any side effect, and a replay with the same ID returns the recorded
+  // outcome instead of creating again. Once a terminal outcome is recorded the
+  // ID is never re-executed, even after the sandbox is deleted.
+  string operation_id = 1;
+  // SandboxID is the explicit sandbox ID this operation creates. It is
+  // required: an operation must name the identity it intends to create so the
+  // durable binding survives reply loss. It must equal start.sandbox_id when
+  // that field is set.
+  string sandbox_id = 2;
+  // Start is the wrapped legacy start request. The daemon normalizes it the
+  // same way Start does and computes a deterministic digest for replay
+  // comparison; only explicitly non-semantic fields (trace ID and the reserved
+  // daemon-owned generation label) are excluded. Any other difference refuses
+  // reuse of the operation ID.
+  StartRequest start = 3;
+  // RestoreArtifacts is required exactly when start.checkpoint_info is set and
+  // carries the artifact identity binding for the restore.
+  RestoreArtifactIdentity restore_artifacts = 4;
+}
+
+// StartOperationState is the durable lifecycle state of a start operation.
+enum StartOperationState {
+  // UNSPECIFIED is never returned by a healthy daemon.
+  START_OPERATION_STATE_UNSPECIFIED = 0;
+  // RUNNING means the operation was admitted and its outcome is still pending.
+  START_OPERATION_STATE_RUNNING = 1;
+  // SUCCEEDED means a durable success fact exists for the operation. It is a
+  // historical fact: it reports the generation the operation created and does
+  // not claim the sandbox still exists or still runs.
+  START_OPERATION_STATE_SUCCEEDED = 2;
+  // FAILED means the start was fully rolled back with a proven cleanup. The
+  // operation ID is spent; creating under the same sandbox ID requires a new
+  // operation ID.
+  START_OPERATION_STATE_FAILED = 3;
+  // UNKNOWN means the outcome could not be proven from durable evidence. The
+  // operation ID is spent and re-execution is forbidden; reconcile the
+  // protected ID before issuing a new operation for it.
+  START_OPERATION_STATE_UNKNOWN = 4;
+}
+
+// StartOperationStatus is the durable state of one start operation, returned by
+// both StartWithOperation and GetStartOperation.
+message StartOperationStatus {
+  // OperationID repeats the queried operation ID.
+  string operation_id = 1;
+  // SandboxID is the sandbox the operation is bound to.
+  string sandbox_id = 2;
+  // State is the durable lifecycle state of the operation.
+  StartOperationState state = 3;
+  // ResourceGeneration is the daemon-assigned physical incarnation generation
+  // the operation created (or, while RUNNING, the one it will use). A caller
+  // label can never choose this value.
+  string resource_generation = 4;
+  // Message carries the outcome detail, including why an UNKNOWN outcome could
+  // not be proven.
+  string message = 5;
+}
+
+// GetStartOperationRequest queries one start operation by identity.
+message GetStartOperationRequest {
+  // OperationID is the operation identity to look up.
+  string operation_id = 1;
 }
 
 // CheckpointRequest describes a synchronous checkpoint operation.

@@ -34,6 +34,8 @@ const _ = grpc.SupportPackageIsVersion9
 
 const (
 	SandboxService_Start_FullMethodName                  = "/runtime.v1.SandboxService/Start"
+	SandboxService_StartWithOperation_FullMethodName     = "/runtime.v1.SandboxService/StartWithOperation"
+	SandboxService_GetStartOperation_FullMethodName      = "/runtime.v1.SandboxService/GetStartOperation"
 	SandboxService_Checkpoint_FullMethodName             = "/runtime.v1.SandboxService/Checkpoint"
 	SandboxService_CheckpointIfGeneration_FullMethodName = "/runtime.v1.SandboxService/CheckpointIfGeneration"
 	SandboxService_Delete_FullMethodName                 = "/runtime.v1.SandboxService/Delete"
@@ -53,6 +55,16 @@ const (
 type SandboxServiceClient interface {
 	// Start creates and starts a sandbox.
 	Start(ctx context.Context, in *StartRequest, opts ...grpc.CallOption) (*StartResponse, error)
+	// StartWithOperation starts a sandbox under an explicit, persistent
+	// operation identity so a client that lost the reply can query or replay the
+	// original operation instead of blindly re-creating the sandbox. The
+	// operation record is node-local idempotency state; it is not a cross-node
+	// writer lease or fencing token. Old servers that predate the RPC return
+	// Unimplemented; callers must fail hard instead of falling back to Start.
+	StartWithOperation(ctx context.Context, in *StartWithOperationRequest, opts ...grpc.CallOption) (*StartOperationStatus, error)
+	// GetStartOperation returns the durable state of one start operation. It
+	// never creates anything and never re-executes a past operation.
+	GetStartOperation(ctx context.Context, in *GetStartOperationRequest, opts ...grpc.CallOption) (*StartOperationStatus, error)
 	// Checkpoint saves a running sandbox into a caller-owned directory.
 	Checkpoint(ctx context.Context, in *CheckpointRequest, opts ...grpc.CallOption) (*CheckpointResponse, error)
 	// CheckpointIfGeneration checkpoints only the physical incarnation that
@@ -89,6 +101,26 @@ func (c *sandboxServiceClient) Start(ctx context.Context, in *StartRequest, opts
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(StartResponse)
 	err := c.cc.Invoke(ctx, SandboxService_Start_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *sandboxServiceClient) StartWithOperation(ctx context.Context, in *StartWithOperationRequest, opts ...grpc.CallOption) (*StartOperationStatus, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(StartOperationStatus)
+	err := c.cc.Invoke(ctx, SandboxService_StartWithOperation_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *sandboxServiceClient) GetStartOperation(ctx context.Context, in *GetStartOperationRequest, opts ...grpc.CallOption) (*StartOperationStatus, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(StartOperationStatus)
+	err := c.cc.Invoke(ctx, SandboxService_GetStartOperation_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -193,6 +225,16 @@ func (c *sandboxServiceClient) SetNetworkPolicy(ctx context.Context, in *SetNetw
 type SandboxServiceServer interface {
 	// Start creates and starts a sandbox.
 	Start(context.Context, *StartRequest) (*StartResponse, error)
+	// StartWithOperation starts a sandbox under an explicit, persistent
+	// operation identity so a client that lost the reply can query or replay the
+	// original operation instead of blindly re-creating the sandbox. The
+	// operation record is node-local idempotency state; it is not a cross-node
+	// writer lease or fencing token. Old servers that predate the RPC return
+	// Unimplemented; callers must fail hard instead of falling back to Start.
+	StartWithOperation(context.Context, *StartWithOperationRequest) (*StartOperationStatus, error)
+	// GetStartOperation returns the durable state of one start operation. It
+	// never creates anything and never re-executes a past operation.
+	GetStartOperation(context.Context, *GetStartOperationRequest) (*StartOperationStatus, error)
 	// Checkpoint saves a running sandbox into a caller-owned directory.
 	Checkpoint(context.Context, *CheckpointRequest) (*CheckpointResponse, error)
 	// CheckpointIfGeneration checkpoints only the physical incarnation that
@@ -227,6 +269,12 @@ type UnimplementedSandboxServiceServer struct{}
 
 func (UnimplementedSandboxServiceServer) Start(context.Context, *StartRequest) (*StartResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Start not implemented")
+}
+func (UnimplementedSandboxServiceServer) StartWithOperation(context.Context, *StartWithOperationRequest) (*StartOperationStatus, error) {
+	return nil, status.Error(codes.Unimplemented, "method StartWithOperation not implemented")
+}
+func (UnimplementedSandboxServiceServer) GetStartOperation(context.Context, *GetStartOperationRequest) (*StartOperationStatus, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetStartOperation not implemented")
 }
 func (UnimplementedSandboxServiceServer) Checkpoint(context.Context, *CheckpointRequest) (*CheckpointResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Checkpoint not implemented")
@@ -290,6 +338,42 @@ func _SandboxService_Start_Handler(srv interface{}, ctx context.Context, dec fun
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(SandboxServiceServer).Start(ctx, req.(*StartRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SandboxService_StartWithOperation_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(StartWithOperationRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SandboxServiceServer).StartWithOperation(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SandboxService_StartWithOperation_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SandboxServiceServer).StartWithOperation(ctx, req.(*StartWithOperationRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SandboxService_GetStartOperation_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetStartOperationRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SandboxServiceServer).GetStartOperation(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SandboxService_GetStartOperation_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SandboxServiceServer).GetStartOperation(ctx, req.(*GetStartOperationRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -466,6 +550,14 @@ var SandboxService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Start",
 			Handler:    _SandboxService_Start_Handler,
+		},
+		{
+			MethodName: "StartWithOperation",
+			Handler:    _SandboxService_StartWithOperation_Handler,
+		},
+		{
+			MethodName: "GetStartOperation",
+			Handler:    _SandboxService_GetStartOperation_Handler,
 		},
 		{
 			MethodName: "Checkpoint",

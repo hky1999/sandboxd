@@ -28,10 +28,14 @@ import (
 // TestV010WireContract pins the public protobuf descriptor while allowing
 // comments and generated-code details to change.
 //
-// The generation-conditional DeleteIfGeneration RPC and the
-// StartResponse.resource_generation identity field are validated and then
-// projected out before the frozen v0.1.0 hash comparison, so every other part
-// of the prior wire contract must remain byte-identical.
+// The generation-conditional DeleteIfGeneration and CheckpointIfGeneration
+// RPCs, the StartResponse.resource_generation identity field, and the
+// additive start-operation identity surface (StartWithOperation /
+// GetStartOperation RPCs, their four request/status messages, and the
+// StartOperationState enum) are validated in shape — field numbers, types,
+// labels, enum values, RPC input/output types, and unary streaming — and
+// then projected out before the frozen v0.1.0 hash comparison, so every
+// other part of the prior wire contract must remain byte-identical.
 func TestV010WireContract(t *testing.T) {
 	descriptor := protodesc.ToFileDescriptorProto(File_api_runtime_v1_sandbox_api_proto)
 	descriptor.SourceCodeInfo = nil
@@ -129,6 +133,111 @@ func TestV010WireContract(t *testing.T) {
 	}
 	descriptor.MessageType = slices.DeleteFunc(descriptor.MessageType, func(m *descriptorpb.DescriptorProto) bool {
 		return m.GetName() == "DeleteIfGenerationRequest" || m.GetName() == "DeleteIfGenerationResponse" || m.GetName() == "CheckpointIfGenerationRequest"
+	})
+	// Validate the additive start-operation identity API, then project it
+	// out the same way, keeping the frozen legacy descriptor hash unchanged.
+	pkg := "." + descriptor.GetPackage()
+	type wireField struct {
+		name     string
+		kind     descriptorpb.FieldDescriptorProto_Type
+		typeName string
+	}
+	stringField := func(name string) wireField {
+		return wireField{name: name, kind: descriptorpb.FieldDescriptorProto_TYPE_STRING}
+	}
+	operationShape := map[string][]wireField{
+		"RestoreArtifactIdentity": {
+			stringField("checkpoint_dir"),
+			stringField("expected_root_digest"),
+		},
+		"StartWithOperationRequest": {
+			stringField("operation_id"),
+			stringField("sandbox_id"),
+			{"start", descriptorpb.FieldDescriptorProto_TYPE_MESSAGE, pkg + ".StartRequest"},
+			{"restore_artifacts", descriptorpb.FieldDescriptorProto_TYPE_MESSAGE, pkg + ".RestoreArtifactIdentity"},
+		},
+		"StartOperationStatus": {
+			stringField("operation_id"),
+			stringField("sandbox_id"),
+			{"state", descriptorpb.FieldDescriptorProto_TYPE_ENUM, pkg + ".StartOperationState"},
+			stringField("resource_generation"),
+			stringField("message"),
+		},
+		"GetStartOperationRequest": {
+			stringField("operation_id"),
+		},
+	}
+	for _, message := range descriptor.MessageType {
+		shape, added := operationShape[message.GetName()]
+		if !added {
+			continue
+		}
+		if len(message.Field) != len(shape) || len(message.NestedType) != 0 || len(message.EnumType) != 0 || len(message.OneofDecl) != 0 || len(message.Extension) != 0 || len(message.ReservedRange) != 0 || len(message.ReservedName) != 0 {
+			t.Fatalf("unexpected start-operation message %s", message.GetName())
+		}
+		for i, want := range shape {
+			f := message.Field[i]
+			if f.GetName() != want.name || f.GetNumber() != int32(i+1) || f.GetType() != want.kind || f.GetTypeName() != want.typeName || f.GetLabel() != descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL || f.OneofIndex != nil || f.GetProto3Optional() {
+				t.Fatalf("unexpected start-operation field %d of %s", i, message.GetName())
+			}
+		}
+		delete(operationShape, message.GetName())
+	}
+	if len(operationShape) != 0 {
+		t.Fatal("missing start-operation messages")
+	}
+	foundOperationEnum := false
+	for _, enum := range descriptor.EnumType {
+		if enum.GetName() != "StartOperationState" {
+			continue
+		}
+		wantValues := []string{
+			"START_OPERATION_STATE_UNSPECIFIED",
+			"START_OPERATION_STATE_RUNNING",
+			"START_OPERATION_STATE_SUCCEEDED",
+			"START_OPERATION_STATE_FAILED",
+			"START_OPERATION_STATE_UNKNOWN",
+		}
+		if foundOperationEnum || len(enum.Value) != len(wantValues) || len(enum.ReservedRange) != 0 || len(enum.ReservedName) != 0 {
+			t.Fatal("unexpected start-operation state enum")
+		}
+		foundOperationEnum = true
+		for i, want := range wantValues {
+			v := enum.Value[i]
+			if v.GetName() != want || v.GetNumber() != int32(i) {
+				t.Fatal("unexpected start-operation state value")
+			}
+		}
+	}
+	if !foundOperationEnum {
+		t.Fatal("missing start-operation state enum")
+	}
+	operationRPCs := map[string][2]string{
+		"StartWithOperation": {pkg + ".StartWithOperationRequest", pkg + ".StartOperationStatus"},
+		"GetStartOperation":  {pkg + ".GetStartOperationRequest", pkg + ".StartOperationStatus"},
+	}
+	for _, service := range descriptor.Service {
+		service.Method = slices.DeleteFunc(service.Method, func(m *descriptorpb.MethodDescriptorProto) bool {
+			io, added := operationRPCs[m.GetName()]
+			if !added {
+				return false
+			}
+			if service.GetName() != "SandboxService" || m.GetInputType() != io[0] || m.GetOutputType() != io[1] || m.GetClientStreaming() || m.GetServerStreaming() {
+				t.Fatalf("unexpected start-operation RPC %s", m.GetName())
+			}
+			delete(operationRPCs, m.GetName())
+			return true
+		})
+	}
+	if len(operationRPCs) != 0 {
+		t.Fatal("missing start-operation RPCs")
+	}
+	descriptor.MessageType = slices.DeleteFunc(descriptor.MessageType, func(m *descriptorpb.DescriptorProto) bool {
+		return m.GetName() == "StartWithOperationRequest" || m.GetName() == "RestoreArtifactIdentity" ||
+			m.GetName() == "StartOperationStatus" || m.GetName() == "GetStartOperationRequest"
+	})
+	descriptor.EnumType = slices.DeleteFunc(descriptor.EnumType, func(e *descriptorpb.EnumDescriptorProto) bool {
+		return e.GetName() == "StartOperationState"
 	})
 	wire, err := proto.MarshalOptions{Deterministic: true}.Marshal(descriptor)
 	if err != nil {

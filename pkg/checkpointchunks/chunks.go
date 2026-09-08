@@ -180,14 +180,47 @@ func WriteNamed(dir, name string, manifest *Manifest) error {
 	return os.WriteFile(filepath.Join(dir, name), append(encoded, '\n'), 0o600)
 }
 
-// LoadNamed reads a sidecar under an explicit file name (the overlay's
-// overlay.ext4.chunks.json).
-func LoadNamed(dir, name string) (*Manifest, error) {
-	raw, err := os.ReadFile(filepath.Join(dir, name))
+// MaxManifestBytes bounds one sidecar read. A 16 GiB memory file chunks into
+// ~65k entries of ~100 encoded bytes, so 32 MiB is far beyond any legitimate
+// sidecar while still rejecting unbounded input before it is buffered.
+const MaxManifestBytes = 32 << 20
+
+// LoadNamedBounded reads a sidecar under an explicit file name with its size
+// checked before any byte is buffered: a non-regular entry or a declared size
+// beyond the limit is rejected from the stat alone, and the read is bounded
+// by the stat so a file growing between the check and the read cannot force
+// an unbounded allocation.
+func LoadNamedBounded(dir, name string, limit int64) (*Manifest, error) {
+	path := filepath.Join(dir, name)
+	info, err := os.Lstat(path)
 	if err != nil {
 		return nil, err
 	}
+	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+		return nil, fmt.Errorf("chunk manifest %s is not a regular file", name)
+	}
+	if info.Size() > limit {
+		return nil, fmt.Errorf("chunk manifest %s is %d bytes, exceeds the %d-byte bound", name, info.Size(), limit)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	raw, err := io.ReadAll(io.LimitReader(f, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(raw)) > limit {
+		return nil, fmt.Errorf("chunk manifest %s exceeds the %d-byte bound while reading", name, limit)
+	}
 	return decodeManifest(raw, false)
+}
+
+// LoadNamed reads a sidecar under an explicit file name (the overlay's
+// overlay.ext4.chunks.json), bounded by MaxManifestBytes.
+func LoadNamed(dir, name string) (*Manifest, error) {
+	return LoadNamedBounded(dir, name, MaxManifestBytes)
 }
 
 // SidecarName is the chunk sidecar file name for an artifact file.
@@ -196,11 +229,7 @@ func SidecarName(file string) string { return file + "." + ManifestName }
 // Load reads the sidecar manifest from a checkpoint directory. A checkpoint
 // without one predates chunked distribution.
 func Load(dir string) (*Manifest, error) {
-	raw, err := os.ReadFile(filepath.Join(dir, ManifestName))
-	if err != nil {
-		return nil, err
-	}
-	return decodeManifest(raw, false)
+	return LoadNamedBounded(dir, ManifestName, MaxManifestBytes)
 }
 
 // validateManifest enforces the structural invariants every consumer

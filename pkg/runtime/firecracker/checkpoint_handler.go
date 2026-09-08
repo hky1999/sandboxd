@@ -32,6 +32,7 @@ import (
 
 	"github.com/inclusionAI/sandboxd/config"
 	"github.com/inclusionAI/sandboxd/internal/firecrackerproto"
+	"github.com/inclusionAI/sandboxd/pkg/checkpointroot"
 	runtimecore "github.com/inclusionAI/sandboxd/pkg/runtime"
 	runtimecommon "github.com/inclusionAI/sandboxd/pkg/runtime/internal/common"
 	"github.com/sirupsen/logrus"
@@ -779,8 +780,15 @@ func checkRestoredMemorySize(memorySize int64) error {
 	return nil
 }
 
-func (handler *Handler) Restore(
-	ctx context.Context,
+// SupportsCheckpointRootVerification declares the Firecracker capability the
+// server requires before admitting an identified restore operation: the
+// restore entry recomputes the checkpoint content root from the manifest view
+// it actually opens and refuses a mismatch before creating anything.
+func (handler *Handler) SupportsCheckpointRootVerification() bool {
+	return true
+}
+
+func (handler *Handler) Restore(ctx context.Context,
 	startConfig runtimecore.StartConfig,
 ) (retErr error) {
 	tStarted := time.Now()
@@ -802,6 +810,36 @@ func (handler *Handler) Restore(
 			"refuse Firecracker restore from %s: %w",
 			startConfig.CheckpointDir, err,
 		)
+	}
+	// An identified restore operation pins the content root its admission
+	// bound. The check recomputes the root from the manifest view THIS restore
+	// just opened and is about to consume — not a second independent read —
+	// and runs before any sandbox resource, storage directory, or VMM action,
+	// so a wrong root or a directory swapped under the same path fails while
+	// nothing has been created. This binds the request to the artifact; the
+	// directory's continued immutability through the restore and the VM's
+	// lifetime stays the caller-owned immutable-artifact contract, which this
+	// does not extend to defending against concurrent malicious writers.
+	if expected := startConfig.ExpectedCheckpointRoot; expected != "" {
+		if artifact.Layout != firecrackerCheckpointLayoutV2Directory {
+			return fmt.Errorf(
+				"Firecracker restore from %s cannot verify expected checkpoint root %s: only sealed v2 directories carry one",
+				startConfig.CheckpointDir, expected,
+			)
+		}
+		binding, err := checkpointroot.RootFromView(startConfig.CheckpointDir, artifact.ManifestRaw)
+		if err != nil {
+			return fmt.Errorf(
+				"verify Firecracker checkpoint root for %s: %w",
+				startConfig.CheckpointDir, err,
+			)
+		}
+		if binding.RootDigest != expected {
+			return fmt.Errorf(
+				"Firecracker checkpoint %s content root %s does not match the operation's expected root %s",
+				startConfig.CheckpointDir, binding.RootDigest, expected,
+			)
+		}
 	}
 	if startConfig.DisableCgroup || startConfig.CgroupPath == "" {
 		return errors.New("Firecracker requires a managed cgroup")

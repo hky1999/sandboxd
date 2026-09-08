@@ -153,6 +153,24 @@ type StartConfig struct {
 	// (including restores) and runtimes that support generation-checked
 	// deletion bind it into their own persisted state.
 	ResourceGeneration string
+	// ExpectedCheckpointRoot is the server-verified content root of the
+	// checkpoint directory this restore consumes, set only by an admitted
+	// start operation (StartWithOperation) whose admission bound the
+	// artifacts. The legacy Start leaves it empty and nothing enforces it;
+	// a runtime that accepts it must implement CheckpointRootVerifier and
+	// recompute the root from the manifest view it actually opens before
+	// creating resources or starting the VMM, refusing on mismatch.
+	ExpectedCheckpointRoot string
+}
+
+// CheckpointRootVerifier is the capability contract for runtimes that enforce
+// a server-admitted checkpoint content root at their restore boundary. A
+// restore operation carrying an expected root is refused for runtimes
+// without the capability instead of silently ignoring the binding.
+type CheckpointRootVerifier interface {
+	// SupportsCheckpointRootVerification reports whether the runtime verifies
+	// StartConfig.ExpectedCheckpointRoot when restoring.
+	SupportsCheckpointRootVerification() bool
 }
 
 // SpecUpdates contains provider-resolved OCI changes. Device providers use

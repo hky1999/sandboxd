@@ -114,13 +114,18 @@ type sandboxMetadataIdentity struct {
 
 // loadStartIntents reads the intent journal before any sandbox recovery runs.
 // metadataIdentity reports the durable identity stored in
-// containers/<id>/meta.pb. Recovery may take over a record only in the
-// committed phase with fully matching identity — ID, runtime handler, and
-// daemon-assigned generation: committed is the durable success
-// linearization point the Start flow writes only after the runtime and every
-// post-runtime step (filesystem commit, metadata persistence) succeeded, so
-// metadata presence alone can never promote a record. prepared and retained
-// records stay pending regardless of what the metadata says — a crash cannot
+// containers/<id>/meta.pb. onCommittedTakeover, when non-nil, is invoked for
+// every committed record recovery takes over (id and generation of the proven
+// start), so dependent journals — the start-operation records — can promote
+// their facts from the same committed evidence; its error fails this load and
+// keeps the committed record on disk, because the takeover proof must outlive
+// the promotion. Recovery may take over a record only in the committed phase
+// with fully matching identity — ID, runtime handler, and daemon-assigned
+// generation: committed is the durable success linearization point the Start
+// flow writes only after the runtime and every post-runtime step (filesystem
+// commit, metadata persistence) succeeded, so metadata presence alone can
+// never promote a record. prepared and retained records stay pending
+// regardless of what the metadata says — a crash cannot
 // be distinguished from a partial StoreMetadata failure by looking at the
 // disk, so the protection wins. A committed record contradicted by missing,
 // unreadable, or mismatched metadata fails startup explicitly; a corrupt
@@ -128,6 +133,7 @@ type sandboxMetadataIdentity struct {
 func loadStartIntents(
 	rootDir string,
 	metadataIdentity func(id string) sandboxMetadataIdentity,
+	onCommittedTakeover func(id, generation string) error,
 ) (*startIntentStore, error) {
 	dir := filepath.Join(rootDir, startIntentsDirName)
 	if err := os.MkdirAll(dir, 0700); err != nil {
@@ -169,6 +175,18 @@ func loadStartIntents(
 		case startIntentPhaseCommitted:
 			if err := bindCommittedIntent(id, record, meta); err != nil {
 				return nil, err
+			}
+			// The dependent success fact is persisted BEFORE the committed
+			// record is removed: while the promotion write fails, the record
+			// stays on disk as the recoverable proof, and startup fails
+			// closed instead of continuing with an in-memory-only success.
+			if onCommittedTakeover != nil {
+				if err := onCommittedTakeover(id, record.Generation); err != nil {
+					return nil, fmt.Errorf(
+						"promote committed start intent %s takeover: %w; the record is kept as proof",
+						id, err,
+					)
+				}
 			}
 			if err := store.durablyRemove(id); err != nil {
 				return nil, fmt.Errorf("retire committed start intent %s: %w", id, err)
@@ -473,13 +491,17 @@ func (s *startIntentStore) retain(id string, seed *startIntentRecord, reason str
 // complete durably marks the intent committed — the success linearization
 // point a Start reaches only after the runtime and every post-runtime step
 // (filesystem commit, sandbox metadata persistence) succeeded — and then
-// removes the record. A committed write that fails leaves the durable state
-// unproven (the record stays prepared or absent, never guessed): the ID
-// remains protected in memory and, after a restart, by whatever record the
-// disk actually holds. Once the committed phase is durably written the start
-// is complete, so a file-removal failure only leaves a committed record that
-// recovery takes over against matching metadata.
-func (s *startIntentStore) complete(id string, seed *startIntentRecord) error {
+// removes the record. onCommitted, when non-nil, runs after the committed
+// record is durable but before the record is removed: it persists dependent
+// success facts (the start-operation record), and while it fails the removal
+// is refused so the committed record — the recoverable proof — stays on disk.
+// A committed write that fails leaves the durable state unproven (the record
+// stays prepared or absent, never guessed): the ID remains protected in
+// memory and, after a restart, by whatever record the disk actually holds.
+// Once the committed phase is durably written the start is complete, so a
+// file-removal failure only leaves a committed record that recovery takes
+// over against matching metadata.
+func (s *startIntentStore) complete(id string, seed *startIntentRecord, onCommitted func() error) error {
 	if s == nil || id == "" {
 		return fmt.Errorf("complete start intent requires an ID")
 	}
@@ -505,6 +527,13 @@ func (s *startIntentStore) complete(id string, seed *startIntentRecord) error {
 		// Unknown durable outcome: the in-memory protection stays exactly as
 		// it was; the caller must not roll back an already-running sandbox.
 		return err
+	}
+	if onCommitted != nil {
+		if err := onCommitted(); err != nil {
+			// The committed record is durable, so the success stays provable
+			// at recovery; the removal is refused to keep that proof on disk.
+			return fmt.Errorf("persist dependent success record after committing %s: %w", id, err)
+		}
 	}
 	if err := s.durablyRemove(id); err != nil {
 		logrus.Warnf("remove committed start intent %s: %v; recovery will take it over", id, err)
