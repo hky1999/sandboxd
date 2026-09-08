@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"github.com/inclusionAI/sandboxd/pkg/checkpointchunks"
+	"github.com/inclusionAI/sandboxd/pkg/checkpointroot"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
 )
@@ -103,6 +104,11 @@ type firecrackerCheckpointArtifact struct {
 	Layout firecrackerCheckpointLayout
 	// Manifest is set for v2 directories only.
 	Manifest *firecrackerCheckpointManifest
+	// ManifestRaw holds the exact manifest.json bytes Manifest was decoded
+	// from, for v2 directories only. Identity checks recompute the content
+	// root from THIS view — the one the runtime is about to consume — never
+	// from a second independent read of the file.
+	ManifestRaw []byte
 	// Files holds the in-directory component paths for v2 directories only.
 	Files firecrackerCheckpointFiles
 }
@@ -307,13 +313,14 @@ func openFirecrackerCheckpoint(dir string) (*firecrackerCheckpointArtifact, erro
 		return nil, fmt.Errorf("inspect Firecracker checkpoint directory: %w", err)
 	}
 
-	manifest, err := readFirecrackerCheckpointManifest(dir)
+	manifest, manifestRaw, err := readFirecrackerCheckpointManifest(dir)
 	if err != nil {
 		return nil, err
 	}
 	artifact := &firecrackerCheckpointArtifact{
-		Layout:   firecrackerCheckpointLayoutV2Directory,
-		Manifest: manifest,
+		Layout:      firecrackerCheckpointLayoutV2Directory,
+		Manifest:    manifest,
+		ManifestRaw: manifestRaw,
 		Files: firecrackerCheckpointFiles{
 			State:   filepath.Join(dir, firecrackerCheckpointStateName),
 			Memory:  filepath.Join(dir, firecrackerCheckpointMemoryName),
@@ -356,19 +363,23 @@ func openFirecrackerCheckpoint(dir string) (*firecrackerCheckpointArtifact, erro
 }
 
 // readFirecrackerCheckpointManifest parses and validates the manifest of a v2
-// checkpoint directory.
-func readFirecrackerCheckpointManifest(dir string) (*firecrackerCheckpointManifest, error) {
-	path := filepath.Join(dir, firecrackerCheckpointManifestName)
-	encoded, err := os.ReadFile(path)
+// checkpoint directory, returning the exact bytes it decoded so identity
+// checks bind the same view the runtime consumes.
+func readFirecrackerCheckpointManifest(dir string) (*firecrackerCheckpointManifest, []byte, error) {
+	// The shared bounded reader refuses an oversized manifest by its stat
+	// before any byte is buffered, and the exact bytes returned here are
+	// both what gets parsed and what the expected-root identity check
+	// recomputes the root from (artifact.ManifestRaw) — one view, never two.
+	encoded, err := checkpointroot.ReadManifestBounded(dir)
 	if err != nil {
-		return nil, fmt.Errorf("read Firecracker checkpoint manifest: %w", err)
+		return nil, nil, fmt.Errorf("read Firecracker checkpoint manifest: %w", err)
 	}
 	var manifest firecrackerCheckpointManifest
 	if err := json.Unmarshal(encoded, &manifest); err != nil {
-		return nil, fmt.Errorf("decode Firecracker checkpoint manifest: %w", err)
+		return nil, nil, fmt.Errorf("decode Firecracker checkpoint manifest: %w", err)
 	}
 	if manifest.Version != firecrackerCheckpointVersion2 {
-		return nil, fmt.Errorf(
+		return nil, nil, fmt.Errorf(
 			"unsupported Firecracker checkpoint manifest version %d",
 			manifest.Version,
 		)
@@ -378,13 +389,13 @@ func readFirecrackerCheckpointManifest(dir string) (*firecrackerCheckpointManife
 		firecrackerSnapshotTypeIncremental,
 		firecrackerSnapshotTypeSoftDirty:
 	default:
-		return nil, fmt.Errorf(
+		return nil, nil, fmt.Errorf(
 			"invalid Firecracker checkpoint snapshot type %q",
 			manifest.SnapshotType,
 		)
 	}
 	if manifest.MemorySize <= 0 || manifest.MemorySize > firecrackerCheckpointMaxComponent {
-		return nil, fmt.Errorf(
+		return nil, nil, fmt.Errorf(
 			"Firecracker checkpoint manifest has unbounded memory size %d",
 			manifest.MemorySize,
 		)
@@ -397,14 +408,14 @@ func readFirecrackerCheckpointManifest(dir string) (*firecrackerCheckpointManife
 			"initrd":      manifest.Compat.Initrd,
 		} {
 			if digest != "" && !isFirecrackerCompatDigest(digest) {
-				return nil, fmt.Errorf(
+				return nil, nil, fmt.Errorf(
 					"Firecracker checkpoint compat %s digest %q is not a sha256 hex string",
 					name, digest,
 				)
 			}
 		}
 	}
-	return &manifest, nil
+	return &manifest, encoded, nil
 }
 
 func isFirecrackerCompatDigest(digest string) bool {

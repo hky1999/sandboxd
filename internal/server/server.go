@@ -123,6 +123,11 @@ type sandboxService struct {
 	// (legacy and conditional), and Checkpoint so a retained failed start can
 	// neither be restarted under the same ID nor be bypassed into cleanup.
 	startIntents *startIntentStore
+	// startOperations is the durable start-operation journal behind
+	// StartWithOperation: per-operation idempotency records that survive reply
+	// loss, daemon restart, and sandbox deletion. It loads before the intent
+	// journal so committed-intent takeovers can promote operation facts.
+	startOperations *startOperationStore
 	// allocateStartResourceFn is an in-package test seam; production is nil.
 	allocateStartResourceFn           allocateStartResourceFunc
 	retirementMu                      sync.Mutex
@@ -646,6 +651,16 @@ func (h *sandboxService) Run() error {
 func (h *sandboxService) Shutdown() {
 	logrus.Info("sandbox service shutting down: cleaning up sandboxes")
 
+	// 0. Drain admitted start operations first. Admission closes atomically,
+	// every in-flight execution's context is cancelled to request
+	// convergence, and Shutdown BLOCKS until each executor has actually
+	// returned — a context deadline proves nothing about goroutine
+	// convergence, and tearing down filesystem/network/runtime state an
+	// executor may still be using would break the rollback and retention
+	// invariants the Start flow enforces. An execution that ignores
+	// cancellation therefore holds shutdown until it exits.
+	h.startOperations.shutdown()
+
 	// 1. Force-delete all running sandboxes with per-sandbox timeout.
 	sandboxes := h.sandboxManager.List()
 	for _, c := range sandboxes {
@@ -793,7 +808,11 @@ func resetStateIfPodChanged(storeDir, rootDir, imageManagerRoot string) error {
 	// sandbox manager and runsc handler for state recovery. The start-intent
 	// journal describes state that this same wipe removes (sandbox metadata,
 	// resource leases), so it is wiped with it rather than left protecting
-	// IDs whose referenced state no longer exists.
+	// IDs whose referenced state no longer exists. The start-operation
+	// tombstones are deliberately KEPT: a historical start fact does not
+	// require the sandbox to exist, and deleting it would let an old
+	// operation ID be re-admitted after the reset — the replay protection
+	// must outlive the instances it describes.
 	for _, sub := range []string{"containers", startIntentsDirName} {
 		p := filepath.Join(rootDir, sub)
 		if err := os.RemoveAll(p); err != nil {
@@ -902,6 +921,14 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 		return nil, fmt.Errorf("create sandbox root: %w", err)
 	}
 
+	// The start-operation journal loads first so committed-intent takeovers
+	// during the intent load below can promote matching operation records
+	// from the same committed evidence. A corrupt record fails startup.
+	startOperations, err := loadStartOperations(cfg.RootDir)
+	if err != nil {
+		return nil, fmt.Errorf("load start operations: %w", err)
+	}
+
 	// The start-intent journal loads before any resource module or recovery
 	// pass runs: a pending intent must be known before a manager could
 	// destroy retained state, and a corrupt or contradictory record must fail
@@ -909,7 +936,11 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 	// intent is satisfied only by sandbox metadata carrying the same
 	// daemon-assigned generation.
 	var startIntents *startIntentStore
-	startIntents, err = loadStartIntents(cfg.RootDir, readSandboxMetadataIdentity(cfg.RootDir))
+	startIntents, err = loadStartIntents(
+		cfg.RootDir,
+		readSandboxMetadataIdentity(cfg.RootDir),
+		startOperations.promoteCommittedTakeover,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("load start intents: %w", err)
 	}
@@ -1029,6 +1060,7 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 		resourceMod:                       nodeResMod,
 		xpuMgr:                            xpuMgr,
 		startIntents:                      startIntents,
+		startOperations:                   startOperations,
 	}
 
 	// VolumeManager comes up before runtime handlers. An ordinary directory is
@@ -1486,6 +1518,21 @@ type resourcePrepareResult struct {
 }
 
 func (h *sandboxService) Start(ctx context.Context, request *runtime.StartRequest) (*runtime.StartResponse, error) {
+	return h.start(ctx, request, nil)
+}
+
+// start runs the complete legacy Start flow. op, when non-nil, is the trusted
+// server-side operation binding StartWithOperation admitted: it fixes the
+// daemon-assigned generation (a caller label can never choose it) and records
+// the operation's terminal facts at the exact ordering points this flow
+// reaches — success between the intent journal's committed write and its
+// record removal, failure before the intent record is cleared, unknown when
+// the outcome cannot be proven. Nothing else about the flow changes.
+func (h *sandboxService) start(
+	ctx context.Context,
+	request *runtime.StartRequest,
+	op *startOperationBinding,
+) (*runtime.StartResponse, error) {
 	if request == nil {
 		err := fmt.Errorf("start request is nil")
 		return &runtime.StartResponse{Code: -1, Message: err.Error()}, err
@@ -1496,8 +1543,16 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 	}
 	startReq := proto.Clone(request).(*runtime.StartRequest)
 	// The physical incarnation identity is daemon-owned: a caller-supplied
-	// label under the reserved key is replaced, never honored.
-	generation := assignResourceGeneration(startReq)
+	// label under the reserved key is replaced, never honored. An admitted
+	// operation reuses the generation persisted at its admission, so a
+	// replayed or recovered operation always names the same incarnation.
+	var generation string
+	if op != nil {
+		generation = op.generation
+		bindResourceGeneration(startReq, generation)
+	} else {
+		generation = assignResourceGeneration(startReq)
+	}
 	checkpointDir := ""
 	var err error
 	if startReq.CheckpointInfo != nil {
@@ -1732,6 +1787,13 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 		if err := h.startIntents.retain(sandboxID, startIntentRecord, reason.Error()); err != nil {
 			logrus.Errorf("persist retained start intent for sandbox %s: %v", sandboxID, err)
 		}
+		if op != nil {
+			// Retention means the outcome could not be proven either way; the
+			// operation must never re-execute under this ID.
+			h.startOperations.markUnknown(op.operationID, fmt.Sprintf(
+				"start retained with undetermined outcome: %v", reason,
+			))
+		}
 		return true
 	}
 	defer func() {
@@ -1879,7 +1941,15 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 		// The rollback is fully proven; the intent record may be dropped only
 		// durably, and only then may the ID return to the pool. A record whose
 		// removal fails keeps the ID blocked — after a restart it shows up as
-		// a pending intent again.
+		// a pending intent again. The operation's failed fact is recorded
+		// first so a crash between the two writes leaves the operation
+		// reporting failure rather than an unproven admission.
+		if op != nil {
+			if err := h.startOperations.markFailedConfirmed(op.operationID,
+				"start was fully rolled back with a proven cleanup"); err != nil {
+				logrus.Errorf("persist failed outcome for start operation %s: %v", op.operationID, err)
+			}
+		}
 		if startIntentRecord != nil {
 			if err := h.startIntents.clear(sandboxID); err != nil {
 				logrus.Errorf(
@@ -2053,6 +2123,10 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 		// The runtime binds the daemon-generated incarnation identity into
 		// its own persisted state, so strict deletes can verify it there.
 		ResourceGeneration: generation,
+		// Only an admitted start operation sets the admission-bound content
+		// root; the legacy Start leaves it empty and runtimes enforce
+		// nothing for it.
+		ExpectedCheckpointRoot: op.expectedCheckpointRoot(),
 	}
 	// Commit the prepared filesystem references and persist the start intent
 	// before the runtime can spawn anything. From the intent's durable write
@@ -2142,16 +2216,37 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 	// The start has now succeeded on every durable axis — runtime, filesystem
 	// commit, sandbox metadata — so the intent records the committed phase,
 	// the success linearization point only recovery may take over against
-	// fully matching metadata identity. A committed write that fails leaves
-	// the outcome unproven on disk: the running instance is never rolled back
-	// or auto-revoked, everything the start owns stays protected (the ID, the
-	// resources, the committed filesystem ownership, and the original
-	// prepared record), and the RPC must report the unknown completion
-	// instead of success. A failure here means the committed write itself
-	// could not be made durable; a committed record whose later removal
-	// failed is NOT an error — complete reports that handover as done and
-	// recovery takes the leftover committed record over.
-	if err := h.startIntents.complete(sandboxID, startIntentRecord); err != nil {
+	// fully matching metadata identity. For an identified operation, the
+	// durable success fact is written between the committed record and its
+	// removal: while that write fails the committed record stays on disk, so
+	// no crash window exists in which the original success fact is lost — it
+	// is recoverable from the operation record or from the committed-intent
+	// takeover, whichever the crash leaves behind. A committed write that
+	// fails leaves the outcome unproven on disk: the running instance is
+	// never rolled back or auto-revoked, everything the start owns stays
+	// protected (the ID, the resources, the committed filesystem ownership,
+	// and the original prepared record), and the RPC must report the unknown
+	// completion instead of success. A failure here means the committed write
+	// itself could not be made durable; a committed record whose later
+	// removal failed is NOT an error — complete reports that handover as done
+	// and recovery takes the leftover committed record over.
+	var onCommitted func() error
+	if op != nil {
+		onCommitted = func() error {
+			return h.startOperations.markSucceeded(op.operationID, fmt.Sprintf(
+				"start succeeded; sandbox %s runs as generation %s (historical fact, not a liveness claim)",
+				sandboxID, generation,
+			))
+		}
+	}
+	if err := h.startIntents.complete(sandboxID, startIntentRecord, onCommitted); err != nil {
+		if op != nil && !op.terminal() {
+			h.startOperations.markUnknown(op.operationID, fmt.Sprintf(
+				"sandbox %s may be running, but recording its start completion failed (%v); "+
+					"the ID stays protected until reconciliation",
+				sandboxID, err,
+			))
+		}
 		retained = true
 		logrus.Errorf(
 			"persist committed start intent for sandbox %s failed (%v): completion outcome unknown; "+
@@ -2183,12 +2278,25 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 // reserved key is discarded: the client must not choose or reuse a sandbox's
 // physical identity.
 func assignResourceGeneration(request *runtime.StartRequest) string {
+	generation := newResourceGeneration()
+	bindResourceGeneration(request, generation)
+	return generation
+}
+
+// newResourceGeneration mints one daemon-owned incarnation identity.
+func newResourceGeneration() string {
+	return uuid.NewString()
+}
+
+// bindResourceGeneration installs an already-assigned daemon-owned generation
+// on the start request. StartWithOperation uses it with the generation
+// persisted at admission so a replayed or recovered operation always names
+// the same incarnation; a caller-supplied value is replaced, never honored.
+func bindResourceGeneration(request *runtime.StartRequest, generation string) {
 	if request.Labels == nil {
 		request.Labels = make(map[string]string)
 	}
-	generation := uuid.NewString()
 	request.Labels[resourceGenerationLabel] = generation
-	return generation
 }
 
 // buildStartIntent snapshots the durable ownership a start has secured for the

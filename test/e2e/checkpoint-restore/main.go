@@ -19,6 +19,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"strings"
@@ -49,6 +50,10 @@ type options struct {
 	leaveRunning             bool
 	snapshotType             string
 	expectedGeneration       string
+	operationID              string
+	operationIDSet           bool
+	expectedRootDigest       string
+	expectedRootDigestSet    bool
 	stdout                   string
 	stderr                   string
 	workloadCmd              string
@@ -66,50 +71,81 @@ func (values *stringList) Set(value string) error {
 	return nil
 }
 
-func main() {
+// parseFlags binds the command line onto one options value. The two
+// operation-mode flags additionally record their presence: an explicitly
+// passed but empty --operation-id or --expected-root-digest is intent, not
+// omission, and must fail validation instead of silently selecting the
+// legacy path. errorOutput receives the flag package's usage text, so tests
+// can parse real argv quietly.
+func parseFlags(args []string, errorOutput io.Writer) (options, error) {
 	var value options
-	flag.StringVar(&value.action, "action", "", "start, checkpoint, restore, or delete")
-	flag.StringVar(&value.socket, "socket", "", "sandboxd Unix socket")
-	flag.StringVar(&value.runtime, "runtime", "runsc", "runtime handler")
-	flag.StringVar(&value.stdout, "stdout", "/var/log/sandboxd/checkpoint-workload.stdout", "sandbox console output path")
-	flag.StringVar(&value.stderr, "stderr", "/var/log/sandboxd/checkpoint-runtime.stderr", "sandbox runtime error log path")
-	flag.StringVar(&value.rootfs, "rootfs", "", "local rootfs path")
-	flag.StringVar(&value.sandboxID, "sandbox-id", "", "source sandbox ID")
-	flag.StringVar(&value.targetID, "target-id", "", "restored sandbox ID")
-	flag.StringVar(&value.requestFile, "request-file", "", "persisted StartRequest JSON")
-	flag.StringVar(&value.checkpointDir, "checkpoint-dir", "", "caller-owned checkpoint directory")
-	flag.DurationVar(&value.timeout, "timeout", 5*time.Minute, "client operation timeout")
-	flag.UintVar(
+	flags := flag.NewFlagSet("checkpoint-restore", flag.ContinueOnError)
+	flags.SetOutput(errorOutput)
+	flags.StringVar(&value.action, "action", "",
+		"start, checkpoint, restore, delete, or get-start-operation")
+	flags.StringVar(&value.socket, "socket", "", "sandboxd Unix socket")
+	flags.StringVar(&value.runtime, "runtime", "runsc", "runtime handler")
+	flags.StringVar(&value.stdout, "stdout", "/var/log/sandboxd/checkpoint-workload.stdout", "sandbox console output path")
+	flags.StringVar(&value.stderr, "stderr", "/var/log/sandboxd/checkpoint-runtime.stderr", "sandbox runtime error log path")
+	flags.StringVar(&value.rootfs, "rootfs", "", "local rootfs path")
+	flags.StringVar(&value.sandboxID, "sandbox-id", "", "source sandbox ID")
+	flags.StringVar(&value.targetID, "target-id", "", "restored sandbox ID")
+	flags.StringVar(&value.requestFile, "request-file", "", "persisted StartRequest JSON")
+	flags.StringVar(&value.checkpointDir, "checkpoint-dir", "", "caller-owned checkpoint directory")
+	flags.DurationVar(&value.timeout, "timeout", 5*time.Minute, "client operation timeout")
+	flags.UintVar(
 		&value.checkpointTimeoutSeconds,
 		"checkpoint-timeout-seconds",
 		180,
 		"sandboxd checkpoint timeout in seconds",
 	)
-	flag.Float64Var(&value.memoryMB, "memory-mb", 128, "sandbox memory in MiB")
-	flag.IntVar(&value.cpu, "cpu", 500, "CPU quota (milli-CPU)")
-	flag.Uint64Var(&value.storageMB, "storage-mb", 64, "writable layer in MiB")
-	flag.StringVar(&value.extraConfig, "extra-config", "",
+	flags.Float64Var(&value.memoryMB, "memory-mb", 128, "sandbox memory in MiB")
+	flags.IntVar(&value.cpu, "cpu", 500, "CPU quota (milli-CPU)")
+	flags.Uint64Var(&value.storageMB, "storage-mb", 64, "writable layer in MiB")
+	flags.StringVar(&value.extraConfig, "extra-config", "",
 		"runtime-specific configuration as a JSON object")
-	flag.BoolVar(&value.compress, "compress", true, "compress checkpoint artifacts")
-	flag.BoolVar(&value.leaveRunning, "leave-running", true, "leave source running")
-	flag.StringVar(&value.snapshotType, "snapshot-type", "",
+	flags.BoolVar(&value.compress, "compress", true, "compress checkpoint artifacts")
+	flags.BoolVar(&value.leaveRunning, "leave-running", true, "leave source running")
+	flags.StringVar(&value.snapshotType, "snapshot-type", "",
 		"checkpoint flavor: empty (auto), Full, Incremental, or SoftDirty")
-	flag.StringVar(&value.expectedGeneration, "expected-generation", "",
+	flags.StringVar(&value.expectedGeneration, "expected-generation", "",
 		"resource_generation the checkpointed or deleted sandbox must still be on "+
 			"(empty keeps the unconditional checkpoint/delete RPCs)")
-	flag.StringVar(&value.workloadCmd, "workload-cmd", "",
+	flags.StringVar(&value.operationID, "operation-id", "",
+		"persistent start operation ID: switches start/restore to "+
+			"StartWithOperation and names the operation to query")
+	flags.StringVar(&value.expectedRootDigest, "expected-root-digest", "",
+		"hex sha-256 over the entire checkpoint content root "+
+			"(the shared checksum algorithm, scheme v2; required for "+
+			"restore with --operation-id)")
+	flags.StringVar(&value.workloadCmd, "workload-cmd", "",
 		"override the built-in start workload command (template warmup hooks)")
 	flag.Var(&value.mounts, "mount",
 		"repeatable mount formatted as host_path:target[:type[:opt1,opt2]]")
 	flag.Parse()
 
+func main() {
+	value, err := parseFlags(os.Args[1:], os.Stderr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "checkpoint-restore: %v\n", err)
+		os.Exit(1)
+	}
 	if err := run(value); err != nil {
 		fmt.Fprintf(os.Stderr, "checkpoint-restore: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func run(value options) error {
+// validateOptions rejects every flag misuse — unknown actions, action/flag
+// conflicts, malformed values, and missing required fields of the operation
+// mode — before the socket is dialed, so a bad invocation never opens a
+// connection to sandboxd.
+func validateOptions(value options) error {
+	switch value.action {
+	case "start", "checkpoint", "restore", "delete", "get-start-operation":
+	default:
+		return errors.New("--action must be start, checkpoint, restore, delete, or get-start-operation")
+	}
 	if value.expectedGeneration != "" && value.action != "checkpoint" && value.action != "delete" {
 		return errors.New("--expected-generation is only valid for checkpoint and delete")
 	}
@@ -117,6 +153,13 @@ func run(value options) error {
 		return errors.New("--socket is required")
 	}
 	if err := validateExpectedGeneration(value.expectedGeneration); err != nil {
+		return err
+	}
+	return validateOperationFlags(value)
+}
+
+func run(value options) error {
+	if err := validateOptions(value); err != nil {
 		return err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), value.timeout)
@@ -145,8 +188,10 @@ func run(value options) error {
 		return restore(ctx, client, value)
 	case "delete":
 		return deleteSandbox(ctx, client, value)
+	case "get-start-operation":
+		return getStartOperation(ctx, client, value)
 	default:
-		return errors.New("--action must be start, checkpoint, restore, or delete")
+		return errors.New("--action must be start, checkpoint, restore, delete, or get-start-operation")
 	}
 }
 
@@ -158,14 +203,37 @@ func start(
 	if value.expectedGeneration != "" {
 		return errors.New("--expected-generation is only valid for checkpoint and delete")
 	}
+	if value.operationID != "" {
+		return startWithOperation(ctx, client, value)
+	}
+	request, err := buildStartRequest(value)
+	if err != nil {
+		return err
+	}
+	response, err := client.Start(ctx, request)
+	if err != nil {
+		return err
+	}
+	if response.Code != 0 || response.ID != value.sandboxID {
+		return fmt.Errorf("start response = %+v", response)
+	}
+	fmt.Println(response.ID)
+	return nil
+}
+
+// buildStartRequest assembles the StartRequest shared by the legacy Start and
+// the operation-wrapped StartWithOperation paths — including persisting it to
+// the request file a later restore replays — so both modes start the exact
+// same sandbox.
+func buildStartRequest(value options) (*runtime.StartRequest, error) {
 	if value.rootfs == "" || value.sandboxID == "" {
-		return errors.New("--rootfs and --sandbox-id are required for start")
+		return nil, errors.New("--rootfs and --sandbox-id are required for start")
 	}
 	if value.requestFile == "" {
-		return errors.New("--request-file is required for start")
+		return nil, errors.New("--request-file is required for start")
 	}
 	if value.storageMB > ^uint64(0)/(1024*1024) {
-		return errors.New("--storage-mb overflows bytes")
+		return nil, errors.New("--storage-mb overflows bytes")
 	}
 	mounts, err := parseMountFlags(value.mounts)
 	if err != nil {
@@ -203,20 +271,12 @@ func start(
 		EmitUnpopulated: true,
 	}.Marshal(request)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if err := os.WriteFile(value.requestFile, append(data, '\n'), 0600); err != nil {
-		return err
+		return nil, err
 	}
-	response, err := client.Start(ctx, request)
-	if err != nil {
-		return err
-	}
-	if response.Code != 0 || response.ID != value.sandboxID {
-		return fmt.Errorf("start response = %+v", response)
-	}
-	fmt.Println(response.ID)
-	return nil
+	return request, nil
 }
 
 func parseMountFlags(values []string) ([]*runtime.Mount, error) {
@@ -331,6 +391,139 @@ func validateExpectedGeneration(value string) error {
 	return nil
 }
 
+// maxOperationIDLength bounds --operation-id. The daemon persists operations
+// under their ID, so the value doubles as a path element and must stay short
+// and path-safe.
+const maxOperationIDLength = 128
+
+// validateOperationIDFormat accepts exactly the identities the daemon accepts
+// — ^[A-Za-z0-9][A-Za-z0-9._-]*$, at most 128 bytes — so a mistyped ID the
+// service would reject anyway fails here, before the dial. The leading
+// alphanumeric also rules out `.`, `..`, and other relative path elements.
+// The CLI generates nothing on the caller's behalf, so an absent or malformed
+// ID is always an error where the ID is required.
+func validateOperationIDFormat(id string) error {
+	if id == "" {
+		return errors.New("--operation-id must not be empty")
+	}
+	if len(id) > maxOperationIDLength {
+		return fmt.Errorf("--operation-id must be at most %d bytes", maxOperationIDLength)
+	}
+	first := id[0]
+	if !((first >= '0' && first <= '9') ||
+		(first >= 'a' && first <= 'z') ||
+		(first >= 'A' && first <= 'Z')) {
+		return fmt.Errorf(
+			"--operation-id must match ^[A-Za-z0-9][A-Za-z0-9._-]*$ "+
+				"(%q starts with %q)",
+			id,
+			first,
+		)
+	}
+	for index := 1; index < len(id); index++ {
+		character := id[index]
+		switch {
+		case character >= '0' && character <= '9',
+			character >= 'a' && character <= 'z',
+			character >= 'A' && character <= 'Z',
+			character == '-', character == '_', character == '.':
+		default:
+			return fmt.Errorf(
+				"--operation-id contains unsupported character %q at byte %d "+
+					"(must match ^[A-Za-z0-9][A-Za-z0-9._-]*$)",
+				character,
+				index,
+			)
+		}
+	}
+	return nil
+}
+
+// validateExpectedRootDigest accepts exactly 64 hex characters — the encoded
+// sha-256 over the entire checkpoint content root under the shared checksum
+// algorithm (scheme v2), not the digest of any single file — and passes them
+// through verbatim; the daemon remains the authority on whether the pinned
+// root matches the directory content.
+func validateExpectedRootDigest(digest string) error {
+	if len(digest) != 64 {
+		return errors.New("--expected-root-digest must be exactly 64 hex characters")
+	}
+	for index := 0; index < len(digest); index++ {
+		character := digest[index]
+		switch {
+		case character >= '0' && character <= '9',
+			character >= 'a' && character <= 'f',
+			character >= 'A' && character <= 'F':
+		default:
+			return fmt.Errorf(
+				"--expected-root-digest contains non-hex character %q at byte %d",
+				character,
+				index,
+			)
+		}
+	}
+	return nil
+}
+
+// validateOperationFlags enforces the persistent-operation flag contract:
+// explicitly passed but empty new flags fail rather than silently selecting
+// the legacy path, only the right actions accept --operation-id,
+// --expected-root-digest belongs only to the operation-mode restore, the
+// query action carries no start payload, and the operation modes have their
+// required fields. It runs before the socket is dialed and the mode helpers
+// re-run their share so direct callers (tests included) stay as safe as the
+// CLI.
+func validateOperationFlags(value options) error {
+	// Presence, not non-emptiness, signals intent: `--operation-id=` is a
+	// malformed operation mode, not a request for legacy Start.
+	if value.operationIDSet && value.operationID == "" {
+		return errors.New("--operation-id must not be empty")
+	}
+	if value.expectedRootDigestSet && value.expectedRootDigest == "" {
+		return errors.New("--expected-root-digest must not be empty")
+	}
+	if value.expectedRootDigest != "" &&
+		(value.action != "restore" || value.operationID == "") {
+		return errors.New("--expected-root-digest is only valid for restore with --operation-id")
+	}
+	if value.operationID == "" {
+		if value.action == "get-start-operation" {
+			return errors.New("--operation-id is required for get-start-operation")
+		}
+		return nil
+	}
+	if err := validateOperationIDFormat(value.operationID); err != nil {
+		return err
+	}
+	switch value.action {
+	case "start":
+		if value.rootfs == "" || value.sandboxID == "" || value.requestFile == "" {
+			return errors.New("--rootfs, --sandbox-id, and --request-file are required for start")
+		}
+	case "restore":
+		if value.targetID == "" || value.checkpointDir == "" || value.requestFile == "" ||
+			value.expectedRootDigest == "" {
+			return errors.New("--target-id, --request-file, --checkpoint-dir, and " +
+				"--expected-root-digest are required for restore with --operation-id")
+		}
+		if err := validateExpectedRootDigest(value.expectedRootDigest); err != nil {
+			return err
+		}
+	case "get-start-operation":
+		// The query takes no start payload: any of these flags set is a
+		// conflicted invocation, not a default.
+		if value.sandboxID != "" || value.targetID != "" || value.requestFile != "" ||
+			value.checkpointDir != "" || value.rootfs != "" || value.snapshotType != "" ||
+			value.workloadCmd != "" {
+			return errors.New("--action get-start-operation takes only --socket, " +
+				"--timeout, and --operation-id")
+		}
+	default:
+		return errors.New("--operation-id is only valid for start, restore, and get-start-operation")
+	}
+	return nil
+}
+
 func restore(
 	ctx context.Context,
 	client runtime.SandboxServiceClient,
@@ -339,23 +532,18 @@ func restore(
 	if value.expectedGeneration != "" {
 		return errors.New("--expected-generation is only valid for checkpoint and delete")
 	}
+	if value.operationID != "" {
+		return restoreWithOperation(ctx, client, value)
+	}
 	if value.targetID == "" || value.checkpointDir == "" {
 		return errors.New("--target-id and --checkpoint-dir are required for restore")
 	}
 	if value.requestFile == "" {
 		return errors.New("--request-file is required for restore")
 	}
-	data, err := os.ReadFile(value.requestFile)
+	request, err := loadRestoreRequest(value)
 	if err != nil {
 		return err
-	}
-	request := new(runtime.StartRequest)
-	if err := (protojson.UnmarshalOptions{DiscardUnknown: false}).Unmarshal(data, request); err != nil {
-		return err
-	}
-	request.SandboxID = value.targetID
-	request.CheckpointInfo = &runtime.CheckpointInfo{
-		CheckpointDir: value.checkpointDir,
 	}
 	response, err := client.Start(ctx, request)
 	if err != nil {
@@ -365,6 +553,225 @@ func restore(
 		return fmt.Errorf("restore response = %+v", response)
 	}
 	fmt.Println(response.ID)
+	return nil
+}
+
+// loadRestoreRequest replays the persisted StartRequest under the restore
+// target ID and checkpoint directory, the shared prefix of both restore modes.
+func loadRestoreRequest(value options) (*runtime.StartRequest, error) {
+	data, err := os.ReadFile(value.requestFile)
+	if err != nil {
+		return nil, err
+	}
+	request := new(runtime.StartRequest)
+	if err := (protojson.UnmarshalOptions{DiscardUnknown: false}).Unmarshal(data, request); err != nil {
+		return nil, err
+	}
+	request.SandboxID = value.targetID
+	request.CheckpointInfo = &runtime.CheckpointInfo{
+		CheckpointDir: value.checkpointDir,
+	}
+	return request, nil
+}
+
+// startWithOperation runs the persistent start mode. The legacy Start RPC is
+// never called here: a failure of StartWithOperation — Unimplemented from an
+// older server included — is terminal, because a silent fallback would create
+// a sandbox outside the durable operation the caller is about to reconcile.
+func startWithOperation(
+	ctx context.Context,
+	client runtime.SandboxServiceClient,
+	value options,
+) error {
+	if err := validateOperationIDFormat(value.operationID); err != nil {
+		return err
+	}
+	if value.expectedRootDigest != "" {
+		return errors.New("--expected-root-digest is only valid for restore")
+	}
+	request, err := buildStartRequest(value)
+	if err != nil {
+		return err
+	}
+	status, err := client.StartWithOperation(ctx, &runtime.StartWithOperationRequest{
+		OperationID: value.operationID,
+		SandboxID:   value.sandboxID,
+		Start:       request,
+	})
+	if err != nil {
+		return fmt.Errorf("start: %w", err)
+	}
+	return reportStartOperation(status, value.operationID, value.sandboxID, "start")
+}
+
+// restoreWithOperation runs the persistent restore mode. Unlike the legacy
+// restore it requires the caller to pin the artifact root digest: the
+// operation must bind to the content it restores, not just a path. The CLI
+// never invents an operation ID or digest on the caller's behalf.
+func restoreWithOperation(
+	ctx context.Context,
+	client runtime.SandboxServiceClient,
+	value options,
+) error {
+	if err := validateOperationIDFormat(value.operationID); err != nil {
+		return err
+	}
+	if value.targetID == "" || value.checkpointDir == "" || value.requestFile == "" ||
+		value.expectedRootDigest == "" {
+		return errors.New("--target-id, --request-file, --checkpoint-dir, and " +
+			"--expected-root-digest are required for restore with --operation-id")
+	}
+	if err := validateExpectedRootDigest(value.expectedRootDigest); err != nil {
+		return err
+	}
+	request, err := loadRestoreRequest(value)
+	if err != nil {
+		return err
+	}
+	status, err := client.StartWithOperation(ctx, &runtime.StartWithOperationRequest{
+		OperationID: value.operationID,
+		SandboxID:   value.targetID,
+		Start:       request,
+		RestoreArtifacts: &runtime.RestoreArtifactIdentity{
+			CheckpointDir:      value.checkpointDir,
+			ExpectedRootDigest: value.expectedRootDigest,
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("restore: %w", err)
+	}
+	return reportStartOperation(status, value.operationID, value.targetID, "restore")
+}
+
+// getStartOperation queries one durable start operation record. A zero exit
+// proves only that the record was retrieved and echoes the requested
+// operation ID: SUCCEEDED is a historical fact about the generation the
+// operation created, not an assertion that the sandbox still exists or still
+// runs, so every state is printed verbatim and the caller reconciles liveness
+// separately.
+func getStartOperation(
+	ctx context.Context,
+	client runtime.SandboxServiceClient,
+	value options,
+) error {
+	if value.operationID == "" {
+		return errors.New("--operation-id is required for get-start-operation")
+	}
+	if err := validateOperationIDFormat(value.operationID); err != nil {
+		return err
+	}
+	status, err := client.GetStartOperation(ctx, &runtime.GetStartOperationRequest{
+		OperationID: value.operationID,
+	})
+	if err != nil {
+		return fmt.Errorf("get-start-operation: %w", err)
+	}
+	if status == nil {
+		return errors.New("get-start-operation: empty operation status")
+	}
+	// A healthy daemon never answers with an unbound record or an UNSPECIFIED
+	// state; treat the obviously malformed as protocol errors instead of
+	// printing something a caller might reconcile against.
+	if status.GetOperationID() == "" || status.GetSandboxID() == "" {
+		return fmt.Errorf(
+			"get-start-operation: malformed record with empty identity (%+v)",
+			status,
+		)
+	}
+	switch status.GetState() {
+	case runtime.StartOperationState_START_OPERATION_STATE_RUNNING,
+		runtime.StartOperationState_START_OPERATION_STATE_SUCCEEDED,
+		runtime.StartOperationState_START_OPERATION_STATE_FAILED,
+		runtime.StartOperationState_START_OPERATION_STATE_UNKNOWN:
+	default:
+		return fmt.Errorf("get-start-operation: invalid record state %d", status.GetState())
+	}
+
+	if status.GetOperationID() != value.operationID {
+		return fmt.Errorf(
+			"get-start-operation: status operation_id %q does not match requested %q",
+			status.GetOperationID(),
+			value.operationID,
+		)
+	}
+	return printOperationStatus(status)
+}
+
+// maxResourceGenerationLength bounds the daemon-assigned generation a
+// SUCCEEDED receipt must carry, matching the service-side identity limit.
+const maxResourceGenerationLength = 128
+
+// reportStartOperation emits the durable operation status as protojson on
+// stdout — the operation mode's entire stdout contract, with no human success
+// line mixed in — but only exits zero when the record is a proven SUCCEEDED
+// for exactly the requested identity. RUNNING, UNKNOWN, and FAILED are
+// printed first so the caller can reconcile the spent operation ID, then
+// reported as an error: a pending or unproven outcome must never masquerade
+// as a completed restore. A receipt naming a different operation or sandbox
+// is not the requested record at all, so it fails without stdout output.
+func reportStartOperation(
+	status *runtime.StartOperationStatus,
+	operationID string,
+	sandboxID string,
+	action string,
+) error {
+	if status == nil {
+		return fmt.Errorf("%s: empty operation status", action)
+	}
+	if status.GetOperationID() != operationID {
+		return fmt.Errorf(
+			"%s: status operation_id %q does not match requested %q",
+			action,
+			status.GetOperationID(),
+			operationID,
+		)
+	}
+	if status.GetSandboxID() != sandboxID {
+		return fmt.Errorf(
+			"%s: status sandbox_id %q does not match requested %q",
+			action,
+			status.GetSandboxID(),
+			sandboxID,
+		)
+	}
+	if status.GetState() != runtime.StartOperationState_START_OPERATION_STATE_SUCCEEDED {
+		if err := printOperationStatus(status); err != nil {
+			return err
+		}
+		return fmt.Errorf(
+			"%s: operation state %s is not SUCCEEDED; reconcile operation %q before issuing a new one",
+			action,
+			status.GetState(),
+			operationID,
+		)
+	}
+	generation := status.GetResourceGeneration()
+	if strings.TrimSpace(generation) == "" || len(generation) > maxResourceGenerationLength {
+		if err := printOperationStatus(status); err != nil {
+			return err
+		}
+		return fmt.Errorf(
+			"%s: SUCCEEDED status must carry a non-blank resource_generation of at most %d bytes",
+			action,
+			maxResourceGenerationLength,
+		)
+	}
+	return printOperationStatus(status)
+}
+
+// printOperationStatus writes one StartOperationStatus to stdout as protojson
+// with snake_case field names and unpopulated fields emitted, so the state is
+// always explicit for the caller's reconciliation.
+func printOperationStatus(status *runtime.StartOperationStatus) error {
+	data, err := protojson.MarshalOptions{
+		Indent:          "  ",
+		UseProtoNames:   true,
+		EmitUnpopulated: true,
+	}.Marshal(status)
+	if err != nil {
+		return err
+	}
+	fmt.Println(string(data))
 	return nil
 }
 

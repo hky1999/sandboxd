@@ -137,11 +137,15 @@ func newIntentTestServiceAtRoot(
 	handlerMap.Set(config.RuntimeNameRunsc, handler)
 	runtimeBinary := map[string]string{config.RuntimeNameRunsc: "/fake/runsc"}
 
-	// Production startup order: the intent journal loads before the sandbox
-	// manager reads containers/, so pending roots survive metadata recycling.
-	// The same metadata-existence rule production recovery uses decides which
-	// records a completed start has already satisfied.
-	intents, err := loadStartIntents(root, readSandboxMetadataIdentity(root))
+	// Production startup order: the operation journal loads before the intent
+	// journal (so committed takeovers can promote operation facts), and the
+	// intent journal loads before the sandbox manager reads containers/, so
+	// pending roots survive metadata recycling. The same metadata-existence
+	// rule production recovery uses decides which records a completed start
+	// has already satisfied.
+	operations, err := loadStartOperations(root)
+	require.NoError(t, err)
+	intents, err := loadStartIntents(root, readSandboxMetadataIdentity(root), operations.promoteCommittedTakeover)
 	require.NoError(t, err)
 
 	healthChan := make(chan bool, 10)
@@ -178,6 +182,7 @@ func newIntentTestServiceAtRoot(
 		fsMgr:                             newFSManager(nil, fsStateStore),
 		networkMgr:                        newNetworkManager(nil, "", false),
 		startIntents:                      intents,
+		startOperations:                   operations,
 	}
 	s.ready.Store(true)
 	s.recoveryReady.Store(true)
@@ -235,7 +240,7 @@ func fsStateOwned(s *sandboxService, id string) bool {
 
 func TestStartIntentStoreBeginRetainClearRoundTrip(t *testing.T) {
 	root := t.TempDir()
-	intentStore, err := loadStartIntents(root, func(string) sandboxMetadataIdentity { return sandboxMetadataIdentity{} })
+	intentStore, err := loadStartIntents(root, func(string) sandboxMetadataIdentity { return sandboxMetadataIdentity{} }, nil)
 	require.NoError(t, err)
 
 	record := &startIntentRecord{
@@ -262,13 +267,13 @@ func TestStartIntentStoreBeginRetainClearRoundTrip(t *testing.T) {
 	// record; a failure of the committed write keeps the ID protected.
 	require.NoError(t, intentStore.begin(record))
 	require.True(t, intentStore.Pending("sbox-store-roundtrip"))
-	require.NoError(t, intentStore.complete("sbox-store-roundtrip", record))
+	require.NoError(t, intentStore.complete("sbox-store-roundtrip", record, nil))
 	require.False(t, intentStore.Pending("sbox-store-roundtrip"))
 	_, err = os.Lstat(startIntentPath(filepath.Join(root, startIntentsDirName), "sbox-store-roundtrip"))
 	require.True(t, os.IsNotExist(err))
 
 	// The durable state matches what a fresh load sees.
-	reopened, err := loadStartIntents(root, func(string) sandboxMetadataIdentity { return sandboxMetadataIdentity{} })
+	reopened, err := loadStartIntents(root, func(string) sandboxMetadataIdentity { return sandboxMetadataIdentity{} }, nil)
 	require.NoError(t, err)
 	require.False(t, reopened.Pending("sbox-store-roundtrip"))
 
@@ -280,7 +285,7 @@ func TestStartIntentStoreBeginRetainClearRoundTrip(t *testing.T) {
 	require.NoError(t, os.Remove(recordPath))
 	require.NoError(t, os.MkdirAll(recordPath, 0700))
 	require.NoError(t, os.WriteFile(filepath.Join(recordPath, "child"), []byte("x"), 0600))
-	require.Error(t, intentStore.complete("sbox-store-roundtrip", record))
+	require.Error(t, intentStore.complete("sbox-store-roundtrip", record, nil))
 	require.True(t, intentStore.Pending("sbox-store-roundtrip"), "an unknown committed-write outcome keeps the ID protected")
 }
 
@@ -299,7 +304,7 @@ func TestLoadStartIntentsRetainsPendingWithoutMetadata(t *testing.T) {
 	require.NoError(t, os.MkdirAll(journal, 0700))
 	writeIntentFile(t, journal, "sbox-pending-restart", "gen-restart", startIntentPhasePrepared)
 
-	loaded, err := loadStartIntents(root, func(string) sandboxMetadataIdentity { return sandboxMetadataIdentity{} })
+	loaded, err := loadStartIntents(root, func(string) sandboxMetadataIdentity { return sandboxMetadataIdentity{} }, nil)
 	require.NoError(t, err)
 	require.True(t, loaded.Pending("sbox-pending-restart"))
 	require.FileExists(t, filepath.Join(journal, "sbox-pending-restart.json"))
@@ -329,7 +334,7 @@ func TestLoadStartIntentsKeepsPreparedIntentDespiteMatchingMetadata(t *testing.T
 	writeIntentFile(t, journal, "sbox-prepared-meta", "gen-prepared", startIntentPhasePrepared)
 	writeSandboxMetadataFile(t, root, "sbox-prepared-meta", config.RuntimeNameRunsc, "gen-prepared")
 
-	loaded, err := loadStartIntents(root, readSandboxMetadataIdentity(root))
+	loaded, err := loadStartIntents(root, readSandboxMetadataIdentity(root), nil)
 	require.NoError(t, err)
 	require.True(t, loaded.Pending("sbox-prepared-meta"))
 	require.FileExists(t, filepath.Join(journal, "sbox-prepared-meta.json"))
@@ -344,7 +349,7 @@ func TestLoadStartIntentsRetiresCommittedIntentOnFullIdentity(t *testing.T) {
 	writeIntentFile(t, journal, "sbox-committed-ok", "gen-committed", startIntentPhaseCommitted)
 	writeSandboxMetadataFile(t, root, "sbox-committed-ok", config.RuntimeNameRunsc, "gen-committed")
 
-	loaded, err := loadStartIntents(root, readSandboxMetadataIdentity(root))
+	loaded, err := loadStartIntents(root, readSandboxMetadataIdentity(root), nil)
 	require.NoError(t, err)
 	require.False(t, loaded.Pending("sbox-committed-ok"))
 	_, statErr := os.Lstat(filepath.Join(journal, "sbox-committed-ok.json"))
@@ -361,7 +366,7 @@ func TestLoadStartIntentsKeepsRetainedIntentDespiteMetadata(t *testing.T) {
 	writeIntentFile(t, journal, "sbox-retained-meta", "gen-retained", startIntentPhaseRetained)
 	writeSandboxMetadataFile(t, root, "sbox-retained-meta", config.RuntimeNameRunsc, "gen-retained")
 
-	loaded, err := loadStartIntents(root, readSandboxMetadataIdentity(root))
+	loaded, err := loadStartIntents(root, readSandboxMetadataIdentity(root), nil)
 	require.NoError(t, err)
 	require.True(t, loaded.Pending("sbox-retained-meta"))
 	require.FileExists(t, filepath.Join(journal, "sbox-retained-meta.json"))
@@ -405,7 +410,7 @@ func TestLoadStartIntentsRejectsCorruptRecords(t *testing.T) {
 			journal := filepath.Join(root, startIntentsDirName)
 			require.NoError(t, os.MkdirAll(journal, 0700))
 			require.NoError(t, os.WriteFile(filepath.Join(journal, "sbox-corrupt.json"), []byte(content), 0600))
-			_, err := loadStartIntents(root, func(string) sandboxMetadataIdentity { return sandboxMetadataIdentity{} })
+			_, err := loadStartIntents(root, func(string) sandboxMetadataIdentity { return sandboxMetadataIdentity{} }, nil)
 			require.Error(t, err, "corrupt record %q must fail startup explicitly", name)
 		})
 	}
@@ -421,7 +426,7 @@ func TestLoadStartIntentsRejectsUnexpectedEntries(t *testing.T) {
 	t.Run("directory with record name", func(t *testing.T) {
 		root := t.TempDir()
 		require.NoError(t, os.MkdirAll(filepath.Join(root, startIntentsDirName, "sbox-dir.json"), 0700))
-		_, err := loadStartIntents(root, func(string) sandboxMetadataIdentity { return sandboxMetadataIdentity{} })
+		_, err := loadStartIntents(root, func(string) sandboxMetadataIdentity { return sandboxMetadataIdentity{} }, nil)
 		require.ErrorContains(t, err, "unexpected directory")
 	})
 	t.Run("foreign file name", func(t *testing.T) {
@@ -429,7 +434,7 @@ func TestLoadStartIntentsRejectsUnexpectedEntries(t *testing.T) {
 		journal := filepath.Join(root, startIntentsDirName)
 		require.NoError(t, os.MkdirAll(journal, 0700))
 		require.NoError(t, os.WriteFile(filepath.Join(journal, "evil.json"), []byte("{}"), 0600))
-		_, err := loadStartIntents(root, func(string) sandboxMetadataIdentity { return sandboxMetadataIdentity{} })
+		_, err := loadStartIntents(root, func(string) sandboxMetadataIdentity { return sandboxMetadataIdentity{} }, nil)
 		require.ErrorContains(t, err, "unexpected entry")
 	})
 }
@@ -440,7 +445,7 @@ func TestLoadStartIntentsRemovesStaleTempFiles(t *testing.T) {
 	require.NoError(t, os.MkdirAll(journal, 0700))
 	require.NoError(t, os.WriteFile(filepath.Join(journal, ".intent-1234"), []byte("partial"), 0600))
 
-	loaded, err := loadStartIntents(root, func(string) sandboxMetadataIdentity { return sandboxMetadataIdentity{} })
+	loaded, err := loadStartIntents(root, func(string) sandboxMetadataIdentity { return sandboxMetadataIdentity{} }, nil)
 	require.NoError(t, err)
 	require.False(t, loaded.Pending("sbox-any"))
 	_, statErr := os.Lstat(filepath.Join(journal, ".intent-1234"))
@@ -460,7 +465,7 @@ func TestManagerLoadSkipsRecycleForPendingIntentRoots(t *testing.T) {
 
 	require.NoError(t, os.MkdirAll(filepath.Join(root, startIntentsDirName), 0700))
 	writeIntentFile(t, filepath.Join(root, startIntentsDirName), "sbox-keep-intent", "gen-restart", startIntentPhaseRetained)
-	loaded2, err := loadStartIntents(root, func(string) sandboxMetadataIdentity { return sandboxMetadataIdentity{} })
+	loaded2, err := loadStartIntents(root, func(string) sandboxMetadataIdentity { return sandboxMetadataIdentity{} }, nil)
 	require.NoError(t, err)
 	require.True(t, loaded2.Pending("sbox-keep-intent"))
 

@@ -76,7 +76,7 @@ func newTestService(t *testing.T, handlers map[string]svc.Handler) *sandboxServi
 		fsMgr:                             newFSManager(nil),
 		networkMgr:                        newNetworkManager(nil, "", false),
 	}
-	intents, err := loadStartIntents(tmpDir, func(string) sandboxMetadataIdentity { return sandboxMetadataIdentity{} })
+	intents, err := loadStartIntents(tmpDir, func(string) sandboxMetadataIdentity { return sandboxMetadataIdentity{} }, nil)
 	if !assert.NoError(t, err) {
 		t.FailNow()
 	}
