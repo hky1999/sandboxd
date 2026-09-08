@@ -53,6 +53,10 @@ service SandboxService {
   rpc Stats(StatsRequest) returns (StatsResponse) {}
   // Apply a scheduler-approved monotonic increase with incarnation and limit checks.
   rpc ResizeResources(ResizeResourcesRequest) returns (ResizeResourcesResponse) {}
+  // Apply a scheduler-approved memory decrease for one incarnation. The CPU
+  // numbers must equal the live limits; the daemon freezes the sandbox's host
+  // cgroup for the write window and never changes the scheduler lifecycle.
+  rpc ShrinkResources(ShrinkResourcesRequest) returns (ResizeResourcesResponse) {}
   // ListAvailableRuntimes lists runtime classes whose handlers are ready.
   rpc ListAvailableRuntimes(ListAvailableRuntimesRequest) returns (ListAvailableRuntimesResponse) {}
   // SetNetworkPolicy atomically replaces the network policy of a running sandbox.
@@ -579,6 +583,40 @@ message StatsResponse {
   // otherwise the server may have substituted current usage as the legacy
   // fallback, which is not an observed peak.
   bool memory_peak_known = 23;
+
+  // Monotonic per-incarnation resource revision. It starts at 1 when the
+  // physical incarnation is created and advances by one for every accepted
+  // grow/shrink operation, including partially applied ones; resource_revision
+  // itself is only a proven fact when resource_revision_known is true. An
+  // incarnation whose state is unknown (created before this contract, or a
+  // damaged record) reports false and rejects revision-conditioned operations
+  // rather than guessing an initial value.
+  uint64 resource_revision = 24;
+  bool resource_revision_known = 25;
+  // Enforced memory.high observation. unlimited has its own flag instead of
+  // masquerading as a finite 0; a false known flag means the number is unknown
+  // or belongs to the cgroup v1 backend, which has no memory.high.
+  uint64 memory_high_bytes = 26;
+  bool memory_high_known = 27;
+  bool memory_high_unlimited = 28;
+  // Kernel-observed frozen state of the sandbox's host cgroup (cgroup.events
+  // frozen). It is the freeze fact, not the freeze request.
+  bool frozen = 29;
+  bool frozen_known = 30;
+  // Operation identity of the last journal-recorded resource operation for
+  // this incarnation. The controller closes an UNKNOWN outcome only by
+  // matching this operation_id at the post-operation revision with
+  // resource_operation_pending false and correct, unfrozen limits; an equal
+  // target number alone never closes it.
+  string resource_operation_id = 31;
+  bool resource_operation_pending = 32;
+  // Absolute cgroup v2 directory behind this Stats read, proven by the
+  // daemon under the same physical lock as the resource revision identity.
+  // Empty when the backend cannot prove one (cgroup v1) or the incarnation's
+  // revision state does not verify. It is a read-only locator for event
+  // watchers; it is never a write target and never replaces the revision
+  // journal's identity verification.
+  string memory_cgroup_path = 33;
 }
 
 // ListAvailableRuntimesRequest requests the runtime classes currently available
@@ -610,6 +648,11 @@ message ResourceLimits {
 // The scheduler must reserve node capacity before sending this request. A
 // transport failure is an uncertain outcome: retain reservation until Stats
 // reconciles it. Matching target retries are idempotent within an incarnation.
+// The operation_id binds the full request fingerprint (identity, revision,
+// numbers, deadline, type); the same ID replays only its recorded outcome and
+// a different fingerprint under the same ID is rejected. expected_revision
+// must equal the incarnation's current resource revision; a request without a
+// proven revision is rejected instead of silently skipping the compare.
 message ResizeResourcesRequest {
   string sandbox_id = 1;
   string resource_generation = 2;
@@ -617,6 +660,24 @@ message ResizeResourcesRequest {
   ResourceLimits target = 4;
   // Required absolute command expiry, checked again under the resource lock.
   int64 deadline_unix_ms = 5;
+  string operation_id = 6;
+  uint64 expected_revision = 7;
+}
+
+// ShrinkResources carries the same field contract as ResizeResources. It is a
+// separate operation type in the fingerprint and on the wire: memory may only
+// decrease and the CPU numbers must equal the live limits exactly. The
+// response reuses ResizeResourcesResponse without changing the independent
+// operation semantics.
+message ShrinkResourcesRequest {
+  string sandbox_id = 1;
+  string resource_generation = 2;
+  ResourceLimits expected = 3;
+  ResourceLimits target = 4;
+  // Required absolute command expiry, checked again under the resource lock.
+  int64 deadline_unix_ms = 5;
+  string operation_id = 6;
+  uint64 expected_revision = 7;
 }
 
 message ResizeResourcesResponse {

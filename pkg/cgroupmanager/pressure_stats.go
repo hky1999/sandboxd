@@ -67,5 +67,24 @@ func readV2PressureStats(groupPath string) Stats {
 		result.MemoryOOMEvents = values["oom"]
 		result.MemoryOOMKillEvents = values["oom_kill"]
 	}
+	result.Frozen, result.FrozenKnown = readFrozenState(filepath.Join(groupPath, "cgroup.events"))
 	return result
+}
+
+// readFrozenState reads the frozen value from cgroup.events. The kernel only
+// ever writes 0 or 1: any other value is a malformed or foreign source and
+// must stay unknown instead of masquerading as an unfrozen reading.
+func readFrozenState(path string) (frozen, known bool) {
+	values, ok := readPressureCounters(path, "frozen")
+	if !ok {
+		return false, false
+	}
+	switch values["frozen"] {
+	case 0:
+		return false, true
+	case 1:
+		return true, true
+	default:
+		return false, false
+	}
 }

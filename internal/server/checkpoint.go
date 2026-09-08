@@ -803,6 +803,15 @@ func (h *sandboxService) executeCheckpoint(
 		h.checkpointState.Complete(attempt, identityErr)
 		return
 	}
+	// Checkpoint drives Sentry-dependent runsc commands: while this daemon
+	// still owns an open shrink freeze for the source, those commands could
+	// hang against the frozen Sentry under the physical lock and wedge the
+	// recovery that must unfreeze it. Refuse until reconciliation closes the
+	// record; the refusal never releases or adopts anyone's freeze.
+	if err := h.rejectUnclosedResourceOperation(key.SandboxID); err != nil {
+		h.checkpointState.Complete(attempt, err)
+		return
+	}
 	_, err := checkpoint.PublishAt(checkpointDir, source, func(imagePath string) error {
 		// W7-P1.1: snapshot the effective cgroup limits BEFORE the runtime
 		// checkpoint (sandbox still alive) so the restore can re-apply them

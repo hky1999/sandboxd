@@ -7,7 +7,9 @@ import (
 	"context"
 	"errors"
 	"net"
+	"os"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -24,36 +26,81 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+// resizeCgroups is the in-memory cgroup backend for the resource operation
+// tests. It simulates the kernel-controlled facts the server can only
+// observe: freeze request/event bits, memory.high/max writes, and per-file
+// write failures for partial outcomes.
 type resizeCgroups struct {
 	stats        cgroupmanager.Stats
 	writes       int
+	memoryWrites int
+	freezeWrites int
 	failUpdate   bool
 	failReadback bool
 	noWrite      bool
 	onPrepare    func()
 	onStats      func()
+	highRatio    float64
+
+	mu                sync.Mutex
+	requestFrozen     bool
+	eventsFrozen      bool
+	requestKnown      bool
+	eventsKnown       bool
+	autoFreezeConfirm bool // the kernel reaches the requested state instantly
+	failFreezeRead    bool
+	shrinkSupported   bool // the v2 freezer capability; false shapes a v1 backend
+	failFreezeWrite   bool
+	failMemoryWrite   bool // apply nothing, return an error
+	partialHighWrite  bool // apply memory.high only, return an error
+	onWriteFreeze     func(frozen bool)
 }
 
-func (*resizeCgroups) Allocate() (string, error) { return "/sandbox/lease", nil }
-func (*resizeCgroups) Recycle(string) error      { return nil }
-func (*resizeCgroups) ShutDown() error           { return nil }
-func (c *resizeCgroups) Stats(string) (cgroupmanager.Stats, error) {
+func (*resizeCgroups) Allocate() (string, error)    { return "/sandbox/lease", nil }
+func (*resizeCgroups) Recycle(string) error         { return nil }
+func (*resizeCgroups) ShutDown() error              { return nil }
+func (c *resizeCgroups) SupportsMemoryShrink() bool { return c.shrinkSupported }
+
+func (c *resizeCgroups) Stats(name string) (cgroupmanager.Stats, error) {
 	if c.onStats != nil {
 		c.onStats()
 	}
-	if c.failReadback && c.writes > 0 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.failReadback && c.writes+c.memoryWrites > 0 {
 		return cgroupmanager.Stats{}, errors.New("stats offline")
 	}
-	return c.stats, nil
+	result := c.stats
+	result.Frozen, result.FrozenKnown = c.eventsFrozen, c.eventsKnown
+	// The v2 backend names the absolute directory it read; the fake's cgroup
+	// paths are already absolute temp directories.
+	result.MemoryCgroupPath = name
+	return result, nil
 }
+
+// applyMemoryHigh mirrors the node policy so the fake enforces the same
+// page-aligned value the server derives.
+func (c *resizeCgroups) applyMemoryHigh(maxBytes uint64) {
+	if c.highRatio > 0 {
+		c.stats.MemoryHighBytes = cgroupmanager.MemoryHighBytes(maxBytes, c.highRatio)
+		c.stats.MemoryHighKnown, c.stats.MemoryHighUnlimited = true, false
+		return
+	}
+	c.stats.MemoryHighBytes = 0
+	c.stats.MemoryHighKnown, c.stats.MemoryHighUnlimited = true, true
+}
+
 func (c *resizeCgroups) Prepare(_ string, r *runtime.LinuxSandboxResources) error {
 	if c.onPrepare != nil {
 		c.onPrepare()
 	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.writes++
 	if !c.noWrite {
 		c.stats.CPUQuotaUsec, c.stats.CPUPeriodUsec = r.CpuQuota, r.CpuPeriod
 		c.stats.MemoryLimitBytes = uint64(r.MemoryLimitInBytes)
+		c.applyMemoryHigh(c.stats.MemoryLimitBytes)
 	}
 	if c.failUpdate {
 		return errors.New("memory.high write failed")
@@ -61,26 +108,105 @@ func (c *resizeCgroups) Prepare(_ string, r *runtime.LinuxSandboxResources) erro
 	return nil
 }
 
+func (c *resizeCgroups) CgroupIdentity(name string) (cgroupmanager.CgroupIdentity, error) {
+	info, err := os.Stat(name)
+	if err != nil {
+		return cgroupmanager.CgroupIdentity{}, err
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return cgroupmanager.CgroupIdentity{}, errors.New("no inode identity")
+	}
+	return cgroupmanager.CgroupIdentity{Path: name, Inode: stat.Ino, Device: uint64(stat.Dev)}, nil
+}
+
+func (c *resizeCgroups) ReadFreeze(string) (cgroupmanager.FreezeState, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.failFreezeRead {
+		return cgroupmanager.FreezeState{}, errors.New("freeze files unreadable")
+	}
+	return cgroupmanager.FreezeState{
+		RequestKnown: c.requestKnown, RequestFrozen: c.requestFrozen,
+		EventsKnown: c.eventsKnown, Frozen: c.eventsFrozen,
+	}, nil
+}
+
+func (c *resizeCgroups) WriteFreeze(_ string, frozen bool) error {
+	c.mu.Lock()
+	c.freezeWrites++
+	if c.failFreezeWrite {
+		c.mu.Unlock()
+		return errors.New("freeze file offline")
+	}
+	c.requestFrozen = frozen
+	if c.autoFreezeConfirm {
+		c.eventsFrozen = frozen
+	}
+	hook := c.onWriteFreeze
+	c.mu.Unlock()
+	// The hook runs outside the lock so tests can block inside it.
+	if hook != nil {
+		hook(frozen)
+	}
+	return nil
+}
+
+func (c *resizeCgroups) WriteMemoryLimits(_ string, highBytes, maxBytes uint64) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.memoryWrites++
+	if c.failMemoryWrite {
+		return errors.New("memory.max write failed")
+	}
+	// Fixed shrink order observable by tests: memory.high lands first.
+	c.stats.MemoryHighBytes, c.stats.MemoryHighKnown, c.stats.MemoryHighUnlimited = highBytes, true, false
+	if c.partialHighWrite {
+		return errors.New("memory.max write failed after memory.high")
+	}
+	c.stats.MemoryLimitBytes = maxBytes
+	return nil
+}
+
+// freezeStateSnapshot copies the simulated kernel freeze facts.
+func (c *resizeCgroups) freezeStateSnapshot() (requestFrozen, eventsFrozen bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.requestFrozen, c.eventsFrozen
+}
+
 func newResizeService(t *testing.T) (*sandboxService, *resizeCgroups, *runtime.ResizeResourcesRequest) {
 	t.Helper()
 	h := newTestService(t, map[string]svc.Handler{"runsc": svc.NewFakeRuntimeHandler()})
 	h.config.CPULimitMode = config.CPULimitModeQuota
+	h.config.ResourceConfig.MemoryHighRatio = 0.8
+	// The revision journal binds the cgroup's inode identity, so the fake
+	// backend needs a real directory to stat.
+	cgroupPath := t.TempDir()
 	labels := elasticTestRequest(t).Labels
 	labels[resourceGenerationLabel] = "generation-1"
 	require.NoError(t, h.sandboxManager.StoreMetadata("elastic", &runtime.SandboxMetadata{
 		ID: "elastic", RuntimeHandler: "runsc", Labels: labels,
-		ResourceFacts: map[string]string{config.ResourceNameCgroup: "/sandbox/lease"},
+		ResourceFacts: map[string]string{config.ResourceNameCgroup: cgroupPath},
 	}))
-	c := &resizeCgroups{stats: cgroupmanager.Stats{
-		CPUQuotaUsec: 50000, CPUPeriodUsec: 100000, CPULimitsKnown: true,
-		MemoryLimitBytes: 512 * 1024 * 1024, MemoryLimitKnown: true,
-	}}
+	c := &resizeCgroups{
+		highRatio: 0.8, requestKnown: true, eventsKnown: true, shrinkSupported: true,
+		stats: cgroupmanager.Stats{
+			CPUQuotaUsec: 50000, CPUPeriodUsec: 100000, CPULimitsKnown: true,
+			MemoryLimitBytes: 512 * 1024 * 1024, MemoryLimitKnown: true,
+			MemoryUsageBytes: 64 * 1024 * 1024, MemoryUsageKnown: true,
+		},
+	}
+	c.applyMemoryHigh(c.stats.MemoryLimitBytes)
 	h.cgroupMgr = c
+	// The incarnation is created with a proven revision of 1.
+	require.NoError(t, h.initResourceOperationState("elastic", "generation-1", cgroupPath))
 	request := &runtime.ResizeResourcesRequest{
 		SandboxID: "elastic", ResourceGeneration: "generation-1",
 		DeadlineUnixMs: time.Now().Add(30 * time.Second).UnixMilli(),
-		Expected:       &runtime.ResourceLimits{CpuQuotaUsec: 50000, CpuPeriodUsec: 100000, MemoryLimitBytes: 512 * 1024 * 1024},
-		Target:         &runtime.ResourceLimits{CpuQuotaUsec: 100000, CpuPeriodUsec: 100000, MemoryLimitBytes: 1024 * 1024 * 1024},
+		OperationID:    "operation-grow-1", ExpectedRevision: 1,
+		Expected: &runtime.ResourceLimits{CpuQuotaUsec: 50000, CpuPeriodUsec: 100000, MemoryLimitBytes: 512 * 1024 * 1024},
+		Target:   &runtime.ResourceLimits{CpuQuotaUsec: 100000, CpuPeriodUsec: 100000, MemoryLimitBytes: 1024 * 1024 * 1024},
 	}
 	return h, c, request
 }
@@ -92,12 +218,32 @@ func TestResizeResourcesGrowthReadbackAndIdempotentRetry(t *testing.T) {
 	require.True(t, response.Complete)
 	require.Equal(t, int64(100000), response.Actual.CpuQuotaUsec)
 	require.Equal(t, uint64(1024*1024*1024), response.Actual.MemoryLimitBytes)
-	require.Equal(t, "generation-1", response.Actual.ResourceGeneration)
-	require.Contains(t, response.Actual.ElasticPolicy, "ceiling")
+	require.Equal(t, uint64(2), response.Actual.ResourceRevision)
+	require.True(t, response.Actual.ResourceRevisionKnown)
+	require.Equal(t, "operation-grow-1", response.Actual.ResourceOperationID)
+	require.False(t, response.Actual.ResourceOperationPending)
+	// The revision advances exactly once per executed operation.
+	state, result, err := h.loadResourceOperationState("elastic", "generation-1")
+	require.NoError(t, err)
+	require.Equal(t, resourceStateLoaded, result)
+	require.Equal(t, uint64(2), state.Revision)
+	// An identical retry replays the recorded outcome; it never re-executes
+	// the write under the revision contract.
 	response, err = h.ResizeResources(context.Background(), request)
 	require.NoError(t, err)
 	require.True(t, response.Complete)
-	require.Equal(t, 2, c.writes) // repeat also repairs memory.high after a partial write
+	require.Equal(t, uint64(2), response.Actual.ResourceRevision)
+	require.Equal(t, 1, c.writes)
+	// A fresh operation under the new revision may re-issue the same targets,
+	// which is what repairs a stale memory.high after a partial write.
+	followUp := proto.Clone(request).(*runtime.ResizeResourcesRequest)
+	followUp.OperationID, followUp.ExpectedRevision = "operation-grow-2", 2
+	followUp.Expected = proto.Clone(request.Target).(*runtime.ResourceLimits)
+	response, err = h.ResizeResources(context.Background(), followUp)
+	require.NoError(t, err)
+	require.True(t, response.Complete)
+	require.Equal(t, uint64(3), response.Actual.ResourceRevision)
+	require.Equal(t, 2, c.writes)
 }
 
 func TestResizeResourcesRejectsStaleAndInvalidRequestsBeforeWrite(t *testing.T) {
@@ -109,6 +255,14 @@ func TestResizeResourcesRejectsStaleAndInvalidRequestsBeforeWrite(t *testing.T) 
 		"cpu period":       func(r *runtime.ResizeResourcesRequest) { r.Target.CpuPeriodUsec = 200000 },
 		"decrease":         func(r *runtime.ResizeResourcesRequest) { r.Target.MemoryLimitBytes = 128 * 1024 * 1024 },
 		"missing target":   func(r *runtime.ResizeResourcesRequest) { r.Target = nil },
+		"missing opid":     func(r *runtime.ResizeResourcesRequest) { r.OperationID = "" },
+		"blank revision":   func(r *runtime.ResizeResourcesRequest) { r.ExpectedRevision = 0 },
+		"stale revision": func(r *runtime.ResizeResourcesRequest) {
+			r.ExpectedRevision = 2 // the incarnation is still on revision 1
+		},
+		"opid control character": func(r *runtime.ResizeResourcesRequest) {
+			r.OperationID = "operation-grow-1\x00"
+		},
 	}
 	for name, modify := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -121,6 +275,23 @@ func TestResizeResourcesRejectsStaleAndInvalidRequestsBeforeWrite(t *testing.T) 
 	}
 }
 
+// An incarnation without revision state (created before this contract, or
+// with the journal removed) must reject bidirectional operations instead of
+// guessing an initial revision; Stats reports the revision as unknown.
+func TestResizeRejectsIncarnationsWithoutProvenRevision(t *testing.T) {
+	h, c, request := newResizeService(t)
+	_, path := h.resourceStatePath("elastic", "generation-1")
+	require.NoError(t, os.Remove(path))
+	stats, err := h.Stats(context.Background(), &runtime.StatsRequest{ID: "elastic"})
+	require.NoError(t, err)
+	require.False(t, stats.ResourceRevisionKnown)
+	require.Zero(t, stats.ResourceRevision)
+	require.False(t, stats.ResourceOperationPending)
+	_, err = h.ResizeResources(context.Background(), request)
+	require.ErrorContains(t, err, "no proven resource revision")
+	require.Zero(t, c.writes)
+}
+
 func TestResizeResourcesReportsPartialWritesAndUncertainReadback(t *testing.T) {
 	h, c, request := newResizeService(t)
 	c.failUpdate = true
@@ -129,8 +300,22 @@ func TestResizeResourcesReportsPartialWritesAndUncertainReadback(t *testing.T) {
 	require.False(t, response.Complete)
 	require.Contains(t, response.UpdateError, "memory.high")
 	require.Equal(t, request.Target.MemoryLimitBytes, response.Actual.MemoryLimitBytes)
+	// A partial outcome keeps the advanced revision and closes the operation:
+	// the controller reconciles through Stats, not by re-running the command.
+	require.Equal(t, uint64(2), response.Actual.ResourceRevision)
+	require.False(t, response.Actual.ResourceOperationPending)
 	c.failUpdate = false
+	// Replaying the partial operation returns the recorded outcome without
+	// another write; a fresh operation under the new revision repairs it.
 	response, err = h.ResizeResources(context.Background(), request)
+	require.NoError(t, err)
+	require.False(t, response.Complete)
+	require.Contains(t, response.UpdateError, "memory.high")
+	require.Equal(t, 1, c.writes)
+	followUp := proto.Clone(request).(*runtime.ResizeResourcesRequest)
+	followUp.OperationID, followUp.ExpectedRevision = "operation-grow-2", 2
+	followUp.Expected = proto.Clone(request.Target).(*runtime.ResourceLimits)
+	response, err = h.ResizeResources(context.Background(), followUp)
 	require.NoError(t, err)
 	require.True(t, response.Complete)
 	h, c, request = newResizeService(t)
@@ -138,6 +323,30 @@ func TestResizeResourcesReportsPartialWritesAndUncertainReadback(t *testing.T) {
 	_, err = h.ResizeResources(context.Background(), request)
 	require.ErrorContains(t, err, "after possible write")
 	require.Equal(t, 1, c.writes)
+	// The journal stays open: an uncertain readback is UNKNOWN, and a new
+	// operation must not run until reconciliation closes it. Restore the
+	// backend's readability first — the point is what Stats observes about
+	// the still-open record, not the backend failure itself.
+	c.failReadback = false
+	stats, err := h.Stats(context.Background(), &runtime.StatsRequest{ID: "elastic"})
+	require.NoError(t, err)
+	require.True(t, stats.ResourceOperationPending)
+	require.Equal(t, "operation-grow-1", stats.ResourceOperationID)
+	_, err = h.ResizeResources(context.Background(), &runtime.ResizeResourcesRequest{
+		SandboxID: "elastic", ResourceGeneration: "generation-1",
+		DeadlineUnixMs: time.Now().Add(30 * time.Second).UnixMilli(),
+		OperationID:    "operation-grow-2", ExpectedRevision: 2,
+		Expected: request.Expected, Target: request.Target,
+	})
+	require.ErrorContains(t, err, "unclosed resource operation")
+	require.Equal(t, 1, c.writes)
+	// Reconciliation (here: the startup-style scan with the backend back
+	// online) closes the record with the physically verified outcome.
+	require.NoError(t, h.recoverResourceOperationStates(context.Background()))
+	stats, err = h.Stats(context.Background(), &runtime.StatsRequest{ID: "elastic"})
+	require.NoError(t, err)
+	require.False(t, stats.ResourceOperationPending)
+	require.Equal(t, uint64(1024*1024*1024), stats.MemoryLimitBytes)
 	h, c, request = newResizeService(t)
 	c.noWrite = true
 	response, err = h.ResizeResources(context.Background(), request)
@@ -297,10 +506,13 @@ func TestElasticReadbackMustPassBeforeRuntimeStart(t *testing.T) {
 			c.noWrite = mismatch
 			c.stats.CPUQuotaUsec = 800000
 			c.stats.MemoryLimitBytes = 8192 * 1024 * 1024
+			c.applyMemoryHigh(c.stats.MemoryLimitBytes)
+			// A distinct generation: the fixture already proved revision 1
+			// for generation-1, and one incarnation is initialized once.
 			annotations := elasticTestRequest(t).Labels
-			annotations[resourceGenerationLabel] = "generation-1"
+			annotations[resourceGenerationLabel] = "generation-readback"
 			start := svc.StartConfig{
-				ID: "elastic", CgroupPath: "/sandbox/lease",
+				ID: "elastic", CgroupPath: t.TempDir(),
 				Resources:   &runtime.LinuxSandboxResources{CpuQuota: 50000, CpuPeriod: 100000, MemoryLimitInBytes: 512 * 1024 * 1024},
 				Annotations: annotations,
 			}

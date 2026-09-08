@@ -41,9 +41,10 @@ func birthMetadata(id, generation string) *runtime.SandboxMetadata {
 	}
 }
 
-func birthStartConfig(id string, annotations map[string]string, quota, memoryBytes int64) svc.StartConfig {
+func birthStartConfig(t *testing.T, id string, annotations map[string]string, quota, memoryBytes int64) svc.StartConfig {
+	t.Helper()
 	return svc.StartConfig{
-		ID: id, CgroupPath: "/sandbox/lease",
+		ID: id, CgroupPath: t.TempDir(),
 		Resources:   &runtime.LinuxSandboxResources{CpuQuota: quota, CpuPeriod: 100000, MemoryLimitInBytes: memoryBytes},
 		Annotations: annotations,
 	}
@@ -63,7 +64,7 @@ func TestBirthEvidencePersistsObservedLeafLimitsBeforeRuntimeStart(t *testing.T)
 	h, _, _ := newResizeService(t)
 	handler := &observedStartHandler{Handler: svc.NewFakeRuntimeHandler()}
 	h.serviceHandler.Set("runsc", handler)
-	metadata := birthMetadata("elastic", "generation-1")
+	metadata := birthMetadata("elastic", "generation-birth")
 	handler.beforeStart = func() {
 		raw, err := os.ReadFile(filepath.Join(h.config.RootDir, "containers", "elastic", config.SandboxMetaFile))
 		require.NoError(t, err)
@@ -71,13 +72,13 @@ func TestBirthEvidencePersistsObservedLeafLimitsBeforeRuntimeStart(t *testing.T)
 		require.NoError(t, proto.Unmarshal(raw, saved))
 		require.Equal(t, runtime.SandboxPhysicalPhase_SANDBOX_PHYSICAL_PHASE_INTENT, saved.PhysicalPhase)
 		birth := decodeBirthEvidence(t, saved.Labels[birthResourcesLabel])
-		require.Equal(t, "generation-1", birth.ResourceGeneration)
+		require.Equal(t, "generation-birth", birth.ResourceGeneration)
 		require.Equal(t, int64(50000), birth.CpuQuotaUsec)
 		require.Equal(t, uint64(512*1024*1024), birth.MemoryLimitBytes)
 	}
 	require.NoError(t, h.sandboxManager.PersistMetadata("elastic", metadata))
 	require.NoError(t, h.startSandboxRuntime(context.Background(), "runsc",
-		birthStartConfig("elastic", birthAnnotations(t, "generation-1"), 50000, 512*1024*1024), metadata))
+		birthStartConfig(t, "elastic", birthAnnotations(t, "generation-birth"), 50000, 512*1024*1024), metadata))
 	require.True(t, handler.started)
 
 	raw := metadata.Labels[birthResourcesLabel]
@@ -85,7 +86,7 @@ func TestBirthEvidencePersistsObservedLeafLimitsBeforeRuntimeStart(t *testing.T)
 	evidence := decodeBirthEvidence(t, raw)
 	require.Equal(t, birthResourceEvidenceSchemaVersion, evidence.SchemaVersion)
 	require.Equal(t, "elastic", evidence.SandboxID)
-	require.Equal(t, "generation-1", evidence.ResourceGeneration)
+	require.Equal(t, "generation-birth", evidence.ResourceGeneration)
 	require.Equal(t, "start", evidence.Phase)
 	require.Equal(t, int64(50000), evidence.CpuQuotaUsec)
 	require.Equal(t, uint64(100000), evidence.CpuPeriodUsec)
@@ -112,8 +113,8 @@ func TestBirthEvidencePersistenceFailureBlocksRuntimeStart(t *testing.T) {
 	require.NoError(t, os.WriteFile(
 		filepath.Join(h.config.RootDir, "containers", id), []byte("not a directory"), 0600))
 	err := h.startSandboxRuntime(context.Background(), "runsc",
-		birthStartConfig(id, birthAnnotations(t, "generation-1"), 50000, 512*1024*1024),
-		birthMetadata(id, "generation-1"))
+		birthStartConfig(t, id, birthAnnotations(t, "generation-birth"), 50000, 512*1024*1024),
+		birthMetadata(id, "generation-birth"))
 	require.ErrorContains(t, err, "persist elastic start birth evidence")
 	require.False(t, handler.started)
 }
@@ -141,9 +142,9 @@ func TestBirthEvidenceRejectsUnboundMetadata(t *testing.T) {
 			h, _, _ := newResizeService(t)
 			handler := &observedStartHandler{Handler: svc.NewFakeRuntimeHandler()}
 			h.serviceHandler.Set("runsc", handler)
-			metadata := prepare(birthMetadata("elastic", "generation-1"))
+			metadata := prepare(birthMetadata("elastic", "generation-birth"))
 			err := h.startSandboxRuntime(context.Background(), "runsc",
-				birthStartConfig("elastic", birthAnnotations(t, "generation-1"), 50000, 512*1024*1024),
+				birthStartConfig(t, "elastic", birthAnnotations(t, "generation-birth"), 50000, 512*1024*1024),
 				metadata)
 			require.ErrorContains(t, err, "birth evidence requires prepared INTENT metadata")
 			require.False(t, handler.started)
@@ -172,16 +173,16 @@ func TestRestoreBirthEvidenceRecordsGrownLimitsAndFreshGeneration(t *testing.T) 
 	h, _, _ := newResizeService(t)
 	handler := &observedRestoreHandler{Handler: svc.NewFakeRuntimeHandler()}
 	h.serviceHandler.Set("runsc", handler)
-	metadata := birthMetadata("elastic", "generation-2")
+	metadata := birthMetadata("elastic", "generation-restore")
 	require.NoError(t, h.sandboxManager.PersistMetadata("elastic", metadata))
 	require.NoError(t, h.restoreSandboxRuntime(context.Background(), "runsc",
-		birthStartConfig("elastic", birthAnnotations(t, "generation-2"), 125000, 2048*1024*1024),
+		birthStartConfig(t, "elastic", birthAnnotations(t, "generation-restore"), 125000, 2048*1024*1024),
 		"checkpoint.img", metadata))
 	require.True(t, handler.restored)
 
 	evidence := decodeBirthEvidence(t, metadata.Labels[birthResourcesLabel])
 	require.Equal(t, "restore", evidence.Phase)
-	require.Equal(t, "generation-2", evidence.ResourceGeneration)
+	require.Equal(t, "generation-restore", evidence.ResourceGeneration)
 	require.Equal(t, int64(125000), evidence.CpuQuotaUsec)
 	require.Equal(t, uint64(100000), evidence.CpuPeriodUsec)
 	require.Equal(t, uint64(2048*1024*1024), evidence.MemoryLimitBytes)

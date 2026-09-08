@@ -27,10 +27,10 @@ func TestUnknownMemoryLimitBlocksBirthEvidenceAndRuntime(t *testing.T) {
 		c.stats.MemoryLimitKnown = false // numbers still equal the request
 		handler := &observedStartHandler{Handler: svc.NewFakeRuntimeHandler()}
 		h.serviceHandler.Set("runsc", handler)
-		metadata := birthMetadata("elastic", "generation-1")
+		metadata := birthMetadata("elastic", "generation-limit")
 		require.NoError(t, h.sandboxManager.PersistMetadata("elastic", metadata))
 		err := h.startSandboxRuntime(context.Background(), "runsc",
-			birthStartConfig("elastic", birthAnnotations(t, "generation-1"), 50000, 512*1024*1024), metadata)
+			birthStartConfig(t, "elastic", birthAnnotations(t, "generation-limit"), 50000, 512*1024*1024), metadata)
 		require.ErrorContains(t, err, "cannot prove requested limits")
 		require.False(t, handler.started)
 		require.NotContains(t, metadata.Labels, birthResourcesLabel)
@@ -43,10 +43,10 @@ func TestUnknownMemoryLimitBlocksBirthEvidenceAndRuntime(t *testing.T) {
 		c.stats.MemoryLimitKnown = false
 		handler := &observedRestoreHandler{Handler: svc.NewFakeRuntimeHandler()}
 		h.serviceHandler.Set("runsc", handler)
-		metadata := birthMetadata("elastic", "generation-2")
+		metadata := birthMetadata("elastic", "generation-limit-restore")
 		require.NoError(t, h.sandboxManager.PersistMetadata("elastic", metadata))
 		err := h.restoreSandboxRuntime(context.Background(), "runsc",
-			birthStartConfig("elastic", birthAnnotations(t, "generation-2"), 50000, 512*1024*1024),
+			birthStartConfig(t, "elastic", birthAnnotations(t, "generation-limit-restore"), 50000, 512*1024*1024),
 			"checkpoint.img", metadata)
 		require.ErrorContains(t, err, "cannot prove requested limits")
 		require.False(t, handler.restored)

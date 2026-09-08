@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/inclusionAI/sandboxd/config"
+	"github.com/inclusionAI/sandboxd/pkg/errord"
 
 	"github.com/containerd/cgroups/v3"
 	cg "github.com/containerd/cgroups/v3/cgroup1"
@@ -154,6 +155,33 @@ func (*cgroupV1) stat(name string) (Stats, error) {
 
 func (*cgroupV1) newOOMWatcher() (oomWatcher, error) {
 	return newV1OOMWatcher()
+}
+
+// identity resolves the v1 memory-hierarchy directory for the manager name.
+func (*cgroupV1) identity(name string) (CgroupIdentity, error) {
+	info, err := os.Stat(filepath.Join(cgroupMountpoint, "memory", name))
+	if err != nil {
+		return CgroupIdentity{}, fmt.Errorf("stat cgroup %s: %w", name, err)
+	}
+	if !info.IsDir() {
+		return CgroupIdentity{}, fmt.Errorf("cgroup %s is not a directory", name)
+	}
+	return cgroupIdentityFromInfo(name, info)
+}
+
+// The freeze writer and the ordered memory writer are cgroup v2 primitives:
+// cgroup v1 has neither cgroup.freeze nor memory.high, so the operations that
+// depend on them must reject explicitly instead of degrading silently.
+func (*cgroupV1) readFreeze(string) (FreezeState, error) {
+	return FreezeState{}, fmt.Errorf("cgroup freeze control requires cgroup v2: %w", errord.ErrNotImplemented)
+}
+
+func (*cgroupV1) writeFreeze(string, bool) error {
+	return fmt.Errorf("cgroup freeze control requires cgroup v2: %w", errord.ErrNotImplemented)
+}
+
+func (*cgroupV1) writeMemoryLimits(string, uint64, uint64) error {
+	return fmt.Errorf("ordered memory limit writes require cgroup v2: %w", errord.ErrNotImplemented)
 }
 
 func (*cgroupV1) kill(name string) error {

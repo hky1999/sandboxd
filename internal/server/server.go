@@ -82,6 +82,11 @@ type sandboxCgroups interface {
 	Recycle(string) error
 	Prepare(string, *runtime.LinuxSandboxResources) error
 	Stats(string) (cgroupmanager.Stats, error)
+	CgroupIdentity(string) (cgroupmanager.CgroupIdentity, error)
+	ReadFreeze(string) (cgroupmanager.FreezeState, error)
+	WriteFreeze(string, bool) error
+	WriteMemoryLimits(string, uint64, uint64) error
+	SupportsMemoryShrink() bool
 	ShutDown() error
 }
 
@@ -129,6 +134,12 @@ type sandboxService struct {
 	checkpointing                     map[string]struct{}
 	firecrackerCheckpointMemorySlotMu sync.Mutex
 	firecrackerCheckpointMemorySlot   chan struct{}
+
+	// resourceStateMu serializes resource-state journal publication across
+	// sandboxes and guards the self-heal loop's lazy start.
+	resourceStateMu          sync.Mutex
+	resourceStateHeal        chan struct{}
+	resourceStateHealStarted bool
 }
 
 // loadRuntimeHandlers loads runtime handlers with exponential backoff.
@@ -280,6 +291,9 @@ func (h *sandboxService) startSandboxRuntime(
 		if err = h.verifyPreparedElasticLimits(startConfig, "start", metadata); err != nil {
 			return err
 		}
+		if err = h.initializeResourceRevision(startConfig, metadata); err != nil {
+			return err
+		}
 		err = handler.Start(ctx, startConfig)
 	}
 	if err != nil {
@@ -320,6 +334,9 @@ func (h *sandboxService) restoreSandboxRuntime(
 		}
 	}
 	if err = h.verifyPreparedElasticLimits(startConfig, "restore", metadata); err != nil {
+		return err
+	}
+	if err = h.initializeResourceRevision(startConfig, metadata); err != nil {
 		return err
 	}
 	if err := restoreHandler.Restore(ctx, startConfig, checkpointImage); err != nil {
@@ -376,6 +393,15 @@ func (h *sandboxService) deleteSandboxRuntime(ctx context.Context, sandboxID str
 
 	if expected != "" && (c.Metadata == nil || c.Metadata.Labels[resourceGenerationLabel] != expected) {
 		return errord.ToGRPCf(errord.ErrFailedPrecondition, "sandbox resource generation changed before delete")
+	}
+
+	// A daemon-owned freeze from an unfinished shrink must be released before
+	// the runtime handler is asked to delete the sandbox: runsc's control
+	// path needs a responsive Sentry, and a frozen cgroup would hang it. Only
+	// this daemon's own still-valid intent for this exact incarnation is
+	// released; a foreign freeze is left for the runtime to report.
+	if generation := c.Metadata.GetLabels()[resourceGenerationLabel]; generation != "" {
+		h.releaseOwnedFreezeForDelete(sandboxID, generation)
 	}
 
 	if h.checkRuntime(c.Metadata.RuntimeHandler) != nil {
@@ -486,6 +512,13 @@ func (h *sandboxService) deleteSandboxRuntime(ctx context.Context, sandboxID str
 		if err := h.writeRetirement(sandboxID, expected, true); err != nil {
 			return err
 		}
+	}
+	if deleteGeneration != "" {
+		// The physical delete is the authority that this incarnation — and
+		// with it any resource operation it still owned — is finished. Close
+		// and drop the revision journal only now; a missing sandbox alone
+		// never justified this elsewhere.
+		h.retireResourceOperationState(sandboxID, deleteGeneration)
 	}
 	return nil
 }
@@ -612,9 +645,10 @@ func (h *sandboxService) resourceStats(id string) (*runtime.StatsResponse, error
 	if err != nil {
 		return nil, errord.ToGRPC(fmt.Errorf("stat cgroup %s failed: %v", cgroupPath, err))
 	}
-
+	generation := current.Metadata.GetLabels()[resourceGenerationLabel]
+	operation := h.observeResourceOperationState(id, generation, cgroupPath, cgroupStats.MemoryCgroupPath)
 	return &runtime.StatsResponse{
-		ResourceGeneration:  current.Metadata.GetLabels()[resourceGenerationLabel],
+		ResourceGeneration:  generation,
 		CpuPressureKnown:    cgroupStats.CPUPressureKnown,
 		CpuPeriods:          cgroupStats.CPUPeriods,
 		CpuThrottledPeriods: cgroupStats.CPUThrottledPeriods,
@@ -638,6 +672,17 @@ func (h *sandboxService) resourceStats(id string) (*runtime.StatsResponse, error
 		MemoryLimitKnown:    cgroupStats.MemoryLimitKnown,
 		MemoryMaxUsageBytes: cgroupStats.MemoryMaxUsageBytes,
 		MemoryPeakKnown:     cgroupStats.MemoryPeakKnown,
+
+		MemoryHighBytes:          cgroupStats.MemoryHighBytes,
+		MemoryHighKnown:          cgroupStats.MemoryHighKnown,
+		MemoryHighUnlimited:      cgroupStats.MemoryHighUnlimited,
+		Frozen:                   cgroupStats.Frozen,
+		FrozenKnown:              cgroupStats.FrozenKnown,
+		ResourceRevision:         operation.Revision,
+		ResourceRevisionKnown:    operation.RevisionKnown,
+		ResourceOperationID:      operation.OperationID,
+		ResourceOperationPending: operation.OperationOpen,
+		MemoryCgroupPath:         operation.CgroupPath,
 	}, nil
 }
 

@@ -38,9 +38,96 @@ import (
 // The generation-conditional CheckpointIfGeneration RPC reuses the existing
 // CheckpointResponse; its one new request message and method are validated
 // and projected out the same way before every frozen hash comparison.
+// The M1 bidirectional resource contract (StatsResponse 24-33, including the
+// read-only memory_cgroup_path locator, ResizeResourcesRequest 6-7,
+// ShrinkResourcesRequest and its RPC) follows the same rule: validated in
+// full, then projected out before any frozen hash.
 func TestV010WireContract(t *testing.T) {
 	descriptor := protodesc.ToFileDescriptorProto(File_api_runtime_v1_sandbox_api_proto)
 	descriptor.SourceCodeInfo = nil
+	// Validate then project only this additive bidirectional resource
+	// contract (M1): StatsResponse fields 24-33, ResizeResourcesRequest fields
+	// 6-7, the ShrinkResourcesRequest message, and the ShrinkResources RPC.
+	for _, message := range descriptor.MessageType {
+		if message.GetName() != "StatsResponse" {
+			continue
+		}
+		if len(message.Field) != 33 {
+			t.Fatalf("unexpected resource-contract field count %d", len(message.Field))
+		}
+		names := []string{"resource_revision", "resource_revision_known", "memory_high_bytes", "memory_high_known", "memory_high_unlimited", "frozen", "frozen_known", "resource_operation_id", "resource_operation_pending", "memory_cgroup_path"}
+		jsonNames := []string{"resourceRevision", "resourceRevisionKnown", "memoryHighBytes", "memoryHighKnown", "memoryHighUnlimited", "frozen", "frozenKnown", "resourceOperationId", "resourceOperationPending", "memoryCgroupPath"}
+		for i, name := range names {
+			field := message.Field[23+i]
+			wantType := descriptorpb.FieldDescriptorProto_TYPE_UINT64
+			switch name {
+			case "resource_revision_known", "memory_high_known", "memory_high_unlimited", "frozen", "frozen_known", "resource_operation_pending":
+				wantType = descriptorpb.FieldDescriptorProto_TYPE_BOOL
+			case "resource_operation_id", "memory_cgroup_path":
+				wantType = descriptorpb.FieldDescriptorProto_TYPE_STRING
+			}
+			if field.GetName() != name || field.GetJsonName() != jsonNames[i] ||
+				field.GetNumber() != int32(24+i) || field.GetType() != wantType ||
+				field.GetLabel() != descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL ||
+				field.OneofIndex != nil || field.GetProto3Optional() {
+				t.Fatalf("unexpected resource-contract field %s", name)
+			}
+		}
+		message.Field = message.Field[:23]
+	}
+	// ShrinkResourcesRequest must mirror ResizeResourcesRequest's seven
+	// fields exactly before both additions are projected away.
+	shrinkNames := []string{"sandbox_id", "resource_generation", "expected", "target", "deadline_unix_ms", "operation_id", "expected_revision"}
+	foundShrink := false
+	for _, message := range descriptor.MessageType {
+		if message.GetName() != "ShrinkResourcesRequest" {
+			continue
+		}
+		if foundShrink || len(message.Field) != len(shrinkNames) || len(message.NestedType) != 0 || len(message.EnumType) != 0 {
+			t.Fatal("unexpected shrink request message")
+		}
+		foundShrink = true
+		for i, name := range shrinkNames {
+			field := message.Field[i]
+			wantType := descriptorpb.FieldDescriptorProto_TYPE_STRING
+			switch name {
+			case "expected", "target":
+				wantType = descriptorpb.FieldDescriptorProto_TYPE_MESSAGE
+			case "deadline_unix_ms":
+				wantType = descriptorpb.FieldDescriptorProto_TYPE_INT64
+			case "expected_revision":
+				wantType = descriptorpb.FieldDescriptorProto_TYPE_UINT64
+			}
+			if field.GetName() != name || field.GetNumber() != int32(i+1) || field.GetType() != wantType {
+				t.Fatalf("unexpected shrink request field %s", name)
+			}
+		}
+	}
+	if !foundShrink {
+		t.Fatal("missing ShrinkResourcesRequest message")
+	}
+	foundShrinkRPC := false
+	for _, service := range descriptor.Service {
+		service.Method = slices.DeleteFunc(service.Method, func(m *descriptorpb.MethodDescriptorProto) bool {
+			if m.GetName() != "ShrinkResources" {
+				return false
+			}
+			if foundShrinkRPC || service.GetName() != "SandboxService" ||
+				m.GetInputType() != "."+descriptor.GetPackage()+".ShrinkResourcesRequest" ||
+				m.GetOutputType() != "."+descriptor.GetPackage()+".ResizeResourcesResponse" ||
+				m.GetClientStreaming() || m.GetServerStreaming() {
+				t.Fatal("unexpected ShrinkResources RPC")
+			}
+			foundShrinkRPC = true
+			return true
+		})
+	}
+	if !foundShrinkRPC {
+		t.Fatal("missing ShrinkResources RPC")
+	}
+	descriptor.MessageType = slices.DeleteFunc(descriptor.MessageType, func(m *descriptorpb.DescriptorProto) bool {
+		return m.GetName() == "ShrinkResourcesRequest"
+	})
 	for _, message := range descriptor.MessageType {
 		if message.GetName() != "StartResponse" {
 			continue
@@ -166,9 +253,18 @@ func TestV010WireContract(t *testing.T) {
 		if message.GetName() != "ResizeResourcesRequest" {
 			continue
 		}
-		if len(message.Field) != 5 || message.Field[4].GetName() != "deadline_unix_ms" ||
+		if len(message.Field) != 7 {
+			t.Fatal("unexpected resize resource-contract field count")
+		}
+		if message.Field[4].GetName() != "deadline_unix_ms" ||
 			message.Field[4].GetNumber() != 5 || message.Field[4].GetType() != descriptorpb.FieldDescriptorProto_TYPE_INT64 {
 			t.Fatal("unexpected resize command expiry field")
+		}
+		if message.Field[5].GetName() != "operation_id" ||
+			message.Field[5].GetNumber() != 6 || message.Field[5].GetType() != descriptorpb.FieldDescriptorProto_TYPE_STRING ||
+			message.Field[6].GetName() != "expected_revision" ||
+			message.Field[6].GetNumber() != 7 || message.Field[6].GetType() != descriptorpb.FieldDescriptorProto_TYPE_UINT64 {
+			t.Fatal("unexpected resize operation identity fields")
 		}
 		message.Field = message.Field[:4]
 	}
@@ -311,5 +407,56 @@ func TestPressureStatsSurviveWireRoundTrip(t *testing.T) {
 	}
 	if !proto.Equal(original, decoded) {
 		t.Fatal("pressure stats changed on wire")
+	}
+}
+
+// The M1 resource revision contract must survive the wire unchanged,
+// including the explicit unlimited marker that must never collapse into a
+// finite zero, and the shrink request carries the same identity fields as
+// resize.
+func TestResourceRevisionContractSurvivesWireRoundTrip(t *testing.T) {
+	original := &StatsResponse{
+		ResourceGeneration:       "generation-1",
+		ResourceRevision:         7,
+		ResourceRevisionKnown:    true,
+		MemoryHighBytes:          1,
+		MemoryHighKnown:          true,
+		MemoryHighUnlimited:      true,
+		Frozen:                   false,
+		FrozenKnown:              true,
+		ResourceOperationID:      "operation-shrink-42",
+		ResourceOperationPending: true,
+	}
+	wire, err := proto.Marshal(original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded := new(StatsResponse)
+	if err := proto.Unmarshal(wire, decoded); err != nil {
+		t.Fatal(err)
+	}
+	if !proto.Equal(original, decoded) {
+		t.Fatal("resource revision contract changed on wire")
+	}
+
+	shrink := &ShrinkResourcesRequest{
+		SandboxID:          "sbox-shrink",
+		ResourceGeneration: "generation-1",
+		Expected:           &ResourceLimits{CpuQuotaUsec: 50000, CpuPeriodUsec: 100000, MemoryLimitBytes: 512 << 20},
+		Target:             &ResourceLimits{CpuQuotaUsec: 50000, CpuPeriodUsec: 100000, MemoryLimitBytes: 256 << 20},
+		DeadlineUnixMs:     1760000000000,
+		OperationID:        "operation-shrink-42",
+		ExpectedRevision:   7,
+	}
+	wire, err = proto.Marshal(shrink)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decodedShrink := new(ShrinkResourcesRequest)
+	if err := proto.Unmarshal(wire, decodedShrink); err != nil {
+		t.Fatal(err)
+	}
+	if !proto.Equal(shrink, decodedShrink) {
+		t.Fatal("shrink request changed on wire")
 	}
 }

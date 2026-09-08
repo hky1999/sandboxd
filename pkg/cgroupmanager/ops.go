@@ -91,6 +91,31 @@ type Stats struct {
 	MemoryLimitKnown    bool // strict memory.max reading; "max" = unlimited
 	MemoryMaxUsageBytes uint64
 	MemoryPeakKnown     bool // measured memory.peak, not the usage fallback
+	// Enforced memory.high under the same strict rules; the cgroup v1 backend
+	// has no memory.high and proves none of these.
+	MemoryHighBytes     uint64
+	MemoryHighKnown     bool
+	MemoryHighUnlimited bool
+	// Kernel-observed frozen state from cgroup.events; the freeze request bit
+	// is tracked separately by FreezeState.
+	Frozen      bool
+	FrozenKnown bool
+	// MemoryCgroupPath is the absolute cgroup v2 directory this Stats call
+	// actually read (mountpoint joined with the manager-relative name). It is
+	// a read-only locator for observers such as inotify watches; the cgroup v1
+	// backend cannot prove one and leaves it empty. It is never a write
+	// target and never replaces journal identity verification.
+	MemoryCgroupPath string
+}
+
+// FreezeState distinguishes the freeze request (cgroup.freeze) from the
+// kernel-confirmed state (cgroup.events frozen). Both readings carry their own
+// known flag; a missing or malformed file is unknown, never an observed false.
+type FreezeState struct {
+	RequestKnown  bool
+	RequestFrozen bool
+	EventsKnown   bool
+	Frozen        bool
 }
 
 type cgroupOps interface {
@@ -102,9 +127,23 @@ type cgroupOps interface {
 	setPidsLimit(name string, limit int64) error
 	update(name string, resources *specs.LinuxResources) error
 	stat(name string) (Stats, error)
+	readFreeze(name string) (FreezeState, error)
+	writeFreeze(name string, frozen bool) error
+	writeMemoryLimits(name string, highBytes, maxBytes uint64) error
+	identity(name string) (CgroupIdentity, error)
 	newOOMWatcher() (oomWatcher, error)
 	kill(name string) error
 	delete(name string) error
+}
+
+// CgroupIdentity is the durable binding between a journal record and the
+// physical cgroup directory it describes: the manager-relative path plus the
+// inode and device of the directory, so a recycled path leased to a later
+// sandbox can never satisfy an old record's identity check.
+type CgroupIdentity struct {
+	Path   string
+	Inode  uint64
+	Device uint64
 }
 
 var detectCgroupMode = cgroups.Mode
@@ -126,13 +165,21 @@ func newCgroupOps(memoryHighRatio float64) (cgroupOps, error) {
 }
 
 // MemoryHighBytes computes the cgroup v2 memory.high value for a sandbox
-// memory limit: ceil(ratio * limit), always below the limit for a valid
-// ratio in [0,1). A zero ratio disables the soft limit (0 is returned).
+// memory limit: ceil(ratio * limit) rounded DOWN to a whole kernel page once
+// the value reaches page size, always below the limit for a valid ratio in
+// [0,1). Downward alignment is the conservative direction: the soft limit
+// stays further below the hard limit and the shrink safety margin compares
+// against a smaller budget. A zero ratio disables the soft limit (0 is
+// returned). Writes, readback checks, and shrink safety margins all derive
+// the value from here, so they can never disagree.
 func MemoryHighBytes(limitBytes uint64, ratio float64) uint64 {
 	if limitBytes == 0 || ratio <= 0 {
 		return 0
 	}
 	high := uint64(math.Ceil(ratio * float64(limitBytes)))
+	if page := uint64(os.Getpagesize()); page > 1 && high >= page {
+		high -= high % page
+	}
 	if high >= limitBytes {
 		high = limitBytes - 1
 	}

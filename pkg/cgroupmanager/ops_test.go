@@ -277,6 +277,21 @@ func (f *fakeCgroupOps) update(string, *specs.LinuxResources) error {
 	return nil
 }
 func (f *fakeCgroupOps) stat(string) (Stats, error) { return f.stats, nil }
+func (f *fakeCgroupOps) readFreeze(string) (FreezeState, error) {
+	f.calls = append(f.calls, "read-freeze")
+	return FreezeState{}, nil
+}
+func (f *fakeCgroupOps) writeFreeze(string, bool) error {
+	f.calls = append(f.calls, "write-freeze")
+	return nil
+}
+func (f *fakeCgroupOps) writeMemoryLimits(string, uint64, uint64) error {
+	f.calls = append(f.calls, "write-memory")
+	return nil
+}
+func (f *fakeCgroupOps) identity(string) (CgroupIdentity, error) {
+	return CgroupIdentity{Inode: 1, Device: 2}, nil
+}
 func (f *fakeCgroupOps) newOOMWatcher() (oomWatcher, error) {
 	if f.oom == nil {
 		f.oom = newFakeOOMWatcher()
@@ -557,6 +572,8 @@ func TestV2ResetAndStats(t *testing.T) {
 	assert.True(t, stats.CPULimitsKnown)
 	assert.Equal(t, int64(-1), stats.CPUQuotaUsec)
 	assert.Equal(t, uint64(100000), stats.CPUPeriodUsec)
+	// The v2 backend names the absolute directory it read.
+	assert.Equal(t, groupPath, stats.MemoryCgroupPath)
 	writeTestFile(t, filepath.Join(groupPath, "cpu.max"), "50000 100000")
 	stats, err = ops.stat(name)
 	require.NoError(t, err)
@@ -571,6 +588,135 @@ func TestV2ResetAndStats(t *testing.T) {
 	require.True(t, stats.MemoryPressureKnown)
 	require.Equal(t, uint64(5), stats.MemoryHighEvents)
 
+}
+
+// memory.high and the frozen state ride the same strict reads as the other
+// counters, with "max" as the known-unlimited sentinel. The fixture carries
+// the full shape containerd's stat walks, so the reads under test are the
+// real ones.
+func TestV2StatReadsMemoryHighAndFrozenState(t *testing.T) {
+	mountpoint := t.TempDir()
+	name := "/sandbox/lease"
+	groupPath := filepath.Join(mountpoint, name)
+	require.NoError(t, os.MkdirAll(groupPath, 0755))
+	for _, filename := range []string{
+		"cgroup.controllers",
+		"cpu.max",
+		"cpu.stat",
+		"cpu.weight",
+		"cpuset.cpus",
+		"cpuset.mems",
+		"memory.current",
+		"memory.events",
+		"memory.high",
+		"memory.max",
+		"memory.peak",
+		"memory.stat",
+		"memory.swap.current",
+		"memory.swap.max",
+		"pids.max",
+	} {
+		writeTestFile(t, filepath.Join(groupPath, filename), "max")
+	}
+	writeTestFile(t, filepath.Join(groupPath, "cpu.max"), "50000 100000")
+	writeTestFile(t, filepath.Join(groupPath, "cpu.stat"), "usage_usec 1\n")
+	writeTestFile(t, filepath.Join(groupPath, "memory.current"), "4096\n")
+	writeTestFile(t, filepath.Join(groupPath, "memory.events"), "high 0\noom 0\noom_kill 0\n")
+	writeTestFile(t, filepath.Join(groupPath, "memory.max"), "268435456")
+	writeTestFile(t, filepath.Join(groupPath, "memory.peak"), "8192\n")
+	writeTestFile(t, filepath.Join(groupPath, "memory.high"), "214748160")
+	ops := &cgroupV2{mountpoint: mountpoint, memoryHighRatio: 0.8}
+
+	stats, err := ops.stat(name)
+	require.NoError(t, err)
+	require.True(t, stats.MemoryHighKnown)
+	require.False(t, stats.MemoryHighUnlimited)
+	assert.Equal(t, uint64(214748160), stats.MemoryHighBytes)
+	assert.False(t, stats.FrozenKnown, "missing cgroup.events is unknown, not unfrozen")
+
+	writeTestFile(t, filepath.Join(groupPath, "cgroup.events"), "populated 1\nfrozen 1\n")
+	stats, err = ops.stat(name)
+	require.NoError(t, err)
+	require.True(t, stats.FrozenKnown)
+	assert.True(t, stats.Frozen)
+
+	writeTestFile(t, filepath.Join(groupPath, "cgroup.events"), "populated 1\nfrozen 0\n")
+	writeTestFile(t, filepath.Join(groupPath, "memory.high"), "max")
+	stats, err = ops.stat(name)
+	require.NoError(t, err)
+	require.True(t, stats.FrozenKnown)
+	assert.False(t, stats.Frozen)
+	require.True(t, stats.MemoryHighKnown)
+	assert.True(t, stats.MemoryHighUnlimited)
+
+	writeTestFile(t, filepath.Join(groupPath, "memory.high"), "junk")
+	stats, err = ops.stat(name)
+	require.NoError(t, err)
+	assert.False(t, stats.MemoryHighKnown)
+
+	// The kernel only writes 0 or 1: any other frozen value is a malformed
+	// source and must stay unknown, never an observed "unfrozen".
+	writeTestFile(t, filepath.Join(groupPath, "memory.high"), "214748160")
+	writeTestFile(t, filepath.Join(groupPath, "cgroup.events"), "populated 1\nfrozen 2\n")
+	stats, err = ops.stat(name)
+	require.NoError(t, err)
+	assert.False(t, stats.FrozenKnown, "frozen 2 is unknown, not unfrozen")
+	freeze, err := ops.readFreeze(name)
+	require.NoError(t, err)
+	assert.False(t, freeze.EventsKnown, "readFreeze treats frozen 2 as unknown too")
+	assert.False(t, freeze.Frozen)
+}
+
+// The freeze request/event bits and the ordered memory writes are the shrink
+// primitives; identity binds the physical directory.
+func TestV2FreezeAndOrderedMemoryWrites(t *testing.T) {
+	mountpoint := t.TempDir()
+	name := "/sandbox/lease"
+	groupPath := filepath.Join(mountpoint, name)
+	require.NoError(t, os.MkdirAll(groupPath, 0755))
+	ops := &cgroupV2{mountpoint: mountpoint}
+
+	_, err := ops.readFreeze(name)
+	require.NoError(t, err)
+	writeTestFile(t, filepath.Join(groupPath, "cgroup.events"), "populated 1\nfrozen 0\n")
+
+	// A failed memory.max write leaves the already-written memory.high in
+	// place: the two files have no atomic combined update. A directory in
+	// place of the file fails the write for root and non-root alike.
+	writeTestFile(t, filepath.Join(groupPath, "memory.high"), "214748160")
+	require.NoError(t, os.Mkdir(filepath.Join(groupPath, "memory.max"), 0755))
+	err = ops.writeMemoryLimits(name, 104857600, 536870912)
+	require.ErrorContains(t, err, "memory.max")
+	assertFileContents(t, filepath.Join(groupPath, "memory.high"), "104857600")
+
+	require.NoError(t, os.RemoveAll(filepath.Join(groupPath, "memory.max")))
+	require.NoError(t, ops.writeMemoryLimits(name, 104857600, 536870912))
+	assertFileContents(t, filepath.Join(groupPath, "memory.high"), "104857600")
+	assertFileContents(t, filepath.Join(groupPath, "memory.max"), "536870912")
+
+	// An unreadable request bit is unknown, never an observed unfrozen one.
+	writeTestFile(t, filepath.Join(groupPath, "cgroup.freeze"), "junk")
+	writeTestFile(t, filepath.Join(groupPath, "cgroup.events"), "populated 1\nfrozen 0\n")
+	freeze, err := ops.readFreeze(name)
+	require.NoError(t, err)
+	assert.False(t, freeze.RequestKnown)
+	assert.True(t, freeze.EventsKnown)
+	assert.False(t, freeze.Frozen)
+
+	require.NoError(t, ops.writeFreeze(name, true))
+	assertFileContents(t, filepath.Join(groupPath, "cgroup.freeze"), "1")
+	writeTestFile(t, filepath.Join(groupPath, "cgroup.events"), "populated 1\nfrozen 1\n")
+	freeze, err = ops.readFreeze(name)
+	require.NoError(t, err)
+	assert.True(t, freeze.RequestKnown)
+	assert.True(t, freeze.RequestFrozen)
+	assert.True(t, freeze.EventsKnown)
+	assert.True(t, freeze.Frozen)
+
+	identity, err := ops.identity(name)
+	require.NoError(t, err)
+	assert.Equal(t, name, identity.Path)
+	assert.NotZero(t, identity.Inode)
 }
 
 func TestV2OOMWatcherUsesCgroupBaseline(t *testing.T) {
@@ -706,6 +852,15 @@ func TestNewCgroupManagerRejectsInvalidMemoryHighRatio(t *testing.T) {
 }
 
 func TestMemoryHighBytes(t *testing.T) {
+	// The aligned expectation follows the host page size, as does the
+	// implementation, instead of assuming 4 KiB pages.
+	alignDown := func(value uint64) uint64 {
+		page := uint64(os.Getpagesize())
+		if value < page {
+			return value
+		}
+		return value - value%page
+	}
 	for _, test := range []struct {
 		limit uint64
 		ratio float64
@@ -715,7 +870,10 @@ func TestMemoryHighBytes(t *testing.T) {
 		{limit: 1 << 30, ratio: 0, want: 0},
 		{limit: 1000, ratio: 0.5, want: 500},
 		{limit: 1001, ratio: 0.5, want: 501},
-		{limit: 1 << 30, ratio: 0.9, want: 966367642},
+		// Page-aligned DOWN once the value reaches a page: the soft limit
+		// stays further below the hard limit and shrink margins compare
+		// against the smaller budget. Sub-page ceilings keep the plain ceil.
+		{limit: 1 << 30, ratio: 0.9, want: alignDown(966367642)},
 		{limit: 100, ratio: 0.99, want: 99},
 		{limit: 10, ratio: 0.999999, want: 9},
 		{limit: 1, ratio: 0.9, want: 0},
@@ -758,7 +916,8 @@ func TestV2UpdateWritesMemoryHigh(t *testing.T) {
 	ops := &cgroupV2{mountpoint: mountpoint, memoryHighRatio: 0.9}
 	require.NoError(t, ops.update(name, resources))
 	assertFileContents(t, filepath.Join(groupPath, "memory.max"), "1073741824")
-	assertFileContents(t, filepath.Join(groupPath, "memory.high"), "966367642")
+	assertFileContents(t, filepath.Join(groupPath, "memory.high"),
+		strconv.FormatUint(MemoryHighBytes(1<<30, 0.9), 10))
 
 	mountpoint, groupPath = newFakeGroup(t)
 	ops = &cgroupV2{mountpoint: mountpoint}

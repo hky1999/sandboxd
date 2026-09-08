@@ -221,6 +221,11 @@ type ResourceConfig struct {
 	// ladder (which raises max and high together) an interception window.
 	// Zero (default) leaves memory.high unset. Valid range is [0, 1).
 	MemoryHighRatio float64 `toml:"memory_high_ratio" json:"memoryHighRatio"`
+	// MemoryShrinkHeadroomMiB is the node-defined headroom a memory shrink
+	// must preserve between the frozen memory.current and the target
+	// memory.high. It is a minimum: values below 16 MiB are raised to 16 MiB,
+	// and no request field can lower it. Zero selects the 16 MiB minimum.
+	MemoryShrinkHeadroomMiB int `toml:"memory_shrink_headroom_mib" json:"memoryShrinkHeadroomMiB"`
 	// InterfaceCacheSize is the size of interface cache. Default is same as max_instance_num.
 	InterfaceCacheSize int `toml:"interface_cache_size" json:"interfaceCacheSize"`
 }

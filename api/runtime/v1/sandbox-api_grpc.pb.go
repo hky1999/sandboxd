@@ -46,6 +46,7 @@ const (
 	SandboxService_List_FullMethodName                   = "/runtime.v1.SandboxService/List"
 	SandboxService_Stats_FullMethodName                  = "/runtime.v1.SandboxService/Stats"
 	SandboxService_ResizeResources_FullMethodName        = "/runtime.v1.SandboxService/ResizeResources"
+	SandboxService_ShrinkResources_FullMethodName        = "/runtime.v1.SandboxService/ShrinkResources"
 	SandboxService_ListAvailableRuntimes_FullMethodName  = "/runtime.v1.SandboxService/ListAvailableRuntimes"
 	SandboxService_SetNetworkPolicy_FullMethodName       = "/runtime.v1.SandboxService/SetNetworkPolicy"
 )
@@ -89,6 +90,10 @@ type SandboxServiceClient interface {
 	Stats(ctx context.Context, in *StatsRequest, opts ...grpc.CallOption) (*StatsResponse, error)
 	// Apply a scheduler-approved monotonic increase with incarnation and limit checks.
 	ResizeResources(ctx context.Context, in *ResizeResourcesRequest, opts ...grpc.CallOption) (*ResizeResourcesResponse, error)
+	// Apply a scheduler-approved memory decrease for one incarnation. The CPU
+	// numbers must equal the live limits; the daemon freezes the sandbox's host
+	// cgroup for the write window and never changes the scheduler lifecycle.
+	ShrinkResources(ctx context.Context, in *ShrinkResourcesRequest, opts ...grpc.CallOption) (*ResizeResourcesResponse, error)
 	// ListAvailableRuntimes lists runtime classes whose handlers are ready.
 	ListAvailableRuntimes(ctx context.Context, in *ListAvailableRuntimesRequest, opts ...grpc.CallOption) (*ListAvailableRuntimesResponse, error)
 	// SetNetworkPolicy atomically replaces the network policy of a running sandbox.
@@ -233,6 +238,16 @@ func (c *sandboxServiceClient) ResizeResources(ctx context.Context, in *ResizeRe
 	return out, nil
 }
 
+func (c *sandboxServiceClient) ShrinkResources(ctx context.Context, in *ShrinkResourcesRequest, opts ...grpc.CallOption) (*ResizeResourcesResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ResizeResourcesResponse)
+	err := c.cc.Invoke(ctx, SandboxService_ShrinkResources_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *sandboxServiceClient) ListAvailableRuntimes(ctx context.Context, in *ListAvailableRuntimesRequest, opts ...grpc.CallOption) (*ListAvailableRuntimesResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ListAvailableRuntimesResponse)
@@ -292,6 +307,10 @@ type SandboxServiceServer interface {
 	Stats(context.Context, *StatsRequest) (*StatsResponse, error)
 	// Apply a scheduler-approved monotonic increase with incarnation and limit checks.
 	ResizeResources(context.Context, *ResizeResourcesRequest) (*ResizeResourcesResponse, error)
+	// Apply a scheduler-approved memory decrease for one incarnation. The CPU
+	// numbers must equal the live limits; the daemon freezes the sandbox's host
+	// cgroup for the write window and never changes the scheduler lifecycle.
+	ShrinkResources(context.Context, *ShrinkResourcesRequest) (*ResizeResourcesResponse, error)
 	// ListAvailableRuntimes lists runtime classes whose handlers are ready.
 	ListAvailableRuntimes(context.Context, *ListAvailableRuntimesRequest) (*ListAvailableRuntimesResponse, error)
 	// SetNetworkPolicy atomically replaces the network policy of a running sandbox.
@@ -344,6 +363,9 @@ func (UnimplementedSandboxServiceServer) Stats(context.Context, *StatsRequest) (
 }
 func (UnimplementedSandboxServiceServer) ResizeResources(context.Context, *ResizeResourcesRequest) (*ResizeResourcesResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ResizeResources not implemented")
+}
+func (UnimplementedSandboxServiceServer) ShrinkResources(context.Context, *ShrinkResourcesRequest) (*ResizeResourcesResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ShrinkResources not implemented")
 }
 func (UnimplementedSandboxServiceServer) ListAvailableRuntimes(context.Context, *ListAvailableRuntimesRequest) (*ListAvailableRuntimesResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ListAvailableRuntimes not implemented")
@@ -606,6 +628,24 @@ func _SandboxService_ResizeResources_Handler(srv interface{}, ctx context.Contex
 	return interceptor(ctx, in, info, handler)
 }
 
+func _SandboxService_ShrinkResources_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ShrinkResourcesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SandboxServiceServer).ShrinkResources(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SandboxService_ShrinkResources_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SandboxServiceServer).ShrinkResources(ctx, req.(*ShrinkResourcesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _SandboxService_ListAvailableRuntimes_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(ListAvailableRuntimesRequest)
 	if err := dec(in); err != nil {
@@ -700,6 +740,10 @@ var SandboxService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ResizeResources",
 			Handler:    _SandboxService_ResizeResources_Handler,
+		},
+		{
+			MethodName: "ShrinkResources",
+			Handler:    _SandboxService_ShrinkResources_Handler,
 		},
 		{
 			MethodName: "ListAvailableRuntimes",

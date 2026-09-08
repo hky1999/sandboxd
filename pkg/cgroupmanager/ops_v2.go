@@ -16,6 +16,7 @@ package cgroupmanager
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -125,10 +126,11 @@ func (o *cgroupV2) create(name string, resources *specs.LinuxResources) error {
 func (o *cgroupV2) reset(name string) error {
 	groupPath := filepath.Join(o.mountpoint, name)
 	values := map[string]string{
-		"cpu.weight":  defaultV2CPUWeight,
-		"cpu.max":     "max " + strconv.FormatUint(config.DefaultCPUPeriodMicros, 10),
-		"memory.max":  defaultV2MemoryMax,
-		"memory.high": defaultV2MemoryHigh,
+		"cpu.weight":    defaultV2CPUWeight,
+		"cpu.max":       "max " + strconv.FormatUint(config.DefaultCPUPeriodMicros, 10),
+		"memory.max":    defaultV2MemoryMax,
+		"memory.high":   defaultV2MemoryHigh,
+		"cgroup.freeze": "0",
 	}
 	for filename, value := range values {
 		if err := os.WriteFile(filepath.Join(groupPath, filename), []byte(value), 0644); err != nil {
@@ -236,7 +238,78 @@ func (o *cgroupV2) stat(name string) (Stats, error) {
 		result.MemoryMaxUsageBytes = peak
 		result.MemoryPeakKnown = true
 	}
+	if high, ok := readUsageLimit(filepath.Join(groupPath, "memory.high")); ok {
+		result.MemoryHighBytes = high
+		result.MemoryHighKnown = true
+		result.MemoryHighUnlimited = high == math.MaxUint64
+	}
+	// cgroup.events' kernel-confirmed frozen state was set by
+	// readV2PressureStats under the strict 0/1 rule; the request bit in
+	// cgroup.freeze stays available through readFreeze.
+	// The absolute directory this read came from: a read-only locator for
+	// event watchers, never a write target.
+	result.MemoryCgroupPath = groupPath
 	return result, nil
+}
+
+// identity proves the physical cgroup directory behind a manager-relative
+// name through its inode and device.
+func (o *cgroupV2) identity(name string) (CgroupIdentity, error) {
+	info, err := os.Stat(filepath.Join(o.mountpoint, name))
+	if err != nil {
+		return CgroupIdentity{}, fmt.Errorf("stat cgroup %s: %w", name, err)
+	}
+	if !info.IsDir() {
+		return CgroupIdentity{}, fmt.Errorf("cgroup %s is not a directory", name)
+	}
+	return cgroupIdentityFromInfo(name, info)
+}
+
+// readFreeze reports both freeze facts of a cgroup: the request bit the
+// controller wrote and the state the kernel has actually reached. Unknown
+// files never become an observed false.
+func (o *cgroupV2) readFreeze(name string) (FreezeState, error) {
+	groupPath := filepath.Join(o.mountpoint, name)
+	var state FreezeState
+	if value, ok := readUsageFile(filepath.Join(groupPath, "cgroup.freeze")); ok {
+		switch value {
+		case "0":
+			state.RequestKnown, state.RequestFrozen = true, false
+		case "1":
+			state.RequestKnown, state.RequestFrozen = true, true
+		}
+	}
+	state.Frozen, state.EventsKnown = readFrozenState(filepath.Join(groupPath, "cgroup.events"))
+	return state, nil
+}
+
+// writeFreeze sets the cgroup.freeze request bit. Confirming that the kernel
+// reached the state is the caller's bounded poll of readFreeze.
+func (o *cgroupV2) writeFreeze(name string, frozen bool) error {
+	value := "0"
+	if frozen {
+		value = "1"
+	}
+	if err := os.WriteFile(filepath.Join(o.mountpoint, name, "cgroup.freeze"), []byte(value), 0644); err != nil {
+		return fmt.Errorf("set cgroup.freeze=%s for cgroup %s: %w", value, name, err)
+	}
+	return nil
+}
+
+// writeMemoryLimits lowers or raises the two memory controls of an allocated
+// cgroup in the fixed shrink order: memory.high first, then memory.max. Each
+// value is written exactly once so a returned error still leaves a truthful
+// partial state for the caller's readback; the two files have no atomic
+// combined update in the kernel.
+func (o *cgroupV2) writeMemoryLimits(name string, highBytes, maxBytes uint64) error {
+	groupPath := filepath.Join(o.mountpoint, name)
+	if err := os.WriteFile(filepath.Join(groupPath, "memory.high"), []byte(strconv.FormatUint(highBytes, 10)), 0644); err != nil {
+		return fmt.Errorf("set memory.high=%d for cgroup %s: %w", highBytes, name, err)
+	}
+	if err := os.WriteFile(filepath.Join(groupPath, "memory.max"), []byte(strconv.FormatUint(maxBytes, 10)), 0644); err != nil {
+		return fmt.Errorf("set memory.max=%d for cgroup %s: %w", maxBytes, name, err)
+	}
+	return nil
 }
 
 func readUintFile(filename string) uint64 {

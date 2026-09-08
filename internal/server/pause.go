@@ -60,6 +60,11 @@ func (h *sandboxService) freezerFor(id string) (svc.TaskFreezer, error) {
 
 // Pause freezes all tasks in a running sandbox. Identity, network, and
 // broker-side records survive; only task execution stops.
+//
+// Pause and Resume share the sandbox's physical resource lock with
+// Stats/Resize/Shrink/Delete/Checkpoint/Restore: an external pause must never
+// interleave with a shrink's freeze window or steal its freeze ownership. The
+// lock is not reentrant — nothing below re-acquires it.
 func (h *sandboxService) Pause(
 	ctx context.Context,
 	request *runtime.PauseRequest,
@@ -67,8 +72,20 @@ func (h *sandboxService) Pause(
 	if request == nil {
 		return nil, checkpointGRPCError(fmt.Errorf("request is required: %w", errord.ErrInvalidArgument))
 	}
+	unlock, err := h.resourceLocks.acquire(ctx, request.ID)
+	if err != nil {
+		return nil, errord.ToGRPC(err)
+	}
+	defer unlock()
 	freezer, err := h.freezerFor(request.ID)
 	if err != nil {
+		return nil, err
+	}
+	// Pause needs a Sentry round-trip: it must not start while this daemon
+	// still owns an open shrink freeze for the sandbox, or the round-trip
+	// could hang under the physical lock and wedge the recovery that has to
+	// unfreeze it. The check never touches anyone's freeze itself.
+	if err := h.rejectUnclosedResourceOperation(request.ID); err != nil {
 		return nil, err
 	}
 	if err := freezer.Pause(ctx, request.ID); err != nil {
@@ -77,7 +94,8 @@ func (h *sandboxService) Pause(
 	return &runtime.PauseResponse{}, nil
 }
 
-// Resume unfreezes a previously paused sandbox.
+// Resume unfreezes a previously paused sandbox under the same serialization
+// and the same pending-operation gate as Pause.
 func (h *sandboxService) Resume(
 	ctx context.Context,
 	request *runtime.PauseRequest,
@@ -85,8 +103,16 @@ func (h *sandboxService) Resume(
 	if request == nil {
 		return nil, checkpointGRPCError(fmt.Errorf("request is required: %w", errord.ErrInvalidArgument))
 	}
+	unlock, err := h.resourceLocks.acquire(ctx, request.ID)
+	if err != nil {
+		return nil, errord.ToGRPC(err)
+	}
+	defer unlock()
 	freezer, err := h.freezerFor(request.ID)
 	if err != nil {
+		return nil, err
+	}
+	if err := h.rejectUnclosedResourceOperation(request.ID); err != nil {
 		return nil, err
 	}
 	if err := freezer.Resume(ctx, request.ID); err != nil {

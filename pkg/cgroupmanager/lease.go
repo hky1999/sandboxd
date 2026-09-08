@@ -16,8 +16,12 @@ package cgroupmanager
 
 import (
 	"fmt"
+	"os"
+	"syscall"
 
 	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
+
+	"github.com/containerd/cgroups/v3"
 )
 
 // Prepare applies the per-sandbox controls to an allocated, already-clean
@@ -66,4 +70,53 @@ func (c *CgroupManager) ReadMemoryLimit(name string) (int64, error) {
 		return 0, err
 	}
 	return int64(stats.MemoryLimitBytes), nil
+
+// SupportsMemoryShrink reports whether the detected backend can run the
+// freeze-guarded memory decrease: only cgroup v2 has cgroup.freeze and
+// memory.high.
+func (c *CgroupManager) SupportsMemoryShrink() bool {
+	return c.ops.mode() == cgroups.Unified
+}
+
+// ReadFreeze reports the freeze request bit and the kernel-confirmed state of
+// an allocated sandbox cgroup.
+func (c *CgroupManager) ReadFreeze(name string) (FreezeState, error) {
+	if !belongsToRoot(name, c.rootName) || !c.cgroups.Has(name) {
+		return FreezeState{}, fmt.Errorf("cgroup %s is not an owned child of %s", name, c.rootName)
+	}
+	return c.ops.readFreeze(name)
+}
+
+// WriteFreeze sets the freeze request bit of an allocated sandbox cgroup.
+func (c *CgroupManager) WriteFreeze(name string, frozen bool) error {
+	if !belongsToRoot(name, c.rootName) || !c.cgroups.Has(name) {
+		return fmt.Errorf("cgroup %s is not an owned child of %s", name, c.rootName)
+	}
+	return c.ops.writeFreeze(name, frozen)
+}
+
+// WriteMemoryLimits applies the two memory controls in the fixed shrink order
+// (memory.high, then memory.max) to an allocated sandbox cgroup.
+func (c *CgroupManager) WriteMemoryLimits(name string, highBytes, maxBytes uint64) error {
+	if !belongsToRoot(name, c.rootName) || !c.cgroups.Has(name) {
+		return fmt.Errorf("cgroup %s is not an owned child of %s", name, c.rootName)
+	}
+	return c.ops.writeMemoryLimits(name, highBytes, maxBytes)
+}
+
+// CgroupIdentity proves the physical directory of an owned cgroup name.
+func (c *CgroupManager) CgroupIdentity(name string) (CgroupIdentity, error) {
+	if !belongsToRoot(name, c.rootName) || !c.cgroups.Has(name) {
+		return CgroupIdentity{}, fmt.Errorf("cgroup %s is not an owned child of %s", name, c.rootName)
+	}
+	return c.ops.identity(name)
+}
+
+// cgroupIdentityFromInfo extracts the inode/device pair from a stat result.
+func cgroupIdentityFromInfo(name string, info os.FileInfo) (CgroupIdentity, error) {
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return CgroupIdentity{}, fmt.Errorf("cgroup %s stat lacks inode identity", name)
+	}
+	return CgroupIdentity{Path: name, Inode: stat.Ino, Device: uint64(stat.Dev)}, nil
 }

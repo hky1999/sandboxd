@@ -38,11 +38,28 @@ type retirementCgroups struct {
 	recycled  []string
 }
 
-func (*retirementCgroups) Allocate() (string, error) { return "/sandbox/lease", nil }
-func (*retirementCgroups) ShutDown() error           { return nil }
+func (*retirementCgroups) Allocate() (string, error)  { return "/sandbox/lease", nil }
+func (*retirementCgroups) ShutDown() error            { return nil }
+func (*retirementCgroups) SupportsMemoryShrink() bool { return false }
 
 func (*retirementCgroups) Prepare(string, *runtime.LinuxSandboxResources) error {
 	return nil
+}
+
+func (*retirementCgroups) CgroupIdentity(string) (cgroupmanager.CgroupIdentity, error) {
+	return cgroupmanager.CgroupIdentity{}, errors.New("retirement fake has no cgroup identity")
+}
+
+func (*retirementCgroups) ReadFreeze(string) (cgroupmanager.FreezeState, error) {
+	return cgroupmanager.FreezeState{}, errors.New("retirement fake has no freeze support")
+}
+
+func (*retirementCgroups) WriteFreeze(string, bool) error {
+	return errors.New("retirement fake has no freeze support")
+}
+
+func (*retirementCgroups) WriteMemoryLimits(string, uint64, uint64) error {
+	return errors.New("retirement fake has no ordered memory writes")
 }
 
 func (c *retirementCgroups) Stats(string) (cgroupmanager.Stats, error) {

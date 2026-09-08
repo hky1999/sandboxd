@@ -226,3 +226,85 @@ Also, LoadStatus currently defaults missing status files to RUNNING: cache state
 is not authoritative runtime liveness. F8 still requires a read-only runtime
 query, persistent operation identity across controller/node restarts, delayed
 request fencing after retirement and authoritative budget reconciliation.
+
+# Scheduler resource revisions and shrink
+
+Every elastic physical incarnation carries one bounded, daemon-owned record
+under `<RootDir>/scheduler-resource-states` (0700 dir, 0600 files, temp +
+fsync + rename + dir fsync, 65536-entry cap, no GC). It binds sandbox,
+resource generation, cgroup path plus inode/device identity, the monotonic
+resource revision (initialized to 1 between birth evidence and runtime start
+for Start and Restore alike), and the last operation's ID, fingerprint,
+limits and outcome. A missing record is unknown state — never an inferred
+initial revision — and a damaged record keeps the incarnation fail-closed
+with Stats reporting a pending operation. A revision at UINT64_MAX refuses
+new operations instead of wrapping.
+
+ResizeResources and the separate ShrinkResources RPC share one contract:
+non-empty printable operation_id, expected_revision CAS against the journal,
+and a full-request fingerprint (kind, identity, revision, both limit triples,
+deadline). Admission resolves the recorded outcome first: the same ID with
+the same fingerprint replays only its recorded outcome and never re-executes,
+and a replay repeats a recorded complete only while the CURRENT physical
+readback still verifies the target limits, the enforced high and an unfrozen
+sandbox — any later perturbation downgrades it to a conservative non-complete
+answer. A different fingerprint under the same ID is rejected. A fresh
+operation then compares strictly (expected limits equal the live limits);
+live==target never substitutes for that compare. The next revision and the
+complete intent are persisted before any side effect; partial or UNKNOWN
+outcomes keep the advanced revision and new operations are rejected until
+reconciliation closes the record. Legacy revision-less requests and
+revision-less incarnations are rejected: there is no implicit compatibility
+path that would break the ABA fence.
+
+Grow stays grow-only (max then high, both verified) and refuses a
+proven-frozen sandbox; its complete demands the same full readback contract
+as shrink — limits, the enforced memory.high, and frozen_known with
+frozen=false. Shrink requires runsc on cgroup v2 with a configured
+memory.high ratio, unchanged CPU numbers, target within the persisted policy
+floor/ceiling, proven usage/limits/high/frozen readings, and no pre-existing
+freeze request or state. It persists a freeze-owning intent, writes
+cgroup.freeze=1, confirms events.frozen within 500ms (timeout releases the
+request and never lowers limits; the poll honors the command context, a
+confirmed frozen reading still counts), re-checks the command deadline and
+context after the freeze is confirmed and before any memory write (expiry
+stops at the already-frozen point), re-checks frozen current + node headroom
+(minimum 16 MiB, configurable upward only) against the target high, writes
+memory.high then memory.max, and only reports complete after verified limits,
+correct high, and a confirmed unfreeze through an RPC-cancellation-independent
+2s cleanup. The enforced high is ceil(ratio*max) page-aligned DOWN to the
+kernel page size. Partial writes restore the recorded original controls
+(never above the original max) and stay partial. Unconfirmed unfreeze leaves
+the journal open for the self-heal loop; recovery and healing never convert
+an error into a success. Every RPC response is assembled from an observation
+taken after the durable journal close under the same physical lock, so
+pending=false, the operation ID and the advanced revision in a response are
+always the closed record's facts; a failed close returns an uncertain error
+and never fakes a terminal state.
+
+Daemon restart scans the journal before recoveryReady: only records whose
+sandbox, generation, cgroup path and inode/device still match are touched,
+their owned freeze is released and read back, and the record closes at its
+advanced revision (complete only when the recorded target fully verifies).
+Foreign or missing incarnations are never unfrozen; their records are
+retained. A physical delete of the generation is the only authority that
+retires a record, and it releases the owned freeze first so the runtime
+handler never meets a frozen Sentry. Pause, Resume and Checkpoint also
+refuse to start while this daemon owns an open or damaged resource operation
+for the incarnation — their Sentry round-trips could hang under the physical
+lock against our own frozen sandbox and wedge recovery; the refusal never
+releases anyone's freeze. Pause/Resume serialize on the same per-sandbox
+physical lock as Stats/Resize/Shrink/Delete/Checkpoint; the lock is not
+reentrant. Recycled cgroups reset cgroup.freeze to 0.
+
+Stats reports resource_revision/known, memory.high bytes/known/unlimited
+(unlimited is explicit, never a finite 0), kernel-confirmed frozen/known
+(frozen_known true and frozen false is the only accepted "unfrozen"), the
+last operation ID with a pending flag, and memory_cgroup_path (field 33):
+the absolute cgroup v2 directory behind the read, exposed only when the
+incarnation's revision record verifies against the live cgroup identity and
+empty for cgroup v1 or unverifiable records. It is a read-only locator for
+event watchers — never a write target, never a replacement for journal
+identity verification. pending=true never closes an UNKNOWN by itself:
+reconciliation must match operation_id and revision with pending=false,
+verified limits and an unfrozen sandbox.

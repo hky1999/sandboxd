@@ -43,6 +43,12 @@ func (h *sandboxService) recoverPhysicalState(ctx context.Context) error {
 	if err := h.restoreSandboxNetworkFacts(); err != nil {
 		return fmt.Errorf("restore sandbox network facts: %w", err)
 	}
+	// Resource-operation recovery runs last, still before recoveryReady: it
+	// releases only this daemon's own verified freeze intents and leaves
+	// anything unresolvable fail-closed with a diagnostic.
+	if err := h.recoverResourceOperationStates(ctx); err != nil {
+		return fmt.Errorf("recover resource operation states: %w", err)
+	}
 	return nil
 }
 
