@@ -370,6 +370,10 @@ func (h *sandboxService) deleteSandboxRuntime(ctx context.Context, sandboxID str
 		return errord.ToGRPC(err)
 	}
 
+	if c == nil || c.Metadata == nil {
+		return errord.ToGRPCf(errord.ErrFailedPrecondition, "sandbox %s metadata is missing before delete", sandboxID)
+	}
+
 	if expected != "" && (c.Metadata == nil || c.Metadata.Labels[resourceGenerationLabel] != expected) {
 		return errord.ToGRPCf(errord.ErrFailedPrecondition, "sandbox resource generation changed before delete")
 	}
@@ -386,6 +390,27 @@ func (h *sandboxService) deleteSandboxRuntime(ctx context.Context, sandboxID str
 	resource, err := h.physicalResources(c.Metadata)
 	if err != nil {
 		return err
+	}
+
+	// Preserve the last daemon-owned observations of a scheduler-managed
+	// generation across the physical delete: external polls can no longer see
+	// intermediate generations once park/eviction retires them. One fresh
+	// attempt ID correlates the before- and after-runtime-delete records, and
+	// every capture binds to an immutable snapshot of the metadata selected
+	// under this physical lock — never to a pointer that could move later in
+	// the attempt. Capture precedes the pending receipt and the runtime
+	// handler alike, for legacy Delete on a generated sandbox just as for
+	// DeleteIfGeneration; sandboxes without a generation label keep the
+	// unconditional-delete behavior unchanged.
+	deleteAttemptID, deleteGeneration := "", ""
+	var deleteSnapshot *runtime.SandboxMetadata
+	if generation := c.Metadata.GetLabels()[resourceGenerationLabel]; generation != "" {
+		deleteAttemptID, deleteGeneration = uuid.NewString(), generation
+		deleteSnapshot = proto.Clone(c.Metadata).(*runtime.SandboxMetadata)
+		if err := h.captureRetirementResources(sandboxID, deleteGeneration, deleteAttemptID,
+			retirementResourcePhaseBeforeDelete, deleteSnapshot); err != nil {
+			return err
+		}
 	}
 
 	if expected != "" {
@@ -406,10 +431,23 @@ func (h *sandboxService) deleteSandboxRuntime(ctx context.Context, sandboxID str
 			firecrackerCheckpointReservationOwner(sandboxID),
 		)
 	}
+	// The runtime handler's own cleanup does not recycle the daemon-owned
+	// cgroup, so one more observation against the same attempt snapshot is
+	// still possible before resource release. It remains observation evidence
+	// — its physical_deletion_confirmed field is permanently false; only a
+	// separate completion receipt proves full cleanup. Persistence failure stops release
+	// and the receipt here, leaving the recoverable unknown state for a retry
+	// under a fresh attempt ID.
+	if deleteAttemptID != "" {
+		if err := h.captureRetirementResources(sandboxID, deleteGeneration, deleteAttemptID,
+			retirementResourcePhaseAfterDelete, deleteSnapshot); err != nil {
+			return err
+		}
+	}
 	if h.networkMgr != nil {
 		h.networkMgr.cleanupDnatRules(sandboxID)
 		h.networkMgr.releaseDnatPorts(sandboxID)
-	}	}
+	}
 	if h.xpuMgr != nil {
 		h.xpuMgr.Release(sandboxID)
 	}

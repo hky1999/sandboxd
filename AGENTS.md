@@ -166,11 +166,41 @@ read as an observed value, let alone a lifetime peak. The cgroup v1 backend
 reports all four flags false: its library metrics cannot prove source presence.
 Servers predating the flags default them false on the wire for the same
 reason, so consumers must consult the flags, never infer validity from a
-nonzero number. Harbor collector/report ingestion and capture before physical
-deletion remain pending.
+nonzero number. Harbor report consumption of node retirement evidence remains pending;
+see the retirement-resource section below for daemon capture.
 Metadata atomic writes now fsync the file, rename, then fsync its directory;
 PersistMetadata also syncs parent entries through the containers-root parent
 before publishing an INTENT in memory. A post-rename sync error can leave the
 new file visible and must remain unresolved. Syscall fault checks are not a real
 power-loss recovery acceptance run. Provision the daemon root durably and preserve
 generation-segmented evidence before deletion.
+
+# Scheduler retirement resource evidence
+
+For a sandbox carrying a resource generation, both Delete and
+DeleteIfGeneration archive observations in the daemon-owned
+`<RootDir>/scheduler-resource-retirements` directory. One delete_attempt_id
+links separate immutable before_runtime_delete and after_runtime_delete
+records; retries create another attempt. The second observation is after
+runtime deletion returns successfully (including NotFound), before daemon
+cgroup/resource recycling. Both compare current metadata with the original
+cloned snapshot under the physical resource lock. Completed conditional
+retirement replay creates no new observation and cannot adopt a replacement.
+
+Records contain only allowlisted identity, validated committed birth data,
+and resource counters with knownness flags. Unavailable Stats is null with
+an explicit category and does not alone prevent cleanup. The records never
+prove full deletion: physical_deletion_confirmed remains false permanently;
+only a separate matching completed retirement receipt proves full cleanup.
+Pre-delete publication failure prevents the runtime call. Post-delete
+publication failure prevents resource recycling and the completed receipt,
+leaving a pending state that must be retried or reconciled.
+
+Keep this directory on durable storage, mode0700; records are mode0600,
+file-fsynced, linked without replacing existing records, then the temporary
+name is removed before directory fsync. The append-only journal permits
+65536 directory entries and at most32KiB per record, with no automatic GC.
+Do not discard records merely to unblock a full journal. Export/history
+consumption and safe archival/reclamation still require implementation.
+These observations do not measure an instantaneous whole-lifetime CPU peak;
+read memory peaks only when memory_peak_known is true.
