@@ -74,6 +74,16 @@ const (
 	// identified checkpoint operations; a journal pinning a value outside
 	// 1..600 is corruption, not data.
 	identifiedCheckpointMaxTimeoutSeconds = 600
+
+	// identifiedRecoveryTimeoutSeconds bounds every explicit
+	// recover-checkpoint-operation attempt this CLI issues (the join of a
+	// still-running original execution, the runtime recovery, and the
+	// acknowledgment). It is deliberately NOT journaled: unlike the pinned
+	// checkpoint payload it is not part of the request digest or any other
+	// bound intent, so a fixed value keeps every retry byte-stable without
+	// widening the journal schema, and the controller's own -wait plus the
+	// node CLI's --timeout still bound the command end to end.
+	identifiedRecoveryTimeoutSeconds = 180
 )
 
 // Migration stages, in execution order. A stage is recorded only once its

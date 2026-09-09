@@ -87,9 +87,12 @@ func (h *sandboxService) CheckpointIfGeneration(
 // runtime that binds its own persisted generation can re-verify the
 // incarnation at its boundary; the server's label check stays the admission
 // gate. A non-nil operation binding marks the exact runtime-entry boundary
-// for CheckpointWithOperation and records the durable success fact after the
+// for CheckpointWithOperation, carries the complete admitted identity
+// (operation ID, request digest, source generation) into the runtime as
+// CheckpointConfig.Operation — the exact binding a version-2 record's runtime
+// witness must record — and records the durable success fact after the
 // runtime returned nil; the legacy and conditional entries pass nil and
-// behave exactly as before.
+// behave exactly as before, leaving the runtime binding zero.
 func (h *sandboxService) checkpoint(
 	ctx context.Context,
 	request *runtime.CheckpointRequest,
@@ -248,6 +251,12 @@ func (h *sandboxService) checkpoint(
 				LeaveRunning:       request.LeaveRunning,
 				SnapshotType:       request.SnapshotType,
 				ExpectedGeneration: expectedGeneration,
+				// The exact admitted identity of an identified operation —
+				// operation ID, request digest, source generation — so the
+				// runtime's durable witness binds to the request this service
+				// admitted, never to a reconstruction. Zero for the legacy
+				// and conditional entries.
+				Operation: operation.runtimeBinding(),
 			})
 		},
 	)

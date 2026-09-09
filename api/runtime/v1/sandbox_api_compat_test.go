@@ -268,7 +268,23 @@ func projectCheckpointOperationWire(t *testing.T, d *descriptorpb.FileDescriptor
 	messages := map[string][]field{
 		"CheckpointWithOperationRequest": {{"operation_id", str, ""}, {"checkpoint", descriptorpb.FieldDescriptorProto_TYPE_MESSAGE, pkg + "CheckpointRequest"}, {"expected_generation", str, ""}},
 		"GetCheckpointOperationRequest":  {{"operation_id", str, ""}},
-		"CheckpointOperationStatus":      {{"operation_id", str, ""}, {"sandbox_id", str, ""}, {"state", descriptorpb.FieldDescriptorProto_TYPE_ENUM, pkg + "CheckpointOperationState"}, {"source_generation", str, ""}, {"checkpoint_dir", str, ""}, {"request_digest", str, ""}, {"artifact_root_digest", str, ""}, {"artifact_root_scheme", str, ""}, {"message", str, ""}},
+		"RecoverCheckpointOperationRequest": {
+			{"operation", descriptorpb.FieldDescriptorProto_TYPE_MESSAGE, pkg + "CheckpointWithOperationRequest"},
+			{"recovery_timeout_seconds", descriptorpb.FieldDescriptorProto_TYPE_UINT32, ""},
+		},
+		"CheckpointOperationStatus": {
+			{"operation_id", str, ""},
+			{"sandbox_id", str, ""},
+			{"state", descriptorpb.FieldDescriptorProto_TYPE_ENUM, pkg + "CheckpointOperationState"},
+			{"source_generation", str, ""},
+			{"checkpoint_dir", str, ""},
+			{"request_digest", str, ""},
+			{"artifact_root_digest", str, ""},
+			{"artifact_root_scheme", str, ""},
+			{"message", str, ""},
+			{"recovery_protocol", descriptorpb.FieldDescriptorProto_TYPE_ENUM, pkg + "CheckpointOperationRecoveryProtocol"},
+			{"evidence_released", descriptorpb.FieldDescriptorProto_TYPE_BOOL, ""},
+		},
 	}
 	d.MessageType = slices.DeleteFunc(d.MessageType, func(m *descriptorpb.DescriptorProto) bool {
 		want, ok := messages[m.GetName()]
@@ -310,7 +326,33 @@ func projectCheckpointOperationWire(t *testing.T, d *descriptorpb.FileDescriptor
 	if !foundEnum {
 		t.Fatal("missing source operation enum")
 	}
-	rpcs := map[string]string{"CheckpointWithOperation": "CheckpointWithOperationRequest", "GetCheckpointOperation": "GetCheckpointOperationRequest"}
+	// The additive recovery-protocol enum of the source-operation surface,
+	// validated and projected out the same way before the frozen hash.
+	foundProtocolEnum := false
+	d.EnumType = slices.DeleteFunc(d.EnumType, func(e *descriptorpb.EnumDescriptorProto) bool {
+		if e.GetName() != "CheckpointOperationRecoveryProtocol" {
+			return false
+		}
+		names := []string{"UNSPECIFIED", "WITNESS"}
+		if foundProtocolEnum || len(e.Value) != len(names) || len(e.ReservedRange) != 0 || len(e.ReservedName) != 0 {
+			t.Fatal("unexpected source recovery protocol enum")
+		}
+		for i, n := range names {
+			if e.Value[i].GetName() != "CHECKPOINT_OPERATION_RECOVERY_PROTOCOL_"+n || e.Value[i].GetNumber() != int32(i) {
+				t.Fatal("unexpected source recovery protocol enum value")
+			}
+		}
+		foundProtocolEnum = true
+		return true
+	})
+	if !foundProtocolEnum {
+		t.Fatal("missing source recovery protocol enum")
+	}
+	rpcs := map[string]string{
+		"CheckpointWithOperation":    "CheckpointWithOperationRequest",
+		"GetCheckpointOperation":     "GetCheckpointOperationRequest",
+		"RecoverCheckpointOperation": "RecoverCheckpointOperationRequest",
+	}
 	for _, service := range d.Service {
 		service.Method = slices.DeleteFunc(service.Method, func(m *descriptorpb.MethodDescriptorProto) bool {
 			input, ok := rpcs[m.GetName()]

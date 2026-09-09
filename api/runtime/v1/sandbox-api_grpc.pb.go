@@ -33,20 +33,21 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	SandboxService_Start_FullMethodName                   = "/runtime.v1.SandboxService/Start"
-	SandboxService_StartWithOperation_FullMethodName      = "/runtime.v1.SandboxService/StartWithOperation"
-	SandboxService_GetStartOperation_FullMethodName       = "/runtime.v1.SandboxService/GetStartOperation"
-	SandboxService_Checkpoint_FullMethodName              = "/runtime.v1.SandboxService/Checkpoint"
-	SandboxService_CheckpointIfGeneration_FullMethodName  = "/runtime.v1.SandboxService/CheckpointIfGeneration"
-	SandboxService_CheckpointWithOperation_FullMethodName = "/runtime.v1.SandboxService/CheckpointWithOperation"
-	SandboxService_GetCheckpointOperation_FullMethodName  = "/runtime.v1.SandboxService/GetCheckpointOperation"
-	SandboxService_Delete_FullMethodName                  = "/runtime.v1.SandboxService/Delete"
-	SandboxService_DeleteIfGeneration_FullMethodName      = "/runtime.v1.SandboxService/DeleteIfGeneration"
-	SandboxService_Wait_FullMethodName                    = "/runtime.v1.SandboxService/Wait"
-	SandboxService_List_FullMethodName                    = "/runtime.v1.SandboxService/List"
-	SandboxService_Stats_FullMethodName                   = "/runtime.v1.SandboxService/Stats"
-	SandboxService_ListAvailableRuntimes_FullMethodName   = "/runtime.v1.SandboxService/ListAvailableRuntimes"
-	SandboxService_SetNetworkPolicy_FullMethodName        = "/runtime.v1.SandboxService/SetNetworkPolicy"
+	SandboxService_Start_FullMethodName                      = "/runtime.v1.SandboxService/Start"
+	SandboxService_StartWithOperation_FullMethodName         = "/runtime.v1.SandboxService/StartWithOperation"
+	SandboxService_GetStartOperation_FullMethodName          = "/runtime.v1.SandboxService/GetStartOperation"
+	SandboxService_Checkpoint_FullMethodName                 = "/runtime.v1.SandboxService/Checkpoint"
+	SandboxService_CheckpointIfGeneration_FullMethodName     = "/runtime.v1.SandboxService/CheckpointIfGeneration"
+	SandboxService_CheckpointWithOperation_FullMethodName    = "/runtime.v1.SandboxService/CheckpointWithOperation"
+	SandboxService_GetCheckpointOperation_FullMethodName     = "/runtime.v1.SandboxService/GetCheckpointOperation"
+	SandboxService_RecoverCheckpointOperation_FullMethodName = "/runtime.v1.SandboxService/RecoverCheckpointOperation"
+	SandboxService_Delete_FullMethodName                     = "/runtime.v1.SandboxService/Delete"
+	SandboxService_DeleteIfGeneration_FullMethodName         = "/runtime.v1.SandboxService/DeleteIfGeneration"
+	SandboxService_Wait_FullMethodName                       = "/runtime.v1.SandboxService/Wait"
+	SandboxService_List_FullMethodName                       = "/runtime.v1.SandboxService/List"
+	SandboxService_Stats_FullMethodName                      = "/runtime.v1.SandboxService/Stats"
+	SandboxService_ListAvailableRuntimes_FullMethodName      = "/runtime.v1.SandboxService/ListAvailableRuntimes"
+	SandboxService_SetNetworkPolicy_FullMethodName           = "/runtime.v1.SandboxService/SetNetworkPolicy"
 )
 
 // SandboxServiceClient is the client API for SandboxService service.
@@ -82,11 +83,26 @@ type SandboxServiceClient interface {
 	// idempotency state, not a cross-node writer lease or fencing token. Old
 	// servers that predate the RPC return Unimplemented; callers must fail
 	// hard instead of falling back to Checkpoint or CheckpointIfGeneration.
+	// New admissions require a runtime with both the sealed-root writer and
+	// the operation-witness capabilities and are recorded under recovery
+	// protocol WITNESS; the exact operation binding is sent to the runtime and
+	// a successful checkpoint acknowledges the retained evidence after the
+	// SUCCEEDED fact is durable.
 	CheckpointWithOperation(ctx context.Context, in *CheckpointWithOperationRequest, opts ...grpc.CallOption) (*CheckpointOperationStatus, error)
 	// GetCheckpointOperation returns the durable state of one checkpoint
 	// operation. It never starts a checkpoint and never re-executes a past
 	// operation.
 	GetCheckpointOperation(ctx context.Context, in *GetCheckpointOperationRequest, opts ...grpc.CallOption) (*CheckpointOperationStatus, error)
+	// RecoverCheckpointOperation explicitly reconciles one already-recorded
+	// checkpoint operation bound to the witness recovery protocol: it completes
+	// the runtime's stop-source flow for an undetermined record and releases
+	// the evidence-retention gate of a durable success. It never admits a new
+	// operation, never takes a snapshot, never resumes the source, and never
+	// falls back to Checkpoint, CheckpointIfGeneration, or
+	// CheckpointWithOperation. A missing record is NotFound; a legacy
+	// protocol-0 record, a FAILED record, and any binding mismatch are
+	// refused.
+	RecoverCheckpointOperation(ctx context.Context, in *RecoverCheckpointOperationRequest, opts ...grpc.CallOption) (*CheckpointOperationStatus, error)
 	// Delete force-deletes a sandbox.
 	Delete(ctx context.Context, in *DeleteRequest, opts ...grpc.CallOption) (*DeleteResponse, error)
 	// DeleteIfGeneration retires one physical generation only when the sandbox
@@ -176,6 +192,16 @@ func (c *sandboxServiceClient) GetCheckpointOperation(ctx context.Context, in *G
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(CheckpointOperationStatus)
 	err := c.cc.Invoke(ctx, SandboxService_GetCheckpointOperation_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *sandboxServiceClient) RecoverCheckpointOperation(ctx context.Context, in *RecoverCheckpointOperationRequest, opts ...grpc.CallOption) (*CheckpointOperationStatus, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CheckpointOperationStatus)
+	err := c.cc.Invoke(ctx, SandboxService_RecoverCheckpointOperation_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -285,11 +311,26 @@ type SandboxServiceServer interface {
 	// idempotency state, not a cross-node writer lease or fencing token. Old
 	// servers that predate the RPC return Unimplemented; callers must fail
 	// hard instead of falling back to Checkpoint or CheckpointIfGeneration.
+	// New admissions require a runtime with both the sealed-root writer and
+	// the operation-witness capabilities and are recorded under recovery
+	// protocol WITNESS; the exact operation binding is sent to the runtime and
+	// a successful checkpoint acknowledges the retained evidence after the
+	// SUCCEEDED fact is durable.
 	CheckpointWithOperation(context.Context, *CheckpointWithOperationRequest) (*CheckpointOperationStatus, error)
 	// GetCheckpointOperation returns the durable state of one checkpoint
 	// operation. It never starts a checkpoint and never re-executes a past
 	// operation.
 	GetCheckpointOperation(context.Context, *GetCheckpointOperationRequest) (*CheckpointOperationStatus, error)
+	// RecoverCheckpointOperation explicitly reconciles one already-recorded
+	// checkpoint operation bound to the witness recovery protocol: it completes
+	// the runtime's stop-source flow for an undetermined record and releases
+	// the evidence-retention gate of a durable success. It never admits a new
+	// operation, never takes a snapshot, never resumes the source, and never
+	// falls back to Checkpoint, CheckpointIfGeneration, or
+	// CheckpointWithOperation. A missing record is NotFound; a legacy
+	// protocol-0 record, a FAILED record, and any binding mismatch are
+	// refused.
+	RecoverCheckpointOperation(context.Context, *RecoverCheckpointOperationRequest) (*CheckpointOperationStatus, error)
 	// Delete force-deletes a sandbox.
 	Delete(context.Context, *DeleteRequest) (*DeleteResponse, error)
 	// DeleteIfGeneration retires one physical generation only when the sandbox
@@ -335,6 +376,9 @@ func (UnimplementedSandboxServiceServer) CheckpointWithOperation(context.Context
 }
 func (UnimplementedSandboxServiceServer) GetCheckpointOperation(context.Context, *GetCheckpointOperationRequest) (*CheckpointOperationStatus, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetCheckpointOperation not implemented")
+}
+func (UnimplementedSandboxServiceServer) RecoverCheckpointOperation(context.Context, *RecoverCheckpointOperationRequest) (*CheckpointOperationStatus, error) {
+	return nil, status.Error(codes.Unimplemented, "method RecoverCheckpointOperation not implemented")
 }
 func (UnimplementedSandboxServiceServer) Delete(context.Context, *DeleteRequest) (*DeleteResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Delete not implemented")
@@ -504,6 +548,24 @@ func _SandboxService_GetCheckpointOperation_Handler(srv interface{}, ctx context
 	return interceptor(ctx, in, info, handler)
 }
 
+func _SandboxService_RecoverCheckpointOperation_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RecoverCheckpointOperationRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SandboxServiceServer).RecoverCheckpointOperation(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SandboxService_RecoverCheckpointOperation_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SandboxServiceServer).RecoverCheckpointOperation(ctx, req.(*RecoverCheckpointOperationRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _SandboxService_Delete_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(DeleteRequest)
 	if err := dec(in); err != nil {
@@ -664,6 +726,10 @@ var SandboxService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetCheckpointOperation",
 			Handler:    _SandboxService_GetCheckpointOperation_Handler,
+		},
+		{
+			MethodName: "RecoverCheckpointOperation",
+			Handler:    _SandboxService_RecoverCheckpointOperation_Handler,
 		},
 		{
 			MethodName: "Delete",

@@ -31,6 +31,7 @@ import (
 	"github.com/inclusionAI/sandboxd/config"
 	"github.com/inclusionAI/sandboxd/pkg/checkpointchunks"
 	"github.com/inclusionAI/sandboxd/pkg/checkpointroot"
+	"github.com/inclusionAI/sandboxd/pkg/errord"
 	svc "github.com/inclusionAI/sandboxd/pkg/runtime"
 	"github.com/inclusionAI/sandboxd/pkg/sandbox"
 	"github.com/inclusionAI/sandboxd/pkg/store"
@@ -43,21 +44,35 @@ import (
 
 // checkpointOperationRuntimeHandler models a runtime whose stop-and-copy
 // checkpoints write a sealed, root-bindable directory: the
-// CheckpointOperationWriter capability the operation RPC requires. It is a
-// fake runtime model for the server-side operation semantics — it is NOT a
-// real Firecracker acceptance (no VMM, no memory wrapper, no cgroup path).
-// It is registered under the runsc name so the plain checkpoint path runs on
-// every host; the capability, not the runtime name, gates operation
-// admission, exactly as CheckpointRootVerifier gates identified restores.
+// CheckpointOperationWriter capability the operation RPC requires, plus the
+// CheckpointOperationWitness capability version-2 admissions additionally
+// demand — a minimal in-memory witness bound to the directory the identified
+// checkpoint sealed. It is a fake runtime model for the server-side operation
+// semantics — it is NOT a real Firecracker acceptance (no VMM, no memory
+// wrapper, no cgroup path, no durable prepared/completed phases). It is
+// registered under the runsc name so the plain checkpoint path runs on every
+// host; the capability, not the runtime name, gates operation admission,
+// exactly as CheckpointRootVerifier gates identified restores.
 type checkpointOperationRuntimeHandler struct {
 	*svc.FakeRuntimeHandler
 
 	mu           sync.Mutex
 	checkpointFn func(context.Context, svc.CheckpointConfig) error
 	checkpoints  []svc.CheckpointConfig
+	// recoverFn and ackFn override the default witness behavior; the default
+	// recovery re-binds the directory the identified checkpoint sealed and the
+	// default acknowledgment succeeds.
+	recoverFn func(context.Context, string, svc.CheckpointOperationBinding) (svc.CheckpointOperationCompletion, error)
+	ackFn     func(context.Context, string, svc.CheckpointOperationBinding) error
+	// witnessDirectory is the output directory the fake sealed for the last
+	// identified checkpoint; its witness answers recoveries from it.
+	witnessDirectory string
+	recovers         []svc.CheckpointOperationBinding
+	acks             []svc.CheckpointOperationBinding
 }
 
 var _ svc.CheckpointHandler = (*checkpointOperationRuntimeHandler)(nil)
+var _ svc.CheckpointOperationWitness = (*checkpointOperationRuntimeHandler)(nil)
 
 func (h *checkpointOperationRuntimeHandler) Restore(context.Context, svc.StartConfig) error {
 	return errors.New("restore is not exercised by checkpoint operation tests")
@@ -83,6 +98,9 @@ func (h *checkpointOperationRuntimeHandler) Checkpoint(
 	h.mu.Lock()
 	h.checkpoints = append(h.checkpoints, config)
 	fn := h.checkpointFn
+	if !config.Operation.IsZero() {
+		h.witnessDirectory = config.Directory
+	}
 	h.mu.Unlock()
 	if fn != nil {
 		return fn(ctx, config)
@@ -94,6 +112,74 @@ func (h *checkpointOperationRuntimeHandler) Checkpoint(
 // before admitting an identified checkpoint operation.
 func (h *checkpointOperationRuntimeHandler) SupportsCheckpointOperations() bool {
 	return true
+}
+
+// RecoverCheckpointOperation is the fake witness half of the recovery
+// protocol: it records the exact binding the service presented and, by
+// default, reports the sealed root of the directory the identified checkpoint
+// wrote — the completion a real runtime answers from its durable record.
+func (h *checkpointOperationRuntimeHandler) RecoverCheckpointOperation(
+	ctx context.Context,
+	sandboxID string,
+	binding svc.CheckpointOperationBinding,
+) (svc.CheckpointOperationCompletion, error) {
+	h.mu.Lock()
+	h.recovers = append(h.recovers, binding)
+	directory := h.witnessDirectory
+	fn := h.recoverFn
+	h.mu.Unlock()
+	if fn != nil {
+		return fn(ctx, sandboxID, binding)
+	}
+	if directory == "" {
+		return svc.CheckpointOperationCompletion{}, fmt.Errorf(
+			"Firecracker-like sandbox %s has no witnessed checkpoint operation: %w",
+			sandboxID, errord.ErrNotFound,
+		)
+	}
+	root, err := checkpointroot.Bind(directory)
+	if err != nil {
+		return svc.CheckpointOperationCompletion{}, err
+	}
+	return svc.CheckpointOperationCompletion{RootDigest: root.RootDigest, RootScheme: root.Scheme}, nil
+}
+
+// AckCheckpointOperation records the acknowledgment binding and succeeds by
+// default, modeling an idempotent release of the evidence gate.
+func (h *checkpointOperationRuntimeHandler) AckCheckpointOperation(
+	ctx context.Context,
+	sandboxID string,
+	binding svc.CheckpointOperationBinding,
+) error {
+	h.mu.Lock()
+	h.acks = append(h.acks, binding)
+	fn := h.ackFn
+	h.mu.Unlock()
+	if fn != nil {
+		return fn(ctx, sandboxID, binding)
+	}
+	return nil
+}
+
+// witnessCounts snapshots the recorded witness interactions.
+func (h *checkpointOperationRuntimeHandler) witnessCounts() (recovers, acks int) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return len(h.recovers), len(h.acks)
+}
+
+// recordedAcks returns the exact bindings the service acknowledged.
+func (h *checkpointOperationRuntimeHandler) recordedAcks() []svc.CheckpointOperationBinding {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]svc.CheckpointOperationBinding(nil), h.acks...)
+}
+
+// recordedRecovers returns the exact bindings the service recovered.
+func (h *checkpointOperationRuntimeHandler) recordedRecovers() []svc.CheckpointOperationBinding {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]svc.CheckpointOperationBinding(nil), h.recovers...)
 }
 
 func (h *checkpointOperationRuntimeHandler) checkpointCount() int {
@@ -920,9 +1006,14 @@ func TestCheckpointOperationJournalValidation(t *testing.T) {
 
 	t.Run("bad version and phase fail", func(t *testing.T) {
 		for name, mutate := range map[string]func(*checkpointOperationRecord){
-			"version":       func(r *checkpointOperationRecord) { r.Version = 2 },
-			"phase":         func(r *checkpointOperationRecord) { r.Phase = "maybe" },
-			"digest length": func(r *checkpointOperationRecord) { r.RequestDigest = "abc" },
+			// Version 2 is a supported record version now (the witness
+			// recovery protocol); a version outside 1 and 2 is corruption —
+			// which is also exactly how a pre-version-2 binary refuses to
+			// load a downgraded journal, fail closed instead of guessing.
+			"version zero":    func(r *checkpointOperationRecord) { r.Version = 0 },
+			"version unknown": func(r *checkpointOperationRecord) { r.Version = 3 },
+			"phase":           func(r *checkpointOperationRecord) { r.Phase = "maybe" },
+			"digest length":   func(r *checkpointOperationRecord) { r.RequestDigest = "abc" },
 			"artifact without success": func(r *checkpointOperationRecord) {
 				r.Phase = checkpointOperationPhaseFailed
 			},
@@ -938,6 +1029,25 @@ func TestCheckpointOperationJournalValidation(t *testing.T) {
 				assert.Error(t, err)
 			})
 		}
+	})
+
+	t.Run("version 2 records load unchanged beside version 1", func(t *testing.T) {
+		root := t.TempDir()
+		writeRecord(t, root, "op-journal-1.json", validRecord(func(r *checkpointOperationRecord) {
+			r.Version = checkpointOperationRecordVersionWitness
+		}))
+		writeRecord(t, root, "op-journal-2.json", validRecord(func(r *checkpointOperationRecord) {
+			r.OperationID = "op-journal-2"
+			r.Version = checkpointOperationRecordVersionLegacy
+		}))
+		store, err := loadCheckpointOperations(root)
+		require.NoError(t, err)
+		witness, ok := store.published("op-journal-1")
+		require.True(t, ok)
+		assert.Equal(t, checkpointOperationRecordVersionWitness, witness.Version)
+		legacy, ok := store.published("op-journal-2")
+		require.True(t, ok)
+		assert.Equal(t, checkpointOperationRecordVersionLegacy, legacy.Version)
 	})
 
 	t.Run("mismatched operation ID fails", func(t *testing.T) {

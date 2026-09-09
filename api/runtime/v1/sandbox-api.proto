@@ -47,11 +47,26 @@ service SandboxService {
   // idempotency state, not a cross-node writer lease or fencing token. Old
   // servers that predate the RPC return Unimplemented; callers must fail
   // hard instead of falling back to Checkpoint or CheckpointIfGeneration.
+  // New admissions require a runtime with both the sealed-root writer and
+  // the operation-witness capabilities and are recorded under recovery
+  // protocol WITNESS; the exact operation binding is sent to the runtime and
+  // a successful checkpoint acknowledges the retained evidence after the
+  // SUCCEEDED fact is durable.
   rpc CheckpointWithOperation(CheckpointWithOperationRequest) returns (CheckpointOperationStatus) {}
   // GetCheckpointOperation returns the durable state of one checkpoint
   // operation. It never starts a checkpoint and never re-executes a past
   // operation.
   rpc GetCheckpointOperation(GetCheckpointOperationRequest) returns (CheckpointOperationStatus) {}
+  // RecoverCheckpointOperation explicitly reconciles one already-recorded
+  // checkpoint operation bound to the witness recovery protocol: it completes
+  // the runtime's stop-source flow for an undetermined record and releases
+  // the evidence-retention gate of a durable success. It never admits a new
+  // operation, never takes a snapshot, never resumes the source, and never
+  // falls back to Checkpoint, CheckpointIfGeneration, or
+  // CheckpointWithOperation. A missing record is NotFound; a legacy
+  // protocol-0 record, a FAILED record, and any binding mismatch are
+  // refused.
+  rpc RecoverCheckpointOperation(RecoverCheckpointOperationRequest) returns (CheckpointOperationStatus) {}
   // Delete force-deletes a sandbox.
   rpc Delete(DeleteRequest) returns (DeleteResponse) {}
   // DeleteIfGeneration retires one physical generation only when the sandbox
@@ -490,6 +505,23 @@ enum CheckpointOperationState {
   CHECKPOINT_OPERATION_STATE_UNKNOWN = 4;
 }
 
+// CheckpointOperationRecoveryProtocol reports which recovery protocol the
+// durable record was admitted under. It is a record property, never a piece
+// of evidence: comparing two historical completion facts must not report a
+// conflict because these protocol fields differ.
+enum CheckpointOperationRecoveryProtocol {
+  // UNSPECIFIED marks a legacy version-1 record. It was admitted before the
+  // runtime recorded prepared/completed operation witnesses, so its UNKNOWN
+  // outcomes cannot be proven recoverable and explicit recovery is refused;
+  // historical Get and same-request replay keep working unchanged.
+  CHECKPOINT_OPERATION_RECOVERY_PROTOCOL_UNSPECIFIED = 0;
+  // WITNESS marks a version-2 record: the admission verified the runtime
+  // supports both the sealed-root writer capability and the operation
+  // witness, and the exact operation binding was sent to the runtime. These
+  // records — and only these — are eligible for RecoverCheckpointOperation.
+  CHECKPOINT_OPERATION_RECOVERY_PROTOCOL_WITNESS = 1;
+}
+
 // CheckpointOperationStatus is the durable state of one checkpoint operation,
 // returned by both CheckpointWithOperation and GetCheckpointOperation.
 message CheckpointOperationStatus {
@@ -518,12 +550,45 @@ message CheckpointOperationStatus {
   // Message carries the outcome detail, including why an UNKNOWN outcome could
   // not be proven.
   string message = 9;
+  // RecoveryProtocol reports which recovery protocol the durable record was
+  // admitted under (see CheckpointOperationRecoveryProtocol). It is set by
+  // every reply — query, replay, and recovery alike — from the record alone.
+  CheckpointOperationRecoveryProtocol recovery_protocol = 10;
+  // EvidenceReleased reports that THIS invocation completed the runtime
+  // acknowledgment that releases the operation's evidence-retention gate,
+  // after the service's SUCCEEDED fact was already durable. It is per-call,
+  // not a durable record field: read-only Get and historical replays report
+  // false without proving anything about a past or lost acknowledgment, so it
+  // must never be compared as a historical fact. A controller that requires
+  // released evidence performs one explicit recovery and reads it there.
+  bool evidence_released = 11;
 }
 
 // GetCheckpointOperationRequest queries one checkpoint operation by identity.
 message GetCheckpointOperationRequest {
   // OperationID is the operation identity to look up.
   string operation_id = 1;
+}
+
+// RecoverCheckpointOperationRequest asks for the explicit recovery of one
+// already-recorded checkpoint operation. The recovery is authorized by the
+// original request alone: the service recomputes the request digest from this
+// complete, unrewritten payload and refuses the operation ID when it does not
+// match the recorded binding. A caller-echoed digest would prove nothing and
+// is deliberately not part of the message.
+message RecoverCheckpointOperationRequest {
+  // Operation is the complete original CheckpointWithOperationRequest, exactly
+  // as it was first admitted — same checkpoint directory spelling, same
+  // original checkpoint timeout, compression, leave_running, snapshot type,
+  // and the exact expected generation. Rewriting any field changes the request
+  // digest and refuses the recovery; the original request timeout keeps its
+  // role in the digest and is never replaced by the recovery timeout below.
+  CheckpointWithOperationRequest operation = 1;
+  // RecoveryTimeoutSeconds bounds this reconciliation attempt — the join of a
+  // still-running original executor, the runtime recovery, and the
+  // acknowledgment — and must be between 1 and 600. It is not part of the
+  // request digest and never rewrites the recorded operation.
+  uint32 recovery_timeout_seconds = 2;
 }
 
 // DeleteRequest describes a force-delete request.
