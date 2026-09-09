@@ -112,6 +112,16 @@ type CheckpointConfig struct {
 	// runtime's automatic tier selection in charge. Runtimes without
 	// incremental checkpoints ignore it.
 	SnapshotType string
+	// ExpectedGeneration is the server-admitted incarnation identity a
+	// conditional (CheckpointIfGeneration) or identified
+	// (CheckpointWithOperation) checkpoint was admitted against, validated by
+	// the server against its own metadata under the per-ID physical lock. It
+	// is internal runtime metadata rather than a public checkpoint option:
+	// the legacy Checkpoint leaves it empty and nothing enforces it. A
+	// runtime that binds a persisted generation (see StrictDeleteHandler)
+	// compares the exact value against its own record before any checkpoint
+	// side effect; runtimes without a bound generation keep ignoring it.
+	ExpectedGeneration string
 }
 
 // HostResourcesProvider maps guest-visible resources to the host cgroup that
