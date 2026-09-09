@@ -87,8 +87,9 @@ const (
 	// unchanged; version 3 adds exactly one fact — `abort_confirmed`, which
 	// only a FAILED version-3 record may carry (a failure the runtime itself
 	// confirmed as an abort), never a version-1/2 record and never beside a
-	// sealed root. The store stage owns the version-3 admission and the abort
-	// slot; no public surface produces or consumes version 3 yet.
+	// sealed root. CheckpointWithOperation writes version 3 whenever the
+	// source runtime holds the aborter capability, and the public
+	// AbortCheckpointOperation consumes it.
 	//
 	// Rollback refusal: a binary that predates version 2 validates records
 	// with `version != 1` as corrupt and fails startup, so a daemon root that
@@ -1433,6 +1434,7 @@ func (h *sandboxService) CheckpointWithOperation(
 		operationID:      request.GetOperationID(),
 		requestDigest:    digest,
 		sourceGeneration: request.ExpectedGeneration,
+		checkpointDir:    canonicalDir,
 	}
 	_, checkpointErr := func() (resp *runtime.CheckpointResponse, err error) {
 		defer func() {
@@ -1840,6 +1842,11 @@ func (h *sandboxService) RecoverCheckpointOperation(
 		OperationID:      bound.OperationID,
 		RequestDigest:    bound.RequestDigest,
 		SourceGeneration: bound.Generation,
+		// The canonical directory from the durable record: the runtime's
+		// zero-witness retirement locates the operation's caller-owned
+		// directory evidence through it, and the initial checkpoint's
+		// directory agreement check reads the same value.
+		CheckpointDir: bound.CheckpointDir,
 	}
 	if !recovery.acknowledgmentOnly() {
 		completion, recoverErr := witness.RecoverCheckpointOperation(execCtx, bound.SandboxID, binding)
@@ -1966,10 +1973,10 @@ func (h *sandboxService) checkpointOperationStatus(operationID string) (*runtime
 // the memory-wrapper callback and records the durable success fact only after
 // the runtime returned nil AND the sealed content root of the output
 // directory was read; it never infers entry from error text. It also carries
-// the complete admitted identity — the request digest and the expected source
-// generation — so the runtime receives the exact operation binding its
-// durable witness must record, never a binding reconstructed from a later
-// view of the request.
+// the complete admitted identity — the request digest, the expected source
+// generation, and the canonical checkpoint directory — so the runtime
+// receives the exact operation binding its durable witness must record,
+// never a binding reconstructed from a later view of the request.
 type checkpointOperationBinding struct {
 	store       *checkpointOperationStore
 	operationID string
@@ -1978,6 +1985,10 @@ type checkpointOperationBinding struct {
 	requestDigest string
 	// sourceGeneration is the exact expected generation of that admission.
 	sourceGeneration string
+	// checkpointDir is the canonical output directory of that admission, the
+	// same value the durable record stores. It flows into every runtime
+	// binding this handle produces.
+	checkpointDir string
 
 	// entered is written inside the runtime-invocation callback and read only
 	// after the callback's wrapper has returned, always on this executor
@@ -1987,9 +1998,9 @@ type checkpointOperationBinding struct {
 
 // runtimeBinding projects the admitted identity onto the internal runtime
 // binding (pkg/runtime CheckpointOperationBinding) the checkpoint path passes
-// to the handler: the exact operation ID, request digest, and source
-// generation the runtime's durable witness must record for a later explicit
-// recovery to reconcile against.
+// to the handler: the exact operation ID, request digest, source generation,
+// and canonical checkpoint directory the runtime's durable witness must
+// record for a later explicit recovery or abort to reconcile against.
 func (b *checkpointOperationBinding) runtimeBinding() svc.CheckpointOperationBinding {
 	if b == nil {
 		return svc.CheckpointOperationBinding{}
@@ -1998,6 +2009,7 @@ func (b *checkpointOperationBinding) runtimeBinding() svc.CheckpointOperationBin
 		OperationID:      b.operationID,
 		RequestDigest:    b.requestDigest,
 		SourceGeneration: b.sourceGeneration,
+		CheckpointDir:    b.checkpointDir,
 	}
 }
 

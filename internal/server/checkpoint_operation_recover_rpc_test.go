@@ -135,6 +135,8 @@ func TestRecoverCheckpointOperationUndeterminedRecord(t *testing.T) {
 		OperationID:      "op-rec-rpc-unknown",
 		RequestDigest:    digest,
 		SourceGeneration: "gen-1",
+		// The binding carries the canonical directory of the durable record.
+		CheckpointDir: directory,
 	}
 	assert.Equal(t, []svc.CheckpointOperationBinding{binding}, handler.recordedRecovers())
 	assert.Equal(t, []svc.CheckpointOperationBinding{binding}, handler.recordedAcks())
@@ -924,6 +926,9 @@ func TestCheckpointWithOperationAcknowledgesAfterDurableSuccess(t *testing.T) {
 		OperationID:      "op-cop-ack",
 		RequestDigest:    digest,
 		SourceGeneration: "gen-1",
+		// The initial execution's acknowledgment carries the admitted
+		// canonical directory like every other runtime binding.
+		CheckpointDir: directory,
 	}, handler.recordedAcks()[0])
 	assert.Equal(t, 1, acks)
 

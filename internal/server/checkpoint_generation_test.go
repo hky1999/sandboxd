@@ -351,7 +351,8 @@ func TestCheckpointPropagatesExpectedGenerationToRuntime(t *testing.T) {
 		require.Len(t, handler.checkpoints, 1)
 		// The runtime receives the admitted expectation AND the exact
 		// operation identity — operation ID, request digest, source
-		// generation — because its durable witness binds to that request.
+		// generation, canonical checkpoint directory — because its durable
+		// witness binds to that request.
 		assert.Equal(t, svc.CheckpointConfig{
 			ID:                 id,
 			Directory:          directory,
@@ -360,6 +361,7 @@ func TestCheckpointPropagatesExpectedGenerationToRuntime(t *testing.T) {
 				OperationID:      "op-prop-1",
 				RequestDigest:    digest,
 				SourceGeneration: "gen-prop-operation",
+				CheckpointDir:    directory,
 			},
 		}, handler.checkpoints[0])
 	})

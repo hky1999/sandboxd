@@ -147,6 +147,10 @@ func TestAbortCheckpointOperationNormalAbort(t *testing.T) {
 		OperationID:      "op-abort-rpc",
 		RequestDigest:    requestDigestOf(t, request),
 		SourceGeneration: "gen-1",
+		// The abort binding carries the canonical directory of the durable
+		// record — the runtime's zero-witness retirement locates the output
+		// directory evidence through it.
+		CheckpointDir: request.GetCheckpoint().GetCheckpointDir(),
 	}
 
 	var seqMu sync.Mutex
@@ -176,7 +180,7 @@ func TestAbortCheckpointOperationNormalAbort(t *testing.T) {
 		aborted.GetRecoveryProtocol())
 	assert.Equal(t, "sbox-abort-rpc", aborted.GetSandboxID())
 	assert.Equal(t, binding.RequestDigest, aborted.GetRequestDigest())
-	assert.Contains(t, aborted.GetMessage(), "source handback was confirmed")
+	assert.Contains(t, aborted.GetMessage(), "runtime operation is durably retired")
 	assert.Contains(t, aborted.GetMessage(), "no successful checkpoint artifact is claimed")
 	assert.NotContains(t, aborted.GetMessage(), "no artifact exists",
 		"an abort may leave unsealed component files, so the receipt must not claim physical absence")

@@ -218,15 +218,22 @@ func (h *sandboxService) AbortCheckpointOperation(
 		OperationID:      bound.OperationID,
 		RequestDigest:    bound.RequestDigest,
 		SourceGeneration: bound.Generation,
+		// The canonical directory from the durable record: the runtime's
+		// zero-witness retirement locates the operation's caller-owned
+		// directory evidence through it, and an empty value simply disables
+		// that retirement (the abort keeps its historical NotFound answer
+		// for a missing witness).
+		CheckpointDir: bound.CheckpointDir,
 	}
 	if !abortSlot.acknowledgmentOnly() {
-		// The runtime retires the never-sealed operation — resuming the source
-		// guest and releasing it from the checkpoint handoff — and its nil
-		// return proves the durable aborted fact on the runtime side. Only
-		// then may the service persist its own confirmed failure.
+		// The runtime retires the never-sealed operation — handing back an
+		// intent-bound source, or recording a zero-witness abort without a
+		// source effect — and its nil return proves the durable aborted fact
+		// on the runtime side. Only then may the service persist its own
+		// confirmed failure.
 		if abortErr := aborter.AbortCheckpointOperation(execCtx, bound.SandboxID, binding); abortErr != nil {
 			return nil, errord.ToGRPCf(abortErr,
-				"abort checkpoint operation %s at runtime %q failed; nothing was persisted and the outcome is unchanged",
+				"abort checkpoint operation %s at runtime %q failed; the service outcome is unchanged and the runtime evidence is retained for retry",
 				bound.OperationID, bound.Runtime,
 			)
 		}
@@ -237,7 +244,7 @@ func (h *sandboxService) AbortCheckpointOperation(
 		// retried; the runtime treats a retried abort as the same recorded
 		// decision.
 		if markErr := abortSlot.markAborted(fmt.Sprintf(
-			"abort of operation %s confirmed by runtime %q; source handback was confirmed and no successful checkpoint artifact is claimed",
+			"abort of operation %s confirmed by runtime %q; the runtime operation is durably retired and no successful checkpoint artifact is claimed",
 			bound.OperationID, bound.Runtime,
 		)); markErr != nil {
 			return nil, errord.ToGRPC(fmt.Errorf(

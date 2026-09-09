@@ -116,6 +116,18 @@ type CheckpointOperationBinding struct {
 	// compares it against its own record before any checkpoint side effect,
 	// exactly like ExpectedGeneration.
 	SourceGeneration string
+	// CheckpointDir is the canonical absolute output directory the service
+	// admitted for the operation, taken from its durable record. It is
+	// internal runtime metadata like the rest of the binding: the initial
+	// checkpoint already carries the same path as CheckpointConfig.Directory
+	// and a runtime may verify the two agree before any side effect, while
+	// the recovery, abort, and acknowledgment calls — which hold no
+	// CheckpointConfig — use it to locate the operation's caller-owned
+	// directory evidence. It stays empty for older callers and for the
+	// legacy checkpoint shape; a runtime that consults it must treat the
+	// empty value as "no directory evidence supplied" and never as proof of
+	// anything about the directory.
+	CheckpointDir string
 }
 
 // IsZero reports whether the binding carries no operation identity, i.e. the
@@ -177,10 +189,10 @@ type CheckpointOperationWitness interface {
 // CheckpointOperationAborter is an internal optional capability for runtimes
 // that can deterministically retire an identified checkpoint operation which
 // never sealed. It is deliberately separate from CheckpointOperationWitness:
-// an abort is never mixed into the success-recovery semantics. Nothing public
-// invokes it yet — it exists so a later service stage can require it before
-// exposing a failure-side release, and a runtime without it keeps refusing
-// aborts rather than degrading them into a recovery or a resume.
+// an abort is never mixed into the success-recovery semantics. The public
+// abort RPC requires it before exposing a failure-side release, and a runtime
+// without it keeps refusing aborts rather than degrading them into a recovery
+// or a resume.
 type CheckpointOperationAborter interface {
 	// AbortCheckpointOperation retires the matching never-sealed operation.
 	// Only a durable intent may be newly aborted — an intent whose artifact
@@ -189,7 +201,13 @@ type CheckpointOperationAborter interface {
 	// before the source is resumed; the exact recorded source birth identity
 	// must be proven live before and after the resume and the guest error
 	// release, so a missing, replaced, or dead source is never claimed
-	// resumed. A nil return proves the durable aborted fact.
+	// resumed. A runtime may additionally retire the zero-witness shape — a
+	// validated current state whose checkpoint operation witness is exactly
+	// zero, for a binding carrying the canonical output directory — because
+	// the durable intent write gates every checkpoint side effect; that
+	// retirement writes the aborted fact from positive state evidence alone
+	// (live source, Running instance, exact directory claim) and never from
+	// a NotFound. A nil return proves the durable aborted fact.
 	AbortCheckpointOperation(
 		ctx context.Context,
 		sandboxID string,

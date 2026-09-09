@@ -25,10 +25,9 @@ import (
 // --- explicit abort of recorded operations (internal store stage) ---
 
 // admitAbortable durably records the operation as a version-3 (abortable)
-// record before any side effect. It is the explicit entry the later abort
-// service stage calls after it verified the runtime holds the
-// CheckpointOperationAborter capability beside writer and witness; nothing
-// public produces version 3 yet, and a caller that did not verify that
+// record before any side effect. It is the entry CheckpointWithOperation
+// calls after it verified the runtime holds the CheckpointOperationAborter
+// capability beside writer and witness; a caller that did not verify that
 // capability must keep using admit. An operation that is already recorded is
 // replayed from history unchanged — its recorded version is a fact, so an
 // abortable admission never upgrades an older record and a plain admission

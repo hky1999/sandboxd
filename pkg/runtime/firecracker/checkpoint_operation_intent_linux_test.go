@@ -323,6 +323,13 @@ func checkpointIntentFixture(
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The fixture models the post-pause crash: the durable intent exists and
+	// the source MicroVM is Paused, exactly the state an abort must resume
+	// exactly once. The pre-pause window — a durable intent with the source
+	// still Running — is forced explicitly by the tests that cover it.
+	if err := api.pause(); err != nil {
+		t.Fatal(err)
+	}
 	state := instance.snapshot()
 	birth, err := captureFirecrackerVMMBirthIdentity(state)
 	if err != nil {
@@ -559,16 +566,18 @@ func TestCheckpointOperationIntentWriteFailureHasZeroSourceEffects(t *testing.T)
 		t.Fatalf("strict delete after failed intent write = %v, want ErrFailedPrecondition", err)
 	}
 
-	// Repaired storage: the same operation aborts cleanly — one resume, one
-	// guest error release, one durable aborted fact — and only the abort
-	// acknowledgment releases the evidence gate.
+	// Repaired storage: the same operation aborts cleanly. The source was
+	// NEVER paused — the intent write failed before any side effect — so the
+	// abort observes a Running instance through GET / and must send NO
+	// resume: one guest error release, one durable aborted fact, and only
+	// the abort acknowledgment releases the evidence gate.
 	makeStateDirWritable(instance)
 	binding := testCheckpointOperationBinding("gen-live")
 	if err := handler.AbortCheckpointOperation(context.Background(), sandboxID, binding); err != nil {
 		t.Fatalf("abort after repaired intent-write failure = %v", err)
 	}
-	if resumes := api.countVMState("Resumed"); resumes != 1 {
-		t.Fatalf("abort resumed the source %d times, want 1", resumes)
+	if resumes := api.countVMState("Resumed"); resumes != 0 {
+		t.Fatalf("abort resumed the never-paused source %d times, want 0", resumes)
 	}
 	assertAbortObservations(t, agent, 1, binding, firecrackerCheckpointOperationPhaseAborting)
 	disk, readErr = readFirecrackerState(before.BundlePath)
@@ -1201,8 +1210,11 @@ func TestAbortCheckpointOperationInterruptedPhases(t *testing.T) {
 		cancel()
 
 		err := handler.AbortCheckpointOperation(ctx, sandboxID, binding)
-		if err == nil || !containsAll(err.Error(), "resume Firecracker sandbox") {
-			t.Fatalf("abort with a cancelled context = %v, want the resume refusal", err)
+		// The cancelled context dies on the instance-state read that now
+		// precedes every resume decision: nothing was resumed, the aborting
+		// decision is durable, and the evidence is retained.
+		if err == nil || !containsAll(err.Error(), "read the Firecracker instance state") {
+			t.Fatalf("abort with a cancelled context = %v, want the state-read refusal", err)
 		}
 		if resumes := api.countVMState("Resumed"); resumes != 0 {
 			t.Fatalf("cancelled abort resumed %d times", resumes)
@@ -1418,8 +1430,14 @@ func TestAbortCheckpointOperationRefusesSealedOrTerminalPhases(t *testing.T) {
 // against the live recorded source.
 func TestAbortCheckpointOperationColdIntent(t *testing.T) {
 	handler, sandboxID, _, command, state := coldCheckpointIntentFixture(t, "", nil)
-	// The abort's resume and guest release need the incarnation's sockets.
+	// The abort's resume and guest release need the incarnation's sockets:
+	// the fake API reports the sandbox's instance id and the Paused state a
+	// crashed-after-pause source is in.
 	api := startFakeFirecrackerAPI(t, state.APIPath)
+	api.setInstanceID(sandboxID)
+	if err := api.pause(); err != nil {
+		t.Fatal(err)
+	}
 	startFakeCheckpointAgent(t, state.VsockPath)
 	fd := checkpointTestPidfd(t, command.Process.Pid)
 
@@ -1484,7 +1502,7 @@ func TestAbortCheckpointOperationLostReplyRetrySendsIdenticalRequest(t *testing.
 	if err == nil || !containsAll(err.Error(), "release Firecracker sandbox") {
 		t.Fatalf("lost abort reply must fail the release: %v", err)
 	}
-	if !containsAll(err.Error(), "the source was resumed but the guest error handoff is unconfirmed") {
+	if !containsAll(err.Error(), "the guest error handoff is unconfirmed") {
 		t.Fatalf("failure must report the unconfirmed release honestly: %v", err)
 	}
 	// The first release observed the durable aborting decision.
@@ -1512,11 +1530,12 @@ func TestAbortCheckpointOperationLostReplyRetrySendsIdenticalRequest(t *testing.
 	if outcomes := agent.checkpointOutcomes(); len(outcomes) != 0 {
 		t.Fatalf("abort fell back to the legacy message: %v", outcomes)
 	}
-	// The host-side resume runs per attempt — the retry's idempotency
-	// contract is the guest receipt dedup above plus the real-VM resume
-	// acceptance, not a host-side resume skip.
-	if resumes := api.countVMState("Resumed"); resumes != 2 {
-		t.Fatalf("abort attempts resumed %d times, want 2", resumes)
+	// The first attempt resumed the paused source exactly once; the retry
+	// observes a Running instance through GET / and must NOT resume again —
+	// resuming a running MicroVM is an error. The retry's idempotency is the
+	// state-driven skip plus the guest receipt dedup above.
+	if resumes := api.countVMState("Resumed"); resumes != 1 {
+		t.Fatalf("abort attempts resumed %d times, want exactly 1 across both attempts", resumes)
 	}
 	disk, readErr = readFirecrackerState(before.BundlePath)
 	if readErr != nil || disk.CheckpointOperation.Phase != firecrackerCheckpointOperationPhaseAborted {
@@ -1691,6 +1710,10 @@ func TestAckAbortedCheckpointOperationContract(t *testing.T) {
 	t.Run("no artifact requirement and cold", func(t *testing.T) {
 		handler, sandboxID, readState, _, state := coldCheckpointIntentFixture(t, "", nil)
 		api := startFakeFirecrackerAPI(t, state.APIPath)
+		api.setInstanceID(sandboxID)
+		if err := api.pause(); err != nil {
+			t.Fatal(err)
+		}
 		startFakeCheckpointAgent(t, state.VsockPath)
 		binding := testCheckpointOperationBinding("gen-live")
 		if err := handler.AbortCheckpointOperation(context.Background(), sandboxID, binding); err != nil {
