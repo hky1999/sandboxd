@@ -18,6 +18,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -173,6 +174,55 @@ func TestBindRealArtifactLayouts(t *testing.T) {
 			t.Fatal("runsc layout must not claim an overlay sidecar")
 		}
 	})
+}
+
+// The source-directory ownership claim a Firecracker identified checkpoint
+// writes beside the artifact is metadata, never content: a sealed directory
+// binds the exact same root with or without it, while any other uncovered
+// regular file keeps refusing the closure.
+func TestClaimFileExcludedFromContentRoot(t *testing.T) {
+	dir, _ := seedSealedDirectory(t,
+		fcArtifacts(),
+		[]string{"vmstate", "memory"},
+		map[string]bool{"memory": true, "overlay.ext4": true},
+		int64(16), nil)
+	withoutClaim, err := Bind(dir)
+	if err != nil {
+		t.Fatalf("bind without claim: %v", err)
+	}
+	claim, err := json.Marshal(map[string]any{
+		"version":           1,
+		"sandbox_id":        "sandbox-claim-root",
+		"operation_id":      "op-claim-root",
+		"request_digest":    strings.Repeat("ab", 32),
+		"source_generation": "gen-claim-root",
+		"directory":         dir,
+		"directory_dev":     1,
+		"directory_inode":   2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ClaimFileName), claim, 0600); err != nil {
+		t.Fatal(err)
+	}
+	withClaim, err := Bind(dir)
+	if err != nil {
+		t.Fatalf("bind with claim: %v", err)
+	}
+	if withClaim.RootDigest != withoutClaim.RootDigest || withClaim.Scheme != withoutClaim.Scheme {
+		t.Fatalf(
+			"claim changed the content root: without %s, with %s",
+			withoutClaim.RootDigest, withClaim.RootDigest,
+		)
+	}
+	// The control: an arbitrary uncovered file still refuses the closure.
+	if err := os.WriteFile(filepath.Join(dir, "uncovered-artifact"), []byte("x"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Bind(dir); err == nil || !errors.Is(err, ErrUnverifiable) {
+		t.Fatalf("uncovered artifact = %v, want ErrUnverifiable", err)
+	}
 }
 
 // A self-consistent replacement under the same path is a different

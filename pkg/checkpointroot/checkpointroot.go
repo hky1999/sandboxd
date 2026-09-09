@@ -50,6 +50,14 @@ const (
 	overlayName        = "overlay.ext4"
 	materializedMarker = ".materialized"
 
+	// ClaimFileName is the fixed name of the source-directory ownership claim
+	// a Firecracker identified checkpoint writes before its runtime intent. It
+	// is ownership metadata of the SOURCE directory — never artifact content —
+	// so the coverage closure excludes it from the logical root: a checkpoint
+	// binds the same root with or without a claim, publication never ships it,
+	// and a restored target is not required to carry one.
+	ClaimFileName = ".sandboxd-checkpoint-claim"
+
 	// MaxManifestBytes is the shared bound on one sealed manifest.json read.
 	// Every consumer — the server's admission Bind and the runtimes feeding
 	// RootFromView — reads the manifest through ReadManifestBounded so an
@@ -290,7 +298,8 @@ func bindFromView(dir string, manifestRaw []byte) (*Binding, error) {
 	// Anything else has no verifiable root and the whole binding is refused.
 	for _, entry := range entries {
 		name := entry.Name()
-		if name == manifestName || isSidecarName(name) || name == materializedMarker {
+		if name == manifestName || isSidecarName(name) ||
+			name == materializedMarker || name == ClaimFileName {
 			continue
 		}
 		info, err := entry.Info()

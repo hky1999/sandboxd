@@ -519,8 +519,26 @@ func TestCheckpointOperationRealFlowReachesCompletedWitness(t *testing.T) {
 	if witness.Phase != firecrackerCheckpointOperationPhaseCompleted {
 		t.Fatalf("durable witness phase = %q, want completed", witness.Phase)
 	}
-	if witness.Version != firecrackerCheckpointOperationRecordVersion2 {
-		t.Fatalf("durable witness version = %d, want %d", witness.Version, firecrackerCheckpointOperationRecordVersion2)
+	if witness.Version != firecrackerCheckpointOperationRecordVersion3 {
+		t.Fatalf("durable witness version = %d, want %d", witness.Version, firecrackerCheckpointOperationRecordVersion3)
+	}
+	if witness.SandboxID != sandboxID {
+		t.Fatalf("witness sandbox identity = %q, want %q", witness.SandboxID, sandboxID)
+	}
+	// The claim is durable ownership metadata of the output directory, never
+	// artifact content: it binds this exact operation and survives the sealed
+	// artifact beside it.
+	claim, claimErr := readFirecrackerCheckpointClaim(directory)
+	if claimErr != nil {
+		t.Fatalf("sealed output carries no usable claim: %v", claimErr)
+	}
+	if claim.SandboxID != sandboxID || claim.OperationID != witness.OperationID ||
+		claim.RequestDigest != witness.RequestDigest ||
+		claim.SourceGeneration != witness.SourceGeneration ||
+		claim.Directory != witness.Directory ||
+		claim.DirectoryDev != witness.DirectoryDev ||
+		claim.DirectoryInode != witness.DirectoryInode {
+		t.Fatalf("claim drifted from the witness binding: claim %+v witness %+v", claim, witness)
 	}
 	if stat, statErr := os.Stat(directory); statErr != nil {
 		t.Fatal(statErr)
@@ -1098,9 +1116,9 @@ func TestRecoverCheckpointOperationRefusesNonMatchingWitness(t *testing.T) {
 		{
 			name: "corrupted record version",
 			mutate: func(record *firecrackerCheckpointOperationRecord) {
-				// Version 2 is the real early-intent schema now; a genuinely
-				// unknown version must stay the unsupported-version refusal.
-				record.Version = firecrackerCheckpointOperationRecordVersion2 + 1
+				// Versions 2 and 3 are real schemas now; a genuinely unknown
+				// version must stay the unsupported-version refusal.
+				record.Version = firecrackerCheckpointOperationRecordVersion3 + 1
 			},
 			wantErr:   errord.ErrFailedPrecondition,
 			fragments: []string{"unsupported checkpoint operation record version"},

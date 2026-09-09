@@ -2,6 +2,8 @@ package firecracker
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -10,7 +12,8 @@ func TestReviewAbortingRetryPersistsBeforeResume(t *testing.T) {
 	h, instance, api, id := checkpointOperationFixture(t, "gen-live")
 	state := instance.snapshot()
 	dir := t.TempDir()
-	dev, ino, err := reserveFirecrackerCheckpointDirectory(dir)
+	binding := testCheckpointOperationBinding("gen-live")
+	dev, ino, err := claimFirecrackerCheckpointDirectory(dir, id, binding)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -18,7 +21,6 @@ func TestReviewAbortingRetryPersistsBeforeResume(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	binding := testCheckpointOperationBinding("gen-live")
 	record := buildFirecrackerCheckpointOperationIntent(binding, state, birth, dir, dev, ino)
 	instance.setCheckpointOperation(record)
 	if err = h.persistInstance(instance); err != nil {
@@ -42,12 +44,13 @@ func TestReviewAbortingRetryPersistsBeforeResume(t *testing.T) {
 }
 
 func TestReviewAbortRejectsHotIdentityDrift(t *testing.T) {
-	for _, kind := range []string{"boot", "directory-inode"} {
+	for _, kind := range []string{"boot", "directory-inode", "claim-deleted"} {
 		t.Run(kind, func(t *testing.T) {
 			h, instance, api, id := checkpointOperationFixture(t, "gen-live")
 			state := instance.snapshot()
 			dir := t.TempDir()
-			dev, ino, err := reserveFirecrackerCheckpointDirectory(dir)
+			binding := testCheckpointOperationBinding("gen-live")
+			dev, ino, err := claimFirecrackerCheckpointDirectory(dir, id, binding)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -55,12 +58,15 @@ func TestReviewAbortRejectsHotIdentityDrift(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			binding := testCheckpointOperationBinding("gen-live")
 			record := buildFirecrackerCheckpointOperationIntent(binding, state, birth, dir, dev, ino)
 			if kind == "boot" {
 				record.VMMBootID = "11111111-2222-4333-8444-555555555555"
-			} else {
+			} else if kind == "directory-inode" {
 				record.DirectoryInode++
+			} else {
+				if err := os.Remove(filepath.Join(dir, firecrackerCheckpointClaimName())); err != nil {
+					t.Fatal(err)
+				}
 			}
 			instance.setCheckpointOperation(record)
 			if err = h.persistInstance(instance); err != nil {
@@ -70,6 +76,9 @@ func TestReviewAbortRejectsHotIdentityDrift(t *testing.T) {
 			defer cancel()
 			if err = h.AbortCheckpointOperation(ctx, id, binding); err == nil {
 				t.Fatal("drift must be refused")
+			}
+			if kind == "claim-deleted" && !containsAll(err.Error(), "claim cannot be verified") {
+				t.Fatalf("deleted claim refusal was masked by another mismatch: %v", err)
 			}
 			if got := api.countVMState("Resumed"); got != 0 {
 				t.Fatalf("%s mismatch still resumed source %d times", kind, got)

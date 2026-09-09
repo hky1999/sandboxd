@@ -369,6 +369,13 @@ type Handler struct {
 	// artifacts so a later XFS reflink does not inherit the previous
 	// generation's buffered-I/O debt.
 	checkpointWriteback *checkpointWritebackScheduler
+
+	// onCheckpointIntentDurable is a narrow test seam: when set, it runs on
+	// the identified-checkpoint path right after the durable intent and
+	// before the pre-layout directory-ownership re-verification, the
+	// deterministic injection window for a claim deleted, replaced, or
+	// rewritten between those two steps. Nil in production.
+	onCheckpointIntentDurable func(directory string)
 }
 
 var _ runtimecore.Handler = &Handler{}

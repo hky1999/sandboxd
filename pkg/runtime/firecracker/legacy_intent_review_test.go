@@ -10,7 +10,8 @@ import (
 
 func TestReviewIntentRejectsLegacyArchiveWithoutPanic(t *testing.T) {
 	dir := t.TempDir()
-	dev, ino, err := reserveFirecrackerCheckpointDirectory(dir)
+	binding := testCheckpointOperationBinding("gen-live")
+	dev, ino, err := claimFirecrackerCheckpointDirectory(dir, "review-sandbox", binding)
 	if err != nil {
 		t.Fatal(err)
 	}

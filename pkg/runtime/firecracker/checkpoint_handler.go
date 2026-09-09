@@ -160,18 +160,23 @@ func (handler *Handler) Checkpoint(
 	// operation protocol owns the source's fate and no implicit cleanup may
 	// resume it; the legacy path keeps its resume-on-failure behavior.
 	resumeAfterFailure := true
+	operationDirectory := ""
+	var intentRecord firecrackerCheckpointOperationRecord
 	if !operation.IsZero() {
-		// The durable early intent precedes every checkpoint side effect —
-		// layout, guest flush or shrink, pause, snapshot: it canonicalizes and
-		// reserves the output directory, captures the full source birth
-		// identity and directory identity, and only a successful durable
-		// write lets the operation proceed. A failed or ambiguous write ran
-		// no source effect and keeps the conservative in-memory gate.
+		// The persistent exclusive directory claim precedes EVERYTHING — the
+		// durable runtime intent below and every checkpoint side effect after
+		// it (layout, guest flush or shrink, pause, snapshot): it takes
+		// ownership of the caller-owned output directory through an exclusive
+		// final-path creation whose full binding and directory birth identity
+		// are durable before anything else observes the operation. A claim
+		// failure runs no source effect and leaves the directory untouched.
 		directory := filepath.Clean(config.Directory)
-		directoryDev, directoryInode, err := reserveFirecrackerCheckpointDirectory(directory)
+		directoryDev, directoryInode, err := claimFirecrackerCheckpointDirectory(
+			directory, sandboxID, operation,
+		)
 		if err != nil {
 			return fmt.Errorf(
-				"reserve Firecracker checkpoint output for operation %s of sandbox %s: %w",
+				"claim Firecracker checkpoint output for operation %s of sandbox %s: %w",
 				operation.OperationID, sandboxID, err,
 			)
 		}
@@ -182,9 +187,11 @@ func (handler *Handler) Checkpoint(
 				sandboxID, operation.OperationID, err,
 			)
 		}
-		instance.setCheckpointOperation(buildFirecrackerCheckpointOperationIntent(
+		operationDirectory = directory
+		intentRecord = buildFirecrackerCheckpointOperationIntent(
 			operation, state, identity, directory, directoryDev, directoryInode,
-		))
+		)
+		instance.setCheckpointOperation(intentRecord)
 		if err := handler.persistInstance(instance); err != nil {
 			return fmt.Errorf(
 				"persist checkpoint operation intent for operation %s of Firecracker sandbox %s: %w; no source side effect ran, the in-memory constraint stays until the operation is aborted or recovered, and the write may have committed",
