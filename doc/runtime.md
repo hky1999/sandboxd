@@ -96,6 +96,30 @@ and mount setup. An explicit writable-layer limit sizes this image, with a
 16 MiB minimum. Without an explicit limit, `default_overlay_size_bytes`
 applies and defaults to 10 GiB. The image is removed on sandbox deletion.
 
+The private ext4 disk defaults to asynchronous host Direct I/O with guest flush support:
+
+```toml
+[plugin.runtime.firecracker]
+writable_io_engine = "AsyncDirect"
+writable_cache_type = "Writeback"
+```
+
+`writable_io_engine` accepts `Sync`, `Async`, `SyncDirect`, and `AsyncDirect`. `Sync` and `Async` use buffered host file I/O. Direct engines require the matching Firecracker build; when using an older VMM, explicitly select `Async` or `Sync`. `writable_cache_type` accepts `Writeback` (the default, honoring guest flush requests) or `Unsafe`. Unknown values fail sandboxd initialization. These settings affect only the private writable disk, including native writable mounts, and are preserved in checkpoint device state. Read-only EROFS disks, virtio-fs exports, and checkpoint memory files retain their own I/O paths.
+
+The Direct I/O implementation requires the host filesystem to report its alignment constraints through `statx(STATX_DIOALIGN)` and requires the backing image length to satisfy those constraints. Guest buffer alignment is adapted with bounded buffers. Requests covering partial host blocks, or large requests with unaligned guest buffers, use a serialized, chunked Direct I/O path; partial writes preserve neighboring sectors after earlier I/O has completed. These exceptional requests may block the VMM event loop while they execute. There is no automatic buffered fallback. Direct I/O bypasses host file-data caching for this disk, but does not eliminate guest page cache, filesystem metadata, or VMM memory overhead. Host memory headroom remains necessary.
+
+Host compatibility is determined by the available kernel and filesystem capabilities, not by matching the build-time Linux header package version. Upstream Linux provides `STATX_DIOALIGN` for ext4 and XFS starting with Linux 6.1; vendor kernels may backport this capability. Both `SyncDirect` and `AsyncDirect` require it, and the current VMM has no legacy XFS alignment-query fallback. An unsupported direct configuration fails VM creation or snapshot restore and is never automatically switched to buffered I/O. The asynchronous engines additionally require usable `io_uring`; Firecracker documents Linux 5.10.51 as their minimum host kernel version. See the [statx interface](https://man7.org/linux/man-pages/man2/statx.2.html) and [Firecracker asynchronous I/O requirements](https://github.com/firecracker-microvm/firecracker/blob/v1.16.1/docs/api_requests/block-io-engine.md).
+
+On hosts without the required Direct I/O capability, explicitly select buffered I/O for new sandboxes:
+
+```toml
+[plugin.runtime.firecracker]
+writable_io_engine = "Async"
+writable_cache_type = "Writeback"
+```
+
+Use `Sync` instead of `Async` when the host cannot provide the required `io_uring` capabilities. Buffered engines use host file-data caching, so account for that memory in addition to guest RAM and VMM overhead. Changing this configuration does not convert an existing Direct I/O checkpoint: restore retains the saved engine and requires a host that supports it.
+
 A Firecracker start may expose directories from that same private ext4 image
 at selected guest paths. This is useful for workloads such as Docker that need
 a native filesystem instead of placing their own overlay on sandboxd's root
