@@ -573,6 +573,310 @@ func sameCheckpointOperationRequest(existing, next *checkpointOperationRecord) e
 	return nil
 }
 
+// --- explicit recovery of recorded operations (internal store stage) ---
+
+// checkpointOperationRecovery is the handle of the single executor that won a
+// recovery slot for one already-recorded operation. It wraps the very same
+// in-flight execution slot the original admission uses — so shutdown, joining
+// replayers, and cancellation converge on one lifecycle — plus the published
+// record the recovery was admitted under, which the completion transition
+// re-verifies before claiming anything. It is a store primitive for the later
+// recovery service stage: it carries no runtime evidence, and holding it
+// proves an execution slot, never a checkpoint outcome.
+type checkpointOperationRecovery struct {
+	store *checkpointOperationStore
+	exec  *checkpointOperationExecution
+
+	// bound is the record as published when recovery was admitted. Its
+	// binding fields are immutable for the record's lifetime; keeping the
+	// snapshot lets the completion transition refuse a record that was
+	// replaced or drifted rather than completed. Only read after admission,
+	// never mutated.
+	bound *checkpointOperationRecord
+
+	// ackOnly marks a slot admitted for a SUCCEEDED record. Its sole purpose
+	// is the side-effecting Ack retry of an already-durable success: it owns a
+	// fully lifecycle-managed executor slot, but it may never create or
+	// rewrite a success fact — the recorded root stays the authority. Set once
+	// at admission, only read afterwards.
+	ackOnly bool
+}
+
+// acknowledgmentOnly reports whether the slot was admitted for a SUCCEEDED
+// record, so the recovery service stage delivers its Ack instead of
+// reconciling an undetermined outcome.
+func (r *checkpointOperationRecovery) acknowledgmentOnly() bool {
+	return r != nil && r.ackOnly
+}
+
+// boundRecord returns a copy of the record the recovery was admitted under, so
+// the recovery service stage can rebuild the runtime binding — operation ID,
+// request digest, source generation, directory — without re-deriving anything
+// from a source sandbox that may no longer exist. The copy is independent all
+// the way down: the artifact receipt is duplicated too, so a caller cannot
+// mutate the published record — least of all a sealed root already recorded as
+// SUCCEEDED — through the handle it was handed.
+func (r *checkpointOperationRecovery) boundRecord() *checkpointOperationRecord {
+	if r == nil {
+		return nil
+	}
+	copyRecord := *r.bound
+	if r.bound.Artifact != nil {
+		artifact := *r.bound.Artifact
+		copyRecord.Artifact = &artifact
+	}
+	return &copyRecord
+}
+
+// registerCancel attaches the recovery executor's cancellation under the same
+// admission lock shutdown uses, with the same compensation for a shutdown that
+// snapshotted before the cancel was attached, as the original execution path.
+func (r *checkpointOperationRecovery) registerCancel(cancel context.CancelFunc) {
+	if r == nil {
+		return
+	}
+	r.store.registerExecutionCancel(r.bound.OperationID, r.exec, cancel)
+}
+
+// finish releases the recovery slot and wakes every joined replayer and a
+// draining shutdown. Like the original executor's last action, a recovery must
+// call it only after it has fully returned from its work.
+func (r *checkpointOperationRecovery) finish() {
+	if r == nil {
+		return
+	}
+	r.store.finishExecution(r.bound.OperationID, r.exec)
+}
+
+// recoverExisting admits the recovery of one already-recorded checkpoint
+// operation. It never creates a record, never executes a checkpoint, and never
+// touches the source sandbox or the artifacts: a missing record is NotFound, a
+// mismatched binding is refused, and a FAILED record stays failed forever. The
+// undetermined outcomes — admitted without a live executor (a restart, or a
+// terminal write that never landed) and unknown — are the records a recovery
+// may reconcile; a SUCCEEDED record admits only the side-effecting half that is
+// still owed, the Ack retry, through an acknowledgment-only slot.
+//
+// A SUCCEEDED record is therefore not answered as a query shortcut here: pure
+// history reads belong to GetCheckpointOperation and the replay path, while an
+// explicit recovery may still owe an acknowledgment. Every phase decision comes
+// after the lifecycle ones — a live executor is joined first, so a recovery
+// racing the original execution's post-success acknowledgment tail waits on
+// that executor instead of acting beside it, and only a store that is not
+// draining may register a fresh slot.
+//
+// Recovery shares the original execution's lifecycle: while any executor (the
+// original one or an earlier recovery) holds the slot, the caller is handed its
+// done channel to join instead of a second slot. Winning a slot registers it
+// under lifeMu atomically with the shutdown flag — a store that began draining
+// never starts a recovery, an acknowledgment-only one included — and admission
+// performs no durable write at all, so no lock is held across one: the record
+// already exists, and its history (generation, runtime, directory, request
+// digest, created_at) must not change.
+func (s *checkpointOperationStore) recoverExisting(draft *checkpointOperationRecord) (
+	recovery *checkpointOperationRecovery,
+	joined <-chan struct{},
+	err error,
+) {
+	if s == nil {
+		return nil, nil, fmt.Errorf("recover checkpoint operation requires a store")
+	}
+	// writeMu serializes the eligibility decision with admission and with
+	// competing recoveries, so exactly one applicant can register the slot.
+	// Nothing here performs durable I/O, so the writeMu discipline (durable
+	// write before publication) is preserved trivially.
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
+	existing, ok := s.published(draft.OperationID)
+	if !ok {
+		return nil, nil, errord.ToGRPCf(
+			errord.ErrNotFound, "checkpoint operation %s is unknown", draft.OperationID)
+	}
+	if err := sameCheckpointOperationRequest(existing, draft); err != nil {
+		return nil, nil, err
+	}
+	switch existing.Phase {
+	case checkpointOperationPhaseAdmitted, checkpointOperationPhaseUnknown,
+		checkpointOperationPhaseSucceeded:
+	case checkpointOperationPhaseFailed:
+		return nil, nil, errord.ToGRPCf(
+			errord.ErrFailedPrecondition,
+			"checkpoint operation %s is recorded failed; a failed operation cannot be recovered",
+			existing.OperationID,
+		)
+	default:
+		return nil, nil, errord.ToGRPCf(
+			errord.ErrUnknown,
+			"checkpoint operation %s has invalid phase %q",
+			existing.OperationID, existing.Phase,
+		)
+	}
+	if done, running := s.executionDone(draft.OperationID); running {
+		// The original executor — including the tail in which its success fact
+		// is already durable but its acknowledgment work has not finished — or
+		// an earlier recovery still owns the operation; join it instead of
+		// creating a second executor.
+		return nil, done, nil
+	}
+	exec := &checkpointOperationExecution{done: make(chan struct{})}
+	s.lifeMu.Lock()
+	if s.shuttingDown {
+		s.lifeMu.Unlock()
+		return nil, nil, errord.ToGRPCf(
+			errord.ErrUnavailable,
+			"daemon is shutting down; checkpoint operation %s cannot be recovered",
+			existing.OperationID,
+		)
+	}
+	s.inflight[draft.OperationID] = exec
+	s.lifeMu.Unlock()
+	bound := *existing
+	return &checkpointOperationRecovery{
+		store:   s,
+		exec:    exec,
+		bound:   &bound,
+		ackOnly: existing.Phase == checkpointOperationPhaseSucceeded,
+	}, nil, nil
+}
+
+// assertExecutionOwnership verifies that exec still holds the operation's
+// in-flight slot. Callers hold writeMu; lifeMu is taken only for the
+// comparison and never across a durable write.
+func (s *checkpointOperationStore) assertExecutionOwnership(
+	id string,
+	exec *checkpointOperationExecution,
+) error {
+	s.lifeMu.Lock()
+	current, ok := s.inflight[id]
+	s.lifeMu.Unlock()
+	if !ok || current != exec {
+		return errord.ToGRPCf(
+			errord.ErrFailedPrecondition,
+			"the recovery slot for checkpoint operation %s no longer owns the operation; re-admit the recovery before claiming its outcome",
+			id,
+		)
+	}
+	return nil
+}
+
+// markRecoveredSucceeded is the dedicated completion transition of a recovery
+// slot: the only path that may move an undetermined record (admitted without
+// an executor, or unknown) to SUCCEEDED, and only while this recovery still
+// owns the operation's execution slot and the record still carries the binding
+// the recovery was admitted under. Like markTerminal's claiming phases it is
+// durable-first and serialized under writeMu: the success fact is constructed,
+// persisted, and only then published, so a slow, blocked, or failed write
+// leaves every query at the undetermined outcome. A failure may be retried
+// with the same slot — or, after it is released, by re-admitting the recovery
+// of the same operation.
+//
+// markTerminal itself is deliberately not relaxed: unknown is terminal there,
+// and the ordinary executor fallbacks must keep being unable to rewrite an
+// undetermined record. An already-SUCCEEDED record is answered idempotently
+// only for the exact same root and scheme — the durable record, not a later
+// recovery, is the authority — and any other root is a conflict. An
+// acknowledgment-only slot can never do more than confirm that recorded root:
+// it may not create a success fact at all.
+//
+// The store verifies input format and these state preconditions only. The
+// sealed root must come from the caller's runtime-witness reconciliation of
+// the canonical artifact root; this primitive never treats a manifest, a
+// directory, or any other caller payload as completion evidence.
+//
+// A draining shutdown cancels the recovery executor's context to request
+// convergence but does not revoke the slot: the executor may still land the
+// original operation's durable fact before it returns, and shutdown waits for
+// that real exit.
+func (r *checkpointOperationRecovery) markRecoveredSucceeded(
+	artifact *checkpointOperationArtifact,
+	message string,
+) error {
+	if r == nil {
+		return fmt.Errorf("checkpoint operation recovery is nil")
+	}
+	if artifact == nil || !validCheckpointOperationDigest(artifact.RootDigest) ||
+		artifact.Scheme != checkpointroot.Scheme {
+		return errord.ToGRPCf(
+			errord.ErrInvalidArgument,
+			"recovered completion of checkpoint operation %s requires a sealed root digest and the %s scheme",
+			r.bound.OperationID, checkpointroot.Scheme,
+		)
+	}
+	if len(message) > checkpointOperationMaxMsg {
+		message = message[:checkpointOperationMaxMsg]
+	}
+	s := r.store
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if err := s.assertExecutionOwnership(r.bound.OperationID, r.exec); err != nil {
+		return err
+	}
+	record, ok := s.published(r.bound.OperationID)
+	if !ok {
+		return fmt.Errorf("recover checkpoint operation %s without a record", r.bound.OperationID)
+	}
+	if err := sameCheckpointOperationRequest(record, r.bound); err != nil {
+		// The record's binding drifted from the one this recovery was admitted
+		// under, so the success fact would land on a different operation.
+		return err
+	}
+	switch record.Phase {
+	case checkpointOperationPhaseSucceeded:
+		if record.Artifact.RootDigest == artifact.RootDigest &&
+			record.Artifact.Scheme == artifact.Scheme {
+			// Idempotent replay of the already-durable fact: a recovery
+			// retrying after an ambiguous reply — including an
+			// acknowledgment-only slot confirming the recorded receipt —
+			// claims nothing new and rewrites nothing.
+			return nil
+		}
+		return errord.ToGRPCf(
+			errord.ErrFailedPrecondition,
+			"checkpoint operation %s is already recorded succeeded with sealed root %s (%s); a different recovered root is a conflict",
+			record.OperationID, record.Artifact.RootDigest, record.Artifact.Scheme,
+		)
+	case checkpointOperationPhaseAdmitted, checkpointOperationPhaseUnknown:
+		if r.ackOnly {
+			// The slot was admitted against a SUCCEEDED record; an
+			// acknowledgment-only executor may not turn an undetermined record
+			// into a success fact. Unreachable while phases only move forward,
+			// and structural rather than incidental for exactly that reason.
+			return errord.ToGRPCf(
+				errord.ErrFailedPrecondition,
+				"the recovery slot for checkpoint operation %s was admitted for acknowledgment only; it may not create a success fact",
+				record.OperationID,
+			)
+		}
+	case checkpointOperationPhaseFailed:
+		return errord.ToGRPCf(
+			errord.ErrFailedPrecondition,
+			"checkpoint operation %s is recorded failed; a failed operation cannot be completed",
+			record.OperationID,
+		)
+	default:
+		return errord.ToGRPCf(
+			errord.ErrUnknown,
+			"checkpoint operation %s has invalid phase %q",
+			record.OperationID, record.Phase,
+		)
+	}
+	updated := *record
+	updated.Phase = checkpointOperationPhaseSucceeded
+	sealed := *artifact
+	updated.Artifact = &sealed
+	updated.Message = message
+	updated.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
+	if err := s.persist(&updated); err != nil {
+		// Durable-first: the published view keeps the undetermined phase, so
+		// queries keep reporting an unproven outcome and no success is
+		// observable before it is durable.
+		return fmt.Errorf("persist recovered success of checkpoint operation %s: %w", r.bound.OperationID, err)
+	}
+	s.publish(&updated)
+	return nil
+}
+
 // markSucceeded durably records the completion fact — the sealed content root
 // of the output directory — and only then publishes it. While it fails, the
 // outcome stays unresolved and must be reported as unknown.
