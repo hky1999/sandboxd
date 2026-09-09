@@ -30,12 +30,14 @@ import (
 	"time"
 
 	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
+	"github.com/inclusionAI/sandboxd/config"
 	"github.com/inclusionAI/sandboxd/pkg/checkpointroot"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	gstatus "google.golang.org/grpc/status"
 	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
 )
 
 type options struct {
@@ -91,7 +93,8 @@ func parseFlags(args []string, errorOutput io.Writer) (options, error) {
 	flags := flag.NewFlagSet("checkpoint-restore", flag.ContinueOnError)
 	flags.SetOutput(errorOutput)
 	flags.StringVar(&value.action, "action", "",
-		"start, checkpoint, restore, delete, get-start-operation, or checkpoint-root")
+		"start, checkpoint, restore, delete, get-start-operation, "+
+			"get-checkpoint-operation, or checkpoint-root")
 	flags.StringVar(&value.socket, "socket", "", "sandboxd Unix socket")
 	flags.StringVar(&value.runtime, "runtime", "runsc", "runtime handler")
 	flags.StringVar(&value.stdout, "stdout", "/var/log/sandboxd/checkpoint-workload.stdout", "sandbox console output path")
@@ -121,8 +124,9 @@ func parseFlags(args []string, errorOutput io.Writer) (options, error) {
 		"resource_generation the checkpointed or deleted sandbox must still be on "+
 			"(empty keeps the unconditional checkpoint/delete RPCs)")
 	flags.StringVar(&value.operationID, "operation-id", "",
-		"persistent start operation ID: switches start/restore to "+
-			"StartWithOperation and names the operation to query")
+		"persistent operation ID: switches start/restore to "+
+			"StartWithOperation, checkpoint to CheckpointWithOperation, "+
+			"and names the operation to query")
 	flags.StringVar(&value.expectedRootDigest, "expected-root-digest", "",
 		"hex sha-256 over the entire checkpoint content root "+
 			"(the shared checksum algorithm, scheme v2; required for "+
@@ -151,11 +155,11 @@ func main() {
 }
 
 // exitOperationNotFound is the process exit code answering a
-// get-start-operation query whose operation record does not exist. It is the
-// structured not-found signal for callers driving this CLI as a subprocess:
-// they key on the exit code (or parse stdout), never on error text, so an
-// ambiguous transport failure can fail closed instead of being mistaken for
-// an absent record.
+// get-start-operation or get-checkpoint-operation query whose operation record
+// does not exist. It is the structured not-found signal for callers driving
+// this CLI as a subprocess: they key on the exit code (or parse stdout), never
+// on error text, so an ambiguous transport failure can fail closed instead of
+// being mistaken for an absent record.
 const exitOperationNotFound = 3
 
 // errOperationNotFound marks a get-start-operation reply whose record is
@@ -164,11 +168,18 @@ const exitOperationNotFound = 3
 // exitOperationNotFound.
 var errOperationNotFound = errors.New("start operation not found")
 
+// errCheckpointOperationNotFound marks a get-checkpoint-operation reply whose
+// record is absent on the server (gRPC NotFound). It shares the structured
+// exitOperationNotFound answer with the start-operation query while keeping
+// its own message, so stderr stays accurate for each action.
+var errCheckpointOperationNotFound = errors.New("checkpoint operation not found")
+
 // runExitCode maps a run error onto the process exit code. The generic
-// failure stays 1; the structured operation-not-found answer of a
-// get-start-operation query is exitOperationNotFound.
+// failure stays 1; the structured operation-not-found answer of a query
+// action is exitOperationNotFound.
 func runExitCode(err error) int {
-	if errors.Is(err, errOperationNotFound) {
+	if errors.Is(err, errOperationNotFound) ||
+		errors.Is(err, errCheckpointOperationNotFound) {
 		return exitOperationNotFound
 	}
 	return 1
@@ -180,9 +191,11 @@ func runExitCode(err error) int {
 // connection to sandboxd.
 func validateOptions(value options) error {
 	switch value.action {
-	case "start", "checkpoint", "restore", "delete", "get-start-operation", "checkpoint-root":
+	case "start", "checkpoint", "restore", "delete", "get-start-operation",
+		"get-checkpoint-operation", "checkpoint-root":
 	default:
-		return errors.New("--action must be start, checkpoint, restore, delete, get-start-operation, or checkpoint-root")
+		return errors.New("--action must be start, checkpoint, restore, delete, " +
+			"get-start-operation, get-checkpoint-operation, or checkpoint-root")
 	}
 	if value.action == "checkpoint-root" {
 		return validateCheckpointRootOptions(value)
@@ -350,8 +363,11 @@ func run(value options) error {
 		return deleteSandbox(ctx, client, value)
 	case "get-start-operation":
 		return getStartOperation(ctx, client, value)
+	case "get-checkpoint-operation":
+		return getCheckpointOperation(ctx, client, value, os.Stdout)
 	default:
-		return errors.New("--action must be start, checkpoint, restore, delete, get-start-operation, or checkpoint-root")
+		return errors.New("--action must be start, checkpoint, restore, delete, " +
+			"get-start-operation, get-checkpoint-operation, or checkpoint-root")
 	}
 }
 
@@ -511,6 +527,9 @@ func checkpoint(
 		LeaveRunning:   value.leaveRunning,
 		SnapshotType:   value.snapshotType,
 	}
+	if value.operationID != "" {
+		return checkpointWithOperation(ctx, client, value, request, os.Stdout)
+	}
 	if value.expectedGeneration == "" {
 		if _, err := client.Checkpoint(ctx, request); err != nil {
 			return fmt.Errorf("checkpoint: %w", err)
@@ -528,6 +547,355 @@ func checkpoint(
 		return fmt.Errorf("checkpoint: %w", err)
 	}
 	return nil
+}
+
+// checkpointOperationMaxTimeoutSeconds mirrors the service-side ceiling of
+// identified checkpoint operations; the legacy checkpoint bound (a non-zero
+// uint32) is unchanged and stays wider on purpose.
+const checkpointOperationMaxTimeoutSeconds = 600
+
+// maxCheckpointDirLength mirrors the service-side canonical directory bound a
+// checkpoint operation record can carry.
+const maxCheckpointDirLength = 4096
+
+// checkpointWithOperation runs the identified source checkpoint mode. The
+// complete legacy CheckpointRequest — id, directory spelling, timeout,
+// compression, leave_running, snapshot type — is passed to
+// CheckpointWithOperation unchanged, so the operation binds the exact request
+// the caller named. The legacy Checkpoint and CheckpointIfGeneration RPCs are
+// never called here: any failure of CheckpointWithOperation, Unimplemented
+// from an older server included, is terminal, because the daemon records the
+// operation before its side effects and a fallback would checkpoint outside
+// the durable identity the caller is about to reconcile. An RPC error carries
+// no usable payload — after one, the only next step is querying the operation
+// ID, never reissuing an older RPC.
+func checkpointWithOperation(
+	ctx context.Context,
+	client runtime.SandboxServiceClient,
+	value options,
+	request *runtime.CheckpointRequest,
+	out io.Writer,
+) error {
+	if err := validateOperationIDFormat(value.operationID); err != nil {
+		return err
+	}
+	if value.sandboxID == "" || value.checkpointDir == "" {
+		return errors.New("--sandbox-id and --checkpoint-dir are required for checkpoint")
+	}
+	if value.expectedGeneration == "" {
+		return errors.New("--expected-generation is required for checkpoint with --operation-id")
+	}
+	if err := validateExpectedGeneration(value.expectedGeneration); err != nil {
+		return err
+	}
+	if value.leaveRunning {
+		return errors.New("checkpoint with --operation-id requires --leave-running=false " +
+			"(identified checkpoints are stop-and-copy)")
+	}
+	if !filepath.IsAbs(value.checkpointDir) {
+		return errors.New("--checkpoint-dir must be absolute for checkpoint with --operation-id")
+	}
+	if value.checkpointTimeoutSeconds < 1 ||
+		value.checkpointTimeoutSeconds > checkpointOperationMaxTimeoutSeconds {
+		return fmt.Errorf(
+			"--checkpoint-timeout-seconds must be between 1 and %d for checkpoint with --operation-id",
+			checkpointOperationMaxTimeoutSeconds,
+		)
+	}
+	wrapped := &runtime.CheckpointWithOperationRequest{
+		OperationID:        value.operationID,
+		Checkpoint:         request,
+		ExpectedGeneration: value.expectedGeneration,
+	}
+	digest, err := checkpointOperationRequestDigest(wrapped)
+	if err != nil {
+		return fmt.Errorf("checkpoint: %w", err)
+	}
+	status, err := client.CheckpointWithOperation(ctx, wrapped)
+	if err != nil {
+		return fmt.Errorf("checkpoint: %w", err)
+	}
+	return reportCheckpointOperation(status, value, digest, out)
+}
+
+// checkpointOperationRequestDigest fingerprints a checkpoint operation request
+// exactly as the service does: clone the wrapped request, drop the operation
+// ID (it is the key being bound, not part of the intent), marshal
+// deterministically, and hash with SHA-256. Every semantic field — sandbox ID,
+// directory spelling, timeout, compression, leave_running, snapshot type, and
+// the exact expected generation — is covered, so the CLI can prove the receipt
+// it receives answers for the request it sent.
+func checkpointOperationRequestDigest(request *runtime.CheckpointWithOperationRequest) (string, error) {
+	normalized := proto.Clone(request).(*runtime.CheckpointWithOperationRequest)
+	normalized.OperationID = ""
+	data, err := proto.MarshalOptions{Deterministic: true}.Marshal(normalized)
+	if err != nil {
+		return "", fmt.Errorf("encode checkpoint operation request deterministically: %w", err)
+	}
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+// validStrictHex64Digest accepts exactly 64 lowercase hex characters. Every
+// digest the service records — the bound request digest and the sealed
+// artifact root alike — is the lowercase hex encoding of a SHA-256, so an
+// uppercase or malformed value in a reply is a protocol error to reject, not
+// a spelling to normalize.
+func validStrictHex64Digest(digest string) bool {
+	if len(digest) != checkpointroot.DigestHexLen {
+		return false
+	}
+	for index := 0; index < len(digest); index++ {
+		character := digest[index]
+		if !((character >= '0' && character <= '9') || (character >= 'a' && character <= 'f')) {
+			return false
+		}
+	}
+	return true
+}
+
+// validCheckpointOperationState reports whether a reply carries one of the
+// states a healthy daemon answers with; UNSPECIFIED and out-of-range values
+// are protocol errors, never records to reconcile against.
+func validCheckpointOperationState(state runtime.CheckpointOperationState) bool {
+	switch state {
+	case runtime.CheckpointOperationState_CHECKPOINT_OPERATION_STATE_RUNNING,
+		runtime.CheckpointOperationState_CHECKPOINT_OPERATION_STATE_SUCCEEDED,
+		runtime.CheckpointOperationState_CHECKPOINT_OPERATION_STATE_FAILED,
+		runtime.CheckpointOperationState_CHECKPOINT_OPERATION_STATE_UNKNOWN:
+		return true
+	default:
+		return false
+	}
+}
+
+// reportCheckpointOperation turns a CheckpointWithOperation reply into the
+// identified checkpoint's entire stdout contract, and only a proven SUCCEEDED
+// receipt for exactly the requested identity exits zero. The identity checks
+// — operation ID, sandbox ID, source generation, canonical directory, and the
+// digest of the very request just sent — run before any output, so a receipt
+// for another intent never reaches stdout. RUNNING, FAILED, and UNKNOWN are
+// printed first (their state field says not-succeeded) so the caller can
+// reconcile the spent operation ID, then reported as an error. A receipt that
+// claims SUCCEEDED without a strict lowercase hex64 sealed root under the
+// shared checkpoint-root scheme proves nothing, so it fails without output: a
+// success-shaped record followed by an error is exactly the partial success
+// output a caller must never have to disambiguate.
+func reportCheckpointOperation(
+	status *runtime.CheckpointOperationStatus,
+	value options,
+	digest string,
+	out io.Writer,
+) error {
+	if status == nil {
+		return errors.New("checkpoint: empty operation status")
+	}
+	if status.GetOperationID() != value.operationID {
+		return fmt.Errorf(
+			"checkpoint: status operation_id %q does not match requested %q",
+			status.GetOperationID(),
+			value.operationID,
+		)
+	}
+	if status.GetSandboxID() != value.sandboxID {
+		return fmt.Errorf(
+			"checkpoint: status sandbox_id %q does not match requested %q",
+			status.GetSandboxID(),
+			value.sandboxID,
+		)
+	}
+	if status.GetSourceGeneration() != value.expectedGeneration {
+		return fmt.Errorf(
+			"checkpoint: status source_generation %q does not match requested %q",
+			status.GetSourceGeneration(),
+			value.expectedGeneration,
+		)
+	}
+	if canonical := filepath.Clean(value.checkpointDir); status.GetCheckpointDir() != canonical {
+		return fmt.Errorf(
+			"checkpoint: status checkpoint_dir %q does not match the canonical form %q of the requested directory",
+			status.GetCheckpointDir(),
+			canonical,
+		)
+	}
+	if status.GetRequestDigest() != digest {
+		return fmt.Errorf(
+			"checkpoint: status request_digest %q does not match the digest %q of the request just sent",
+			status.GetRequestDigest(),
+			digest,
+		)
+	}
+	if !validCheckpointOperationState(status.GetState()) {
+		return fmt.Errorf("checkpoint: invalid record state %d", status.GetState())
+	}
+	if status.GetState() != runtime.CheckpointOperationState_CHECKPOINT_OPERATION_STATE_SUCCEEDED {
+		if status.GetArtifactRootDigest() != "" || status.GetArtifactRootScheme() != "" {
+			return fmt.Errorf(
+				"checkpoint: %s record carries a sealed root; malformed reply",
+				status.GetState(),
+			)
+		}
+		if err := printCheckpointOperationStatus(status, out); err != nil {
+			return err
+		}
+		return fmt.Errorf(
+			"checkpoint: operation state %s is not SUCCEEDED; reconcile operation %q before issuing a new one",
+			status.GetState(),
+			value.operationID,
+		)
+	}
+	if !validStrictHex64Digest(status.GetArtifactRootDigest()) {
+		return fmt.Errorf(
+			"checkpoint: SUCCEEDED record must carry a strict lowercase hex64 artifact_root_digest, got %q",
+			status.GetArtifactRootDigest(),
+		)
+	}
+	if status.GetArtifactRootScheme() != checkpointroot.Scheme {
+		return fmt.Errorf(
+			"checkpoint: SUCCEEDED record root scheme %q is not %q",
+			status.GetArtifactRootScheme(),
+			checkpointroot.Scheme,
+		)
+	}
+	return printCheckpointOperationStatus(status, out)
+}
+
+// getCheckpointOperation queries one durable checkpoint operation record and
+// nothing else: it never executes work, never reads artifacts, and never
+// inspects the source sandbox, so a historical SUCCEEDED is printed verbatim
+// as the recorded fact it is. The reply must be a well-formed record — a
+// bound identity, a canonical directory, a strict request digest, a known
+// state, and the sealed root exactly on SUCCEEDED and nowhere else — and it
+// must echo the queried operation ID; anything else is a protocol error
+// without stdout output. A query answer alone does not prove the record binds
+// the caller's request payload: reconciling that is the caller's replay, not
+// this query.
+func getCheckpointOperation(
+	ctx context.Context,
+	client runtime.SandboxServiceClient,
+	value options,
+	out io.Writer,
+) error {
+	if value.operationID == "" {
+		return errors.New("--operation-id is required for get-checkpoint-operation")
+	}
+	if err := validateOperationIDFormat(value.operationID); err != nil {
+		return err
+	}
+	status, err := client.GetCheckpointOperation(ctx, &runtime.GetCheckpointOperationRequest{
+		OperationID: value.operationID,
+	})
+	if err != nil {
+		// Absence is the one answer callers may act on (a NotFound record
+		// proves the operation was never admitted, so the same operation may
+		// be re-issued). Mark exactly the gRPC NotFound status with the
+		// structured sentinel; every other failure — Unimplemented, a
+		// transport error, a deadline — stays a plain error so subprocess
+		// callers fail closed instead of grepping stderr for "not found".
+		if gstatus.Code(err) == codes.NotFound {
+			return fmt.Errorf("get-checkpoint-operation: %w: %w", errCheckpointOperationNotFound, err)
+		}
+		return fmt.Errorf("get-checkpoint-operation: %w", err)
+	}
+	if err := validateCheckpointOperationRecordReply(status, value.operationID); err != nil {
+		return err
+	}
+	return printCheckpointOperationStatus(status, out)
+}
+
+// validateCheckpointOperationRecordReply enforces the record syntax and the
+// queried-ID echo of a GetCheckpointOperation answer. It checks only what the
+// query itself can prove — shape and self-consistency — and deliberately not
+// whether the record matches any caller intent.
+func validateCheckpointOperationRecordReply(
+	status *runtime.CheckpointOperationStatus,
+	operationID string,
+) error {
+	if status == nil {
+		return errors.New("get-checkpoint-operation: empty operation status")
+	}
+	if status.GetOperationID() == "" || !config.IsValidSandboxID(status.GetSandboxID()) {
+		return fmt.Errorf(
+			"get-checkpoint-operation: malformed record with empty identity (%+v)",
+			status,
+		)
+	}
+	generation := status.GetSourceGeneration()
+	if strings.TrimSpace(generation) == "" || len(generation) > maxExpectedGenerationLength {
+		return fmt.Errorf(
+			"get-checkpoint-operation: malformed record source_generation %q",
+			generation,
+		)
+	}
+	dir := status.GetCheckpointDir()
+	if !filepath.IsAbs(dir) || dir != filepath.Clean(dir) ||
+		dir == string(filepath.Separator) || len(dir) > maxCheckpointDirLength {
+		return fmt.Errorf(
+			"get-checkpoint-operation: malformed record checkpoint_dir %q",
+			dir,
+		)
+	}
+	if !validStrictHex64Digest(status.GetRequestDigest()) {
+		return fmt.Errorf(
+			"get-checkpoint-operation: malformed record request_digest %q",
+			status.GetRequestDigest(),
+		)
+	}
+	if !validCheckpointOperationState(status.GetState()) {
+		return fmt.Errorf("get-checkpoint-operation: invalid record state %d", status.GetState())
+	}
+	// The sealed root is exactly the SUCCEEDED evidence: mandatory with a
+	// strict lowercase hex64 digest under the shared scheme, and absent on
+	// every other state.
+	if status.GetState() == runtime.CheckpointOperationState_CHECKPOINT_OPERATION_STATE_SUCCEEDED {
+		if !validStrictHex64Digest(status.GetArtifactRootDigest()) {
+			return fmt.Errorf(
+				"get-checkpoint-operation: SUCCEEDED record must carry a strict lowercase hex64 artifact_root_digest, got %q",
+				status.GetArtifactRootDigest(),
+			)
+		}
+		if status.GetArtifactRootScheme() != checkpointroot.Scheme {
+			return fmt.Errorf(
+				"get-checkpoint-operation: SUCCEEDED record root scheme %q is not %q",
+				status.GetArtifactRootScheme(),
+				checkpointroot.Scheme,
+			)
+		}
+	} else if status.GetArtifactRootDigest() != "" || status.GetArtifactRootScheme() != "" {
+		return fmt.Errorf(
+			"get-checkpoint-operation: %s record carries a sealed root; malformed reply",
+			status.GetState(),
+		)
+	}
+	if status.GetOperationID() != operationID {
+		return fmt.Errorf(
+			"get-checkpoint-operation: status operation_id %q does not match requested %q",
+			status.GetOperationID(),
+			operationID,
+		)
+	}
+	return nil
+}
+
+// printCheckpointOperationStatus writes one CheckpointOperationStatus to the
+// output writer as protojson with snake_case field names and unpopulated
+// fields emitted, so the state is always explicit for the caller's
+// reconciliation. Taking an io.Writer keeps stdout and error text separable
+// and lets tests capture the exact bytes.
+func printCheckpointOperationStatus(
+	status *runtime.CheckpointOperationStatus,
+	out io.Writer,
+) error {
+	data, err := protojson.MarshalOptions{
+		Indent:          "  ",
+		UseProtoNames:   true,
+		EmitUnpopulated: true,
+	}.Marshal(status)
+	if err != nil {
+		return err
+	}
+	_, err = fmt.Fprintln(out, string(data))
+	return err
 }
 
 // maxExpectedGenerationLength bounds --expected-generation so a mistyped
@@ -694,6 +1062,9 @@ func validateOperationFlags(value options) error {
 		if value.action == "get-start-operation" {
 			return errors.New("--operation-id is required for get-start-operation")
 		}
+		if value.action == "get-checkpoint-operation" {
+			return errors.New("--operation-id is required for get-checkpoint-operation")
+		}
 		return nil
 	}
 	if err := validateOperationIDFormat(value.operationID); err != nil {
@@ -713,6 +1084,32 @@ func validateOperationFlags(value options) error {
 		if err := validateExpectedRootDigest(value.expectedRootDigest); err != nil {
 			return err
 		}
+	case "checkpoint":
+		// The identified checkpoint is stop-and-copy only: the service refuses
+		// a leave-running request outright, so the CLI demands the explicit
+		// opt-down instead of forwarding a request bound to fail — and never
+		// silently sends leave_running=true under an operation identity.
+		if value.sandboxID == "" || value.checkpointDir == "" {
+			return errors.New("--sandbox-id and --checkpoint-dir are required for " +
+				"checkpoint with --operation-id")
+		}
+		if value.expectedGeneration == "" {
+			return errors.New("--expected-generation is required for checkpoint with --operation-id")
+		}
+		if value.leaveRunning {
+			return errors.New("checkpoint with --operation-id requires --leave-running=false " +
+				"(identified checkpoints are stop-and-copy)")
+		}
+		if !filepath.IsAbs(value.checkpointDir) {
+			return errors.New("--checkpoint-dir must be absolute for checkpoint with --operation-id")
+		}
+		if value.checkpointTimeoutSeconds < 1 ||
+			value.checkpointTimeoutSeconds > checkpointOperationMaxTimeoutSeconds {
+			return fmt.Errorf(
+				"--checkpoint-timeout-seconds must be between 1 and %d for checkpoint with --operation-id",
+				checkpointOperationMaxTimeoutSeconds,
+			)
+		}
 	case "get-start-operation":
 		// The query takes no start payload: any of these flags set is a
 		// conflicted invocation, not a default.
@@ -722,8 +1119,19 @@ func validateOperationFlags(value options) error {
 			return errors.New("--action get-start-operation takes only --socket, " +
 				"--timeout, and --operation-id")
 		}
+	case "get-checkpoint-operation":
+		// Same query discipline: the action answers from the operation record
+		// alone, so any payload flag set here is explicit intent to be
+		// rejected, not a default to silently ignore.
+		if value.sandboxID != "" || value.targetID != "" || value.requestFile != "" ||
+			value.checkpointDir != "" || value.rootfs != "" || value.snapshotType != "" ||
+			value.workloadCmd != "" {
+			return errors.New("--action get-checkpoint-operation takes only --socket, " +
+				"--timeout, and --operation-id")
+		}
 	default:
-		return errors.New("--operation-id is only valid for start, restore, and get-start-operation")
+		return errors.New("--operation-id is only valid for start, restore, checkpoint, " +
+			"get-start-operation, and get-checkpoint-operation")
 	}
 	return nil
 }

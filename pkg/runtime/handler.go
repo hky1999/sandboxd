@@ -173,6 +173,19 @@ type CheckpointRootVerifier interface {
 	SupportsCheckpointRootVerification() bool
 }
 
+// CheckpointOperationWriter is the capability contract for runtimes whose
+// stop-and-copy checkpoints write sealed directories whose content root the
+// shared pkg/checkpointroot algorithm can bind. Identified checkpoint
+// operations (CheckpointWithOperation) record their durable success fact from
+// that root, so runtimes without this capability are refused at admission
+// instead of recording success facts that cannot be proven.
+type CheckpointOperationWriter interface {
+	// SupportsCheckpointOperations reports whether the runtime writes sealed,
+	// root-bindable checkpoints compatible with identified checkpoint
+	// operations.
+	SupportsCheckpointOperations() bool
+}
+
 // SpecUpdates contains provider-resolved OCI changes. Device providers use
 // this boundary so vendor-specific discovery and authorization do not leak
 // into the runsc client.

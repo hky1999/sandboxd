@@ -39,6 +39,19 @@ service SandboxService {
   // servers that predate the RPC return Unimplemented; callers must not
   // fall back to the unconditional Checkpoint.
   rpc CheckpointIfGeneration(CheckpointIfGenerationRequest) returns (CheckpointResponse) {}
+  // CheckpointWithOperation checkpoints a running sandbox under an explicit,
+  // persistent operation identity so a client that lost the reply can query
+  // or replay the original checkpoint instead of re-running it against an
+  // unproven source state. Only stop-and-copy Firecracker directory
+  // checkpoints are supported; the operation record is node-local
+  // idempotency state, not a cross-node writer lease or fencing token. Old
+  // servers that predate the RPC return Unimplemented; callers must fail
+  // hard instead of falling back to Checkpoint or CheckpointIfGeneration.
+  rpc CheckpointWithOperation(CheckpointWithOperationRequest) returns (CheckpointOperationStatus) {}
+  // GetCheckpointOperation returns the durable state of one checkpoint
+  // operation. It never starts a checkpoint and never re-executes a past
+  // operation.
+  rpc GetCheckpointOperation(GetCheckpointOperationRequest) returns (CheckpointOperationStatus) {}
   // Delete force-deletes a sandbox.
   rpc Delete(DeleteRequest) returns (DeleteResponse) {}
   // DeleteIfGeneration retires one physical generation only when the sandbox
@@ -424,6 +437,93 @@ message CheckpointIfGenerationRequest {
   // incarnation the caller intends to checkpoint. It is compared as an exact
   // string against the sandbox's current generation label, without trimming.
   string expected_generation = 2;
+}
+
+// CheckpointWithOperationRequest wraps one CheckpointRequest with a persistent
+// operation identity. Only stop-and-copy Firecracker directory checkpoints are
+// admitted: leave_running must be false and the source runtime must be
+// Firecracker. The legacy Checkpoint and CheckpointIfGeneration semantics are
+// unchanged; this wrapper adds only the operation binding.
+message CheckpointWithOperationRequest {
+  // OperationID is the stable caller-chosen identifier of this checkpoint
+  // operation. It is the durable idempotency key: the daemon records it before
+  // any checkpoint side effect, and a replay with the same ID returns the
+  // recorded outcome instead of checkpointing again. Once a terminal outcome is
+  // recorded the ID is never re-executed, even after the source sandbox is
+  // deleted.
+  string operation_id = 1;
+  // Checkpoint is the wrapped checkpoint command. Every field is semantic and
+  // covered by the request digest bound to the operation ID; a replay with any
+  // field changed — directory, timeout, compression, leave_running, or
+  // snapshot type — refuses the reuse.
+  CheckpointRequest checkpoint = 2;
+  // ExpectedGeneration is required and binds the operation to the exact
+  // physical source incarnation, exactly as in CheckpointIfGeneration. The
+  // authoritative comparison still happens inside the checkpoint path under
+  // the per-ID physical lock; this field is not a substitute for it.
+  string expected_generation = 3;
+}
+
+// CheckpointOperationState is the durable lifecycle state of a checkpoint
+// operation.
+enum CheckpointOperationState {
+  // UNSPECIFIED is never returned by a healthy daemon.
+  CHECKPOINT_OPERATION_STATE_UNSPECIFIED = 0;
+  // RUNNING means the operation was admitted and its outcome is still pending.
+  CHECKPOINT_OPERATION_STATE_RUNNING = 1;
+  // SUCCEEDED means the checkpoint flow returned success, the sealed content
+  // root of the output directory was read, and that fact was made durable. It
+  // is a historical fact about the checkpoint completion: it does not claim
+  // the artifacts still exist unchanged, nor that the source is still absent
+  // or still running.
+  CHECKPOINT_OPERATION_STATE_SUCCEEDED = 2;
+  // FAILED means the checkpoint was refused or failed before the runtime
+  // checkpoint was entered, so no artifact can exist. The operation ID is
+  // spent; checkpointing again requires a new operation ID.
+  CHECKPOINT_OPERATION_STATE_FAILED = 3;
+  // UNKNOWN means the outcome could not be proven from durable evidence — the
+  // runtime was entered and then failed, timed out, or was cancelled, the
+  // daemon restarted with the operation in flight, or the terminal fact could
+  // not be persisted. The operation ID is spent and re-execution is forbidden;
+  // reconcile the source and the retained output directory before issuing a
+  // new operation.
+  CHECKPOINT_OPERATION_STATE_UNKNOWN = 4;
+}
+
+// CheckpointOperationStatus is the durable state of one checkpoint operation,
+// returned by both CheckpointWithOperation and GetCheckpointOperation.
+message CheckpointOperationStatus {
+  // OperationID repeats the queried operation ID.
+  string operation_id = 1;
+  // SandboxID is the source sandbox the operation is bound to.
+  string sandbox_id = 2;
+  // State is the durable lifecycle state of the operation.
+  CheckpointOperationState state = 3;
+  // SourceGeneration is the caller-expected physical incarnation generation
+  // the operation was bound to at admission.
+  string source_generation = 4;
+  // CheckpointDir is the canonical output directory the operation writes to.
+  string checkpoint_dir = 5;
+  // RequestDigest is the hex SHA-256 of the deterministic encoding of the
+  // bound request, exposing exactly which intent the ID answers for.
+  string request_digest = 6;
+  // ArtifactRootDigest is the content root of the output directory, read from
+  // the sealed manifest after the checkpoint completed. It is set only for
+  // SUCCEEDED and is a completion-time fact: it does not attest that the
+  // directory still holds that content.
+  string artifact_root_digest = 7;
+  // ArtifactRootScheme names the content-root composition scheme behind
+  // ArtifactRootDigest.
+  string artifact_root_scheme = 8;
+  // Message carries the outcome detail, including why an UNKNOWN outcome could
+  // not be proven.
+  string message = 9;
+}
+
+// GetCheckpointOperationRequest queries one checkpoint operation by identity.
+message GetCheckpointOperationRequest {
+  // OperationID is the operation identity to look up.
+  string operation_id = 1;
 }
 
 // DeleteRequest describes a force-delete request.

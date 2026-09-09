@@ -20,16 +20,32 @@ package main
 // before the side effect that gives the stage its name, so a retry after a
 // lost reply, a killed CLI, or a crash resumes the SAME migration:
 //
-//   - the checkpoint directory and the target operation ID are pure
-//     functions of the migration ID, so a retry never forks a second
-//     checkpoint or a second target start;
+//   - the checkpoint directory, the source checkpoint operation ID, and the
+//     target operation ID are pure functions of the migration ID, so a
+//     retry never forks a second checkpoint or a second target start;
+//   - the source checkpoint runs as an identified stop-and-copy operation
+//     (CheckpointWithOperation) whose complete payload — directory,
+//     generation, timeout, compression, snapshot flavor — is pinned in the
+//     journal and replayed from it, so the request bound to the operation
+//     ID can never drift with future defaults. A lost or failed reply is
+//     reconciled by querying the durable operation record FIRST. Only a
+//     proven-absent record (the structured not-found exit code of the query
+//     action, never stderr text) permits re-issuing the very same operation
+//     with the very same payload; a SUCCEEDED record additionally requires
+//     a same-payload replay before it authorizes anything, because the
+//     query answer alone does not bind the caller's request. RUNNING /
+//     UNKNOWN / FAILED / ambiguous answers fail closed: no source rollback,
+//     no legacy checkpoint RPC, no new operation ID, no target start;
+//   - the checkpoint receipt's sealed root is preserved durably before the
+//     checkpoint-sealed stage, and the later root binding must re-derive
+//     exactly that root and scheme from the artifact — a directory whose
+//     content changed after completion is refused, never re-pinned;
 //   - the checkpoint content root is pinned from the source through the
 //     read-only checkpoint-root action, and the restore names it as
 //     --expected-root-digest, so the operation binds to the artifact it
 //     restores and a replaced directory cannot ride the operation ID;
 //   - a restore whose reply was lost is resolved by querying the durable
-//     operation record FIRST; only a proven-absent record (the structured
-//     not-found exit code of the query action, never stderr text) permits
+//     operation record FIRST; only a proven-absent record permits
 //     re-issuing the very same operation, and RUNNING / UNKNOWN / FAILED /
 //     ambiguous answers fail closed: no source rollback, no new operation
 //     ID, no target delete;
@@ -43,10 +59,10 @@ package main
 //     a retry or an operator.
 //
 // This is a staged integration, not final fencing: the journal is
-// node-local CLI progress, not a cross-node writer lease, and an outstanding
-// checkpoint with an unknown outcome stays pending — this mode neither
-// re-issues it nor decides it, because nothing observable here can prove
-// whether the source executed it.
+// node-local CLI progress, not a cross-node writer lease, and the source
+// operation records are node-local idempotency state, not cross-node
+// ownership. Version 1 journals from the pre-operation flow are refused
+// unless already `done`.
 
 import (
 	"context"
@@ -55,19 +71,22 @@ import (
 	"fmt"
 	"io"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 
 	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
 	"github.com/inclusionAI/sandboxd/pkg/checkpointlocator"
 	"github.com/inclusionAI/sandboxd/pkg/checkpointpublish"
+	"github.com/inclusionAI/sandboxd/pkg/checkpointroot"
 	"google.golang.org/protobuf/encoding/protojson"
 )
 
 // exitCodeOperationNotFound mirrors the checkpoint-restore CLI's structured
-// not-found exit code for --action get-start-operation. It is the ONLY
-// absent-record signal this CLI accepts — an executor that swallows exit
-// codes turns every query into an ambiguous failure, which fails closed.
+// not-found exit code for the --action get-start-operation and
+// --action get-checkpoint-operation queries. It is the ONLY absent-record
+// signal this CLI accepts — an executor that swallows exit codes turns
+// every query into an ambiguous failure, which fails closed.
 const exitCodeOperationNotFound = 3
 
 // resumableConfig carries the validated flags of one resumable invocation.
@@ -170,28 +189,237 @@ func runResumableMigration(cfg resumableConfig) {
 	report.Target = journal.Target
 	report.Stage = journal.Stage
 
+	// issueSourceCheckpoint runs the identified source checkpoint exactly as
+	// pinned in the journal: the durable operation identity, the captured
+	// generation, and the complete fixed CheckpointRequest payload (sandbox,
+	// directory spelling, timeout, compression, leave-running, snapshot
+	// flavor) all come from the record, so every invocation — first issue,
+	// NotFound resend, and SUCCEEDED verification replay alike — sends
+	// byte-stable intent. There is deliberately no legacy fallback: an
+	// unsupported or unavailable CheckpointWithOperation is a hard failure,
+	// because a fallback would checkpoint outside the durable identity this
+	// flow is about to reconcile.
+	issueSourceCheckpoint := func() (string, int) {
+		return runCode(cfg.source, "checkpoint", cfg.bin+"/checkpoint-restore",
+			"--action", "checkpoint", "--socket", "/run/sandboxd/sandboxd.sock",
+			"--sandbox-id", cfg.sandbox,
+			"--checkpoint-dir", journal.CheckpointDir,
+			"--checkpoint-timeout-seconds", strconv.FormatUint(uint64(journal.CheckpointTimeoutSeconds), 10),
+			"--compress="+strconv.FormatBool(journal.CheckpointCompress),
+			"--leave-running="+strconv.FormatBool(journal.CheckpointLeaveRunning),
+			"--snapshot-type", journal.CheckpointSnapshotType,
+			"--operation-id", journal.SourceOperationID,
+			"--expected-generation", journal.SourceGeneration)
+	}
+	// receiptConflict validates one checkpoint operation receipt against this
+	// migration: the echoed identities, the terminal success state, the
+	// request digest validated by the node CLI, and the sealed
+	// root's digest shape and scheme. The receipt's checkpoint directory is
+	// deliberately NOT compared with the journal's logical path — under an
+	// executor template the node-local CLI already verified the server's
+	// canonical directory against the directory actually sent, and the two
+	// spellings legitimately differ across the mapping.
+	receiptConflict := func(status *runtime.CheckpointOperationStatus) string {
+		if status.GetOperationID() != journal.SourceOperationID {
+			return fmt.Sprintf("receipt operation %q does not answer for the journaled source operation %q", status.GetOperationID(), journal.SourceOperationID)
+		}
+		if status.GetSandboxID() != cfg.sandbox {
+			return fmt.Sprintf("receipt sandbox %q is not the migrated sandbox %q", status.GetSandboxID(), cfg.sandbox)
+		}
+		if status.GetSourceGeneration() != journal.SourceGeneration {
+			return fmt.Sprintf("receipt source_generation %q is not the pinned generation %q", status.GetSourceGeneration(), journal.SourceGeneration)
+		}
+		if status.GetState() != runtime.CheckpointOperationState_CHECKPOINT_OPERATION_STATE_SUCCEEDED {
+			return fmt.Sprintf("operation state %s is not SUCCEEDED", status.GetState())
+		}
+		// The node CLI validates the exact request it sent, including the
+		// executor-mapped directory spelling. The controller only knows the
+		// logical path and cannot independently reconstruct those bytes.
+		// Reconciliation additionally requires same-request replay and equal
+		// query/replay/persisted receipts below.
+		if len(status.GetRequestDigest()) != 64 || !isHex(status.GetRequestDigest()) || status.GetRequestDigest() != strings.ToLower(status.GetRequestDigest()) {
+			return fmt.Sprintf("receipt request_digest %q is not a canonical SHA-256 digest", status.GetRequestDigest())
+		}
+		if len(status.GetArtifactRootDigest()) != 64 || !isHex(status.GetArtifactRootDigest()) || status.GetArtifactRootDigest() != strings.ToLower(status.GetArtifactRootDigest()) {
+			return fmt.Sprintf("receipt artifact_root_digest %q is not a 64-hex digest", status.GetArtifactRootDigest())
+		}
+		if status.GetArtifactRootScheme() != checkpointroot.Scheme {
+			return fmt.Sprintf("receipt artifact_root_scheme %q is not the shared root scheme %q", status.GetArtifactRootScheme(), checkpointroot.Scheme)
+		}
+		return ""
+	}
+	// parseReceipt strictly decodes the protojson CheckpointOperationStatus
+	// the operation-mode CLI prints on stdout: one document, no unknown
+	// fields, no trailing content. Output of a FAILED command is never
+	// parsed as a receipt — callers only reach here on exit 0.
+	parseReceipt := func(output string) (*runtime.CheckpointOperationStatus, error) {
+		status, err := parseCheckpointOperationStatus(output)
+		if err != nil {
+			return nil, fmt.Errorf("the checkpoint operation reply is not a readable receipt: %w", err)
+		}
+		return status, nil
+	}
+	// persistReceiptConflict additionally holds a receipt that is already
+	// durable in the journal to the newly observed one: once a success
+	// receipt is preserved, every later observation of the same operation
+	// must repeat it exactly, or the record is not trustworthy.
+	persistReceiptConflict := func(status *runtime.CheckpointOperationStatus) string {
+		if strings.TrimSpace(journal.SourceRootDigest) == "" {
+			return ""
+		}
+		if status.GetRequestDigest() != journal.SourceOpRequestDigest ||
+			status.GetArtifactRootDigest() != journal.SourceRootDigest ||
+			status.GetArtifactRootScheme() != journal.SourceRootScheme ||
+			status.GetSourceGeneration() != journal.SourceGeneration {
+			return fmt.Sprintf(
+				"operation %s now reports (digest %s, root %s, scheme %s, generation %s) but the journal already preserved (digest %s, root %s, scheme %s, generation %s) — the durable receipt and the record disagree",
+				journal.SourceOperationID,
+				status.GetRequestDigest(), status.GetArtifactRootDigest(), status.GetArtifactRootScheme(), status.GetSourceGeneration(),
+				journal.SourceOpRequestDigest, journal.SourceRootDigest, journal.SourceRootScheme, journal.SourceGeneration,
+			)
+		}
+		return ""
+	}
+	// acceptSourceReceipt is the single way a checkpoint becomes sealed: the
+	// reply parses, carries this migration's identity, reports SUCCEEDED
+	// with the pinned payload's digest and a well-shaped sealed root, agrees
+	// with any already-preserved receipt — and only then is the receipt
+	// preserved durably WHILE THE STAGE IS STILL checkpoint-issued, so a
+	// crash before the stage advance leaves an observable, reloadable fact
+	// rather than a lost one.
+	acceptSourceReceipt := func(output string) {
+		status, err := parseReceipt(output)
+		if err != nil {
+			fail("checkpoint", fmt.Sprintf("%v — the journal stays at checkpoint-issued; query operation %q on %s before doing anything else", err, journal.SourceOperationID, cfg.source))
+		}
+		if conflict := receiptConflict(status); conflict != "" {
+			fail("checkpoint", fmt.Sprintf(
+				"the checkpoint receipt does not prove this operation succeeded for this migration: %s — the journal stays at checkpoint-issued, no receipt is preserved, and no rollback or target start happens; reconcile operation %q on %s manually",
+				conflict, journal.SourceOperationID, cfg.source))
+		}
+		if conflict := persistReceiptConflict(status); conflict != "" {
+			fail("checkpoint", fmt.Sprintf("%s — failing closed with the journal at checkpoint-issued; reconcile operation %q on %s manually", conflict, journal.SourceOperationID, cfg.source))
+		}
+		persist(stageCheckpointIssued, func(j *migrationJournal) {
+			j.SourceOpRequestDigest = status.GetRequestDigest()
+			j.SourceRootDigest = status.GetArtifactRootDigest()
+			j.SourceRootScheme = status.GetArtifactRootScheme()
+		})
+		persist(stageCheckpointSealed, func(*migrationJournal) {})
+	}
+	// reconcileSourceCheckpoint resolves a checkpoint whose reply was lost
+	// or whose issuing process died. The durable operation record is queried
+	// FIRST, and the outcome is bounded — one query plus at most one
+	// same-identity re-issue or replay per process, no loops, no recursion:
+	//   - the structured not-found exit code is the only proof the operation
+	//     was never admitted, and it authorizes exactly one resend of the
+	//     SAME operation with the SAME pinned payload — never a new ID, a
+	//     re-inspected generation, or a legacy RPC. A not-found record that
+	//     contradicts an already-preserved receipt is an inconsistency and
+	//     fails closed instead of re-executing;
+	//   - a SUCCEEDED record proves only history: the query answer carries
+	//     no caller-payload binding, so the same-payload checkpoint is
+	//     replayed once (the daemon replays the recorded outcome and refuses
+	//     a changed request) and the replayed receipt must repeat the
+	//     queried one exactly before anything is accepted;
+	//   - RUNNING, UNKNOWN, FAILED, an unparseable or mismatched record, and
+	//     every ambiguous query error stop the run: the journal stays at
+	//     checkpoint-issued, nothing is rolled back, no target is started,
+	//     and the operation ID stays spent.
+	reconcileSourceCheckpoint := func() {
+		output, code := runCode(cfg.source, "query-checkpoint-operation", cfg.bin+"/checkpoint-restore",
+			"--action", "get-checkpoint-operation", "--socket", "/run/sandboxd/sandboxd.sock",
+			"--operation-id", journal.SourceOperationID)
+		switch {
+		case code == exitCodeOperationNotFound:
+			if strings.TrimSpace(journal.SourceRootDigest) != "" {
+				fail("checkpoint", fmt.Sprintf(
+					"operation %s is absent on %s but this journal already preserved its success receipt — the record and the receipt contradict; failing closed at checkpoint-issued with no re-execution, no rollback, and no target",
+					journal.SourceOperationID, cfg.source))
+			}
+			reply, resend := issueSourceCheckpoint()
+			if resend != 0 {
+				fail("checkpoint", fmt.Sprintf(
+					"the checkpoint retry failed after the operation record was absent — its outcome is unknown; the journal stays at checkpoint-issued, operation %q may still have been admitted on %s, and no rollback, no new operation ID, and no target start happen; retry this migration to reconcile",
+					journal.SourceOperationID, cfg.source))
+			}
+			acceptSourceReceipt(reply)
+		case code != 0:
+			fail("checkpoint", fmt.Sprintf(
+				"the checkpoint operation query failed ambiguously (exit %d) — failing closed: the journal stays at checkpoint-issued; no rollback, no legacy checkpoint, no new operation ID, no target start; resolve operation %q on %s manually or retry this migration",
+				code, journal.SourceOperationID, cfg.source))
+		default:
+			queried, err := parseReceipt(output)
+			if err != nil {
+				fail("checkpoint", fmt.Sprintf(
+					"the checkpoint operation query returned an unreadable record: %v — failing closed at checkpoint-issued; resolve operation %q on %s manually",
+					err, journal.SourceOperationID, cfg.source))
+			}
+			if queried.GetOperationID() != journal.SourceOperationID || queried.GetSandboxID() != cfg.sandbox ||
+				queried.GetSourceGeneration() != journal.SourceGeneration {
+				fail("checkpoint", fmt.Sprintf(
+					"operation %q on %s does not answer for this migration (sandbox %q, generation %q) — failing closed at checkpoint-issued with no rollback and no target; reconcile the record, then continue with a new -migration-id",
+					queried.GetOperationID(), cfg.source, queried.GetSandboxID(), queried.GetSourceGeneration()))
+			}
+			if queried.GetState() != runtime.CheckpointOperationState_CHECKPOINT_OPERATION_STATE_SUCCEEDED {
+				fail("checkpoint", fmt.Sprintf(
+					"source checkpoint operation %q on %s is %s — its outcome does not authorize this migration: the journal stays at checkpoint-issued and the operation ID is spent; no re-execution, no rollback, no legacy checkpoint, no new operation ID, no target start; reconcile the record and the source, then continue with a new -migration-id",
+					journal.SourceOperationID, cfg.source, queried.GetState()))
+			}
+			if conflict := persistReceiptConflict(queried); conflict != "" {
+				fail("checkpoint", fmt.Sprintf("%s — failing closed at checkpoint-issued; reconcile operation %q on %s manually", conflict, journal.SourceOperationID, cfg.source))
+			}
+			// The record proves the operation succeeded, but a query alone
+			// does not bind this caller's payload: replay the exact pinned
+			// request once so the daemon (and the receipt validation above)
+			// can refuse a changed intent, and require the replay to repeat
+			// the queried fact.
+			reply, replay := issueSourceCheckpoint()
+			if replay != 0 {
+				fail("checkpoint", fmt.Sprintf(
+					"historical operation success could not be verified against this migration's pinned payload — the replay failed, so the journal stays at checkpoint-issued; no receipt is preserved, no rollback, no new operation ID, no target start; retry this migration to reconcile",
+				))
+			}
+			replayed, err := parseReceipt(reply)
+			if err != nil {
+				fail("checkpoint", fmt.Sprintf("%v — the journal stays at checkpoint-issued; query operation %q on %s before doing anything else", err, journal.SourceOperationID, cfg.source))
+			}
+			if conflict := receiptConflict(replayed); conflict != "" {
+				fail("checkpoint", fmt.Sprintf(
+					"the replayed checkpoint receipt does not prove this operation succeeded for this migration: %s — the journal stays at checkpoint-issued; no rollback and no target start; reconcile operation %q on %s manually",
+					conflict, journal.SourceOperationID, cfg.source))
+			}
+			if replayed.GetArtifactRootDigest() != queried.GetArtifactRootDigest() ||
+				replayed.GetArtifactRootScheme() != queried.GetArtifactRootScheme() ||
+				replayed.GetSourceGeneration() != queried.GetSourceGeneration() ||
+				replayed.GetRequestDigest() != queried.GetRequestDigest() {
+				fail("checkpoint", fmt.Sprintf(
+					"the replay of operation %s did not repeat the queried receipt (digest %s, root %s, scheme %s, generation %s) — failing closed at checkpoint-issued; reconcile the record on %s manually",
+					journal.SourceOperationID,
+					replayed.GetRequestDigest(), replayed.GetArtifactRootDigest(), replayed.GetArtifactRootScheme(), replayed.GetSourceGeneration(),
+					cfg.source))
+			}
+			acceptSourceReceipt(reply)
+		}
+	}
+
 	// A finished migration replays as a pure report: no node command at all,
-	// because everything the stages name is already durably done.
+	// because everything the stages name is already durably done. This also
+	// holds for a terminal version 1 `done` record — the one v1 stage this
+	// build still loads.
 	if journal.Stage == stageDone {
 		report.OK = true
 		finish(report, cfg.jsonOut, true)
 	}
-	// An outstanding checkpoint with an unknown outcome stays pending: a
-	// failed command does not prove the source never executed it, and
-	// nothing this CLI can observe decides it. No re-issue (a second
-	// checkpoint could seal a replacement incarnation or clobber the sealed
-	// one), no rollback, no target start — the operator reconciles the
-	// checkpoint, then resumes with a fresh migration ID.
+	// A checkpoint that was issued but not yet proven sealed is reconciled
+	// through the durable source operation record — never by guessing.
 	if journal.Stage == stageCheckpointIssued {
-		fail("checkpoint", fmt.Sprintf(
-			"the previous checkpoint command's outcome is unknown (journal at checkpoint-issued for %s on %s) — this mode re-issues nothing, rolls back nothing, and starts no target; reconcile the checkpoint manually and continue with a new -migration-id once decided",
-			journal.CheckpointDir, journal.Source,
-		))
+		reconcileSourceCheckpoint()
 	}
 
 	// Pin the source incarnation once, before anything is issued. A resume
 	// past this stage does NOT re-probe the source: it was finalized at
-	// checkpoint time, and the conditional checkpoint already refuses a
+	// checkpoint time, and the identified checkpoint already refuses a
 	// replaced incarnation by generation.
 	if journal.Stage == stagePrepared {
 		if _, ok := run(cfg.source, "list", cfg.bin+"/sbox",
@@ -218,38 +446,42 @@ func runResumableMigration(cfg resumableConfig) {
 		report.SourceGeneration = journal.SourceGeneration
 	}
 
-	// Checkpoint, conditionally on the pinned generation. The issued stage
-	// is durable BEFORE the command runs; on any failure the record stays
-	// there and every later process refuses to continue (see above).
+	// Checkpoint the pinned incarnation as an identified stop-and-copy
+	// operation. checkpoint-issued is durable BEFORE the command runs, so
+	// its unknown-outcome window is always observable by the next process;
+	// on any failure the reconciliation runs immediately in this same
+	// process, and its own failure leaves the journal at checkpoint-issued
+	// for the next process — the same bounded rules, never a re-execution
+	// without a proven-absent record.
 	if journal.Stage == stageSourcePinned {
 		persist(stageCheckpointIssued, func(*migrationJournal) {})
-		if _, ok := run(cfg.source, "checkpoint", cfg.bin+"/checkpoint-restore",
-			"--action", "checkpoint", "--socket", "/run/sandboxd/sandboxd.sock",
-			"--request-file", cfg.ckReq, "--sandbox-id", cfg.sandbox,
-			"--checkpoint-dir", journal.CheckpointDir, "--compress=false",
-			"--leave-running=false",
-			"--expected-generation", journal.SourceGeneration); !ok {
-			fail("checkpoint", fmt.Sprintf(
-				"checkpoint command failed — its outcome is unknown (a failed command does not prove it was not executed); the journal stays at checkpoint-issued, the source is left exactly as it is, and no rollback or target start happens in this mode; reconcile the checkpoint at %s on %s, then continue with a new -migration-id",
-				journal.CheckpointDir, cfg.source))
+		if reply, code := issueSourceCheckpoint(); code == 0 {
+			acceptSourceReceipt(reply)
+		} else {
+			reconcileSourceCheckpoint()
 		}
-		persist(stageCheckpointSealed, func(*migrationJournal) {})
 	}
 
 	// Pin the artifact's content root AND the exact restore request bytes
 	// from the source, in one read-only roundtrip: the request file is
 	// node-local, so the source node's checkpoint-root action hashes it
-	// (--request-file) beside the artifact identity. Both digests are pinned
-	// at root-bound and NEVER refreshed afterwards — a retry that finds
-	// different bytes at the same request path fails at the restore instead
-	// of quietly re-pinning content under the same operation identity. The
-	// same root later gates the target's materialization and names the
-	// restore's expected root, so the source root and the materialized root
-	// must agree or nothing runs.
+	// (--request-file) beside the artifact identity. The freshly derived
+	// root and scheme must repeat the source receipt's sealed root exactly:
+	// the receipt is a completion-time fact and does not attest the files
+	// are still unchanged, so a directory that drifted after completion is
+	// refused here — never re-pinned as if it were the sealed checkpoint.
+	// The restore request digest is pinned beside them and NEVER refreshed
+	// afterwards; it stays strictly separate from the checkpoint request
+	// digest the source receipt carried.
 	if journal.Stage == stageCheckpointSealed {
 		root, scheme, requestDigest, bindErr := bindSourceIdentity(cfg, run, journal)
 		if bindErr != nil {
 			fail("bind-source-root", bindErr.Error())
+		}
+		if root != journal.SourceRootDigest || scheme != journal.SourceRootScheme {
+			fail("bind-source-root", fmt.Sprintf(
+				"the sealed directory at %s now derives root %s (%s) but the source receipt bound root %s (%s) at completion — the artifact changed after the checkpoint completed; refusing to re-pin the changed artifact as this checkpoint (no rollback, no target start; reconcile the artifact on %s, then continue with a new -migration-id)",
+				journal.CheckpointDir, root, scheme, journal.SourceRootDigest, journal.SourceRootScheme, cfg.source))
 		}
 		persist(stageRootBound, func(j *migrationJournal) {
 			j.RootDigest = root
@@ -598,6 +830,34 @@ func parseStartOperationStatus(output string) (*runtime.StartOperationStatus, er
 	}
 	if status.GetOperationID() == "" || status.GetSandboxID() == "" {
 		return nil, fmt.Errorf("receipt %v carries no operation or sandbox identity", status)
+	}
+	return status, nil
+}
+
+// parseCheckpointOperationStatus strictly decodes the protojson
+// CheckpointOperationStatus the operation-mode CLI prints for the identified
+// source checkpoint and its query: one document, no unknown fields, no
+// trailing content. UNSPECIFIED is rejected — a healthy daemon never reports
+// it, so it is a protocol error rather than a state to guess about.
+func parseCheckpointOperationStatus(output string) (*runtime.CheckpointOperationStatus, error) {
+	trimmed := strings.TrimSpace(output)
+	if trimmed == "" {
+		return nil, errors.New("empty output")
+	}
+	status := new(runtime.CheckpointOperationStatus)
+	if err := (protojson.UnmarshalOptions{DiscardUnknown: false}).Unmarshal([]byte(trimmed), status); err != nil {
+		return nil, fmt.Errorf("parse CheckpointOperationStatus protojson: %w", err)
+	}
+	if status.GetOperationID() == "" || status.GetSandboxID() == "" {
+		return nil, fmt.Errorf("receipt %v carries no operation or sandbox identity", status)
+	}
+	switch status.GetState() {
+	case runtime.CheckpointOperationState_CHECKPOINT_OPERATION_STATE_RUNNING,
+		runtime.CheckpointOperationState_CHECKPOINT_OPERATION_STATE_SUCCEEDED,
+		runtime.CheckpointOperationState_CHECKPOINT_OPERATION_STATE_FAILED,
+		runtime.CheckpointOperationState_CHECKPOINT_OPERATION_STATE_UNKNOWN:
+	default:
+		return nil, fmt.Errorf("receipt reports unrecognized operation state %s", status.GetState())
 	}
 	return status, nil
 }
