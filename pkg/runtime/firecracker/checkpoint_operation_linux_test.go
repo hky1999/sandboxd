@@ -1445,7 +1445,12 @@ func TestCompletedPersistenceFailureCannotReplaySuccess(t *testing.T) {
 	}
 	repair := blockStateWrite(t, state)
 
-	_, err := handler.RecoverCheckpointOperation(context.Background(), sandboxID, binding)
+	// The fixture already has a durable prepared record. Exercise the completion
+	// publisher directly so the fault stays at completed persistence; subsequent
+	// Recover calls below still check that memory cannot replay false success.
+	instance.operationMu.Lock()
+	err := handler.completeIdentifiedCheckpointOperation(instance, state.CheckpointOperation)
+	instance.operationMu.Unlock()
 	if err == nil || !containsAll(err.Error(), "persist completed checkpoint operation witness") {
 		t.Fatalf("recovery did not reach the injected completion persistence failure: %v", err)
 	}
@@ -1520,7 +1525,12 @@ func TestCompletedPublishOrderingHoldsAgainstConcurrentStateWriters(t *testing.T
 		}
 	}()
 
-	_, err := handler.RecoverCheckpointOperation(context.Background(), sandboxID, binding)
+	// The fixture already has a durable prepared record. Exercise the completion
+	// publisher directly so the fault stays at completed persistence; subsequent
+	// Recover calls below still check that memory cannot replay false success.
+	instance.operationMu.Lock()
+	err := handler.completeIdentifiedCheckpointOperation(instance, state.CheckpointOperation)
+	instance.operationMu.Unlock()
 	if err == nil || !containsAll(err.Error(), "persist completed checkpoint operation witness") {
 		t.Fatalf("recovery did not reach the injected completion persistence failure: %v", err)
 	}
@@ -1665,5 +1675,89 @@ func TestAckCheckpointOperationAfterArtifactGCIndependentOfMapping(t *testing.T)
 				t.Fatalf("ack after completed source/artifact GC (cold=%v): %v", cold, err)
 			}
 		})
+	}
+}
+
+// Persistent preparation failure must never allow a hot retry to stop its source.
+func TestRecoverCheckpointOperationPreparedRetryPersistsBeforeStopping(t *testing.T) {
+	handler, instance, api, sandboxID := checkpointOperationFixture(t, "gen-live")
+	directory := filepath.Join(t.TempDir(), "checkpoint")
+	before := instance.snapshot()
+	fd := checkpointTestPidfd(t, before.PID)
+	makeStateDirUnwritable(t, instance)
+
+	// The original checkpoint seals the artifact and then fails the prepared
+	// witness write: the source stays paused and only the in-memory record
+	// binds this daemon.
+	err := runIdentifiedCheckpoint(t, handler, sandboxID, "gen-live", directory)
+	if !containsAll(err.Error(), "persist prepared checkpoint operation witness") {
+		t.Fatalf("failure must name the ambiguous prepared write: %v", err)
+	}
+	disk, readErr := readFirecrackerState(before.BundlePath)
+	if readErr != nil || !disk.CheckpointOperation.isZero() {
+		t.Fatalf("durable witness state = %+v %v, want none", disk.CheckpointOperation, readErr)
+	}
+	if checkpointTestExitReady(t, fd) {
+		t.Fatal("source already stopped before the retry")
+	}
+
+	// Hot retry with the storage still unwritable: the recovery must refuse
+	// on the prepared re-persist boundary, before any stop processing.
+	_, err = handler.RecoverCheckpointOperation(
+		context.Background(), sandboxID, testCheckpointOperationBinding("gen-live"),
+	)
+	if err == nil || !containsAll(err.Error(), "persist prepared checkpoint operation witness before recovering") {
+		t.Fatalf("retry with unwritable storage = %v, want the prepared re-persist refusal", err)
+	}
+	if checkpointTestExitReady(t, fd) {
+		t.Fatal("retry stopped the source although no durable prepared witness exists")
+	}
+	if resumes := api.countVMState("Resumed"); resumes != 0 {
+		t.Fatalf("retry resumed the source %d times", resumes)
+	}
+	if snapshots := api.countSnapshotCreates(); snapshots != 1 {
+		t.Fatalf("retry re-took snapshots: %d", snapshots)
+	}
+	disk, readErr = readFirecrackerState(before.BundlePath)
+	if readErr != nil || !disk.CheckpointOperation.isZero() {
+		t.Fatalf("failed retry wrote durable evidence: %+v %v", disk.CheckpointOperation, readErr)
+	}
+	if phase := instance.snapshot().CheckpointOperation.Phase; phase != firecrackerCheckpointOperationPhasePrepared {
+		t.Fatalf("failed retry dropped the in-memory witness: %q", phase)
+	}
+
+	// Repaired storage: the same operation's recovery proves the prepared
+	// boundary durably, completes the original stop, and returns the
+	// originally sealed root — with no new snapshot or resume.
+	makeStateDirWritable(instance)
+	root, bindErr := checkpointroot.Bind(directory)
+	if bindErr != nil {
+		t.Fatal(bindErr)
+	}
+	completion, err := handler.RecoverCheckpointOperation(
+		context.Background(), sandboxID, testCheckpointOperationBinding("gen-live"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if completion.RootDigest != root.RootDigest || completion.RootScheme != root.Scheme {
+		t.Fatalf("recovered root %s (%s), want the sealed root %s (%s)",
+			completion.RootDigest, completion.RootScheme, root.RootDigest, root.Scheme)
+	}
+	if !checkpointTestExitReady(t, fd) {
+		t.Fatal("repaired retry returned before the source's kernel exit notification")
+	}
+	disk, readErr = readFirecrackerState(before.BundlePath)
+	if readErr != nil || disk.CheckpointOperation.Phase != firecrackerCheckpointOperationPhaseCompleted || !disk.Exited {
+		t.Fatalf("durable completion after repaired retry = %+v %v", disk.CheckpointOperation, readErr)
+	}
+	if disk.CheckpointOperation.RootDigest != root.RootDigest {
+		t.Fatalf("completion root drifted from the sealed artifact: %+v", disk.CheckpointOperation)
+	}
+	if snapshots := api.countSnapshotCreates(); snapshots != 1 {
+		t.Fatalf("repaired retry re-took snapshots: %d", snapshots)
+	}
+	if resumes := api.countVMState("Resumed"); resumes != 0 {
+		t.Fatalf("repaired retry resumed the source %d times", resumes)
 	}
 }

@@ -610,8 +610,10 @@ func verifyCheckpointOperationWitnessScope(
 // generation exactly, the record's source generation must still equal the
 // runtime's own persisted incarnation identity, and the recorded artifact
 // root must still bind the recorded directory. Within the lock the recovery
-// only completes the original stop-source flow: it never allocates artifacts,
-// takes a snapshot, resumes the source, or modifies the artifact root. A
+// only completes the original stop-source flow: a prepared witness is first
+// made durable again — the in-memory record alone does not prove the original
+// write landed — and then it never allocates artifacts, takes a snapshot,
+// resumes the source, or modifies the artifact root. A
 // durable completion is returned as the original binding's recorded result
 // with zero further work. The returned completion is a fact about the sealed
 // root and the confirmed stop, not a payload-durability claim.
@@ -671,6 +673,23 @@ func (handler *Handler) RecoverCheckpointOperation(
 			RootDigest: record.RootDigest,
 			RootScheme: record.RootScheme,
 		}, nil
+	}
+	// The prepared witness held in daemon memory is not proof of its own
+	// durability: the original write may have failed with an unknown result,
+	// leaving only the in-memory record that binds this daemon fail-closed.
+	// Re-establish the durable prepared boundary before any stop-source or
+	// uffd exit processing. persistInstance serializes on the same persistMu
+	// as every other state writer and writes through the atomic rename and
+	// directory fsync with no unchanged-state shortcut, so a nil result here
+	// has re-proven the matching prepared state on disk. A failure stops
+	// nothing: the source, the in-memory record, and the sealed artifact are
+	// retained exactly as they were, and the recovery can be retried once
+	// the state storage is writable.
+	if err := handler.persistInstance(instance); err != nil {
+		return runtimecore.CheckpointOperationCompletion{}, fmt.Errorf(
+			"persist prepared checkpoint operation witness before recovering operation %s of Firecracker sandbox %s: %w; no stop was attempted, the source and the sealed artifact are retained, and the recovery must be retried once the state storage is writable",
+			record.OperationID, sandboxID, err,
+		)
 	}
 	if err := handler.completeIdentifiedCheckpointOperation(instance, record); err != nil {
 		return runtimecore.CheckpointOperationCompletion{}, err
