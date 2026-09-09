@@ -194,8 +194,10 @@ func checkpointRequestFromOptions(value options) *runtime.CheckpointRequest {
 }
 
 // parseCheckpointOperationStatus asserts the CLI printed exactly one
-// protojson CheckpointOperationStatus — all nine snake_case keys, nothing
-// else — so callers can reject mixed or partial output instead of guessing.
+// protojson CheckpointOperationStatus — all eleven snake_case keys,
+// nothing else — so callers can reject mixed or partial output instead of
+// guessing. The recovery-protocol and evidence-release transport fields are
+// part of the record surface every reply serializes.
 func parseCheckpointOperationStatus(t *testing.T, output string) *runtime.CheckpointOperationStatus {
 	t.Helper()
 	fields := make(map[string]json.RawMessage)
@@ -205,14 +207,15 @@ func parseCheckpointOperationStatus(t *testing.T, output string) *runtime.Checkp
 	for _, key := range []string{
 		"operation_id", "sandbox_id", "state", "source_generation",
 		"checkpoint_dir", "request_digest", "artifact_root_digest",
-		"artifact_root_scheme", "message",
+		"artifact_root_scheme", "message", "recovery_protocol",
+		"evidence_released",
 	} {
 		if _, ok := fields[key]; !ok {
 			t.Fatalf("stdout %q lacks the %q field", output, key)
 		}
 	}
-	if len(fields) != 9 {
-		t.Fatalf("stdout %q must carry exactly the nine record fields, got %d keys", output, len(fields))
+	if len(fields) != 11 {
+		t.Fatalf("stdout %q must carry exactly the eleven record fields, got %d keys", output, len(fields))
 	}
 	status := new(runtime.CheckpointOperationStatus)
 	if err := (protojson.UnmarshalOptions{}).Unmarshal([]byte(output), status); err != nil {

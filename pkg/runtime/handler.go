@@ -140,10 +140,11 @@ type CheckpointOperationCompletion struct {
 
 // CheckpointOperationWitness is an internal optional capability for runtimes
 // that record durable prepared/completed witnesses for identified checkpoint
-// operations and can reconcile them after a daemon crash. It is deliberately
-// NOT wired to any public RPC yet: the server-side recovery protocol and the
-// controller integration are separate stages, and until they land no public
-// request can reach these methods.
+// operations and can reconcile them after a daemon crash. It is wired to the
+// public witness recovery protocol: CheckpointWithOperation requires it at
+// admission (version-2 records), passes the exact operation binding into the
+// checkpoint, and acknowledges the retained evidence after its durable
+// success; RecoverCheckpointOperation drives the reconciliation below.
 type CheckpointOperationWitness interface {
 	// RecoverCheckpointOperation reconciles one EXISTING operation against
 	// its exact binding. A missing record is NotFound and creates nothing;

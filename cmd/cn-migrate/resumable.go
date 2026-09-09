@@ -32,10 +32,22 @@ package main
 //     proven-absent record (the structured not-found exit code of the query
 //     action, never stderr text) permits re-issuing the very same operation
 //     with the very same payload; a SUCCEEDED record additionally requires
-//     a same-payload replay before it authorizes anything, because the
-//     query answer alone does not bind the caller's request. RUNNING /
-//     UNKNOWN / FAILED / ambiguous answers fail closed: no source rollback,
-//     no legacy checkpoint RPC, no new operation ID, no target start;
+//     proof of the caller's payload before it authorizes anything, because
+//     the query answer alone does not bind the caller's request. A record
+//     admitted under the WITNESS recovery protocol must additionally prove
+//     the release of its retained evidence — evidence_released=true in the
+//     response being accepted — before its receipt is preserved and the
+//     checkpoint is sealed: an initial success that acknowledged in its own
+//     call is accepted with no extra command, while anything else performs
+//     exactly one explicit recover-checkpoint-operation carrying the
+//     COMPLETE original payload, which the service re-digests against the
+//     record and which must repeat the same op/sandbox/generation/request
+//     digest/root/scheme and complete the acknowledgment. A SUCCEEDED
+//     protocol-0 record keeps the historical same-payload replay; an
+//     UNKNOWN WITNESS record may be reconciled by the same single explicit
+//     recovery; UNKNOWN protocol-0, RUNNING, FAILED, and ambiguous answers
+//     fail closed: no source rollback, no legacy checkpoint RPC, no new
+//     operation ID, no target start;
 //   - the checkpoint receipt's sealed root is preserved durably before the
 //     checkpoint-sealed stage, and the later root binding must re-derive
 //     exactly that root and scheme from the artifact — a directory whose
@@ -280,23 +292,87 @@ func runResumableMigration(cfg resumableConfig) {
 		}
 		return ""
 	}
-	// acceptSourceReceipt is the single way a checkpoint becomes sealed: the
-	// reply parses, carries this migration's identity, reports SUCCEEDED
-	// with the pinned payload's digest and a well-shaped sealed root, agrees
-	// with any already-preserved receipt — and only then is the receipt
-	// preserved durably WHILE THE STAGE IS STILL checkpoint-issued, so a
+	// recoverSourceOperation issues this process's ONE explicit recovery
+	// attempt of the recorded source operation. The command repeats the
+	// COMPLETE original payload exactly as pinned in the journal — the same
+	// flags issueSourceCheckpoint sends, mapped to the node's physical
+	// request by the same node CLI — plus an independent recovery timeout
+	// that bounds the reconciliation attempt only and never rewrites the
+	// recorded operation or its request digest. The controller never
+	// recomputes a service digest from its logical checkpoint path: the node
+	// CLI validates the digest of the physical request it actually sent, and
+	// the service recomputes the digest from the full original request
+	// before authorizing anything.
+	recoverSourceOperation := func() (string, int) {
+		return runCode(cfg.source, "recover-checkpoint-operation", cfg.bin+"/checkpoint-restore",
+			"--action", "recover-checkpoint-operation", "--socket", "/run/sandboxd/sandboxd.sock",
+			"--sandbox-id", cfg.sandbox,
+			"--checkpoint-dir", journal.CheckpointDir,
+			"--checkpoint-timeout-seconds", strconv.FormatUint(uint64(journal.CheckpointTimeoutSeconds), 10),
+			"--compress="+strconv.FormatBool(journal.CheckpointCompress),
+			"--leave-running="+strconv.FormatBool(journal.CheckpointLeaveRunning),
+			"--snapshot-type", journal.CheckpointSnapshotType,
+			"--operation-id", journal.SourceOperationID,
+			"--expected-generation", journal.SourceGeneration,
+			"--recovery-timeout-seconds", strconv.FormatUint(uint64(identifiedRecoveryTimeoutSeconds), 10))
+	}
+	// releaseProven reports whether a success receipt itself proves the
+	// release of the retained evidence. A protocol-0 record keeps its
+	// historical meaning — it predates the witness, holds no runtime
+	// evidence, and has no release gate — while every WITNESS success must
+	// carry evidence_released=true from THIS response: the field is
+	// per-call, a query or replay answer reports false by construction, and
+	// a false answer proves nothing about any past or lost acknowledgment.
+	releaseProven := func(status *runtime.CheckpointOperationStatus) bool {
+		if status.GetRecoveryProtocol() !=
+			runtime.CheckpointOperationRecoveryProtocol_CHECKPOINT_OPERATION_RECOVERY_PROTOCOL_WITNESS {
+			return true
+		}
+		return status.GetEvidenceReleased()
+	}
+	// recoveryConflict validates one explicit recovery receipt against the
+	// success fact this process already observed: the recovery must repeat
+	// the same operation, sandbox, generation, request digest, sealed root,
+	// and scheme, and must itself prove the release. evidence_released and
+	// the protocol field are transport facts of the response that carried
+	// them, never content to preserve — the comparison below deliberately
+	// excludes them and the release is demanded separately, from this reply.
+	recoveryConflict := func(recovered, prior *runtime.CheckpointOperationStatus) string {
+		if prior != nil &&
+			(recovered.GetOperationID() != prior.GetOperationID() ||
+				recovered.GetSandboxID() != prior.GetSandboxID() ||
+				recovered.GetSourceGeneration() != prior.GetSourceGeneration() ||
+				recovered.GetRequestDigest() != prior.GetRequestDigest() ||
+				recovered.GetArtifactRootDigest() != prior.GetArtifactRootDigest() ||
+				recovered.GetArtifactRootScheme() != prior.GetArtifactRootScheme()) {
+			return fmt.Sprintf(
+				"the recovery of operation %s reported (sandbox %s, generation %s, digest %s, root %s, scheme %s) but the record already answered (sandbox %s, generation %s, digest %s, root %s, scheme %s) — the recovery does not repeat the recorded completion fact",
+				recovered.GetOperationID(),
+				recovered.GetSandboxID(), recovered.GetSourceGeneration(), recovered.GetRequestDigest(),
+				recovered.GetArtifactRootDigest(), recovered.GetArtifactRootScheme(),
+				prior.GetSandboxID(), prior.GetSourceGeneration(), prior.GetRequestDigest(),
+				prior.GetArtifactRootDigest(), prior.GetArtifactRootScheme(),
+			)
+		}
+		if recovered.GetRecoveryProtocol() !=
+			runtime.CheckpointOperationRecoveryProtocol_CHECKPOINT_OPERATION_RECOVERY_PROTOCOL_WITNESS {
+			return fmt.Sprintf(
+				"the recovery receipt reports recovery protocol %s — an explicit recovery is defined for WITNESS records only, and a legacy or unknown protocol cannot be recovered",
+				recovered.GetRecoveryProtocol(),
+			)
+		}
+		if !recovered.GetEvidenceReleased() {
+			return "the recovery receipt reports evidence_released=false — this response did not complete the runtime acknowledgment, so the release of the retained evidence is unproven"
+		}
+		return ""
+	}
+	// persistSourceReceipt is the single durable step that seals a
+	// checkpoint: the exact source receipt — request digest, sealed root,
+	// scheme — is preserved WHILE THE STAGE IS STILL checkpoint-issued, so a
 	// crash before the stage advance leaves an observable, reloadable fact
-	// rather than a lost one.
-	acceptSourceReceipt := func(output string) {
-		status, err := parseReceipt(output)
-		if err != nil {
-			fail("checkpoint", fmt.Sprintf("%v — the journal stays at checkpoint-issued; query operation %q on %s before doing anything else", err, journal.SourceOperationID, cfg.source))
-		}
-		if conflict := receiptConflict(status); conflict != "" {
-			fail("checkpoint", fmt.Sprintf(
-				"the checkpoint receipt does not prove this operation succeeded for this migration: %s — the journal stays at checkpoint-issued, no receipt is preserved, and no rollback or target start happens; reconcile operation %q on %s manually",
-				conflict, journal.SourceOperationID, cfg.source))
-		}
+	// rather than a lost one. Callers must already have proven the success
+	// AND, for a WITNESS record, the release of the retained evidence.
+	persistSourceReceipt := func(status *runtime.CheckpointOperationStatus) {
 		if conflict := persistReceiptConflict(status); conflict != "" {
 			fail("checkpoint", fmt.Sprintf("%s — failing closed with the journal at checkpoint-issued; reconcile operation %q on %s manually", conflict, journal.SourceOperationID, cfg.source))
 		}
@@ -307,25 +383,98 @@ func runResumableMigration(cfg resumableConfig) {
 		})
 		persist(stageCheckpointSealed, func(*migrationJournal) {})
 	}
+	// recoverReleased performs this process's ONE explicit recovery/Ack
+	// attempt and persists the source receipt only after the release is
+	// verified. prior is the success fact the recovery must repeat exactly,
+	// or nil when the record was UNKNOWN — the recovery then establishes the
+	// fact itself through the full receipt validation. Every failure — the
+	// command, an unparseable reply, a receipt that fails validation, does
+	// not repeat the observed fact, or does not prove the release — fails
+	// closed: the journal stays at checkpoint-issued, nothing is re-issued
+	// under a new ID, no checkpoint fallback runs, nothing is rolled back,
+	// and no target is started. There is no recursion into the reconcile
+	// path and no second attempt inside one process.
+	recoverReleased := func(prior *runtime.CheckpointOperationStatus) {
+		reply, code := recoverSourceOperation()
+		if code != 0 {
+			fail("checkpoint", fmt.Sprintf(
+				"the explicit recovery of source operation %q on %s failed (exit %d) — the journal stays at checkpoint-issued; the operation ID is unchanged, no receipt is preserved, no checkpoint fallback, no rollback, no target start; retry this migration to attempt the recovery again or reconcile the operation manually",
+				journal.SourceOperationID, cfg.source, code))
+		}
+		recovered, err := parseReceipt(reply)
+		if err != nil {
+			fail("checkpoint", fmt.Sprintf(
+				"the recovery reply of operation %q is not a readable receipt: %v — failing closed at checkpoint-issued; query the operation on %s before doing anything else",
+				journal.SourceOperationID, err, cfg.source))
+		}
+		if conflict := receiptConflict(recovered); conflict != "" {
+			fail("checkpoint", fmt.Sprintf(
+				"the recovery receipt does not prove this operation succeeded for this migration: %s — the journal stays at checkpoint-issued; no receipt is preserved, no rollback, no target start; reconcile operation %q on %s manually",
+				conflict, journal.SourceOperationID, cfg.source))
+		}
+		if conflict := recoveryConflict(recovered, prior); conflict != "" {
+			fail("checkpoint", fmt.Sprintf(
+				"%s — failing closed at checkpoint-issued with no receipt preserved; reconcile operation %q on %s manually",
+				conflict, journal.SourceOperationID, cfg.source))
+		}
+		persistSourceReceipt(recovered)
+	}
+	// acceptSourceReceipt is the single way a checkpoint becomes sealed: the
+	// reply parses, carries this migration's identity, reports SUCCEEDED
+	// with the pinned payload's digest and a well-shaped sealed root, and —
+	// for a WITNESS record — proves the release of the retained evidence
+	// from THIS response. An initial success whose own call completed the
+	// acknowledgment is accepted directly with no extra RPC; one that does
+	// not prove the release (a first reply, a replay) triggers exactly one
+	// explicit recovery that must repeat the same completion fact. A
+	// protocol-0 success keeps its historical acceptance unchanged.
+	acceptSourceReceipt := func(output string) {
+		status, err := parseReceipt(output)
+		if err != nil {
+			fail("checkpoint", fmt.Sprintf("%v — the journal stays at checkpoint-issued; query operation %q on %s before doing anything else", err, journal.SourceOperationID, cfg.source))
+		}
+		if conflict := receiptConflict(status); conflict != "" {
+			fail("checkpoint", fmt.Sprintf(
+				"the checkpoint receipt does not prove this operation succeeded for this migration: %s — the journal stays at checkpoint-issued, no receipt is preserved, and no rollback or target start happens; reconcile operation %q on %s manually",
+				conflict, journal.SourceOperationID, cfg.source))
+		}
+		if releaseProven(status) {
+			persistSourceReceipt(status)
+			return
+		}
+		recoverReleased(status)
+	}
 	// reconcileSourceCheckpoint resolves a checkpoint whose reply was lost
 	// or whose issuing process died. The durable operation record is queried
 	// FIRST, and the outcome is bounded — one query plus at most one
-	// same-identity re-issue or replay per process, no loops, no recursion:
+	// same-identity re-issue, replay, or explicit recovery per process, no
+	// loops, no recursion:
 	//   - the structured not-found exit code is the only proof the operation
 	//     was never admitted, and it authorizes exactly one resend of the
 	//     SAME operation with the SAME pinned payload — never a new ID, a
 	//     re-inspected generation, or a legacy RPC. A not-found record that
 	//     contradicts an already-preserved receipt is an inconsistency and
 	//     fails closed instead of re-executing;
-	//   - a SUCCEEDED record proves only history: the query answer carries
-	//     no caller-payload binding, so the same-payload checkpoint is
-	//     replayed once (the daemon replays the recorded outcome and refuses
-	//     a changed request) and the replayed receipt must repeat the
-	//     queried one exactly before anything is accepted;
-	//   - RUNNING, UNKNOWN, FAILED, an unparseable or mismatched record, and
-	//     every ambiguous query error stop the run: the journal stays at
-	//     checkpoint-issued, nothing is rolled back, no target is started,
-	//     and the operation ID stays spent.
+	//   - a SUCCEEDED WITNESS record owes the evidence release: the query
+	//     answer reports evidence_released=false by construction, so one
+	//     explicit recovery carrying the COMPLETE original payload both
+	//     proves the payload binding (the service recomputes the request
+	//     digest from that payload and refuses a changed one) and completes
+	//     the acknowledgment; its receipt must repeat the queried fact
+	//     exactly and prove the release before anything is accepted;
+	//   - a SUCCEEDED protocol-0 record keeps the historical verification:
+	//     the same-payload checkpoint is replayed once (the daemon replays
+	//     the recorded outcome and refuses a changed request) and the
+	//     replayed receipt must repeat the queried one exactly;
+	//   - an UNKNOWN WITNESS record may be reconciled by exactly one
+	//     explicit recovery of the same operation after the identity checks
+	//     — no new operation ID, no checkpoint fallback;
+	//   - RUNNING reports the still-pending execution and fails closed (an
+	//     in-flight outcome authorizes nothing and cannot be waited out
+	//     here); FAILED, an UNKNOWN protocol-0 record, an unparseable or
+	//     mismatched record, and every ambiguous query error stop the run:
+	//     the journal stays at checkpoint-issued, nothing is rolled back, no
+	//     target is started, and the operation ID stays spent.
 	reconcileSourceCheckpoint := func() {
 		output, code := runCode(cfg.source, "query-checkpoint-operation", cfg.bin+"/checkpoint-restore",
 			"--action", "get-checkpoint-operation", "--socket", "/run/sandboxd/sandboxd.sock",
@@ -361,45 +510,79 @@ func runResumableMigration(cfg resumableConfig) {
 					"operation %q on %s does not answer for this migration (sandbox %q, generation %q) — failing closed at checkpoint-issued with no rollback and no target; reconcile the record, then continue with a new -migration-id",
 					queried.GetOperationID(), cfg.source, queried.GetSandboxID(), queried.GetSourceGeneration()))
 			}
-			if queried.GetState() != runtime.CheckpointOperationState_CHECKPOINT_OPERATION_STATE_SUCCEEDED {
+			switch queried.GetState() {
+			case runtime.CheckpointOperationState_CHECKPOINT_OPERATION_STATE_UNKNOWN:
+				// Only a WITNESS record may be recovered: its admission
+				// verified the runtime holds the operation evidence, so one
+				// explicit recovery can complete the stop-source flow and
+				// release it. A protocol-0 UNKNOWN stays unprovable — the
+				// same refusal as before this protocol existed.
+				if queried.GetRecoveryProtocol() ==
+					runtime.CheckpointOperationRecoveryProtocol_CHECKPOINT_OPERATION_RECOVERY_PROTOCOL_WITNESS {
+					recoverReleased(nil)
+					return
+				}
 				fail("checkpoint", fmt.Sprintf(
-					"source checkpoint operation %q on %s is %s — its outcome does not authorize this migration: the journal stays at checkpoint-issued and the operation ID is spent; no re-execution, no rollback, no legacy checkpoint, no new operation ID, no target start; reconcile the record and the source, then continue with a new -migration-id",
+					"source checkpoint operation %q on %s is %s under the legacy recovery protocol — its outcome cannot be proven recoverable and the operation ID is spent: the journal stays at checkpoint-issued; no re-execution, no rollback, no legacy checkpoint, no new operation ID, no target start; reconcile the record and the source, then continue with a new -migration-id",
 					journal.SourceOperationID, cfg.source, queried.GetState()))
-			}
-			if conflict := persistReceiptConflict(queried); conflict != "" {
-				fail("checkpoint", fmt.Sprintf("%s — failing closed at checkpoint-issued; reconcile operation %q on %s manually", conflict, journal.SourceOperationID, cfg.source))
-			}
-			// The record proves the operation succeeded, but a query alone
-			// does not bind this caller's payload: replay the exact pinned
-			// request once so the daemon (and the receipt validation above)
-			// can refuse a changed intent, and require the replay to repeat
-			// the queried fact.
-			reply, replay := issueSourceCheckpoint()
-			if replay != 0 {
+			case runtime.CheckpointOperationState_CHECKPOINT_OPERATION_STATE_RUNNING:
 				fail("checkpoint", fmt.Sprintf(
-					"historical operation success could not be verified against this migration's pinned payload — the replay failed, so the journal stays at checkpoint-issued; no receipt is preserved, no rollback, no new operation ID, no target start; retry this migration to reconcile",
-				))
-			}
-			replayed, err := parseReceipt(reply)
-			if err != nil {
-				fail("checkpoint", fmt.Sprintf("%v — the journal stays at checkpoint-issued; query operation %q on %s before doing anything else", err, journal.SourceOperationID, cfg.source))
-			}
-			if conflict := receiptConflict(replayed); conflict != "" {
+					"source checkpoint operation %q on %s is still RUNNING — its outcome is pending and authorizes nothing yet: the journal stays at checkpoint-issued and the operation ID is spent; no re-execution, no recovery beside a live execution, no rollback, no legacy checkpoint, no new operation ID, no target start; retry this migration once the execution finishes, or reconcile the record and then continue with a new -migration-id",
+					journal.SourceOperationID, cfg.source))
+			case runtime.CheckpointOperationState_CHECKPOINT_OPERATION_STATE_FAILED:
 				fail("checkpoint", fmt.Sprintf(
-					"the replayed checkpoint receipt does not prove this operation succeeded for this migration: %s — the journal stays at checkpoint-issued; no rollback and no target start; reconcile operation %q on %s manually",
-					conflict, journal.SourceOperationID, cfg.source))
+					"source checkpoint operation %q on %s is %s — its outcome does not authorize this migration: the journal stays at checkpoint-issued and the operation ID is spent; no re-execution, no recovery, no rollback, no legacy checkpoint, no new operation ID, no target start; reconcile the record and the source, then continue with a new -migration-id",
+					journal.SourceOperationID, cfg.source, queried.GetState()))
+			default:
+				// SUCCEEDED: the release gate decides how the historical
+				// fact may be verified against this migration's payload.
+				if conflict := persistReceiptConflict(queried); conflict != "" {
+					fail("checkpoint", fmt.Sprintf("%s — failing closed at checkpoint-issued; reconcile operation %q on %s manually", conflict, journal.SourceOperationID, cfg.source))
+				}
+				if queried.GetRecoveryProtocol() ==
+					runtime.CheckpointOperationRecoveryProtocol_CHECKPOINT_OPERATION_RECOVERY_PROTOCOL_WITNESS {
+					// The query proves the success but never the release,
+					// and a same-payload replay would prove the binding yet
+					// still answer evidence_released=false. One explicit
+					// recovery carries the COMPLETE original payload — the
+					// service recomputes the request digest from it and
+					// refuses a changed binding, which is the same-payload
+					// verification the replay provides — and completes the
+					// acknowledgment the release gate requires.
+					recoverReleased(queried)
+					return
+				}
+				// Protocol-0 history keeps its existing verification: replay
+				// the exact pinned request once so the daemon (and the
+				// receipt validation above) can refuse a changed intent, and
+				// require the replay to repeat the queried fact.
+				reply, replay := issueSourceCheckpoint()
+				if replay != 0 {
+					fail("checkpoint", fmt.Sprintf(
+						"historical operation success could not be verified against this migration's pinned payload — the replay failed, so the journal stays at checkpoint-issued; no receipt is preserved, no rollback, no new operation ID, no target start; retry this migration to reconcile",
+					))
+				}
+				replayed, err := parseReceipt(reply)
+				if err != nil {
+					fail("checkpoint", fmt.Sprintf("%v — the journal stays at checkpoint-issued; query operation %q on %s before doing anything else", err, journal.SourceOperationID, cfg.source))
+				}
+				if conflict := receiptConflict(replayed); conflict != "" {
+					fail("checkpoint", fmt.Sprintf(
+						"the replayed checkpoint receipt does not prove this operation succeeded for this migration: %s — the journal stays at checkpoint-issued; no rollback and no target start; reconcile operation %q on %s manually",
+						conflict, journal.SourceOperationID, cfg.source))
+				}
+				if replayed.GetArtifactRootDigest() != queried.GetArtifactRootDigest() ||
+					replayed.GetArtifactRootScheme() != queried.GetArtifactRootScheme() ||
+					replayed.GetSourceGeneration() != queried.GetSourceGeneration() ||
+					replayed.GetRequestDigest() != queried.GetRequestDigest() {
+					fail("checkpoint", fmt.Sprintf(
+						"the replay of operation %s did not repeat the queried receipt (digest %s, root %s, scheme %s, generation %s) — failing closed at checkpoint-issued; reconcile the record on %s manually",
+						journal.SourceOperationID,
+						replayed.GetRequestDigest(), replayed.GetArtifactRootDigest(), replayed.GetArtifactRootScheme(), replayed.GetSourceGeneration(),
+						cfg.source))
+				}
+				acceptSourceReceipt(reply)
 			}
-			if replayed.GetArtifactRootDigest() != queried.GetArtifactRootDigest() ||
-				replayed.GetArtifactRootScheme() != queried.GetArtifactRootScheme() ||
-				replayed.GetSourceGeneration() != queried.GetSourceGeneration() ||
-				replayed.GetRequestDigest() != queried.GetRequestDigest() {
-				fail("checkpoint", fmt.Sprintf(
-					"the replay of operation %s did not repeat the queried receipt (digest %s, root %s, scheme %s, generation %s) — failing closed at checkpoint-issued; reconcile the record on %s manually",
-					journal.SourceOperationID,
-					replayed.GetRequestDigest(), replayed.GetArtifactRootDigest(), replayed.GetArtifactRootScheme(), replayed.GetSourceGeneration(),
-					cfg.source))
-			}
-			acceptSourceReceipt(reply)
 		}
 	}
 
@@ -836,9 +1019,16 @@ func parseStartOperationStatus(output string) (*runtime.StartOperationStatus, er
 
 // parseCheckpointOperationStatus strictly decodes the protojson
 // CheckpointOperationStatus the operation-mode CLI prints for the identified
-// source checkpoint and its query: one document, no unknown fields, no
-// trailing content. UNSPECIFIED is rejected — a healthy daemon never reports
-// it, so it is a protocol error rather than a state to guess about.
+// source checkpoint, its query, and its explicit recovery: one document, no
+// unknown fields, no trailing content. UNSPECIFIED states are rejected — a
+// healthy daemon never reports one, so it is a protocol error rather than a
+// state to guess about. The recovery protocol is accepted in both of its
+// defined values (legacy records and witness records are equally legal
+// history) while an out-of-range value is rejected: an unsupported protocol
+// must never be reinterpreted as the legacy protocol, because the field
+// decides whether the record holds recoverable runtime evidence.
+// evidence_released is decoded but never trusted as history — it is a fact
+// about the response that carried it, nothing more.
 func parseCheckpointOperationStatus(output string) (*runtime.CheckpointOperationStatus, error) {
 	trimmed := strings.TrimSpace(output)
 	if trimmed == "" {
@@ -858,6 +1048,15 @@ func parseCheckpointOperationStatus(output string) (*runtime.CheckpointOperation
 		runtime.CheckpointOperationState_CHECKPOINT_OPERATION_STATE_UNKNOWN:
 	default:
 		return nil, fmt.Errorf("receipt reports unrecognized operation state %s", status.GetState())
+	}
+	switch status.GetRecoveryProtocol() {
+	case runtime.CheckpointOperationRecoveryProtocol_CHECKPOINT_OPERATION_RECOVERY_PROTOCOL_UNSPECIFIED,
+		runtime.CheckpointOperationRecoveryProtocol_CHECKPOINT_OPERATION_RECOVERY_PROTOCOL_WITNESS:
+	default:
+		return nil, fmt.Errorf(
+			"receipt reports unrecognized recovery protocol %s; refusing to treat an unknown protocol as legacy",
+			status.GetRecoveryProtocol(),
+		)
 	}
 	return status, nil
 }

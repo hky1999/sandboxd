@@ -331,15 +331,17 @@ func TestCheckpointPropagatesExpectedGenerationToRuntime(t *testing.T) {
 		}, handler.checkpoints[0])
 	})
 
-	t.Run("identified checkpoint operation passes the validated expectation", func(t *testing.T) {
+	t.Run("identified checkpoint operation passes the validated expectation and the exact operation binding", func(t *testing.T) {
 		handler := newCheckpointOperationRuntimeHandler()
 		s := newCheckpointOperationService(t, handler, t.TempDir())
 		const id = "sbox-prop-operation"
 		storeCheckpointOperationSandbox(t, s, id, "gen-prop-operation")
 		directory := filepath.Join(t.TempDir(), "checkpoint")
+		request := checkpointOperationRequest("op-prop-1", id, directory, "gen-prop-operation", 5)
+		digest, err := checkpointOperationRequestDigest(request)
+		require.NoError(t, err)
 
-		opStatus, err := s.CheckpointWithOperation(context.Background(),
-			checkpointOperationRequest("op-prop-1", id, directory, "gen-prop-operation", 5))
+		opStatus, err := s.CheckpointWithOperation(context.Background(), request)
 		require.NoError(t, err)
 		require.NotNil(t, opStatus)
 		assert.Equal(t, runtime.CheckpointOperationState_CHECKPOINT_OPERATION_STATE_SUCCEEDED, opStatus.GetState())
@@ -347,10 +349,18 @@ func TestCheckpointPropagatesExpectedGenerationToRuntime(t *testing.T) {
 		handler.mu.Lock()
 		defer handler.mu.Unlock()
 		require.Len(t, handler.checkpoints, 1)
+		// The runtime receives the admitted expectation AND the exact
+		// operation identity — operation ID, request digest, source
+		// generation — because its durable witness binds to that request.
 		assert.Equal(t, svc.CheckpointConfig{
 			ID:                 id,
 			Directory:          directory,
 			ExpectedGeneration: "gen-prop-operation",
+			Operation: svc.CheckpointOperationBinding{
+				OperationID:      "op-prop-1",
+				RequestDigest:    digest,
+				SourceGeneration: "gen-prop-operation",
+			},
 		}, handler.checkpoints[0])
 	})
 }

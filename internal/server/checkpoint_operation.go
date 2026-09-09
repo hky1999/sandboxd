@@ -64,6 +64,31 @@ const (
 	checkpointOperationPhaseFailed    = "failed"
 	checkpointOperationPhaseUnknown   = "unknown"
 
+	// Checkpoint operation record versions. The JSON field set is identical;
+	// the version marks the recovery protocol the admission ran under.
+	//
+	// Version 1 (legacy): the admission verified only the sealed-root writer
+	// capability and never sent an operation binding to the runtime, so no
+	// runtime witness exists for these records. They are read unchanged and
+	// their historical Get/same-request replay keep working, but their
+	// undetermined outcomes cannot be proven recoverable — explicit recovery
+	// refuses them instead of guessing.
+	//
+	// Version 2 (witness): the admission verified the runtime supports both
+	// the writer and the CheckpointOperationWitness capabilities, sent the
+	// exact operation binding to the runtime, and persists the success fact
+	// before acknowledging the retained evidence. Only these records are
+	// eligible for explicit recovery.
+	//
+	// Rollback refusal: a binary that predates version 2 validates records
+	// with `version != 1` as corrupt and fails startup, so a daemon root that
+	// carries a version-2 record cannot be silently downgraded — it must be
+	// upgraded again before the journal loads. This is deliberate and
+	// documented; the alternative (silently dropping or reinterpreting v2
+	// records) would claim an unproven recovery protocol.
+	checkpointOperationRecordVersionLegacy  = 1
+	checkpointOperationRecordVersionWitness = 2
+
 	// checkpointOperationMaxBytes bounds one record. Records carry identity
 	// and outcome text only, so the cap is tight on purpose.
 	checkpointOperationMaxBytes = 64 << 10
@@ -121,13 +146,73 @@ func (e *checkpointOperationExecution) finish() {
 	e.doneOnce.Do(func() { close(e.done) })
 }
 
+// contextMutex is a mutual-exclusion lock whose acquisition can be bounded by
+// a context. It is a one-token semaphore: the zero value is usable (the token
+// channel is created on first use), Lock/Unlock keep the plain sync.Mutex
+// call shape every ordinary writer already uses, and Acquire waits for the
+// token OR the context — never a background goroutine parked on a lock it
+// would abandon on timeout, and never busy TryLock polling. A context that is
+// already expired never wins the lock, even when the token is free: winning
+// the token is re-checked against the context before it is returned, because
+// granting a slot (or a write path) to a caller whose budget is gone is worse
+// than a late refusal. Unlock of an unlocked mutex panics exactly like
+// sync.Mutex, so ownership discipline stays observable in tests.
+type contextMutex struct {
+	once  sync.Once
+	token chan struct{}
+}
+
+func (m *contextMutex) semaphore() chan struct{} {
+	m.once.Do(func() { m.token = make(chan struct{}, 1) })
+	return m.token
+}
+
+// Lock acquires the token uninterruptibly, exactly like sync.Mutex.Lock.
+func (m *contextMutex) Lock() {
+	token := m.semaphore()
+	token <- struct{}{}
+}
+
+// Unlock releases the token; unlocking an unlocked mutex is a programming
+// error and panics as sync.Mutex does.
+func (m *contextMutex) Unlock() {
+	select {
+	case <-m.token:
+	default:
+		panic("unlock of unlocked contextMutex")
+	}
+}
+
+// Acquire waits for the token bounded by ctx. It returns the context's error
+// when ctx is done first (or already done), having taken nothing, and having
+// released the token again if the select raced a ready token against a done
+// context.
+func (m *contextMutex) Acquire(ctx context.Context) error {
+	token := m.semaphore()
+	select {
+	case token <- struct{}{}:
+		if err := ctx.Err(); err != nil {
+			// The token was free and grabbed in the same instant the context
+			// expired: refuse rather than grant.
+			<-token
+			return err
+		}
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 // checkpointOperationStore owns the durable checkpoint operation journal for
 // one daemon root. The locking tiers are the same as the start-operation
 // store: viewsMu guards the published view (queries never block on durable
 // I/O), writeMu serializes state transitions end to end (durable write before
 // publication, so a claimed fact is never observable before it is durable),
 // and lifeMu guards admission/shutdown atomicity plus the in-flight registry
-// and is never held across a durable write.
+// and is never held across a durable write. writeMu is a contextMutex: the
+// plain writers keep the Lock/Unlock discipline, while a recovery admission
+// that has not yet won its execution slot waits for it bounded by the
+// caller's own budget instead of queueing unbounded behind a durable write.
 type checkpointOperationStore struct {
 	dir     string
 	rootDir string
@@ -135,7 +220,7 @@ type checkpointOperationStore struct {
 	viewsMu sync.RWMutex
 	records map[string]*checkpointOperationRecord
 
-	writeMu sync.Mutex
+	writeMu contextMutex
 
 	lifeMu       sync.Mutex
 	inflight     map[string]*checkpointOperationExecution
@@ -291,7 +376,8 @@ func validCheckpointOperationDigest(value string) bool {
 }
 
 func validateCheckpointOperationRecord(record *checkpointOperationRecord) error {
-	if record.Version != 1 {
+	if record.Version != checkpointOperationRecordVersionLegacy &&
+		record.Version != checkpointOperationRecordVersionWitness {
 		return fmt.Errorf("unsupported version %d", record.Version)
 	}
 	if !validStartOperationID(record.OperationID) {
@@ -428,7 +514,11 @@ func (s *checkpointOperationStore) admit(draft *checkpointOperationRecord) (
 		return exec, done, err
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
-	draft.Version = 1
+	// New admissions are version-2 records: the caller (CheckpointWithOperation)
+	// has already verified the runtime holds both the writer and the witness
+	// capability, and will send the exact operation binding to the runtime so
+	// the witness evidence this version promises actually exists.
+	draft.Version = checkpointOperationRecordVersionWitness
 	draft.Phase = checkpointOperationPhaseAdmitted
 	draft.CreatedAt = now
 	draft.UpdatedAt = now
@@ -673,6 +763,14 @@ func (r *checkpointOperationRecovery) finish() {
 // performs no durable write at all, so no lock is held across one: the record
 // already exists, and its history (generation, runtime, directory, request
 // digest, created_at) must not change.
+//
+// Admission itself comes in two shapes with one shared decision: the legacy
+// recoverExisting waits for the store's admission lock uninterruptibly (plain
+// Lock/Unlock, the shape every other writer uses), while recoverExistingContext
+// — the one the public RPC drives — waits for that lock bounded by the
+// caller's context, because a request whose budget expires while queueing
+// behind a durable write must refuse instead of blocking past its deadline
+// before it has even won an execution slot.
 func (s *checkpointOperationStore) recoverExisting(draft *checkpointOperationRecord) (
 	recovery *checkpointOperationRecovery,
 	joined <-chan struct{},
@@ -681,12 +779,55 @@ func (s *checkpointOperationStore) recoverExisting(draft *checkpointOperationRec
 	if s == nil {
 		return nil, nil, fmt.Errorf("recover checkpoint operation requires a store")
 	}
-	// writeMu serializes the eligibility decision with admission and with
-	// competing recoveries, so exactly one applicant can register the slot.
-	// Nothing here performs durable I/O, so the writeMu discipline (durable
-	// write before publication) is preserved trivially.
+	// The legacy uninterruptible admission: internal callers that own no
+	// deadline keep the exact previous behavior.
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	return s.recoverExistingAdmitted(draft)
+}
+
+// recoverExistingContext is the context-aware recovery admission the public
+// RPC uses: waiting for the store's admission lock is part of the caller's
+// recovery budget, so a durable write (or any other writer) holding writeMu
+// past the budget ends this attempt with the context's error — DeadlineExceeded
+// or Canceled — having granted no slot and mutated nothing. An already-expired
+// context never wins admission even when the lock is free. Once the lock is
+// held the eligibility decision itself is pure memory work under lifeMu, so
+// the writeMu discipline (no durable write on the admission path, other
+// writers stay serialized) is unchanged.
+func (s *checkpointOperationStore) recoverExistingContext(
+	ctx context.Context,
+	draft *checkpointOperationRecord,
+) (
+	recovery *checkpointOperationRecovery,
+	joined <-chan struct{},
+	err error,
+) {
+	if s == nil {
+		return nil, nil, fmt.Errorf("recover checkpoint operation requires a store")
+	}
+	if err := s.writeMu.Acquire(ctx); err != nil {
+		return nil, nil, errord.ToGRPCf(
+			err,
+			"admit the recovery of checkpoint operation %s: the store admission lock wait exceeded the caller's budget; "+
+				"no execution slot was granted and nothing was reconciled",
+			draft.OperationID,
+		)
+	}
+	defer s.writeMu.Unlock()
+	return s.recoverExistingAdmitted(draft)
+}
+
+// recoverExistingAdmitted is the eligibility decision under a held writeMu,
+// shared by the legacy and the context-aware admission: writeMu serializes it
+// with admission and with competing recoveries, so exactly one applicant can
+// register the slot. Nothing here performs durable I/O, so the writeMu
+// discipline (durable write before publication) is preserved trivially.
+func (s *checkpointOperationStore) recoverExistingAdmitted(draft *checkpointOperationRecord) (
+	recovery *checkpointOperationRecovery,
+	joined <-chan struct{},
+	err error,
+) {
 
 	existing, ok := s.published(draft.OperationID)
 	if !ok {
@@ -1094,55 +1235,9 @@ func (h *sandboxService) CheckpointWithOperation(
 	if !h.recoveryReady.Load() {
 		return nil, errord.ToGRPCf(errord.ErrUnavailable, "distillfs recovery is incomplete")
 	}
-	if !validStartOperationID(request.GetOperationID()) {
-		return nil, errord.ToGRPCf(
-			errord.ErrInvalidArgument,
-			"operation_id must be 1-%d characters matching %s and path-free",
-			startOperationMaxID, startOperationIDPattern.String(),
-		)
-	}
-	checkpointReq := request.GetCheckpoint()
-	if checkpointReq == nil {
-		return nil, errord.ToGRPCf(errord.ErrInvalidArgument, "checkpoint request is required")
-	}
-	if strings.TrimSpace(checkpointReq.ID) == "" {
-		return nil, errord.ToGRPCf(errord.ErrInvalidArgument, "sandbox ID is required")
-	}
-	if checkpointReq.TimeoutSeconds == 0 || checkpointReq.TimeoutSeconds > checkpointOperationMaxTimeoutSeconds {
-		return nil, errord.ToGRPCf(
-			errord.ErrInvalidArgument,
-			"checkpoint timeout_seconds must be between 1 and %d", checkpointOperationMaxTimeoutSeconds,
-		)
-	}
-	// The identified form exists for stop-and-copy migration checkpoints only;
-	// a leave-running request is refused outright instead of being admitted
-	// and executed with quieter semantics.
-	if checkpointReq.LeaveRunning {
-		return nil, errord.ToGRPCf(
-			errord.ErrInvalidArgument,
-			"checkpoint operations support only stop-and-copy checkpoints; leave_running must be false",
-		)
-	}
-	if strings.TrimSpace(request.ExpectedGeneration) == "" {
-		return nil, errord.ToGRPCf(
-			errord.ErrInvalidArgument,
-			"expected_generation is required",
-		)
-	}
-	if len(request.ExpectedGeneration) > checkpointOperationMaxGeneration {
-		return nil, errord.ToGRPCf(
-			errord.ErrInvalidArgument,
-			"expected_generation exceeds %d bytes",
-			checkpointOperationMaxGeneration,
-		)
-	}
-	canonicalDir := filepath.Clean(checkpointReq.CheckpointDir)
-	if err := validateCanonicalCheckpointDir(canonicalDir); err != nil {
-		return nil, errord.ToGRPC(err)
-	}
-	digest, err := checkpointOperationRequestDigest(request)
+	checkpointReq, canonicalDir, digest, err := validatedCheckpointOperation(request)
 	if err != nil {
-		return nil, errord.ToGRPCf(errord.ErrInvalidArgument, "fingerprint checkpoint operation request: %v", err)
+		return nil, err
 	}
 
 	// Replay fast path: an existing record is answered entirely from durable
@@ -1211,6 +1306,21 @@ func (h *sandboxService) CheckpointWithOperation(
 			sandbox.Metadata.RuntimeHandler,
 		)
 	}
+	// A new admission is a version-2 record, and that version promises the
+	// runtime reconciliation contract: durable prepared/completed witnesses
+	// bound to the exact request, and an acknowledgment that releases the
+	// retained evidence. A runtime with the writer capability but without the
+	// witness capability cannot honor that promise, so it is refused here —
+	// before the operation ID is spent — rather than admitted as a record
+	// whose UNKNOWN outcomes could never be reconciled.
+	if _, ok := handler.(svc.CheckpointOperationWitness); !ok {
+		return nil, errord.ToGRPCf(
+			errord.ErrNotImplemented,
+			"runtime %q does not support checkpoint operation witnesses; "+
+				"identified checkpoint operations require a runtime that records recoverable operation evidence",
+			sandbox.Metadata.RuntimeHandler,
+		)
+	}
 
 	draft := &checkpointOperationRecord{
 		OperationID:   request.GetOperationID(),
@@ -1256,8 +1366,10 @@ func (h *sandboxService) CheckpointWithOperation(
 	h.checkpointOperations.registerExecutionCancel(request.GetOperationID(), exec, cancel)
 
 	binding := &checkpointOperationBinding{
-		store:       h.checkpointOperations,
-		operationID: request.GetOperationID(),
+		store:            h.checkpointOperations,
+		operationID:      request.GetOperationID(),
+		requestDigest:    digest,
+		sourceGeneration: request.ExpectedGeneration,
 	}
 	_, checkpointErr := func() (resp *runtime.CheckpointResponse, err error) {
 		defer func() {
@@ -1299,16 +1411,68 @@ func (h *sandboxService) CheckpointWithOperation(
 	}
 	// Release the executor slot before building the reply so a record that
 	// could not reach a terminal phase reports unknown, not eternally
-	// running. The deferred call is the backstop and is idempotent.
+	// running. The deferred call is the backstop and is idempotent. The
+	// acknowledgment tail below runs BEFORE the release: the slot — and with
+	// it the shutdown drain — must cover every side effect of this execution.
+	evidenceReleased := false
+	if checkpointErr == nil && binding.succeeded() {
+		// Durable success first, acknowledgment second: the runtime releases
+		// its evidence-retention gate only for a service receipt that is
+		// already durable, so this order is the protocol, not an
+		// optimization. A failure here never downgrades the recorded success;
+		// the RPC reports an explicit error instead, the record stays
+		// SUCCEEDED, and the caller reconciles through one explicit
+		// RecoverCheckpointOperation of the same operation.
+		if ackErr := h.acknowledgeCheckpointOperation(
+			execCtx, checkpointReq.ID, request.GetOperationID(), sandbox.Metadata.RuntimeHandler, binding.runtimeBinding(),
+		); ackErr != nil {
+			h.checkpointOperations.finishExecution(request.GetOperationID(), exec)
+			return nil, errord.ToGRPCf(ackErr,
+				"checkpoint operation %s succeeded and its receipt is durable, but the runtime acknowledgment failed; "+
+					"the success fact is retained and must be reconciled by an explicit recovery of the same operation",
+				request.GetOperationID(),
+			)
+		}
+		evidenceReleased = true
+	}
 	h.checkpointOperations.finishExecution(request.GetOperationID(), exec)
 	status, err := h.checkpointOperationStatus(request.GetOperationID())
 	if err != nil {
 		return nil, err
 	}
+	// evidence_released is per-invocation: true only because THIS executor
+	// completed the acknowledgment after its own durable success. A later
+	// replay of the same SUCCEEDED record reports false by construction.
+	status.EvidenceReleased = evidenceReleased
 	if checkpointErr != nil {
 		return status, checkpointErr
 	}
 	return status, nil
+}
+
+// acknowledgeCheckpointOperation releases the evidence-retention gate of one
+// identified checkpoint operation whose service receipt is already durable.
+// The runtime binding must be the exact admitted identity, and the runtime is
+// looked up from the recorded handler name — never re-derived from a source
+// sandbox that may since have been replaced or deleted.
+func (h *sandboxService) acknowledgeCheckpointOperation(
+	ctx context.Context,
+	sandboxID, operationID, runtimeName string,
+	binding svc.CheckpointOperationBinding,
+) error {
+	handler, ok := h.serviceHandler.Get(runtimeName)
+	if !ok {
+		return errord.ToGRPC(errord.ErrNotImplemented)
+	}
+	witness, ok := handler.(svc.CheckpointOperationWitness)
+	if !ok {
+		return errord.ToGRPCf(
+			errord.ErrNotImplemented,
+			"runtime %q no longer provides the checkpoint operation witness required to acknowledge operation %s",
+			runtimeName, operationID,
+		)
+	}
+	return witness.AckCheckpointOperation(ctx, sandboxID, binding)
 }
 
 // GetCheckpointOperation returns the durable state of one checkpoint
@@ -1327,6 +1491,348 @@ func (h *sandboxService) GetCheckpointOperation(
 	return h.checkpointOperationStatus(request.GetOperationID())
 }
 
+// validatedCheckpointOperation validates the complete wrapped request of an
+// identified checkpoint operation — the same rules for the initial admission
+// and for an explicit recovery of that admission — and returns the inner
+// checkpoint request, the canonical output directory, and the deterministic
+// request digest computed from the request as presented. The digest is always
+// derived here, from the complete payload; a caller-echoed digest is never
+// accepted, because a recovery must authorize itself with the original
+// request alone.
+func validatedCheckpointOperation(request *runtime.CheckpointWithOperationRequest) (
+	*runtime.CheckpointRequest, string, string, error,
+) {
+	if !validStartOperationID(request.GetOperationID()) {
+		return nil, "", "", errord.ToGRPCf(
+			errord.ErrInvalidArgument,
+			"operation_id must be 1-%d characters matching %s and path-free",
+			startOperationMaxID, startOperationIDPattern.String(),
+		)
+	}
+	checkpointReq := request.GetCheckpoint()
+	if checkpointReq == nil {
+		return nil, "", "", errord.ToGRPCf(errord.ErrInvalidArgument, "checkpoint request is required")
+	}
+	if strings.TrimSpace(checkpointReq.ID) == "" {
+		return nil, "", "", errord.ToGRPCf(errord.ErrInvalidArgument, "sandbox ID is required")
+	}
+	if checkpointReq.TimeoutSeconds == 0 || checkpointReq.TimeoutSeconds > checkpointOperationMaxTimeoutSeconds {
+		return nil, "", "", errord.ToGRPCf(
+			errord.ErrInvalidArgument,
+			"checkpoint timeout_seconds must be between 1 and %d", checkpointOperationMaxTimeoutSeconds,
+		)
+	}
+	// The identified form exists for stop-and-copy migration checkpoints only;
+	// a leave-running request is refused outright instead of being admitted
+	// and executed with quieter semantics.
+	if checkpointReq.LeaveRunning {
+		return nil, "", "", errord.ToGRPCf(
+			errord.ErrInvalidArgument,
+			"checkpoint operations support only stop-and-copy checkpoints; leave_running must be false",
+		)
+	}
+	if strings.TrimSpace(request.ExpectedGeneration) == "" {
+		return nil, "", "", errord.ToGRPCf(errord.ErrInvalidArgument, "expected_generation is required")
+	}
+	if len(request.ExpectedGeneration) > checkpointOperationMaxGeneration {
+		return nil, "", "", errord.ToGRPCf(
+			errord.ErrInvalidArgument,
+			"expected_generation exceeds %d bytes",
+			checkpointOperationMaxGeneration,
+		)
+	}
+	canonicalDir := filepath.Clean(checkpointReq.CheckpointDir)
+	if err := validateCanonicalCheckpointDir(canonicalDir); err != nil {
+		return nil, "", "", errord.ToGRPC(err)
+	}
+	digest, err := checkpointOperationRequestDigest(request)
+	if err != nil {
+		return nil, "", "", errord.ToGRPCf(errord.ErrInvalidArgument, "fingerprint checkpoint operation request: %v", err)
+	}
+	return checkpointReq, canonicalDir, digest, nil
+}
+
+// --- explicit recovery of recorded operations (public service stage) ---
+
+// RecoverCheckpointOperation reconciles one already-recorded checkpoint
+// operation through the witness recovery protocol. The request must repeat
+// the COMPLETE original payload unchanged: the service recomputes the request
+// digest from that payload — never from a caller-echoed digest — and refuses
+// the operation ID unless it matches the recorded binding exactly. Recovery
+// never admits a record, never executes a checkpoint, never takes a snapshot,
+// never resumes the source, and never falls back to the legacy checkpoint
+// RPCs: a missing record is NotFound, a FAILED record is refused forever, a
+// legacy version-1 record is refused because its outcome cannot be proven
+// recoverable without a runtime witness, and a binding conflict is refused.
+//
+// Lifecycle: the recovery shares the store's single-execution slots (including
+// the acknowledgment-only slots of SUCCEEDED records). One absolute deadline
+// taken at request admission bounds the whole call — the join of a live
+// executor (which listens to that deadline AND to the caller's cancellation,
+// so even an uncancellable Background caller cannot wait unbounded), the
+// physical-lock queue, the runtime reconciliation, and the acknowledgment all
+// share it, and the work context after a slot is won detaches from the caller
+// but carries the same deadline rather than a fresh timeout. Once a slot is
+// won, its cancellation is registered with the store's shutdown drain
+// immediately, and the per-ID physical resource lock is acquired, so a
+// recovery never acts beside a checkpoint, start, or delete of the same
+// sandbox; the source metadata binding is verified only after that lock is
+// held, so a sandbox replaced while the recovery was queued cannot pass a
+// stale pre-lock read. The slot is retained until the real work has returned;
+// nothing is left to an abandoned goroutine.
+//
+// Undetermined version-2 records (admitted without an executor, or unknown)
+// are reconciled through the runtime witness: RecoverCheckpointOperation
+// returns the recorded completion, whose sealed root and scheme must equal
+// checkpointroot.Bind of the service's canonical directory, and only then is
+// the SUCCEEDED fact made durable through the dedicated transition — followed
+// by the acknowledgment. A SUCCEEDED version-2 record owes only the
+// acknowledgment: the recorded artifact is the authority, the possibly-GCed
+// directory is deliberately not re-read, and the runtime Recover is not
+// called, because an already-acknowledged runtime refuses it by contract.
+//
+// The acknowledgment tail is fail-closed in both branches: an Ack whose
+// target no longer exists (NotFound) is NOT a release — the source may have
+// been replaced, and treating a missing witness as success would unbind the
+// delete gate from any proven fact — so the RPC fails while preserving the
+// durable record for explicit reconciliation.
+func (h *sandboxService) RecoverCheckpointOperation(
+	ctx context.Context,
+	request *runtime.RecoverCheckpointOperationRequest,
+) (*runtime.CheckpointOperationStatus, error) {
+	if request == nil {
+		return nil, errord.ToGRPCf(errord.ErrInvalidArgument, "recover checkpoint operation request is nil")
+	}
+	if !h.recoveryReady.Load() {
+		return nil, errord.ToGRPCf(errord.ErrUnavailable, "distillfs recovery is incomplete")
+	}
+	if request.GetRecoveryTimeoutSeconds() == 0 ||
+		request.GetRecoveryTimeoutSeconds() > checkpointOperationMaxTimeoutSeconds {
+		return nil, errord.ToGRPCf(
+			errord.ErrInvalidArgument,
+			"recovery timeout_seconds must be between 1 and %d", checkpointOperationMaxTimeoutSeconds,
+		)
+	}
+	operation := request.GetOperation()
+	if operation == nil {
+		return nil, errord.ToGRPCf(errord.ErrInvalidArgument, "operation request is required")
+	}
+	_, canonicalDir, digest, err := validatedCheckpointOperation(operation)
+	if err != nil {
+		return nil, err
+	}
+	draft := &checkpointOperationRecord{
+		OperationID:   operation.GetOperationID(),
+		SandboxID:     operation.GetCheckpoint().ID,
+		Generation:    operation.ExpectedGeneration,
+		CheckpointDir: canonicalDir,
+		RequestDigest: digest,
+	}
+	// The record version is static for an operation's lifetime, so a legacy
+	// record is refused before any slot is taken: its admission predates the
+	// witness protocol, no runtime evidence exists for it, and guessing
+	// recoverability from files or source state is exactly what this RPC must
+	// not do. Historical reads of the record keep working through
+	// GetCheckpointOperation and same-request replay.
+	if existing := h.checkpointOperations.snapshot(operation.GetOperationID()); existing != nil &&
+		existing.Version != checkpointOperationRecordVersionWitness {
+		return nil, errord.ToGRPCf(
+			errord.ErrFailedPrecondition,
+			"checkpoint operation %s is a legacy version-%d record without a runtime witness; "+
+				"its outcome cannot be proven recoverable and explicit recovery is refused "+
+				"(queries and same-request replays keep answering from the record)",
+			operation.GetOperationID(), existing.Version,
+		)
+	}
+
+	// One absolute recovery deadline governs the whole call, taken at request
+	// admission: the store's admission-lock queue, the join below, the
+	// physical-lock queue, the runtime reconciliation, and the acknowledgment
+	// all share it, and none of them ever resets it. admitCtx carries BOTH the
+	// caller's cancellation and this deadline into the context-aware recovery
+	// admission, so a recovery still queueing behind a durable write for the
+	// admission lock answers the budget instead of blocking past it before it
+	// has won a slot; the join below listens to the same two ends — a
+	// Background caller without a deadline of its own must not turn a
+	// one-second recovery into an unbounded wait on an executor that never
+	// returns. The join holds no lock; a slot won afterwards is released by
+	// the deferred finish below, and shutdown waits for that real exit instead
+	// of revoking the work.
+	deadline := time.Now().Add(time.Duration(request.GetRecoveryTimeoutSeconds()) * time.Second)
+	admitCtx, admitCancel := context.WithDeadline(ctx, deadline)
+	defer admitCancel()
+	var recovery *checkpointOperationRecovery
+	for {
+		candidate, joined, err := h.checkpointOperations.recoverExistingContext(admitCtx, draft)
+		if err != nil {
+			return nil, err
+		}
+		if candidate != nil {
+			recovery = candidate
+			break
+		}
+		timer := time.NewTimer(time.Until(deadline))
+		select {
+		case <-joined:
+			timer.Stop()
+		case <-timer.C:
+			return nil, errord.ToGRPCf(
+				context.DeadlineExceeded,
+				"the existing execution of checkpoint operation %s did not finish within the recovery deadline; "+
+					"nothing was reconciled and the operation ID is unchanged",
+				operation.GetOperationID(),
+			)
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, status.FromContextError(ctx.Err()).Err()
+		}
+		// The joined executor finished, but the budget it consumed counts
+		// here: a re-admission with no remaining budget answers the deadline
+		// instead of starting fresh work.
+		if !time.Now().Before(deadline) {
+			return nil, errord.ToGRPCf(
+				context.DeadlineExceeded,
+				"the recovery deadline of checkpoint operation %s expired while joining its existing execution; "+
+					"nothing was reconciled and the operation ID is unchanged",
+				operation.GetOperationID(),
+			)
+		}
+	}
+	defer recovery.finish()
+	bound := recovery.boundRecord()
+	// Defense in depth beside the pre-admission check: the slot's binding is
+	// the authority for everything below.
+	if bound.Version != checkpointOperationRecordVersionWitness {
+		return nil, errord.ToGRPCf(
+			errord.ErrFailedPrecondition,
+			"checkpoint operation %s is a legacy version-%d record without a runtime witness; recovery is refused",
+			bound.OperationID, bound.Version,
+		)
+	}
+	// The recovery work detaches from the caller's cancellation but carries
+	// the SAME absolute deadline — the join's leftover budget is the work's
+	// budget; it is never refreshed. Registering the cancellation immediately
+	// after the slot is won keeps a draining shutdown able to request
+	// convergence of every step below, not only of the runtime calls, while
+	// the slot itself is retained until this executor has really returned.
+	execCtx, cancel := context.WithDeadline(context.WithoutCancel(ctx), deadline)
+	defer cancel()
+	recovery.registerCancel(cancel)
+	handler, ok := h.serviceHandler.Get(bound.Runtime)
+	if !ok {
+		return nil, errord.ToGRPC(errord.ErrNotImplemented)
+	}
+	witness, ok := handler.(svc.CheckpointOperationWitness)
+	if !ok {
+		// A missing witness capability is a refusal, never a reason to run a
+		// legacy checkpoint instead: the record is bound to an operation whose
+		// evidence only this runtime holds.
+		return nil, errord.ToGRPCf(
+			errord.ErrNotImplemented,
+			"runtime %q no longer provides the checkpoint operation witness required to recover operation %s; "+
+				"no checkpoint fallback exists for an undetermined record",
+			bound.Runtime, bound.OperationID,
+		)
+	}
+	// Serialize the reconciliation against checkpoint, start, and delete for
+	// this sandbox. The queue wait shares the absolute deadline: a recovery
+	// that cannot acquire the physical lock in its remaining budget fails
+	// with that deadline having reconciled nothing.
+	unlock, lockErr := h.resourceLocks.acquire(execCtx, bound.SandboxID)
+	if lockErr != nil {
+		return nil, errord.ToGRPC(lockErr)
+	}
+	defer unlock()
+	// If the source sandbox is still managed here, its live metadata must
+	// still answer for the recorded binding — read HERE, under the physical
+	// lock and after the queue wait, so a sandbox replaced while this recovery
+	// was queued cannot slip past a stale pre-lock read. An absent source is
+	// legitimate — it may have been deleted after a durable success — and the
+	// runtime's own cold/hot identity gates then decide from their durable
+	// state. A replaced generation or a re-created sandbox under another
+	// runtime is a conflict this reconciliation refuses before touching
+	// anything.
+	if sandbox, getErr := h.sandboxManager.Get(bound.SandboxID); getErr == nil {
+		if sandbox.Metadata == nil || sandbox.Metadata.RuntimeHandler == "" ||
+			sandbox.Metadata.RuntimeHandler != bound.Runtime ||
+			sandbox.Metadata.Labels[resourceGenerationLabel] != bound.Generation {
+			return nil, errord.ToGRPCf(
+				errord.ErrFailedPrecondition,
+				"source sandbox %s no longer matches the recorded binding of checkpoint operation %s "+
+					"(runtime %q, generation %q); refusing to reconcile against a replaced source",
+				bound.SandboxID, bound.OperationID, bound.Runtime, bound.Generation,
+			)
+		}
+	} else if !errors.Is(getErr, errord.ErrNotFound) {
+		return nil, errord.ToGRPC(getErr)
+	}
+
+	binding := svc.CheckpointOperationBinding{
+		OperationID:      bound.OperationID,
+		RequestDigest:    bound.RequestDigest,
+		SourceGeneration: bound.Generation,
+	}
+	if !recovery.acknowledgmentOnly() {
+		completion, recoverErr := witness.RecoverCheckpointOperation(execCtx, bound.SandboxID, binding)
+		if recoverErr != nil {
+			return nil, errord.ToGRPC(recoverErr)
+		}
+		// The runtime's recorded root must be the sealed root of the service's
+		// canonical directory — derived through the one shared algorithm, not
+		// trusted from the reply alone: this is what binds the runtime's
+		// completion evidence to the directory this service admitted.
+		root, bindErr := checkpointroot.Bind(bound.CheckpointDir)
+		if bindErr != nil {
+			return nil, errord.ToGRPCf(
+				errord.ErrFailedPrecondition,
+				"the canonical checkpoint directory %s of operation %s can no longer be bound (%v); "+
+					"the runtime completion is not accepted as success",
+				bound.CheckpointDir, bound.OperationID, bindErr,
+			)
+		}
+		if completion.RootDigest != root.RootDigest || completion.RootScheme != root.Scheme {
+			return nil, errord.ToGRPCf(
+				errord.ErrFailedPrecondition,
+				"the runtime recovery of operation %s reports sealed root %s (%s) but the canonical directory %s binds %s (%s); "+
+					"refusing to record a success that does not match the admitted directory",
+				bound.OperationID, completion.RootDigest, completion.RootScheme,
+				bound.CheckpointDir, root.RootDigest, root.Scheme,
+			)
+		}
+		// Durable-first through the dedicated transition: while this write is
+		// slow or fails, every query keeps reporting the undetermined outcome.
+		if markErr := recovery.markRecoveredSucceeded(
+			&checkpointOperationArtifact{RootDigest: root.RootDigest, Scheme: root.Scheme},
+			fmt.Sprintf(
+				"recovery reconciled the runtime witness of operation %s; sealed content root %s (%s) is a completion-time fact, not an artifact liveness claim",
+				bound.OperationID, root.RootDigest, root.Scheme,
+			),
+		); markErr != nil {
+			return nil, errord.ToGRPC(fmt.Errorf(
+				"persist the recovered success of checkpoint operation %s: %w; "+
+					"the outcome stays undetermined and the same recovery may be retried",
+				bound.OperationID, markErr,
+			))
+		}
+	}
+	// Acknowledgment tail, in both branches, strictly after any durable
+	// success above. A NotFound answer is not a release: fail closed and keep
+	// the record for another explicit attempt.
+	if ackErr := witness.AckCheckpointOperation(execCtx, bound.SandboxID, binding); ackErr != nil {
+		return nil, errord.ToGRPC(fmt.Errorf(
+			"acknowledge the recovered checkpoint operation %s: %w; "+
+				"the durable record is retained (a SUCCEEDED fact is not downgraded) and the evidence release is unproven",
+			bound.OperationID, ackErr,
+		))
+	}
+	recovered, err := h.checkpointOperationStatus(bound.OperationID)
+	if err != nil {
+		return nil, err
+	}
+	recovered.EvidenceReleased = true
+	return recovered, nil
+}
+
 func (h *sandboxService) checkpointOperationStatus(operationID string) (*runtime.CheckpointOperationStatus, error) {
 	record := h.checkpointOperations.snapshot(operationID)
 	if record == nil {
@@ -1339,6 +1845,14 @@ func (h *sandboxService) checkpointOperationStatus(operationID string) (*runtime
 		CheckpointDir:    record.CheckpointDir,
 		RequestDigest:    record.RequestDigest,
 		Message:          record.Message,
+	}
+	// The protocol is a property of the record, reported by every reply.
+	// evidence_released is deliberately NOT set here: it is per-invocation —
+	// true only when the call itself completed the runtime acknowledgment
+	// after the durable success — so read-only queries and historical
+	// replays keep reporting false.
+	if record.Version == checkpointOperationRecordVersionWitness {
+		status.RecoveryProtocol = runtime.CheckpointOperationRecoveryProtocol_CHECKPOINT_OPERATION_RECOVERY_PROTOCOL_WITNESS
 	}
 	switch record.Phase {
 	case checkpointOperationPhaseAdmitted:
@@ -1377,15 +1891,40 @@ func (h *sandboxService) checkpointOperationStatus(operationID string) (*runtime
 // checkpoint path consumes. It marks the exact runtime-entry boundary inside
 // the memory-wrapper callback and records the durable success fact only after
 // the runtime returned nil AND the sealed content root of the output
-// directory was read; it never infers entry from error text.
+// directory was read; it never infers entry from error text. It also carries
+// the complete admitted identity — the request digest and the expected source
+// generation — so the runtime receives the exact operation binding its
+// durable witness must record, never a binding reconstructed from a later
+// view of the request.
 type checkpointOperationBinding struct {
 	store       *checkpointOperationStore
 	operationID string
+	// requestDigest is the deterministic digest of the complete wrapped
+	// request the operation was admitted under.
+	requestDigest string
+	// sourceGeneration is the exact expected generation of that admission.
+	sourceGeneration string
 
 	// entered is written inside the runtime-invocation callback and read only
 	// after the callback's wrapper has returned, always on this executor
 	// goroutine, mirroring the runtimeCheckpointEntered flag it augments.
 	entered bool
+}
+
+// runtimeBinding projects the admitted identity onto the internal runtime
+// binding (pkg/runtime CheckpointOperationBinding) the checkpoint path passes
+// to the handler: the exact operation ID, request digest, and source
+// generation the runtime's durable witness must record for a later explicit
+// recovery to reconcile against.
+func (b *checkpointOperationBinding) runtimeBinding() svc.CheckpointOperationBinding {
+	if b == nil {
+		return svc.CheckpointOperationBinding{}
+	}
+	return svc.CheckpointOperationBinding{
+		OperationID:      b.operationID,
+		RequestDigest:    b.requestDigest,
+		SourceGeneration: b.sourceGeneration,
+	}
 }
 
 // noteRuntimeEntered marks that the runtime checkpoint call was actually
@@ -1407,6 +1946,15 @@ func (b *checkpointOperationBinding) terminal() bool {
 	}
 	record := b.store.snapshot(b.operationID)
 	return record != nil && isTerminalCheckpointOperationPhase(record.Phase)
+}
+
+// succeeded reports whether the durable record carries the completion fact.
+func (b *checkpointOperationBinding) succeeded() bool {
+	if b == nil {
+		return false
+	}
+	record := b.store.snapshot(b.operationID)
+	return record != nil && record.Phase == checkpointOperationPhaseSucceeded
 }
 
 // recordSuccess completes an identified checkpoint: the runtime returned nil,

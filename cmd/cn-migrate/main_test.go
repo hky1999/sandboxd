@@ -255,19 +255,12 @@ func executorMain(stateDir, node string, args []string) {
 			if err := json.Unmarshal(raw, &record); err != nil {
 				os.Exit(1) // a corrupt record is an ambiguous failure
 			}
-			status := &runtime.CheckpointOperationStatus{
-				OperationID:        record.OperationID,
-				SandboxID:          record.SandboxID,
-				State:              fakeCheckpointOpState(record.State),
-				SourceGeneration:   record.SourceGeneration,
-				CheckpointDir:      record.CheckpointDir,
-				RequestDigest:      record.RequestDigest,
-				ArtifactRootDigest: record.ArtifactRootDigest,
-				ArtifactRootScheme: record.ArtifactRootScheme,
-			}
+			status := record.status()
 			fakeApplyReceiptPoison(stateDir, status)
 			fakePrintCheckpointOpStatus(status)
 			os.Exit(0)
+		case "recover-checkpoint-operation":
+			recoverCheckpointOperationExecutor(stateDir, args, value("--operation-id"), value)
 		case "get-start-operation":
 			operation := value("--operation-id")
 			if operation == "" || !strings.HasPrefix(operation, "migrate-") {
@@ -381,7 +374,9 @@ func liveGeneration(stateDir string) string {
 
 // fakeCheckpointRecord is the fake node's durable checkpoint-operation
 // receipt — the server-side journal entry, persisted independently of any
-// response the CLI does or does not receive.
+// response the CLI does or does not receive. RecoveryProtocol mirrors the
+// record version the service admits under (0 legacy, 1 WITNESS); it is a
+// record property every reply restates, never per-call evidence.
 type fakeCheckpointRecord struct {
 	OperationID        string `json:"operation_id"`
 	SandboxID          string `json:"sandbox_id"`
@@ -389,6 +384,7 @@ type fakeCheckpointRecord struct {
 	CheckpointDir      string `json:"checkpoint_dir"`
 	RequestDigest      string `json:"request_digest"`
 	State              string `json:"state"`
+	RecoveryProtocol   int    `json:"recovery_protocol,omitempty"`
 	ArtifactRootDigest string `json:"artifact_root_digest,omitempty"`
 	ArtifactRootScheme string `json:"artifact_root_scheme,omitempty"`
 }
@@ -536,7 +532,10 @@ func controlPresent(stateDir, name string) bool {
 	return err == nil
 }
 
-// status renders the durable record as the operation receipt.
+// status renders the durable record as the operation receipt. Every reply
+// restates the record's recovery protocol; evidence_released stays false —
+// read-only queries and historical replays never prove a release, only the
+// response that completed the acknowledgment does.
 func (r fakeCheckpointRecord) status() *runtime.CheckpointOperationStatus {
 	return &runtime.CheckpointOperationStatus{
 		OperationID:        r.OperationID,
@@ -545,6 +544,7 @@ func (r fakeCheckpointRecord) status() *runtime.CheckpointOperationStatus {
 		SourceGeneration:   r.SourceGeneration,
 		CheckpointDir:      r.CheckpointDir,
 		RequestDigest:      r.RequestDigest,
+		RecoveryProtocol:   runtime.CheckpointOperationRecoveryProtocol(r.RecoveryProtocol),
 		ArtifactRootDigest: r.ArtifactRootDigest,
 		ArtifactRootScheme: r.ArtifactRootScheme,
 	}
@@ -627,6 +627,12 @@ func identifiedCheckpointExecutor(stateDir string, args []string, operation stri
 		RequestDigest:    digest,
 		State:            state,
 	}
+	// The staged protocol models the record version the daemon admits
+	// under: witness records are the ones whose runtime holds the operation
+	// evidence (and whose successes owe an acknowledgment).
+	if controlFileValue(stateDir, "checkpoint-op-protocol") == "witness" {
+		record.RecoveryProtocol = 1
+	}
 	if state == "succeeded" {
 		record.ArtifactRootDigest = sourceRootDigest(stateDir)
 		record.ArtifactRootScheme = "v2:manifest+sidecar-roots"
@@ -648,16 +654,137 @@ func identifiedCheckpointExecutor(stateDir string, args []string, operation stri
 		if raw, replaceErr := os.ReadFile(filepath.Join(stateDir, "replace-source")); replaceErr == nil {
 			_ = os.WriteFile(filepath.Join(stateDir, "source-generation"), bytes.TrimSpace(raw), 0o600)
 		}
+		// The witness acknowledgment tail runs strictly after the durable
+		// success, exactly as the service does: its failure keeps the
+		// SUCCEEDED record and returns an explicit RPC error (no receipt
+		// reaches the CLI), its success marks the released evidence, and
+		// only then may the reply report evidence_released=true.
+		if record.RecoveryProtocol == 1 {
+			if controlPresent(stateDir, "fail-source-ack") {
+				os.Exit(1) // durable success, failed acknowledgment — reconcile through recovery
+			}
+			_ = os.WriteFile(filepath.Join(stateDir, "source-evidence-released"), nil, 0o600)
+		}
 	}
 	if controlPresent(stateDir, "lose-checkpoint-reply") {
 		os.Exit(1) // the node committed; the reply never reached the CLI
 	}
 	status := record.status()
+	if record.RecoveryProtocol == 1 && state == "succeeded" &&
+		!controlPresent(stateDir, "checkpoint-receipt-unreleased") {
+		status.EvidenceReleased = true // this call completed the acknowledgment after its durable success
+	}
 	fakeApplyReceiptPoison(stateDir, status)
 	fakePrintCheckpointOpStatus(status)
 	if state != "succeeded" {
 		os.Exit(1) // a recorded non-success outcome is reported, then fails
 	}
+	os.Exit(0)
+}
+
+// recoverCheckpointOperationExecutor emulates the node CLI and daemon
+// contract for `--action recover-checkpoint-operation`. It enforces the same
+// complete-original-payload contract the service does — the request digest is
+// recomputed from the payload flags actually received (the executor's
+// directory mapping included) and the recovery timeout deliberately plays no
+// part in it — refuses absent records, legacy-protocol records, FAILED
+// records, and still-RUNNING executions, reconciles an UNKNOWN witness
+// record into the durable success (stop-source completion), and always ends
+// with the acknowledgment tail whose completed release is the only reply
+// allowed to report evidence_released=true.
+func recoverCheckpointOperationExecutor(stateDir string, args []string, operation string, value func(string) string) {
+	if operation == "" || !strings.HasPrefix(operation, "checkpoint-") {
+		os.Exit(2)
+	}
+	timeout, timeoutErr := strconv.ParseUint(value("--recovery-timeout-seconds"), 10, 32)
+	if timeoutErr != nil || timeout < 1 || timeout > 600 {
+		_ = os.WriteFile(filepath.Join(stateDir, "bad-recovery-timeout"), nil, 0o600)
+		os.Exit(1) // the node CLI refuses a malformed recovery timeout locally
+	}
+	if leaveRunning, leaveSet := fakeBoolFlag(args, "--leave-running"); !leaveSet || leaveRunning {
+		_ = os.WriteFile(filepath.Join(stateDir, "bad-recovery-request"), nil, 0o600)
+		os.Exit(1) // the recovery repeats the stop-and-copy original payload
+	}
+	if controlPresent(stateDir, "fail-recover-op") {
+		os.Exit(1) // the recovery command fails before anything is reconciled
+	}
+	raw, readErr := os.ReadFile(fakeCheckpointRecordPath(stateDir, operation))
+	if readErr != nil {
+		_ = os.WriteFile(filepath.Join(stateDir, "recover-absent-record"), nil, 0o600)
+		fmt.Fprintf(os.Stderr, "checkpoint operation %s is unknown\n", operation)
+		os.Exit(1) // NotFound is an error here, never a structured absence and never a resend trigger
+	}
+	var record fakeCheckpointRecord
+	if json.Unmarshal(raw, &record) != nil {
+		os.Exit(1) // a corrupt record is an ambiguous failure
+	}
+	// The same executor-side directory mapping the identified checkpoint
+	// applies: the digest must bind the physical request the node CLI sends,
+	// never the controller's logical path.
+	if controlPresent(stateDir, "map-source-path") {
+		physical := filepath.Join("/physical/source/checkpoints", filepath.Base(value("--checkpoint-dir")))
+		original := value
+		value = func(flag string) string {
+			if flag == "--checkpoint-dir" {
+				return physical
+			}
+			return original(flag)
+		}
+	}
+	digest, err := fakeCheckpointOpDigest(args, value)
+	if err != nil {
+		os.Exit(1)
+	}
+	if record.RequestDigest != digest {
+		_ = os.WriteFile(filepath.Join(stateDir, "checkpoint-op-reuse-refused"), nil, 0o600)
+		os.Exit(1) // the service refuses a recovery whose complete original payload differs from the recorded binding
+	}
+	if record.RecoveryProtocol != 1 {
+		_ = os.WriteFile(filepath.Join(stateDir, "recover-protocol-refused"), nil, 0o600)
+		os.Exit(1) // a legacy record holds no runtime witness and cannot be recovered
+	}
+	switch record.State {
+	case "failed":
+		os.Exit(1) // a FAILED record is refused forever
+	case "running":
+		os.Exit(1) // the join of the live execution did not finish within the recovery timeout
+	}
+	fakeCount(stateDir, "source-recoveries")
+	if record.State == "unknown" {
+		// The runtime recovery completes the original stop-source flow and
+		// the service persists the dedicated success transition.
+		record.State = "succeeded"
+		record.ArtifactRootDigest = sourceRootDigest(stateDir)
+		record.ArtifactRootScheme = "v2:manifest+sidecar-roots"
+		encoded, marshalErr := json.Marshal(record)
+		if marshalErr != nil || os.WriteFile(fakeCheckpointRecordPath(stateDir, operation), append(encoded, '\n'), 0o600) != nil {
+			os.Exit(2)
+		}
+		_ = os.WriteFile(filepath.Join(stateDir, "stopped"), nil, 0o600)
+		_ = os.WriteFile(filepath.Join(stateDir, "checkpoint-id"), []byte(filepath.Base(record.CheckpointDir)), 0o600)
+	}
+	// Acknowledgment tail, strictly after any durable success above. A staged
+	// unreleased reply models a node CLI that reports the success with a
+	// zero exit but without a completed release: the controller must reject
+	// the receipt on its own evidence_released validation.
+	if controlPresent(stateDir, "recover-receipt-unreleased") {
+		fakePrintCheckpointOpStatus(record.status())
+		os.Exit(0)
+	}
+	_ = os.WriteFile(filepath.Join(stateDir, "source-evidence-released"), nil, 0o600)
+	if controlPresent(stateDir, "lose-recover-reply") {
+		os.Exit(1) // the recovery and its acknowledgment committed; the reply never reached the CLI
+	}
+	status := record.status()
+	status.EvidenceReleased = true
+	// A recovery-only poison: the query already answered truthfully from the
+	// durable record, so staging the generic poison through this control
+	// corrupts exactly the recovery reply a test wants contradicted.
+	if raw := controlFileValue(stateDir, "poison-recovery-receipt"); raw != "" {
+		_ = os.WriteFile(filepath.Join(stateDir, "poison-checkpoint-receipt"), []byte(raw), 0o600)
+	}
+	fakeApplyReceiptPoison(stateDir, status)
+	fakePrintCheckpointOpStatus(status)
 	os.Exit(0)
 }
 

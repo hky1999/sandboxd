@@ -51,6 +51,7 @@ type options struct {
 	checkpointDir            string
 	timeout                  time.Duration
 	checkpointTimeoutSeconds uint
+	recoveryTimeoutSeconds   uint
 	memoryMB                 float64
 	cpu                      int
 	storageMB                uint64
@@ -94,7 +95,8 @@ func parseFlags(args []string, errorOutput io.Writer) (options, error) {
 	flags.SetOutput(errorOutput)
 	flags.StringVar(&value.action, "action", "",
 		"start, checkpoint, restore, delete, get-start-operation, "+
-			"get-checkpoint-operation, or checkpoint-root")
+			"get-checkpoint-operation, recover-checkpoint-operation, or "+
+			"checkpoint-root")
 	flags.StringVar(&value.socket, "socket", "", "sandboxd Unix socket")
 	flags.StringVar(&value.runtime, "runtime", "runsc", "runtime handler")
 	flags.StringVar(&value.stdout, "stdout", "/var/log/sandboxd/checkpoint-workload.stdout", "sandbox console output path")
@@ -110,6 +112,15 @@ func parseFlags(args []string, errorOutput io.Writer) (options, error) {
 		"checkpoint-timeout-seconds",
 		180,
 		"sandboxd checkpoint timeout in seconds",
+	)
+	flags.UintVar(
+		&value.recoveryTimeoutSeconds,
+		"recovery-timeout-seconds",
+		180,
+		"bounded timeout in seconds of one recover-checkpoint-operation "+
+			"attempt (joins a still-running original execution, runs the "+
+			"runtime recovery, and acknowledges; never part of the original "+
+			"request digest)",
 	)
 	flags.Float64Var(&value.memoryMB, "memory-mb", 128, "sandbox memory in MiB")
 	flags.IntVar(&value.cpu, "cpu", 500, "CPU quota (milli-CPU)")
@@ -192,16 +203,20 @@ func runExitCode(err error) int {
 func validateOptions(value options) error {
 	switch value.action {
 	case "start", "checkpoint", "restore", "delete", "get-start-operation",
-		"get-checkpoint-operation", "checkpoint-root":
+		"get-checkpoint-operation", "recover-checkpoint-operation", "checkpoint-root":
 	default:
 		return errors.New("--action must be start, checkpoint, restore, delete, " +
-			"get-start-operation, get-checkpoint-operation, or checkpoint-root")
+			"get-start-operation, get-checkpoint-operation, " +
+			"recover-checkpoint-operation, or checkpoint-root")
 	}
 	if value.action == "checkpoint-root" {
 		return validateCheckpointRootOptions(value)
 	}
-	if value.expectedGeneration != "" && value.action != "checkpoint" && value.action != "delete" {
-		return errors.New("--expected-generation is only valid for checkpoint and delete")
+	if value.expectedGeneration != "" &&
+		value.action != "checkpoint" && value.action != "delete" &&
+		value.action != "recover-checkpoint-operation" {
+		return errors.New("--expected-generation is only valid for checkpoint, delete, " +
+			"and recover-checkpoint-operation")
 	}
 	if value.socket == "" {
 		return errors.New("--socket is required")
@@ -365,9 +380,12 @@ func run(value options) error {
 		return getStartOperation(ctx, client, value)
 	case "get-checkpoint-operation":
 		return getCheckpointOperation(ctx, client, value, os.Stdout)
+	case "recover-checkpoint-operation":
+		return recoverCheckpointOperation(ctx, client, value, os.Stdout)
 	default:
 		return errors.New("--action must be start, checkpoint, restore, delete, " +
-			"get-start-operation, get-checkpoint-operation, or checkpoint-root")
+			"get-start-operation, get-checkpoint-operation, " +
+			"recover-checkpoint-operation, or checkpoint-root")
 	}
 }
 
@@ -669,6 +687,75 @@ func validCheckpointOperationState(state runtime.CheckpointOperationState) bool 
 	}
 }
 
+// validCheckpointOperationRecoveryProtocol reports whether a reply carries a
+// recovery protocol this build understands. The protocol is a record
+// property, never content: a legacy UNSPECIFIED record and a WITNESS record
+// are both legal history wherever facts are compared, so neither is
+// normalized away — but an out-of-range value is a protocol error. An
+// unsupported protocol must be rejected, never reinterpreted as the legacy
+// one, because whether a record holds runtime evidence decides what may be
+// recovered from it.
+func validCheckpointOperationRecoveryProtocol(
+	protocol runtime.CheckpointOperationRecoveryProtocol,
+) bool {
+	switch protocol {
+	case runtime.CheckpointOperationRecoveryProtocol_CHECKPOINT_OPERATION_RECOVERY_PROTOCOL_UNSPECIFIED,
+		runtime.CheckpointOperationRecoveryProtocol_CHECKPOINT_OPERATION_RECOVERY_PROTOCOL_WITNESS:
+		return true
+	default:
+		return false
+	}
+}
+
+// checkpointOperationIdentityConflict names the first way a reply fails to
+// answer for exactly the request the CLI just sent: the echoed operation and
+// sandbox identities, the bound source generation, the canonical form of the
+// requested directory, and the digest of the very request just sent. caller
+// prefixes every message so the failing action stays identifiable. Identity
+// is all it checks — state, sealed-root, protocol, and release evidence are
+// each action's separate contract.
+func checkpointOperationIdentityConflict(
+	status *runtime.CheckpointOperationStatus,
+	value options,
+	digest string,
+	caller string,
+) string {
+	if status == nil {
+		return caller + ": empty operation status"
+	}
+	if status.GetOperationID() != value.operationID {
+		return fmt.Sprintf(
+			"%s: status operation_id %q does not match requested %q",
+			caller, status.GetOperationID(), value.operationID,
+		)
+	}
+	if status.GetSandboxID() != value.sandboxID {
+		return fmt.Sprintf(
+			"%s: status sandbox_id %q does not match requested %q",
+			caller, status.GetSandboxID(), value.sandboxID,
+		)
+	}
+	if status.GetSourceGeneration() != value.expectedGeneration {
+		return fmt.Sprintf(
+			"%s: status source_generation %q does not match requested %q",
+			caller, status.GetSourceGeneration(), value.expectedGeneration,
+		)
+	}
+	if canonical := filepath.Clean(value.checkpointDir); status.GetCheckpointDir() != canonical {
+		return fmt.Sprintf(
+			"%s: status checkpoint_dir %q does not match the canonical form %q of the requested directory",
+			caller, status.GetCheckpointDir(), canonical,
+		)
+	}
+	if status.GetRequestDigest() != digest {
+		return fmt.Sprintf(
+			"%s: status request_digest %q does not match the digest %q of the request just sent",
+			caller, status.GetRequestDigest(), digest,
+		)
+	}
+	return ""
+}
+
 // reportCheckpointOperation turns a CheckpointWithOperation reply into the
 // identified checkpoint's entire stdout contract, and only a proven SUCCEEDED
 // receipt for exactly the requested identity exits zero. The identity checks
@@ -681,52 +768,29 @@ func validCheckpointOperationState(state runtime.CheckpointOperationState) bool 
 // shared checkpoint-root scheme proves nothing, so it fails without output: a
 // success-shaped record followed by an error is exactly the partial success
 // output a caller must never have to disambiguate.
+//
+// evidence_released is serialized but never gated here: a first-issue success
+// that acknowledged in the same call reports true and needs nothing further,
+// while a replay of a durable success reports false by construction — the
+// checkpoint DID succeed, so the CLI reports that fact and the release gate
+// belongs to the caller that requires it (the explicit recovery action).
 func reportCheckpointOperation(
 	status *runtime.CheckpointOperationStatus,
 	value options,
 	digest string,
 	out io.Writer,
 ) error {
-	if status == nil {
-		return errors.New("checkpoint: empty operation status")
-	}
-	if status.GetOperationID() != value.operationID {
-		return fmt.Errorf(
-			"checkpoint: status operation_id %q does not match requested %q",
-			status.GetOperationID(),
-			value.operationID,
-		)
-	}
-	if status.GetSandboxID() != value.sandboxID {
-		return fmt.Errorf(
-			"checkpoint: status sandbox_id %q does not match requested %q",
-			status.GetSandboxID(),
-			value.sandboxID,
-		)
-	}
-	if status.GetSourceGeneration() != value.expectedGeneration {
-		return fmt.Errorf(
-			"checkpoint: status source_generation %q does not match requested %q",
-			status.GetSourceGeneration(),
-			value.expectedGeneration,
-		)
-	}
-	if canonical := filepath.Clean(value.checkpointDir); status.GetCheckpointDir() != canonical {
-		return fmt.Errorf(
-			"checkpoint: status checkpoint_dir %q does not match the canonical form %q of the requested directory",
-			status.GetCheckpointDir(),
-			canonical,
-		)
-	}
-	if status.GetRequestDigest() != digest {
-		return fmt.Errorf(
-			"checkpoint: status request_digest %q does not match the digest %q of the request just sent",
-			status.GetRequestDigest(),
-			digest,
-		)
+	if conflict := checkpointOperationIdentityConflict(status, value, digest, "checkpoint"); conflict != "" {
+		return errors.New(conflict)
 	}
 	if !validCheckpointOperationState(status.GetState()) {
 		return fmt.Errorf("checkpoint: invalid record state %d", status.GetState())
+	}
+	if !validCheckpointOperationRecoveryProtocol(status.GetRecoveryProtocol()) {
+		return fmt.Errorf(
+			"checkpoint: reply reports unrecognized recovery protocol %d; refusing to treat an unknown protocol as legacy",
+			status.GetRecoveryProtocol(),
+		)
 	}
 	if status.GetState() != runtime.CheckpointOperationState_CHECKPOINT_OPERATION_STATE_SUCCEEDED {
 		if status.GetArtifactRootDigest() != "" || status.GetArtifactRootScheme() != "" {
@@ -803,6 +867,179 @@ func getCheckpointOperation(
 	return printCheckpointOperationStatus(status, out)
 }
 
+// recoverCheckpointOperation runs the explicit recovery of one ALREADY
+// recorded checkpoint operation. The request reconstructs the COMPLETE
+// original CheckpointWithOperation payload from the same flags that first
+// issued it — sandbox ID, directory spelling, original checkpoint timeout,
+// compression, leave_running, snapshot type, and the exact expected
+// generation — and carries it unchanged inside RecoverCheckpointOperationRequest
+// beside an independent recovery timeout. The recovery timeout bounds only
+// this reconciliation attempt; the ORIGINAL checkpoint timeout keeps its role
+// in the request digest, so the two flags are never substituted for one
+// another, and the digest the CLI validates against is computed from the
+// reconstructed original payload alone.
+//
+// There is deliberately no fallback and no structured not-found answer: any
+// RPC failure — Unimplemented from an older server, a transport error, a
+// deadline, a refused legacy or FAILED record included — is terminal. A
+// recovery targets an operation the caller already holds a record for;
+// callers reconciling a possibly-absent record use the query action. After
+// one RPC error the only next step is querying or recovering the same
+// operation ID again, never re-issuing an older checkpoint RPC.
+func recoverCheckpointOperation(
+	ctx context.Context,
+	client runtime.SandboxServiceClient,
+	value options,
+	out io.Writer,
+) error {
+	if err := validateOperationIDFormat(value.operationID); err != nil {
+		return err
+	}
+	if value.sandboxID == "" || value.checkpointDir == "" {
+		return errors.New("--sandbox-id and --checkpoint-dir are required for " +
+			"recover-checkpoint-operation")
+	}
+	if value.expectedGeneration == "" {
+		return errors.New("--expected-generation is required for " +
+			"recover-checkpoint-operation (it repeats the ORIGINAL operation binding)")
+	}
+	if err := validateExpectedGeneration(value.expectedGeneration); err != nil {
+		return err
+	}
+	if value.leaveRunning {
+		return errors.New("recover-checkpoint-operation requires --leave-running=false " +
+			"(the original identified checkpoint was stop-and-copy, and the recovery " +
+			"repeats its exact payload)")
+	}
+	if !filepath.IsAbs(value.checkpointDir) {
+		return errors.New("--checkpoint-dir must be absolute for recover-checkpoint-operation")
+	}
+	if value.checkpointTimeoutSeconds < 1 ||
+		value.checkpointTimeoutSeconds > checkpointOperationMaxTimeoutSeconds {
+		return fmt.Errorf(
+			"--checkpoint-timeout-seconds must be between 1 and %d for "+
+				"recover-checkpoint-operation (it repeats the ORIGINAL checkpoint timeout, "+
+				"which the request digest covers)",
+			checkpointOperationMaxTimeoutSeconds,
+		)
+	}
+	if value.recoveryTimeoutSeconds < 1 ||
+		value.recoveryTimeoutSeconds > checkpointOperationMaxTimeoutSeconds {
+		return fmt.Errorf(
+			"--recovery-timeout-seconds must be between 1 and %d for "+
+				"recover-checkpoint-operation",
+			checkpointOperationMaxTimeoutSeconds,
+		)
+	}
+	original := &runtime.CheckpointWithOperationRequest{
+		OperationID: value.operationID,
+		Checkpoint: &runtime.CheckpointRequest{
+			ID:             value.sandboxID,
+			CheckpointDir:  value.checkpointDir,
+			TimeoutSeconds: uint32(value.checkpointTimeoutSeconds),
+			Compress:       value.compress,
+			LeaveRunning:   value.leaveRunning,
+			SnapshotType:   value.snapshotType,
+		},
+		ExpectedGeneration: value.expectedGeneration,
+	}
+	digest, err := checkpointOperationRequestDigest(original)
+	if err != nil {
+		return fmt.Errorf("recover-checkpoint-operation: %w", err)
+	}
+	status, err := client.RecoverCheckpointOperation(ctx, &runtime.RecoverCheckpointOperationRequest{
+		Operation:              original,
+		RecoveryTimeoutSeconds: uint32(value.recoveryTimeoutSeconds),
+	})
+	if err != nil {
+		return fmt.Errorf("recover-checkpoint-operation: %w", err)
+	}
+	return reportRecoveredCheckpointOperation(status, value, digest, out)
+}
+
+// reportRecoveredCheckpointOperation turns a RecoverCheckpointOperation reply
+// into the recovery action's entire stdout contract. A zero exit proves the
+// strongest fact this action exists for, all of it from THIS response: the
+// operation is SUCCEEDED for exactly the reconstructed original request, the
+// record reports the WITNESS recovery protocol (explicit recovery is defined
+// for witness records only — the service refuses legacy ones before
+// replying, so a reply claiming otherwise is a protocol error), and this
+// invocation completed the runtime acknowledgment — evidence_released=true —
+// which is the release of the evidence-retention gate the caller recovers
+// for. A SUCCEEDED receipt without that release proof is printed first — the
+// success fact may be durable and worth reconciling — and then reported as
+// an error, exactly like every non-SUCCEEDED state, so a zero exit can never
+// be mistaken for a completed release.
+func reportRecoveredCheckpointOperation(
+	status *runtime.CheckpointOperationStatus,
+	value options,
+	digest string,
+	out io.Writer,
+) error {
+	const caller = "recover-checkpoint-operation"
+	if conflict := checkpointOperationIdentityConflict(status, value, digest, caller); conflict != "" {
+		return errors.New(conflict)
+	}
+	if !validCheckpointOperationState(status.GetState()) {
+		return fmt.Errorf("%s: invalid record state %d", caller, status.GetState())
+	}
+	if !validCheckpointOperationRecoveryProtocol(status.GetRecoveryProtocol()) {
+		return fmt.Errorf(
+			"%s: reply reports unrecognized recovery protocol %d; refusing to treat an unknown protocol as legacy",
+			caller, status.GetRecoveryProtocol(),
+		)
+	}
+	if status.GetRecoveryProtocol() !=
+		runtime.CheckpointOperationRecoveryProtocol_CHECKPOINT_OPERATION_RECOVERY_PROTOCOL_WITNESS {
+		return fmt.Errorf(
+			"%s: record reports recovery protocol %s, but explicit recovery is defined for WITNESS records only "+
+				"(legacy records are refused by the service and cannot be recovered)",
+			caller, status.GetRecoveryProtocol(),
+		)
+	}
+	if status.GetState() != runtime.CheckpointOperationState_CHECKPOINT_OPERATION_STATE_SUCCEEDED {
+		if status.GetArtifactRootDigest() != "" || status.GetArtifactRootScheme() != "" {
+			return fmt.Errorf(
+				"%s: %s record carries a sealed root; malformed reply",
+				caller, status.GetState(),
+			)
+		}
+		if err := printCheckpointOperationStatus(status, out); err != nil {
+			return err
+		}
+		return fmt.Errorf(
+			"%s: operation state %s is not SUCCEEDED; the attempt reconciled nothing and the operation ID is unchanged",
+			caller, status.GetState(),
+		)
+	}
+	if !validStrictHex64Digest(status.GetArtifactRootDigest()) {
+		return fmt.Errorf(
+			"%s: SUCCEEDED record must carry a strict lowercase hex64 artifact_root_digest, got %q",
+			caller, status.GetArtifactRootDigest(),
+		)
+	}
+	if status.GetArtifactRootScheme() != checkpointroot.Scheme {
+		return fmt.Errorf(
+			"%s: SUCCEEDED record root scheme %q is not %q",
+			caller, status.GetArtifactRootScheme(), checkpointroot.Scheme,
+		)
+	}
+	if !status.GetEvidenceReleased() {
+		// The success may be durable, but THIS call did not complete the
+		// acknowledgment — a recovery answering false releases nothing, and
+		// treating it as complete would unbind the evidence gate from any
+		// proven fact. Print the record for reconciliation, then fail.
+		if err := printCheckpointOperationStatus(status, out); err != nil {
+			return err
+		}
+		return fmt.Errorf(
+			"%s: SUCCEEDED record reports evidence_released=false — this response did not complete the runtime acknowledgment; the release of the retained evidence is unproven, retry the recovery of operation %q",
+			caller, value.operationID,
+		)
+	}
+	return printCheckpointOperationStatus(status, out)
+}
+
 // validateCheckpointOperationRecordReply enforces the record syntax and the
 // queried-ID echo of a GetCheckpointOperation answer. It checks only what the
 // query itself can prove — shape and self-consistency — and deliberately not
@@ -843,6 +1080,17 @@ func validateCheckpointOperationRecordReply(
 	}
 	if !validCheckpointOperationState(status.GetState()) {
 		return fmt.Errorf("get-checkpoint-operation: invalid record state %d", status.GetState())
+	}
+	// The protocol is reported by every reply, and the two defined values are
+	// both legal history here — legacy records keep querying and replaying
+	// unchanged. An out-of-range value is a protocol error: an unknown
+	// protocol must not be silently read as the legacy one, because the field
+	// decides which records hold recoverable runtime evidence.
+	if !validCheckpointOperationRecoveryProtocol(status.GetRecoveryProtocol()) {
+		return fmt.Errorf(
+			"get-checkpoint-operation: reply reports unrecognized recovery protocol %d",
+			status.GetRecoveryProtocol(),
+		)
 	}
 	// The sealed root is exactly the SUCCEEDED evidence: mandatory with a
 	// strict lowercase hex64 digest under the shared scheme, and absent on
@@ -1065,6 +1313,9 @@ func validateOperationFlags(value options) error {
 		if value.action == "get-checkpoint-operation" {
 			return errors.New("--operation-id is required for get-checkpoint-operation")
 		}
+		if value.action == "recover-checkpoint-operation" {
+			return errors.New("--operation-id is required for recover-checkpoint-operation")
+		}
 		return nil
 	}
 	if err := validateOperationIDFormat(value.operationID); err != nil {
@@ -1129,9 +1380,43 @@ func validateOperationFlags(value options) error {
 			return errors.New("--action get-checkpoint-operation takes only --socket, " +
 				"--timeout, and --operation-id")
 		}
+	case "recover-checkpoint-operation":
+		// The recovery repeats the ORIGINAL identified checkpoint payload, so
+		// it demands exactly the same complete fixed request — the service
+		// recomputes the request digest from this payload and refuses the
+		// operation ID when any field changed. The original timeout keeps its
+		// digest role; the recovery timeout only bounds this attempt.
+		if value.sandboxID == "" || value.checkpointDir == "" {
+			return errors.New("--sandbox-id and --checkpoint-dir are required for " +
+				"recover-checkpoint-operation")
+		}
+		if value.expectedGeneration == "" {
+			return errors.New("--expected-generation is required for recover-checkpoint-operation")
+		}
+		if value.leaveRunning {
+			return errors.New("recover-checkpoint-operation requires --leave-running=false " +
+				"(the original identified checkpoint was stop-and-copy)")
+		}
+		if !filepath.IsAbs(value.checkpointDir) {
+			return errors.New("--checkpoint-dir must be absolute for recover-checkpoint-operation")
+		}
+		if value.checkpointTimeoutSeconds < 1 ||
+			value.checkpointTimeoutSeconds > checkpointOperationMaxTimeoutSeconds {
+			return fmt.Errorf(
+				"--checkpoint-timeout-seconds must be between 1 and %d for recover-checkpoint-operation",
+				checkpointOperationMaxTimeoutSeconds,
+			)
+		}
+		if value.recoveryTimeoutSeconds < 1 ||
+			value.recoveryTimeoutSeconds > checkpointOperationMaxTimeoutSeconds {
+			return fmt.Errorf(
+				"--recovery-timeout-seconds must be between 1 and %d for recover-checkpoint-operation",
+				checkpointOperationMaxTimeoutSeconds,
+			)
+		}
 	default:
 		return errors.New("--operation-id is only valid for start, restore, checkpoint, " +
-			"get-start-operation, and get-checkpoint-operation")
+			"get-start-operation, get-checkpoint-operation, and recover-checkpoint-operation")
 	}
 	return nil
 }
