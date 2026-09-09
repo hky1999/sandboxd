@@ -1436,42 +1436,92 @@ func (handler *Handler) verifyCheckpointOperationAbortScope(
 // in-memory `aborting` witness is not proof its write landed — so a crash or
 // timeout retries the same decision instead of silently re-owning the source.
 // The handback then proves the exact recorded birth identity is live before
-// and after the resume and the guest error release; a missing, replaced, or
-// dead source is never claimed resumed. Only after that proof is the source's
-// incremental lineage invalidated — a failed snapshot may have reset the VMM's
-// dirty accounting — and the `aborted` fact made durable. Every failure
-// retains the evidence and reports honestly what did and did not happen; an
-// ambiguous aborted write is re-persisted by the retry before success is
-// reported.
+// it, drives the source to Running exactly as the instance state demands
+// (resuming only a Paused source, never re-resuming a Running one), releases
+// the guest through the idempotent abort message, and re-proves the pinned
+// birth and a Running instance before the fact is made durable; a missing,
+// replaced, or dead source is never claimed resumed. Only after that proof is
+// the source's incremental lineage invalidated — a failed snapshot may have
+// reset the VMM's dirty accounting — and the `aborted` fact made durable.
+// Every failure retains the evidence and reports honestly what did and did
+// not happen; an ambiguous aborted write is re-persisted by the retry before
+// success is reported.
+//
+// One further shape retires without any of the handback: a VALIDATED current
+// state whose checkpoint operation witness is exactly zero. The durable
+// intent write is the gate before every checkpoint side effect — layout,
+// guest flush or shrink, pause, snapshot — so a zero witness on the state of
+// the exact admitted sandbox and generation proves the operation never
+// reached a single one of them. That positive ordering proof, not any
+// NotFound, is what authorizes the no-witness retirement below (see
+// retireZeroWitnessCheckpointOperation): it requires the complete binding
+// carrying the canonical directory, a live handler-owned source, and an
+// instance the API positively reports as Running, before AND after the exact
+// directory claim. A missing runtime state, a corrupt record, a different
+// generation, a dead or replaced source, a VM that is not Running, and a
+// foreign, corrupt, symlinked, or stray-holding directory are all refused
+// without a write. An empty or noncanonical binding directory keeps the
+// historical behavior — NotFound and nothing written.
 func (handler *Handler) AbortCheckpointOperation(
 	ctx context.Context,
 	sandboxID string,
 	binding runtimecore.CheckpointOperationBinding,
 ) error {
+	// An incomplete binding is refused before ANY lookup: the cold lookup
+	// below can otherwise map and recover an incarnation — lineage reset,
+	// recovery monitors, a recorded-process stop — only for the request to
+	// be refused afterwards. The recovery and acknowledgment paths keep
+	// their own inside-the-lock completeness checks.
+	if binding.OperationID == "" || binding.RequestDigest == "" ||
+		binding.SourceGeneration == "" {
+		return fmt.Errorf(
+			"abort of a checkpoint operation of Firecracker sandbox %s carries an incomplete binding: %w",
+			sandboxID, errord.ErrInvalidArgument,
+		)
+	}
+	// A canonical binding directory is what makes the zero-witness retirement
+	// below possible; without it the abort keeps its historical answer for a
+	// missing witness.
+	zeroWitnessDirectory := canonicalCheckpointOperationBindingDir(binding.CheckpointDir)
 	handler.mu.RLock()
 	instance := handler.instances[sandboxID]
 	handler.mu.RUnlock()
 	if instance == nil {
-		record, err := handler.verifyCheckpointOperationColdState(sandboxID, binding)
-		if err != nil {
-			return err
+		state, coldErr := handler.readValidatedColdState(sandboxID)
+		if coldErr != nil {
+			return coldErr
 		}
-		if err := refuseAbortablePhase(sandboxID, record); err != nil {
-			return err
-		}
-		// The identity and new-abort seal boundaries also hold before any
-		// cold recovery side effect: a drifted or sealed intent must not run
-		// recovery only to be refused under the lock.
-		if err := handler.verifyCheckpointOperationAbortScope(sandboxID, record); err != nil {
-			return err
-		}
-		if record.Phase == firecrackerCheckpointOperationPhaseIntent {
-			if err := refuseAbortCheckpointOperationSealedIntent(sandboxID, record); err != nil {
+		if !(zeroWitnessDirectory != "" && state.CheckpointOperation.isZero()) {
+			record, err := matchCheckpointOperationWitness(sandboxID, binding, state)
+			if err != nil {
 				return err
+			}
+			if err := verifyCheckpointOperationWitnessScope(sandboxID, record); err != nil {
+				return err
+			}
+			if err := refuseAbortablePhase(sandboxID, record); err != nil {
+				return err
+			}
+			// The identity and new-abort seal boundaries also hold before any
+			// cold recovery side effect: a drifted or sealed intent must not
+			// run recovery only to be refused under the lock.
+			if err := handler.verifyCheckpointOperationAbortScope(sandboxID, record); err != nil {
+				return err
+			}
+			if record.Phase == firecrackerCheckpointOperationPhaseIntent {
+				if err := refuseAbortCheckpointOperationSealedIntent(sandboxID, record); err != nil {
+					return err
+				}
 			}
 		}
 	}
-	instance, err := handler.lookupInstance(sandboxID)
+	// The generation-expecting lookup keeps the cold path a pure observation
+	// on a mismatch: a state whose generation differs from the binding is
+	// refused before recoverState can reset the lineage, persist, start
+	// recovery monitors, or stop a recorded process. The hot path returns the
+	// mapped instance directly and the generation is re-verified under the
+	// operation lock below.
+	instance, err := handler.lookupInstanceExpected(sandboxID, binding.SourceGeneration)
 	if err != nil {
 		return err
 	}
@@ -1480,6 +1530,11 @@ func (handler *Handler) AbortCheckpointOperation(
 	state := instance.snapshot()
 	record, err := matchCheckpointOperationWitness(sandboxID, binding, state)
 	if err != nil {
+		if record.isZero() && errors.Is(err, errord.ErrNotFound) && zeroWitnessDirectory != "" {
+			return handler.retireZeroWitnessCheckpointOperation(
+				ctx, instance, sandboxID, binding, zeroWitnessDirectory,
+			)
+		}
 		return err
 	}
 	if err := refuseAbortablePhase(sandboxID, record); err != nil {
@@ -1533,13 +1588,272 @@ func (handler *Handler) AbortCheckpointOperation(
 	return handler.resumeCheckpointOperationForAbort(ctx, instance, record)
 }
 
+// canonicalCheckpointOperationBindingDir accepts only the canonical absolute
+// non-root directory form the service records, and answers "" for everything
+// else — the empty binding of older internal callers and any noncanonical
+// string alike. An empty answer disables the no-witness retirement: it adds
+// no directory evidence and must never be read as a statement about the
+// directory.
+func canonicalCheckpointOperationBindingDir(directory string) string {
+	if directory == "" {
+		return ""
+	}
+	canonical := filepath.Clean(directory)
+	if canonical != directory || !filepath.IsAbs(canonical) ||
+		canonical == string(filepath.Separator) {
+		return ""
+	}
+	return canonical
+}
+
+// requireFirecrackerInstanceRunning positively proves, through the instance
+// API the VMM itself answers, that the source of sandboxID is the Running
+// MicroVM. A transport failure, a non-200 answer, an unusable body, a foreign
+// instance id, or any state other than Running is a refusal: reconciliation
+// decisions are never made from a state that could not be read or is not
+// exactly the one required.
+func requireFirecrackerInstanceRunning(
+	ctx context.Context,
+	api *firecrackerAPI,
+	sandboxID string,
+) error {
+	info, err := api.instanceInfo(ctx)
+	if err != nil {
+		return fmt.Errorf(
+			"read the Firecracker instance state of sandbox %s: %w; refusing to decide from an unreadable source state: %w",
+			sandboxID, err, errord.ErrFailedPrecondition,
+		)
+	}
+	if info.ID != sandboxID {
+		return fmt.Errorf(
+			"the Firecracker API of sandbox %s reports instance id %s: %w",
+			sandboxID, info.ID, errord.ErrFailedPrecondition,
+		)
+	}
+	if info.State != firecrackerInstanceInfoStateRunning {
+		return fmt.Errorf(
+			"the Firecracker instance of sandbox %s is %s, not Running: %w",
+			sandboxID, info.State, errord.ErrFailedPrecondition,
+		)
+	}
+	return nil
+}
+
+// retireZeroWitnessCheckpointOperation retires the one identified-checkpoint
+// crash shape no witness record describes: the operation entered the runtime
+// and possibly took its output directory claim, but died before the durable
+// intent write landed — or the intent write failed before any side effect
+// ran. The caller holds the instance operation lock and has already refused
+// incomplete bindings and established, through the generation-expecting
+// lookup, that the durable state describes the exact admitted incarnation;
+// this function re-verifies the zero witness under the lock and then every
+// further gate, fail-closed and with no state write before the final one:
+//
+//   - the state's source generation equals the binding's, the incarnation is
+//     configured and not exited, and the recorded source process is the live
+//     executable this handler owns under its recorded API socket;
+//   - the exact source birth is PINNED (pidfd) before anything else happens
+//     and re-confirmed against the same pinned handle after the directory
+//     claim, so a PID reuse between the gates can never substitute a
+//     different process for the one whose liveness was proven;
+//   - the instance API positively answers GET / with this sandbox's id in
+//     the Running state — before the claim and again after it;
+//   - the output directory is claimed or re-entered through the durable,
+//     descriptor-anchored claim protocol: a missing leaf is created and
+//     claimed, an empty reserved directory is claimed, and an exact
+//     claim-only directory is re-entered — but the retirement additionally
+//     requires the claimed directory to hold EXACTLY its own claim, because
+//     with no durable intent no layout component can legitimately sit there.
+//     A foreign, corrupt, or symlinked claim, any other entry, and a
+//     directory replaced underneath the acquisition are refused.
+//
+// The claim acquired here is a tombstone that stays retained even when a
+// later gate refuses or the final persist fails; only the successful path
+// additionally writes a schema-valid version-3 `aborted` record from the
+// pinned birth and the directory identity — in memory before the persist, so
+// an ambiguous write leaves this daemon's evidence gate in force exactly like
+// the intent and aborting writes do — and the retry re-persists before
+// reporting success. Nothing else ever happens: no resume, no guest abort
+// message, no artifact read or delete, no incremental-lineage change.
+func (handler *Handler) retireZeroWitnessCheckpointOperation(
+	ctx context.Context,
+	instance *firecrackerInstance,
+	sandboxID string,
+	binding runtimecore.CheckpointOperationBinding,
+	directory string,
+) error {
+	state := instance.snapshot()
+	if !state.CheckpointOperation.isZero() {
+		return fmt.Errorf(
+			"Firecracker sandbox %s gained checkpoint operation evidence under the no-witness retirement of operation %s: %w",
+			sandboxID, binding.OperationID, errord.ErrFailedPrecondition,
+		)
+	}
+	if err := verifyCheckpointExpectedGeneration(
+		sandboxID, binding.SourceGeneration, state.Generation,
+	); err != nil {
+		return err
+	}
+	// A source that already exited, or an incarnation whose configuration
+	// never completed, is not a live Running source whose zero witness could
+	// prove anything: refuse before any directory work.
+	if state.Exited || !state.Configured {
+		return fmt.Errorf(
+			"Firecracker sandbox %s is not a configured live source (exited=%v configured=%v); the no-witness retirement of operation %s refuses without touching the output directory: %w",
+			sandboxID, state.Exited, state.Configured, binding.OperationID,
+			errord.ErrFailedPrecondition,
+		)
+	}
+	identity, err := captureFirecrackerVMMBirthIdentity(state)
+	if err != nil {
+		return fmt.Errorf(
+			"capture the source identity of Firecracker sandbox %s for the no-witness retirement of operation %s: %w; no witness was written and the output directory was not touched: %w",
+			sandboxID, binding.OperationID, err, errord.ErrFailedPrecondition,
+		)
+	}
+	// Pin the exact birth for the whole retirement. The pidfd holds the
+	// process identity across both instance-state checks and the directory
+	// claim, so every later re-confirmation — not a second path-based process
+	// lookup, which a PID reuse could satisfy — proves the SAME process whose
+	// liveness was established here.
+	fd, err := pinAliveFirecrackerProcessBirth(identity.pid, identity.startTime)
+	if err != nil {
+		return fmt.Errorf(
+			"pin the source of the no-witness retirement of operation %s of Firecracker sandbox %s before claiming its directory: %w; no witness was written and the output directory was not touched: %w",
+			binding.OperationID, sandboxID, err, errord.ErrFailedPrecondition,
+		)
+	}
+	defer unix.Close(fd)
+	// Verify the executable and command-line ownership only while the captured
+	// birth is pinned, then immediately prove that the PID still denotes that
+	// same birth. Checking the pathname identity before capturing starttime
+	// would leave a PID-reuse window in which a replacement VMM could become
+	// the identity this retirement records.
+	if !firecrackerProcessMatches(state.PID, handler.binary, state.APIPath, state.ID) {
+		return fmt.Errorf(
+			"Firecracker sandbox %s source pid %d is not the live executable this handler owns at %s; the no-witness retirement of operation %s refuses without touching the output directory: %w",
+			sandboxID, state.PID, state.APIPath, binding.OperationID,
+			errord.ErrFailedPrecondition,
+		)
+	}
+	if err := confirmPinnedFirecrackerProcessBirth(identity.pid, identity.startTime, fd); err != nil {
+		return fmt.Errorf(
+			"re-confirm the pinned source of the no-witness retirement of operation %s of Firecracker sandbox %s after verifying its executable identity: %w; no witness was written and the output directory was not touched: %w",
+			binding.OperationID, sandboxID, err, errord.ErrFailedPrecondition,
+		)
+	}
+	api := newFirecrackerAPI(state.APIPath)
+	if err := requireFirecrackerInstanceRunning(ctx, api, sandboxID); err != nil {
+		return fmt.Errorf(
+			"prove the source of the no-witness retirement of operation %s is Running before claiming its directory: %w; no witness was written and the output directory was not touched",
+			binding.OperationID, err,
+		)
+	}
+	directoryDev, directoryInode, err := claimFirecrackerCheckpointDirectory(
+		directory, sandboxID, binding,
+	)
+	if err != nil {
+		return fmt.Errorf(
+			"claim the output directory of the zero-witness checkpoint operation %s of Firecracker sandbox %s: %w; no witness was written",
+			binding.OperationID, sandboxID, err,
+		)
+	}
+	// The claim is durable: from here it is a retained tombstone even when a
+	// later gate refuses. The zero-witness shape admits a directory holding
+	// exactly its own claim and nothing else — no durable intent means no
+	// layout component can legitimately sit beside it.
+	claimDir, reopenedDev, reopenedInode, openErr := openFirecrackerClaimDirFD(directory)
+	if openErr != nil {
+		return fmt.Errorf(
+			"re-open the claimed output of the zero-witness checkpoint operation %s of Firecracker sandbox %s: %w; the claim is retained as the directory's tombstone and no witness was written",
+			binding.OperationID, sandboxID, openErr,
+		)
+	}
+	defer claimDir.Close()
+	if reopenedDev != directoryDev || reopenedInode != directoryInode {
+		return fmt.Errorf(
+			"the output directory of the zero-witness checkpoint operation %s of Firecracker sandbox %s was replaced after it was claimed (claimed dev=%d inode=%d, reopened dev=%d inode=%d): %w; the original claim is retained as its tombstone and no witness was written",
+			binding.OperationID, sandboxID, directoryDev, directoryInode,
+			reopenedDev, reopenedInode, errord.ErrFailedPrecondition,
+		)
+	}
+	if claimed, stray, scanErr := scanFirecrackerClaimEntries(claimDir, directory); scanErr != nil {
+		return fmt.Errorf(
+			"inspect the claimed output of the zero-witness checkpoint operation %s of Firecracker sandbox %s: %w; the claim is retained as the directory's tombstone and no witness was written",
+			binding.OperationID, sandboxID, scanErr,
+		)
+	} else if !claimed || stray > 0 {
+		return fmt.Errorf(
+			"the claimed output of the zero-witness checkpoint operation %s of Firecracker sandbox %s holds %d non-claim entries beside its claim; a directory that is not exactly claim-only can never be proven side-effect free: %w; the claim is retained as the directory's tombstone and no witness was written",
+			binding.OperationID, sandboxID, stray, errord.ErrFailedPrecondition,
+		)
+	}
+	// Re-prove the PINNED birth and the Running state against what the claim
+	// just did to the world.
+	if err := confirmPinnedFirecrackerProcessBirth(identity.pid, identity.startTime, fd); err != nil {
+		return fmt.Errorf(
+			"re-confirm the pinned source of the no-witness retirement of operation %s of Firecracker sandbox %s after claiming its directory: %w; the claim is retained as the directory's tombstone and no witness was written",
+			binding.OperationID, sandboxID, err,
+		)
+	}
+	if err := requireFirecrackerInstanceRunning(ctx, api, sandboxID); err != nil {
+		return fmt.Errorf(
+			"prove the source of the no-witness retirement of operation %s is still Running after claiming its directory: %w; the claim is retained as the directory's tombstone and no witness was written",
+			binding.OperationID, err,
+		)
+	}
+	if err := verifyFirecrackerClaimPathIdentity(directory, directoryDev, directoryInode); err != nil {
+		return fmt.Errorf(
+			"re-confirm the output directory of the zero-witness checkpoint operation %s of Firecracker sandbox %s before recording its abort: %w; the original claim is retained as its tombstone and no witness was written",
+			binding.OperationID, sandboxID, err,
+		)
+	}
+	aborted := firecrackerCheckpointOperationRecord{
+		Version:          firecrackerCheckpointOperationRecordVersion3,
+		Phase:            firecrackerCheckpointOperationPhaseAborted,
+		OperationID:      binding.OperationID,
+		RequestDigest:    binding.RequestDigest,
+		SourceGeneration: state.Generation,
+		SandboxID:        state.ID,
+		Directory:        directory,
+		DirectoryDev:     directoryDev,
+		DirectoryInode:   directoryInode,
+		VMMPID:           identity.pid,
+		VMMStartTime:     identity.startTime,
+		VMMBootID:        identity.bootID,
+		VMMAPIPath:       state.APIPath,
+		Uffd:             state.Uffd,
+	}
+	if err := validateFirecrackerCheckpointOperationRecord(aborted); err != nil {
+		return fmt.Errorf(
+			"assemble the aborted witness of the zero-witness checkpoint operation %s of Firecracker sandbox %s: %w; the claim is retained as the directory's tombstone and no witness was written",
+			binding.OperationID, sandboxID, err,
+		)
+	}
+	// In memory before the write, so an ambiguous persist leaves the evidence
+	// gate binding this daemon; the retry re-persists before success.
+	instance.setCheckpointOperation(aborted)
+	if err := handler.persistInstance(instance); err != nil {
+		return fmt.Errorf(
+			"persist the aborted witness of the zero-witness checkpoint operation %s of Firecracker sandbox %s: %w; no source effect ran, the directory claim is retained as its tombstone, the in-memory constraint holds, and the retry must re-persist before success",
+			binding.OperationID, sandboxID, err,
+		)
+	}
+	return nil
+}
+
 // resumeCheckpointOperationForAbort performs the abort's source handback for
-// an `aborting` witness: prove the exact recorded birth identity live, resume
-// the source, release the guest checkpoint error handoff, re-prove the same
-// birth still live, invalidate the incremental lineage, and only then make
-// the `aborted` fact durable. Every failure returns an explicit error with
-// the `aborting` evidence retained and never claims the source was resumed
-// when that is unproven.
+// an `aborting` witness: prove the exact recorded birth identity live, drive
+// the source to Running exactly as the instance API reports it — resuming
+// only a Paused source, skipping an already-Running one, and refusing every
+// other state — release the guest checkpoint error handoff, re-prove the same
+// pinned birth and a Running instance, invalidate the incremental lineage,
+// and only then make the `aborted` fact durable. Every failure returns an
+// explicit error with the `aborting` evidence retained and never claims the
+// source was resumed when that is unproven. The state-driven handback is what
+// makes the retry idempotent: a retry after a landed resume observes Running
+// and does not resume again, and a retry after a failed one observes the
+// still-Paused state and resumes it once more.
 func (handler *Handler) resumeCheckpointOperationForAbort(
 	ctx context.Context,
 	instance *firecrackerInstance,
@@ -1555,17 +1869,55 @@ func (handler *Handler) resumeCheckpointOperationForAbort(
 	}
 	defer unix.Close(fd)
 	api := newFirecrackerAPI(instance.snapshot().APIPath)
-	if err := api.resume(ctx); err != nil {
+	// The instance's own state decides the handback. A Paused source — the
+	// ordinary crash shape after the durable intent — is resumed exactly once
+	// here; a Running one — the window between the durable intent and the
+	// pause request, or a resume whose reply was lost — is left untouched,
+	// because resuming a running MicroVM is an error, not a no-op. Any other
+	// state, and any state that cannot be positively read, refuses: the
+	// handback never guesses.
+	info, err := api.instanceInfo(ctx)
+	if err != nil {
 		return fmt.Errorf(
-			"resume Firecracker sandbox %s for the abort of checkpoint operation %s: %w; the resumption is unconfirmed, the evidence is retained, and the abort must be retried",
+			"read the Firecracker instance state of sandbox %s for the abort of checkpoint operation %s: %w; the source's resumption is unproven, the evidence is retained, and the abort must be retried",
 			sandboxID, record.OperationID, err,
 		)
 	}
-	// Guest release through the retryable abort message: the full record
-	// binding lets the guest agent deduplicate a retry after a lost reply,
-	// which the legacy one-shot error outcome cannot. An agent that predates
-	// the message rejects it, and this path has no legacy fallback — the
-	// abort simply stays retryable with its evidence retained.
+	if info.ID != sandboxID {
+		return fmt.Errorf(
+			"the Firecracker API of sandbox %s reports instance id %s for the abort of checkpoint operation %s: %w; the evidence is retained",
+			sandboxID, info.ID, record.OperationID, errord.ErrFailedPrecondition,
+		)
+	}
+	switch info.State {
+	case firecrackerInstanceInfoStatePaused:
+		if err := api.resume(ctx); err != nil {
+			return fmt.Errorf(
+				"resume the paused Firecracker sandbox %s for the abort of checkpoint operation %s: %w; the resumption is unconfirmed, the evidence is retained, and the abort must be retried",
+				sandboxID, record.OperationID, err,
+			)
+		}
+		if err := requireFirecrackerInstanceRunning(ctx, api, sandboxID); err != nil {
+			return fmt.Errorf(
+				"prove the resumed Firecracker sandbox %s is Running for the abort of checkpoint operation %s: %w; the evidence is retained and the abort must be retried",
+				sandboxID, record.OperationID, err,
+			)
+		}
+	case firecrackerInstanceInfoStateRunning:
+		// Already running: no resume request, exactly as a retry after a
+		// landed resume must observe.
+	default:
+		return fmt.Errorf(
+			"the Firecracker instance of sandbox %s is %s, not Paused or Running, for the abort of checkpoint operation %s: %w; the evidence is retained",
+			sandboxID, info.State, record.OperationID, errord.ErrFailedPrecondition,
+		)
+	}
+	// Guest release through the retryable abort message — always, whether or
+	// not a resume ran: the full record binding lets the guest agent
+	// deduplicate a retry after a lost reply, which the legacy one-shot error
+	// outcome cannot. An agent that predates the message rejects it, and this
+	// path has no legacy fallback — the abort simply stays retryable with its
+	// evidence retained.
 	if err := requestFirecrackerAgent(
 		ctx,
 		instance.snapshot().VsockPath,
@@ -1573,7 +1925,7 @@ func (handler *Handler) resumeCheckpointOperationForAbort(
 		firecrackerproto.CheckpointAbortRequest{OperationID: record.OperationID, RequestDigest: record.RequestDigest, SourceGeneration: record.SourceGeneration},
 	); err != nil {
 		return fmt.Errorf(
-			"release Firecracker sandbox %s after the abort of checkpoint operation %s: %w; the source was resumed but the guest error handoff is unconfirmed, the evidence is retained, and the abort must be retried",
+			"release Firecracker sandbox %s after the abort of checkpoint operation %s: %w; the source is Running but the guest error handoff is unconfirmed, the evidence is retained, and the abort must be retried",
 			sandboxID, record.OperationID, err,
 		)
 	}
@@ -1581,6 +1933,12 @@ func (handler *Handler) resumeCheckpointOperationForAbort(
 		return fmt.Errorf(
 			"re-confirm the resumed source of aborting checkpoint operation %s of Firecracker sandbox %s: %w; the source's continued resumption is unproven and the evidence is retained",
 			record.OperationID, sandboxID, err,
+		)
+	}
+	if err := requireFirecrackerInstanceRunning(ctx, api, sandboxID); err != nil {
+		return fmt.Errorf(
+			"re-prove the resumed Firecracker sandbox %s is Running after the guest release of checkpoint operation %s: %w; the evidence is retained",
+			sandboxID, record.OperationID, err,
 		)
 	}
 	// The failed operation may have disturbed the VMM's dirty-page ledger

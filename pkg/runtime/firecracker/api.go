@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -26,6 +27,11 @@ import (
 	"os"
 	"time"
 )
+
+// firecrackerInstanceInfoMaxBytes bounds one GET / (InstanceInfo) body. The
+// object is a fixed small set of short strings; anything larger is a protocol
+// surprise and the read fails closed.
+const firecrackerInstanceInfoMaxBytes = 4 << 10
 
 type firecrackerAPI struct {
 	socket string
@@ -71,6 +77,89 @@ func (api *firecrackerAPI) put(ctx context.Context, path string, value any) erro
 
 func (api *firecrackerAPI) patch(ctx context.Context, path string, value any) error {
 	return api.request(ctx, http.MethodPatch, path, value)
+}
+
+// firecrackerInstanceInfoStateNotStarted and friends are the MicroVM states
+// the Firecracker API reports through GET / (InstanceInfo.state). The set is
+// deliberately closed: an answer outside it is a protocol surprise the caller
+// must refuse, never reinterpret.
+const (
+	firecrackerInstanceInfoStateNotStarted = "Not started"
+	firecrackerInstanceInfoStateRunning    = "Running"
+	firecrackerInstanceInfoStatePaused     = "Paused"
+)
+
+// firecrackerInstanceInfo is the bounded subset of the Firecracker InstanceInfo
+// object (GET /) the reconciliation paths consult: the configured machine ID
+// and the current MicroVM state. app_name and vmm_version are accepted but not
+// retained.
+type firecrackerInstanceInfo struct {
+	ID    string `json:"id"`
+	State string `json:"state"`
+}
+
+// instanceInfo reads GET / under the caller's context. The answer must be a
+// complete HTTP 200 whose body is one bounded JSON object carrying a nonempty
+// id and one of the known MicroVM states; anything else — a transport failure,
+// another status, an undecodable, truncated, oversized, or trailing body, a
+// missing field, or an unknown state — is an explicit error, because a
+// reconciliation that cannot positively read the source's state must refuse
+// instead of guessing it.
+func (api *firecrackerAPI) instanceInfo(ctx context.Context) (firecrackerInstanceInfo, error) {
+	request, err := http.NewRequestWithContext(
+		ctx, http.MethodGet, "http://localhost/", nil,
+	)
+	if err != nil {
+		return firecrackerInstanceInfo{}, err
+	}
+	response, err := api.client.Do(request)
+	if err != nil {
+		return firecrackerInstanceInfo{}, fmt.Errorf("Firecracker GET /: %w", err)
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(response.Body, firecrackerInstanceInfoMaxBytes+1))
+	if err != nil {
+		return firecrackerInstanceInfo{}, fmt.Errorf("Firecracker GET /: %w", err)
+	}
+	if response.StatusCode != http.StatusOK {
+		return firecrackerInstanceInfo{}, fmt.Errorf(
+			"Firecracker GET / returned %s: %s",
+			response.Status, bytes.TrimSpace(body),
+		)
+	}
+	if len(body) > firecrackerInstanceInfoMaxBytes {
+		return firecrackerInstanceInfo{}, fmt.Errorf(
+			"Firecracker GET / body exceeds %d bytes", firecrackerInstanceInfoMaxBytes,
+		)
+	}
+	var info firecrackerInstanceInfo
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	if err := decoder.Decode(&info); err != nil {
+		return firecrackerInstanceInfo{}, fmt.Errorf(
+			"Firecracker GET / body is not InstanceInfo JSON: %w", err,
+		)
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return firecrackerInstanceInfo{}, fmt.Errorf(
+			"Firecracker GET / body carries trailing content",
+		)
+	}
+	if info.ID == "" {
+		return firecrackerInstanceInfo{}, fmt.Errorf(
+			"Firecracker GET / body carries no instance id",
+		)
+	}
+	switch info.State {
+	case firecrackerInstanceInfoStateNotStarted,
+		firecrackerInstanceInfoStateRunning,
+		firecrackerInstanceInfoStatePaused:
+	default:
+		return firecrackerInstanceInfo{}, fmt.Errorf(
+			"Firecracker GET / reports unknown MicroVM state %q", info.State,
+		)
+	}
+	return info, nil
 }
 
 func (api *firecrackerAPI) request(

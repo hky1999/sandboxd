@@ -163,6 +163,25 @@ func (handler *Handler) Checkpoint(
 	operationDirectory := ""
 	var intentRecord firecrackerCheckpointOperationRecord
 	if !operation.IsZero() {
+		directory := filepath.Clean(config.Directory)
+		// The service may carry the canonical directory the operation was
+		// admitted under inside the binding. When it carries one, the
+		// directory this call received must be exactly it — a mismatch means
+		// the binding and the requested output describe different operations,
+		// and the runtime refuses before any side effect, claim included. The
+		// emptiness test must come before any cleaning: filepath.Clean("") is
+		// ".", and the empty binding directory is the older internal caller
+		// shape, which constrains nothing.
+		if operation.CheckpointDir != "" {
+			boundDirectory := canonicalCheckpointOperationBindingDir(operation.CheckpointDir)
+			if boundDirectory == "" || boundDirectory != directory {
+				return fmt.Errorf(
+					"identified checkpoint operation %s for Firecracker sandbox %s binds checkpoint directory %q, not the canonical output %s: %w",
+					operation.OperationID, sandboxID, operation.CheckpointDir, directory,
+					errord.ErrInvalidArgument,
+				)
+			}
+		}
 		// The persistent exclusive directory claim precedes EVERYTHING — the
 		// durable runtime intent below and every checkpoint side effect after
 		// it (layout, guest flush or shrink, pause, snapshot): it takes
@@ -170,7 +189,6 @@ func (handler *Handler) Checkpoint(
 		// final-path creation whose full binding and directory birth identity
 		// are durable before anything else observes the operation. A claim
 		// failure runs no source effect and leaves the directory untouched.
-		directory := filepath.Clean(config.Directory)
 		directoryDev, directoryInode, err := claimFirecrackerCheckpointDirectory(
 			directory, sandboxID, operation,
 		)

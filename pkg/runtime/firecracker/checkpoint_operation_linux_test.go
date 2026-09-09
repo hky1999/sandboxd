@@ -50,15 +50,28 @@ type fakeVMMAPICall struct {
 }
 
 // fakeFirecrackerAPI stands up a unix HTTP server speaking the subset of the
-// Firecracker API the checkpoint flow uses: PATCH /vm (pause/resume) and PUT
+// Firecracker API the checkpoint flow uses: GET / (InstanceInfo), PATCH /vm
+// (pause/resume) with the real MicroVM state machine, and PUT
 // /snapshot/create (which, like the real VMM, writes the component files the
 // flow then seals). Every call is recorded so tests can prove flow ordering —
-// in particular that a source was paused once and never resumed.
+// in particular that a source was paused once and resumed only from Paused,
+// never re-resumed while Running.
 type fakeFirecrackerAPI struct {
 	t *testing.T
 
 	mu    sync.Mutex
 	calls []fakeVMMAPICall
+	// vmState is the MicroVM state GET / reports and PATCH /vm mutates. It
+	// starts Running — the state every fixture's live source is in — and only
+	// legal transitions move it: Paused from Running, Resumed from Paused.
+	// Every other transition answers 400 exactly like the real VMM, so a
+	// runtime bug that resumes a running source fails its test loudly.
+	vmState string
+	// instanceID is the id GET / reports; the fixture binds it to the sandbox
+	// ID the way vmmCommand's --id argument does.
+	instanceID string
+	// failInstanceInfo makes GET / answer 500, the unreadable-source shape.
+	failInstanceInfo bool
 	// onSnapshotCreate runs exactly once inside the FIRST snapshot create
 	// request, before its reply: the deterministic injection point between
 	// the durable intent and the prepared promotion write. The hook must not
@@ -71,7 +84,7 @@ type fakeFirecrackerAPI struct {
 
 func startFakeFirecrackerAPI(t *testing.T, socket string) *fakeFirecrackerAPI {
 	t.Helper()
-	fake := &fakeFirecrackerAPI{t: t}
+	fake := &fakeFirecrackerAPI{t: t, vmState: firecrackerInstanceInfoStateRunning}
 	listener, err := net.Listen("unix", socket)
 	if err != nil {
 		t.Fatal(err)
@@ -85,6 +98,52 @@ func startFakeFirecrackerAPI(t *testing.T, socket string) *fakeFirecrackerAPI {
 		_ = os.Remove(socket)
 	})
 	return fake
+}
+
+// setInstanceID binds the id GET / reports. Fixtures set it to the sandbox ID
+// so the production instance-id check has the real shape to verify.
+func (fake *fakeFirecrackerAPI) setInstanceID(id string) {
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	fake.instanceID = id
+}
+
+// pause moves the fake MicroVM to Paused — the state a source is in after the
+// checkpoint flow's pause request — so an abort fixture can model the
+// post-pause crash window exactly. It reports the state actually left behind;
+// pausing an already-paused source reports the refusal the real VMM gives.
+func (fake *fakeFirecrackerAPI) pause() error {
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if fake.vmState != firecrackerInstanceInfoStateRunning {
+		return fmt.Errorf("fake VMM is %s, cannot pause", fake.vmState)
+	}
+	fake.vmState = firecrackerInstanceInfoStatePaused
+	return nil
+}
+
+// setInstanceInfoFailure toggles GET / between serving InstanceInfo and
+// answering 500, the shape of an unreadable source state.
+func (fake *fakeFirecrackerAPI) setInstanceInfoFailure(fail bool) {
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	fake.failInstanceInfo = fail
+}
+
+// forceVMState moves the fake MicroVM to an arbitrary raw state, including
+// states outside the legal transition machine — the shape an unknown or
+// transitional VMM state presents to the reconciliation paths.
+func (fake *fakeFirecrackerAPI) forceVMState(state string) {
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	fake.vmState = state
+}
+
+// currentVMState reports the MicroVM state right now.
+func (fake *fakeFirecrackerAPI) currentVMState() string {
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	return fake.vmState
 }
 
 // snapshotHookError returns the injection hook's result for the test
@@ -113,6 +172,25 @@ func (fake *fakeFirecrackerAPI) serve(
 	request *http.Request,
 ) {
 	defer request.Body.Close()
+	if request.Method == http.MethodGet && request.URL.Path == "/" {
+		fake.mu.Lock()
+		id, state, fail := fake.instanceID, fake.vmState, fake.failInstanceInfo
+		fake.calls = append(fake.calls, fakeVMMAPICall{Method: request.Method, Path: request.URL.Path})
+		fake.mu.Unlock()
+		if fail {
+			writer.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		writer.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(writer).Encode(map[string]string{
+			"app_name":    "Firecracker",
+			"id":          id,
+			"state":       state,
+			"vmm_version": "1.9.0-fake",
+		})
+		return
+	}
 	var payload map[string]any
 	if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
 		writer.WriteHeader(http.StatusBadRequest)
@@ -121,6 +199,32 @@ func (fake *fakeFirecrackerAPI) serve(
 	call := fakeVMMAPICall{Method: request.Method, Path: request.URL.Path}
 	if request.Method == http.MethodPatch && request.URL.Path == "/vm" {
 		call.State, _ = payload["state"].(string)
+		fake.mu.Lock()
+		current := fake.vmState
+		var next string
+		switch call.State {
+		case "Paused":
+			// The real VMM pauses only a running instance.
+			if current == firecrackerInstanceInfoStateRunning {
+				next = firecrackerInstanceInfoStatePaused
+			}
+		case "Resumed":
+			// The real VMM resumes only a paused instance; resuming a
+			// running one is an error, not a no-op.
+			if current == firecrackerInstanceInfoStatePaused {
+				next = firecrackerInstanceInfoStateRunning
+			}
+		}
+		if next == "" {
+			fake.mu.Unlock()
+			writer.WriteHeader(http.StatusBadRequest)
+			_, _ = writer.Write([]byte(fmt.Sprintf(
+				`{"error":"invalid transition %s from %s"}`, call.State, current,
+			)))
+			return
+		}
+		fake.vmState = next
+		fake.mu.Unlock()
 	}
 	if request.Method == http.MethodPut && request.URL.Path == "/snapshot/create" {
 		for _, field := range []string{"snapshot_path", "mem_file_path"} {
@@ -231,6 +335,7 @@ func checkpointOperationFixture(
 	t.Cleanup(func() { close(handler.checkpointWriteback.queue) })
 	spawnCheckpointOperationChild(t, handler, instance)
 	api := startFakeFirecrackerAPI(t, instance.state.APIPath)
+	api.setInstanceID(instance.state.ID)
 	if err := handler.persistInstance(instance); err != nil {
 		t.Fatal(err)
 	}

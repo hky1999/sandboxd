@@ -22,6 +22,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 
 	"github.com/inclusionAI/sandboxd/pkg/checkpointroot"
@@ -144,56 +145,13 @@ func validateFirecrackerCheckpointClaim(claim firecrackerCheckpointClaim) error 
 	return nil
 }
 
-// openFirecrackerClaimDirFD opens the canonical output directory WITHOUT
-// following a symlink at the final component and returns the open descriptor
-// plus the birth identity the descriptor itself carries — never a stat of the
-// path taken earlier. Every claim read, creation, and sync is then issued
-// relative to this descriptor, so a path swapped between the open and the
-// claim operations cannot redirect them.
+// openFirecrackerClaimDirFD opens an existing canonical output directory by
+// walking every pathname component without following symbolic links. It never
+// creates a missing leaf.
 func openFirecrackerClaimDirFD(
 	canonical string,
 ) (*os.File, uint64, uint64, error) {
-	fd, err := unix.Open(
-		canonical,
-		unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC,
-		0,
-	)
-	if err != nil {
-		// O_NOFOLLOW on a symlink reports ELOOP, but paired with O_DIRECTORY
-		// some filesystems report ENOTDIR instead; classify through Lstat so
-		// the refusal names the actual shape at the path.
-		if errors.Is(err, unix.ELOOP) || errors.Is(err, unix.ENOTDIR) {
-			if info, statErr := os.Lstat(canonical); statErr == nil &&
-				info.Mode()&os.ModeSymlink != 0 {
-				return nil, 0, 0, fmt.Errorf(
-					"Firecracker checkpoint output %s is a symbolic link; a link is refused, never resolved: %w",
-					canonical, errord.ErrFailedPrecondition,
-				)
-			}
-			return nil, 0, 0, fmt.Errorf(
-				"Firecracker checkpoint output %s is not a directory", canonical,
-			)
-		}
-		return nil, 0, 0, fmt.Errorf(
-			"open Firecracker checkpoint output %s: %w", canonical, err,
-		)
-	}
-	dir := os.NewFile(uintptr(fd), canonical)
-	info, statErr := dir.Stat()
-	if statErr != nil {
-		dir.Close()
-		return nil, 0, 0, fmt.Errorf(
-			"inspect Firecracker checkpoint output %s: %w", canonical, statErr,
-		)
-	}
-	stat, ok := info.Sys().(*syscall.Stat_t)
-	if !ok {
-		dir.Close()
-		return nil, 0, 0, fmt.Errorf(
-			"Firecracker checkpoint output %s carries no unix directory identity", canonical,
-		)
-	}
-	return dir, uint64(stat.Dev), stat.Ino, nil
+	return openFirecrackerClaimDirAnchored(canonical, false)
 }
 
 // openFirecrackerClaimFileAt opens the claim file relative to the open
@@ -323,31 +281,15 @@ func readFirecrackerCheckpointClaim(
 // acquisition wrote lives in the descriptor's directory, and a different
 // object at the pathname must never be reported as claimed.
 func verifyFirecrackerClaimPathIdentity(canonical string, dev, inode uint64) error {
-	info, err := os.Lstat(canonical)
+	dir, gotDev, gotInode, err := openFirecrackerClaimDirFD(canonical)
 	if err != nil {
 		return fmt.Errorf(
-			"Firecracker checkpoint output %s can no longer be inspected after claiming it: %w; refusing fail-closed: %w",
+			"Firecracker checkpoint output %s can no longer be opened through its symlink-free path after claiming it: %w; refusing fail-closed: %w",
 			canonical, err, errord.ErrFailedPrecondition,
 		)
 	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		return fmt.Errorf(
-			"Firecracker checkpoint output %s became a symbolic link after it was claimed; a link is refused, never resolved: %w",
-			canonical, errord.ErrFailedPrecondition,
-		)
-	}
-	if !info.IsDir() {
-		return fmt.Errorf(
-			"Firecracker checkpoint output %s is no longer a directory after it was claimed: %w",
-			canonical, errord.ErrFailedPrecondition,
-		)
-	}
-	stat, ok := info.Sys().(*syscall.Stat_t)
-	var gotDev, gotInode uint64
-	if ok {
-		gotDev, gotInode = uint64(stat.Dev), stat.Ino
-	}
-	if !ok || gotDev != dev || gotInode != inode {
+	dir.Close()
+	if gotDev != dev || gotInode != inode {
 		return fmt.Errorf(
 			"Firecracker checkpoint output %s was replaced while it was being claimed (claimed dev=%d inode=%d, path now carries dev=%d inode=%d); a replaced output directory is never reported as claimed: %w",
 			canonical, dev, inode, gotDev, gotInode, errord.ErrFailedPrecondition,
@@ -356,15 +298,136 @@ func verifyFirecrackerClaimPathIdentity(canonical string, dev, inode uint64) err
 	return nil
 }
 
+// openFirecrackerClaimDirAnchored opens the canonical checkpoint output
+// directory through a descriptor-anchored walk: starting from a descriptor on
+// / itself, EVERY component is opened with openat(2) carrying
+// O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC, so no step of the acquisition resolves a
+// pathname through the kernel's symlink-following lookup. An intermediate
+// symbolic link — present from the start or swapped in while the acquisition
+// runs — can therefore neither redirect the walk nor receive a created leaf;
+// it is refused fail-closed by name. A missing FINAL component is the one
+// creation: it is mkdirat(2)'d relative to the walked parent descriptor, and
+// that same parent descriptor is fsynced, so the reservation entry is durable
+// exactly where it was created — never in a pathname-derived parent a swapped
+// intermediate component could point elsewhere. Missing intermediate
+// components are refusals (the service contract requires the parent to
+// already exist); a racing creator's EEXIST is fine, because the shared open
+// and the exclusivity of the claim decide ownership. The returned descriptor
+// anchors the leaf, and its own fstat supplies the birth identity the claim
+// records. createLeaf controls whether the final component may be created;
+// reads and witness verification always pass false.
+func openFirecrackerClaimDirAnchored(
+	canonical string,
+	createLeaf bool,
+) (*os.File, uint64, uint64, error) {
+	if filepath.Clean(canonical) != canonical || !filepath.IsAbs(canonical) ||
+		canonical == string(filepath.Separator) {
+		return nil, 0, 0, fmt.Errorf(
+			"checkpoint output %q is not an absolute non-root canonical directory path", canonical,
+		)
+	}
+	components := strings.Split(
+		strings.TrimPrefix(canonical, string(filepath.Separator)),
+		string(filepath.Separator),
+	)
+	if len(components) == 0 || components[0] == "" {
+		return nil, 0, 0, fmt.Errorf(
+			"checkpoint output %q is not an absolute non-root canonical directory path", canonical,
+		)
+	}
+	rootFD, err := unix.Open(
+		string(filepath.Separator),
+		unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0,
+	)
+	if err != nil {
+		return nil, 0, 0, fmt.Errorf(
+			"open the filesystem root to walk to Firecracker checkpoint output %s: %w", canonical, err,
+		)
+	}
+	parent := os.NewFile(uintptr(rootFD), string(filepath.Separator))
+	// fail closes the walked-so-far descriptor and formats the refusal.
+	fail := func(format string, args ...any) (*os.File, uint64, uint64, error) {
+		parent.Close()
+		return nil, 0, 0, fmt.Errorf(format, args...)
+	}
+	for index, component := range components {
+		fd, openErr := unix.Openat(
+			int(parent.Fd()), component,
+			unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0,
+		)
+		if openErr != nil && errors.Is(openErr, unix.ENOENT) &&
+			createLeaf && index == len(components)-1 {
+			// A fresh leaf is the one creation, relative to the walked
+			// parent descriptor.
+			if mkErr := unix.Mkdirat(int(parent.Fd()), component, 0700); mkErr != nil &&
+				!errors.Is(mkErr, unix.EEXIST) {
+				return fail("reserve Firecracker checkpoint output %s: %w", canonical, mkErr)
+			}
+			// The reservation entry itself must survive a crash for the
+			// recorded directory identity to stay meaningful: sync the parent
+			// DESCRIPTOR the entry was created in, never a path.
+			if syncErr := firecrackerClaimSyncDir(parent); syncErr != nil {
+				return fail("sync Firecracker checkpoint output reservation %s: %w", canonical, syncErr)
+			}
+			fd, openErr = unix.Openat(
+				int(parent.Fd()), component,
+				unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0,
+			)
+		}
+		if openErr != nil {
+			if errors.Is(openErr, unix.ELOOP) || errors.Is(openErr, unix.ENOTDIR) {
+				// O_NOFOLLOW on a symlink reports ELOOP, but paired with
+				// O_DIRECTORY some filesystems report ENOTDIR instead;
+				// classify through a no-follow fstatat relative to the walked
+				// parent so the refusal names the actual shape.
+				var stat unix.Stat_t
+				if statErr := unix.Fstatat(
+					int(parent.Fd()), component, &stat, unix.AT_SYMLINK_NOFOLLOW,
+				); statErr == nil && stat.Mode&syscall.S_IFMT == syscall.S_IFLNK {
+					return fail(
+						"Firecracker checkpoint output component %s of %s is a symbolic link; a link is refused, never resolved: %w",
+						component, canonical, errord.ErrFailedPrecondition,
+					)
+				}
+				return fail(
+					"Firecracker checkpoint output component %s of %s is not a directory: %w",
+					component, canonical, errord.ErrFailedPrecondition,
+				)
+			}
+			return fail(
+				"open Firecracker checkpoint output component %s of %s: %w",
+				component, canonical, openErr,
+			)
+		}
+		opened := os.NewFile(uintptr(fd), filepath.Join(parent.Name(), component))
+		parent.Close()
+		parent = opened
+	}
+	info, statErr := parent.Stat()
+	if statErr != nil {
+		return fail("inspect Firecracker checkpoint output %s: %w", canonical, statErr)
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fail(
+			"Firecracker checkpoint output %s carries no unix directory identity", canonical,
+		)
+	}
+	return parent, uint64(stat.Dev), stat.Ino, nil
+}
+
 // claimFirecrackerCheckpointDirectory acquires the persistent exclusive claim
 // on the caller-owned output directory of an identified operation, replacing
-// the weaker emptiness-only reservation. The directory is opened once with
-// O_DIRECTORY|O_NOFOLLOW and every claim operation — the pre-scan, the
-// creation, the read, the syncs, the post-create rescan — is anchored to that
-// descriptor, whose fstat supplies the birth identity the claim records; the
-// pathname is re-verified against the same identity before success, so a
-// replaced or deleted directory fails closed instead of being claimed against
-// a stale name. A NEW claim is created at its final component with
+// the weaker emptiness-only reservation. The directory is reached through the
+// descriptor-anchored component walk (openFirecrackerClaimDirAnchored) — no
+// intermediate symlink is ever resolved, and a missing leaf is created
+// relative to the walked parent — and is then opened as that one descriptor,
+// to which every claim operation — the pre-scan, the creation, the read, the
+// syncs, the post-create rescan — is anchored; the descriptor's fstat
+// supplies the birth identity the claim records, and the pathname is
+// re-verified against the same identity before success, so a replaced or
+// deleted directory fails closed instead of being claimed against a stale
+// name. A NEW claim is created at its final component with
 // O_CREATE|O_EXCL|O_NOFOLLOW — never a rename over a competitor — written in
 // full, fsynced, closed, and the directory fsynced, so the claim is durable
 // before the caller persists the runtime intent or runs any layout, guest
@@ -397,29 +460,7 @@ func claimFirecrackerCheckpointDirectory(
 			"checkpoint output %q is not an absolute non-root canonical directory path", directory,
 		)
 	}
-	if _, statErr := os.Lstat(canonical); statErr != nil {
-		if !os.IsNotExist(statErr) {
-			return 0, 0, fmt.Errorf(
-				"inspect Firecracker checkpoint output %s: %w", canonical, statErr,
-			)
-		}
-		// A fresh leaf: the parent must already exist, matching the service
-		// contract. A racing creator's EEXIST is fine — the shared open below
-		// and the exclusivity of the claim decide ownership.
-		if err := os.Mkdir(canonical, 0700); err != nil && !os.IsExist(err) {
-			return 0, 0, fmt.Errorf(
-				"reserve Firecracker checkpoint output %s: %w", canonical, err,
-			)
-		}
-		// The reservation entry itself must survive a crash for the recorded
-		// directory identity to stay meaningful.
-		if err := syncFirecrackerDirectory(filepath.Dir(canonical)); err != nil {
-			return 0, 0, fmt.Errorf(
-				"sync Firecracker checkpoint output reservation %s: %w", canonical, err,
-			)
-		}
-	}
-	dir, dev, inode, err := openFirecrackerClaimDirFD(canonical)
+	dir, dev, inode, err := openFirecrackerClaimDirAnchored(canonical, true)
 	if err != nil {
 		return 0, 0, err
 	}

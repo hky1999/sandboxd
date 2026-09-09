@@ -923,6 +923,53 @@ func TestReadClaimDirectoryRefusesSymlinkedDirectory(t *testing.T) {
 	}
 }
 
+// TestClaimReadersRefuseIntermediateSymlink proves every later claim read and
+// witness verification uses the same component-by-component no-follow walk as
+// acquisition. Moving an already claimed parent aside and linking the old
+// name back to it preserves the leaf inode, so a final-component-only open
+// would incorrectly accept this shape.
+func TestClaimReadersRefuseIntermediateSymlink(t *testing.T) {
+	base := t.TempDir()
+	parent := filepath.Join(base, "parent")
+	if err := os.Mkdir(parent, 0700); err != nil {
+		t.Fatal(err)
+	}
+	directory := filepath.Join(parent, "checkpoint")
+	if err := os.Mkdir(directory, 0700); err != nil {
+		t.Fatal(err)
+	}
+	binding := claimTestBinding("op-intermediate-read", "gen-intermediate-read")
+	binding.RequestDigest = claimTestDigest(binding.OperationID)
+	dev, inode, err := claimFirecrackerCheckpointDirectory(directory, "sandbox-a", binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := schemaTestV3Witness(firecrackerCheckpointOperationPhaseIntent)
+	record.OperationID = binding.OperationID
+	record.RequestDigest = binding.RequestDigest
+	record.SourceGeneration = binding.SourceGeneration
+	record.Directory = directory
+	record.DirectoryDev = dev
+	record.DirectoryInode = inode
+	record.SandboxID = "sandbox-a"
+
+	moved := filepath.Join(base, "moved")
+	if err := os.Rename(parent, moved); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(moved, parent); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := readFirecrackerCheckpointClaim(directory); !errors.Is(err, errord.ErrFailedPrecondition) ||
+		!containsAll(err.Error(), "symbolic link") {
+		t.Fatalf("claim read through an intermediate symlink = %v, want symlink refusal", err)
+	}
+	if err := verifyFirecrackerCheckpointDirectoryClaim("sandbox-a", record); !errors.Is(err, errord.ErrFailedPrecondition) || !containsAll(err.Error(), "symbolic link") {
+		t.Fatalf("witness verification through an intermediate symlink = %v, want symlink refusal", err)
+	}
+}
+
 // TestVerifyCheckpointOperationDirectoryClaimScopesToV3 proves the claim
 // verification is exactly the claim-bound schema's contract: a matching claim
 // verifies, a missing or drifted one refuses, and version-1/2 records verify
@@ -1036,4 +1083,101 @@ func TestVerifyCheckpointOperationDirectoryClaimScopesToV3(t *testing.T) {
 			t.Fatalf("v2 record must not consult the claim: %v", err)
 		}
 	})
+}
+
+// TestClaimDirectoryRefusesIntermediateSymlinkWalks proves the acquisition
+// never resolves a symbolic link at an intermediate component: a claim
+// addressed through a symlinked parent is refused by name, a missing leaf
+// behind such a parent is never created in the link's target, and an
+// existing directory behind such a parent is never claimed.
+func TestClaimDirectoryRefusesIntermediateSymlinkWalks(t *testing.T) {
+	base := t.TempDir()
+	realParent := filepath.Join(base, "real")
+	if err := os.Mkdir(realParent, 0700); err != nil {
+		t.Fatal(err)
+	}
+	linkedParent := filepath.Join(base, "link")
+	if err := os.Symlink(realParent, linkedParent); err != nil {
+		t.Fatal(err)
+	}
+	binding := claimTestBinding("op-symlink-walk", "gen-walk")
+	binding.RequestDigest = claimTestDigest("op-symlink-walk")
+
+	t.Run("missing leaf behind a symlinked parent", func(t *testing.T) {
+		_, _, err := claimFirecrackerCheckpointDirectory(
+			filepath.Join(linkedParent, "checkpoint"), "sandbox-walk", binding,
+		)
+		if err == nil || !containsAll(err.Error(), "symbolic link") {
+			t.Fatalf("claim through a symlinked parent = %v, want the symlink refusal", err)
+		}
+		// Nothing was created anywhere: neither behind the link's target nor
+		// beside it.
+		if entries, readErr := os.ReadDir(realParent); readErr != nil || len(entries) != 0 {
+			t.Fatalf("symlink refusal created %d entries in the link target: %v", len(entries), readErr)
+		}
+		if entries, readErr := os.ReadDir(base); readErr != nil || len(entries) != 2 {
+			t.Fatalf("symlink refusal created entries beside the link: %d %v", len(entries), readErr)
+		}
+	})
+	t.Run("existing directory behind a symlinked parent", func(t *testing.T) {
+		realDirectory := filepath.Join(realParent, "checkpoint")
+		if err := os.Mkdir(realDirectory, 0700); err != nil {
+			t.Fatal(err)
+		}
+		_, _, err := claimFirecrackerCheckpointDirectory(linkedParent, "sandbox-walk", binding)
+		if err == nil || !containsAll(err.Error(), "symbolic link") {
+			t.Fatalf("claim of a symlinked directory = %v, want the symlink refusal", err)
+		}
+		if _, statErr := os.Lstat(filepath.Join(realDirectory, firecrackerCheckpointClaimName())); !os.IsNotExist(statErr) {
+			t.Fatalf("symlink refusal wrote into the link target: %v", statErr)
+		}
+	})
+}
+
+// TestClaimDirectoryRefusesMissingIntermediateParent proves a missing
+// intermediate component is a refusal — the service contract requires the
+// parent to exist — and that nothing is created on the way to it.
+func TestClaimDirectoryRefusesMissingIntermediateParent(t *testing.T) {
+	base := t.TempDir()
+	binding := claimTestBinding("op-missing-parent", "gen-walk")
+	binding.RequestDigest = claimTestDigest("op-missing-parent")
+
+	_, _, err := claimFirecrackerCheckpointDirectory(
+		filepath.Join(base, "absent", "nested", "checkpoint"), "sandbox-walk", binding,
+	)
+	if err == nil || !containsAll(err.Error(), "absent") {
+		t.Fatalf("claim under a missing parent = %v, want the missing-component refusal", err)
+	}
+	if entries, readErr := os.ReadDir(base); readErr != nil || len(entries) != 0 {
+		t.Fatalf("missing-parent refusal created %d entries: %v", len(entries), readErr)
+	}
+}
+
+// TestClaimDirectoryCreatesDeepMissingLeaf proves the walk creates exactly
+// the missing FINAL component of an existing deep parent chain and leaves
+// the claim durably bound to the created leaf's birth identity.
+func TestClaimDirectoryCreatesDeepMissingLeaf(t *testing.T) {
+	base := t.TempDir()
+	deep := filepath.Join(base, "one", "two", "three")
+	if err := os.MkdirAll(deep, 0700); err != nil {
+		t.Fatal(err)
+	}
+	directory := filepath.Join(deep, "checkpoint")
+	binding := claimTestBinding("op-deep-leaf", "gen-walk")
+	binding.RequestDigest = claimTestDigest("op-deep-leaf")
+
+	dev, inode, err := claimFirecrackerCheckpointDirectory(directory, "sandbox-walk", binding)
+	if err != nil {
+		t.Fatalf("claim of a deep missing leaf = %v", err)
+	}
+	wantDev, wantInode := claimTestDirectoryStats(t, directory)
+	if dev != wantDev || inode != wantInode {
+		t.Fatalf("claimed identity (dev=%d inode=%d), directory carries (dev=%d inode=%d)",
+			dev, inode, wantDev, wantInode)
+	}
+	claim, readErr := readFirecrackerCheckpointClaim(directory)
+	if readErr != nil || claim.Directory != directory ||
+		claim.DirectoryDev != dev || claim.DirectoryInode != inode {
+		t.Fatalf("deep claim binding drifted: %+v %v", claim, readErr)
+	}
 }
