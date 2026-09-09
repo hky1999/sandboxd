@@ -79,6 +79,21 @@ func schemaTestV2Witness(phase string) firecrackerCheckpointOperationRecord {
 	return record
 }
 
+// schemaTestV3Witness builds a complete valid version-3 claim-bound witness
+// in the given phase: the full version-2 identity plus the sandbox identity
+// whose operation claimed the output directory. The sandbox ID is the fixed
+// identity checkpointPersistenceFixture maps, so the record also passes the
+// live binding match of the ack and recovery paths.
+func schemaTestV3Witness(phase string) firecrackerCheckpointOperationRecord {
+	record := schemaTestV2Witness(phase)
+	record.Version = firecrackerCheckpointOperationRecordVersion3
+	record.OperationID = "op-schema-3"
+	record.Directory = "/var/lib/sandboxd/checkpoints/op-schema-3"
+	record.VMMAPIPath = "/run/sandboxd/op-schema-3/api.sock"
+	record.SandboxID = "persist-test"
+	return record
+}
+
 // schemaTestOperationInstance maps a hot instance whose persisted state
 // matches the witness binding exactly (generation, pid, API path, uffd), so
 // AckCheckpointOperation and RecoverCheckpointOperation run past the binding
@@ -405,10 +420,10 @@ func TestCheckpointOperationSchemaV2RejectsIncompleteOrWrongIdentity(t *testing.
 
 // TestCheckpointOperationSchemaRejectsUnknownVersions proves an unknown
 // schema version is never reinterpreted — including version zero and any
-// version beyond the version-2 draft.
+// version beyond the version-3 claim-bound schema.
 func TestCheckpointOperationSchemaRejectsUnknownVersions(t *testing.T) {
 	for _, version := range []int{
-		0, -1, 3, firecrackerCheckpointOperationRecordVersion2 + 5,
+		0, -1, 4, firecrackerCheckpointOperationRecordVersion3 + 5,
 	} {
 		record := schemaTestV2Witness(firecrackerCheckpointOperationPhaseIntent)
 		record.Version = version
@@ -706,6 +721,158 @@ func TestRecoverCheckpointOperationRefusesAbortPhases(t *testing.T) {
 				t.Fatalf("refused recovery rewrote durable state:\nbefore: %s\nafter:  %s", before, after)
 			}
 		})
+	}
+}
+
+// TestCheckpointOperationSchemaV3AcceptsCompleteShapes proves every
+// version-3 phase validates in exactly one complete shape — the full
+// version-2 identity plus the sandbox identity — that the JSON carries the
+// sandbox_id key, and that the record survives a durable state round-trip.
+func TestCheckpointOperationSchemaV3AcceptsCompleteShapes(t *testing.T) {
+	for _, phase := range []string{
+		firecrackerCheckpointOperationPhasePrepared,
+		firecrackerCheckpointOperationPhaseCompleted,
+		firecrackerCheckpointOperationPhaseAcked,
+		firecrackerCheckpointOperationPhaseIntent,
+		firecrackerCheckpointOperationPhaseAborting,
+		firecrackerCheckpointOperationPhaseAborted,
+		firecrackerCheckpointOperationPhaseAbortAcked,
+	} {
+		t.Run(phase, func(t *testing.T) {
+			record := schemaTestV3Witness(phase)
+			if err := validateFirecrackerCheckpointOperationRecord(record); err != nil {
+				t.Fatalf("complete v3 %s witness rejected: %v", phase, err)
+			}
+			data, err := json.Marshal(record)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var fields map[string]json.RawMessage
+			if err := json.Unmarshal(data, &fields); err != nil {
+				t.Fatal(err)
+			}
+			if _, ok := fields["sandbox_id"]; !ok {
+				t.Fatalf("v3 %s JSON omits sandbox_id: %s", phase, data)
+			}
+			_, instance, _ := schemaTestOperationInstance(t, record)
+			disk, err := readFirecrackerState(instance.snapshot().BundlePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if disk.CheckpointOperation != record {
+				t.Fatalf("v3 %s witness drifted across the state round-trip: %+v", phase, disk.CheckpointOperation)
+			}
+			if disk.CheckpointOperation.SandboxID != record.SandboxID {
+				t.Fatalf("v3 %s witness lost its sandbox identity: %+v", phase, disk.CheckpointOperation)
+			}
+		})
+	}
+}
+
+// TestCheckpointOperationSchemaV3RejectsMissingSandboxIdentity proves the
+// claim-bound schema's own field is mandatory: a version-3 record without
+// the sandbox identity proves nothing about which operation claimed the
+// directory and is corruption.
+func TestCheckpointOperationSchemaV3RejectsMissingSandboxIdentity(t *testing.T) {
+	record := schemaTestV3Witness(firecrackerCheckpointOperationPhaseIntent)
+	record.SandboxID = ""
+	err := validateFirecrackerCheckpointOperationRecord(record)
+	if err == nil || !containsAll(err.Error(), "carries no sandbox identity") {
+		t.Fatalf("v3 record without sandbox identity = %v, want the missing-identity refusal", err)
+	}
+}
+
+// TestCheckpointOperationSchemaRejectsMixedSandboxIdentity proves no older
+// schema borrows the version-3 field: a version-1 or version-2 record
+// carrying a sandbox identity is corruption, never a richer schema in
+// disguise.
+func TestCheckpointOperationSchemaRejectsMixedSandboxIdentity(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		record firecrackerCheckpointOperationRecord
+	}{
+		{
+			name:   "v1 prepared",
+			record: schemaTestV1Witness(firecrackerCheckpointOperationPhasePrepared),
+		},
+		{
+			name:   "v2 intent",
+			record: schemaTestV2Witness(firecrackerCheckpointOperationPhaseIntent),
+		},
+		{
+			name:   "v2 completed",
+			record: schemaTestV2Witness(firecrackerCheckpointOperationPhaseCompleted),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.record.SandboxID = "persist-test"
+			err := validateFirecrackerCheckpointOperationRecord(tc.record)
+			if err == nil || !containsAll(err.Error(), "must not carry a sandbox identity") {
+				t.Fatalf("mixed-schema %s record = %v, want the sandbox-identity refusal", tc.name, err)
+			}
+		})
+	}
+}
+
+// TestCheckpointOperationSchemaV3RetentionAndRelease extends the retention
+// matrix to the claim-bound schema: every phase that owes an answer keeps the
+// evidence gate, and only a fully valid acknowledged record releases it.
+func TestCheckpointOperationSchemaV3RetentionAndRelease(t *testing.T) {
+	for _, phase := range []string{
+		firecrackerCheckpointOperationPhasePrepared,
+		firecrackerCheckpointOperationPhaseCompleted,
+		firecrackerCheckpointOperationPhaseIntent,
+		firecrackerCheckpointOperationPhaseAborting,
+		firecrackerCheckpointOperationPhaseAborted,
+	} {
+		if !schemaTestV3Witness(phase).retainsEvidence() {
+			t.Fatalf("v3 %s must retain evidence", phase)
+		}
+	}
+	for _, phase := range []string{
+		firecrackerCheckpointOperationPhaseAcked,
+		firecrackerCheckpointOperationPhaseAbortAcked,
+	} {
+		if schemaTestV3Witness(phase).retainsEvidence() {
+			t.Fatalf("v3 %s must release evidence", phase)
+		}
+	}
+	// A v3 acknowledgment that lost its sandbox identity proves no release.
+	malformed := schemaTestV3Witness(firecrackerCheckpointOperationPhaseAcked)
+	malformed.SandboxID = ""
+	if !malformed.retainsEvidence() {
+		t.Fatal("malformed v3 acknowledgment must keep the evidence gate")
+	}
+}
+
+// TestAckCheckpointOperationReleasesV3CompletedWitness pins that the existing
+// success acknowledgment releases a claim-bound completed witness and keeps
+// its version, sandbox identity, and directory identity intact.
+func TestAckCheckpointOperationReleasesV3CompletedWitness(t *testing.T) {
+	record := schemaTestV3Witness(firecrackerCheckpointOperationPhaseCompleted)
+	handler, instance, binding := schemaTestOperationInstance(t, record)
+
+	if err := handler.AckCheckpointOperation(
+		context.Background(), instance.snapshot().ID, binding,
+	); err != nil {
+		t.Fatalf("ack of a v3 completed witness = %v", err)
+	}
+	disk, err := readFirecrackerState(instance.snapshot().BundlePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	acknowledged := disk.CheckpointOperation
+	if acknowledged.Phase != firecrackerCheckpointOperationPhaseAcked {
+		t.Fatalf("durable phase after ack = %q, want acked", acknowledged.Phase)
+	}
+	if acknowledged.Version != firecrackerCheckpointOperationRecordVersion3 ||
+		acknowledged.SandboxID != record.SandboxID ||
+		acknowledged.DirectoryDev != record.DirectoryDev ||
+		acknowledged.DirectoryInode != record.DirectoryInode {
+		t.Fatalf("acknowledged witness dropped its v3 identity: %+v", acknowledged)
+	}
+	if acknowledged.retainsEvidence() {
+		t.Fatal("acked v3 witness must release the evidence gate")
 	}
 }
 

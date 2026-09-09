@@ -318,7 +318,8 @@ func checkpointIntentFixture(
 	handler, instance, api, sandboxID := checkpointOperationFixture(t, generation)
 	agent := pointFixtureVsockAtAgent(t, handler, instance)
 	directory := filepath.Join(t.TempDir(), "checkpoint")
-	dev, inode, err := reserveFirecrackerCheckpointDirectory(directory)
+	binding := testCheckpointOperationBinding(generation)
+	dev, inode, err := claimFirecrackerCheckpointDirectory(directory, sandboxID, binding)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -328,7 +329,7 @@ func checkpointIntentFixture(
 		t.Fatal(err)
 	}
 	instance.setCheckpointOperation(buildFirecrackerCheckpointOperationIntent(
-		testCheckpointOperationBinding(generation), state, birth, directory, dev, inode,
+		binding, state, birth, directory, dev, inode,
 	))
 	if err := handler.persistInstance(instance); err != nil {
 		t.Fatal(err)
@@ -520,11 +521,21 @@ func TestCheckpointOperationIntentWriteFailureHasZeroSourceEffects(t *testing.T)
 		t.Fatalf("intent write failure released the guest: %+v", observations)
 	}
 	assertLiveOwnedChild(t, instance, fd, handler.binary, before.APIPath, sandboxID)
-	// The reserved output directory exists and stays empty; nothing was
-	// written into it before the intent was durable.
+	// The claimed output directory holds exactly the durable claim — its full
+	// binding was persisted before the intent write was attempted — and no
+	// checkpoint component was written into it.
 	entries, readErr := os.ReadDir(directory)
-	if readErr != nil || len(entries) != 0 {
-		t.Fatalf("reserved output not empty: %d entries %v", len(entries), readErr)
+	if readErr != nil || len(entries) != 1 || entries[0].Name() != firecrackerCheckpointClaimName() {
+		t.Fatalf("claimed output must hold only the claim: %d entries %v", len(entries), readErr)
+	}
+	claim, claimErr := readFirecrackerCheckpointClaim(directory)
+	if claimErr != nil {
+		t.Fatalf("claim left by the failed intent write is unusable: %v", claimErr)
+	}
+	if claim.SandboxID != sandboxID || claim.OperationID != "op-source-1" ||
+		claim.RequestDigest != strings.Repeat("ab", 32) ||
+		claim.SourceGeneration != "gen-live" || claim.Directory != directory {
+		t.Fatalf("claim binding drifted: %+v", claim)
 	}
 	// The durable record never landed; the in-memory intent keeps the gate.
 	disk, readErr := readFirecrackerState(before.BundlePath)
@@ -712,7 +723,7 @@ func TestCheckpointOperationPreparedWriteGapAfterDurableIntent(t *testing.T) {
 		t.Fatalf("durable completion after intent promotion = %+v %v", disk.CheckpointOperation, readErr)
 	}
 	completed := disk.CheckpointOperation
-	if completed.Version != firecrackerCheckpointOperationRecordVersion2 ||
+	if completed.Version != firecrackerCheckpointOperationRecordVersion3 ||
 		completed.DirectoryDev != durableIntent.DirectoryDev ||
 		completed.DirectoryInode != durableIntent.DirectoryInode ||
 		completed.VMMPID != durableIntent.VMMPID ||
@@ -1264,9 +1275,16 @@ func TestAbortCheckpointOperationRefusesSealedOrTerminalPhases(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				instance.setCheckpointOperation(buildFirecrackerCheckpointOperationIntent(
+				// A version-2 record keeps this subtest on the seal-attribution
+				// boundary: the foreign seal's directory claim binds a
+				// different operation, so a version-3 record would be refused
+				// on the claim first (covered by the claim tests).
+				record := buildFirecrackerCheckpointOperationIntent(
 					binding, state, birth, foreignDir, uint64(stat.Dev), stat.Ino,
-				))
+				)
+				record.Version = firecrackerCheckpointOperationRecordVersion2
+				record.SandboxID = ""
+				instance.setCheckpointOperation(record)
 				if err := handler.persistInstance(instance); err != nil {
 					t.Fatal(err)
 				}
@@ -1289,9 +1307,15 @@ func TestAbortCheckpointOperationRefusesSealedOrTerminalPhases(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				instance.setCheckpointOperation(buildFirecrackerCheckpointOperationIntent(
+				// Version 2 for the same reason as the foreign-seal case: a
+				// legacy seal carries no claim at all, and the version-3
+				// refusal for a missing claim is covered by the claim tests.
+				record := buildFirecrackerCheckpointOperationIntent(
 					binding, state, birth, legacyDir, uint64(stat.Dev), stat.Ino,
-				))
+				)
+				record.Version = firecrackerCheckpointOperationRecordVersion2
+				record.SandboxID = ""
+				instance.setCheckpointOperation(record)
 				if err := handler.persistInstance(instance); err != nil {
 					t.Fatal(err)
 				}
