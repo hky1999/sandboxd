@@ -91,12 +91,29 @@ func (handler *Handler) Checkpoint(
 ) (retErr error) {
 	sandboxID := config.ID
 	tStarted := time.Now()
+	// An identified checkpoint operation is stop-and-copy by contract: its
+	// durable witness binds a source that must stop, and a leave-running
+	// snapshot has no such lifecycle to reconcile. Refuse before any side
+	// effect.
+	operation := config.Operation
+	if !operation.IsZero() && config.LeaveRunning {
+		return fmt.Errorf(
+			"identified checkpoint operation %s for Firecracker sandbox %s must be stop-and-copy: %w",
+			operation.OperationID, sandboxID, errord.ErrInvalidArgument,
+		)
+	}
+	// The operation binding carries its own source-generation expectation,
+	// enforced on the cold path exactly like ExpectedGeneration.
+	expectedGeneration := config.ExpectedGeneration
+	if operation.SourceGeneration != "" {
+		expectedGeneration = operation.SourceGeneration
+	}
 	// The lookup itself enforces the expectation on the cold path: a sandbox
 	// absent from the in-memory map is recovered from durable state only after
 	// that state's bound generation matches, so a stale or unbound record is
 	// refused before recovery's own side effects (lineage reset, monitors, a
 	// recorded-process stop) can touch the incarnation.
-	instance, err := handler.lookupInstanceExpected(sandboxID, config.ExpectedGeneration)
+	instance, err := handler.lookupInstanceExpected(sandboxID, expectedGeneration)
 	if err != nil {
 		return err
 	}
@@ -111,6 +128,21 @@ func (handler *Handler) Checkpoint(
 	// effect, so a rejected checkpoint leaves the incarnation fully intact.
 	if err := verifyCheckpointExpectedGeneration(sandboxID, config.ExpectedGeneration, state.Generation); err != nil {
 		return err
+	}
+	// Unacknowledged operation evidence blocks every checkpoint — legacy,
+	// conditional, or identified — before any side effect: the source of a
+	// prepared or completed operation is bound to that operation's stop, and
+	// a new snapshot could neither replace the retained evidence nor resume
+	// the source.
+	if err := refuseCheckpointOperationEvidence(sandboxID, state); err != nil {
+		return err
+	}
+	// An identified operation additionally requires a complete binding whose
+	// source generation matches this runtime's own persisted identity.
+	if !operation.IsZero() {
+		if err := verifyCheckpointOperationRequest(sandboxID, operation, state); err != nil {
+			return err
+		}
 	}
 	if state.Exited || !state.Configured ||
 		!firecrackerProcessMatches(state.PID, handler.binary, state.APIPath, state.ID) {
@@ -230,8 +262,14 @@ func (handler *Handler) Checkpoint(
 		return fmt.Errorf("pause Firecracker sandbox %s: %w", sandboxID, err)
 	}
 	handoffReleased := false
+	// resumeAfterFailure gates the deferred failure cleanup below. An
+	// identified stop-and-copy operation flips it off once its artifact is
+	// sealed: from that point a prepared witness write may commit whatever
+	// its return value says, so resuming the source is never safe again and
+	// the operation protocol owns its fate.
+	resumeAfterFailure := true
 	defer func() {
-		if retErr == nil || handoffReleased ||
+		if retErr == nil || handoffReleased || !resumeAfterFailure ||
 			!firecrackerProcessMatches(state.PID, handler.binary, state.APIPath, state.ID) {
 			return
 		}
@@ -368,6 +406,43 @@ func (handler *Handler) Checkpoint(
 		))
 	}
 	tFinalized := time.Now()
+	if !operation.IsZero() {
+		// The artifact is sealed for an identified stop-and-copy operation:
+		// the operation's own tail takes over from here. The deferred failure
+		// cleanup may no longer resume the source — even a failure preparing
+		// or persisting the witness leaves the operation owning a possibly
+		// committed durable record of this sealed snapshot.
+		resumeAfterFailure = false
+		if err := handler.finishIdentifiedCheckpointOperation(
+			instance, sandboxID, operation, config.Directory, files,
+		); err != nil {
+			return err
+		}
+		// Identified success keeps the same phase observability as the legacy
+		// path; the seal phase here is the witness tail — root binding,
+		// identity capture, the prepared write, the confirmed stop, and the
+		// completed write. Failures returned above log nothing: an
+		// unidentified outcome never reports success.
+		phaseMS := func(from, to time.Time) int64 { return to.Sub(from).Milliseconds() }
+		tWitnessed := time.Now()
+		logrus.Infof(
+			"firecracker: checkpointed sandbox %s operation=%s type=%s memory=%dMiB dir=%s "+
+				"phases: layout=%dms flush=%dms pause=%dms snapshot=%dms overlay=%dms "+
+				"resume=0ms seal=%dms total=%dms",
+			sandboxID, operation.OperationID, snapshotType, memoryInfo.Size()>>20, config.Directory,
+			phaseMS(tStarted, tPrepared), phaseMS(tPrepared, tFlushed),
+			phaseMS(tFlushed, tPaused), phaseMS(tOverlay, tSnapshotted),
+			phaseMS(tPaused, tOverlay),
+			phaseMS(tResumed, tWitnessed),
+			phaseMS(tStarted, tWitnessed),
+		)
+		logrus.Infof(
+			"firecracker: checkpoint tail dir=%s operation=%s finalize=%dms witness=%dms",
+			config.Directory, operation.OperationID,
+			phaseMS(tResumed, tFinalized), phaseMS(tFinalized, tWitnessed),
+		)
+		return nil
+	}
 	updateSealedCheckpointLineage(ctx, instance, files.Memory, manifest, config.LeaveRunning)
 	tAdopted := time.Now()
 	// The continuation base is process-local authority: recovery always

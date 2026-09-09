@@ -123,6 +123,14 @@ type firecrackerPersistedState struct {
 	// the exit barrier — see the compatibility limitation in
 	// doc/checkpoint-restore.md.
 	Uffd firecrackerUffdRecord `json:"uffd"`
+	// CheckpointOperation is the durable prepared/completed witness of an
+	// identified stop-and-copy checkpoint operation. The zero record — a
+	// legacy checkpoint, or a state written before this record existed —
+	// keeps the legacy lifecycle behavior unchanged. A prepared or completed
+	// record blocks new checkpoints and the evidence-clearing delete until
+	// the service acknowledges the operation; see
+	// firecrackerCheckpointOperationRecord.
+	CheckpointOperation firecrackerCheckpointOperationRecord `json:"checkpoint_operation,omitempty"`
 }
 
 // firecrackerUffdRecord is the persisted identity of the external uffd
@@ -193,6 +201,18 @@ func (instance *firecrackerInstance) markConfigured() {
 func (instance *firecrackerInstance) setUffdRecord(record firecrackerUffdRecord) {
 	instance.mu.Lock()
 	instance.state.Uffd = record
+	instance.mu.Unlock()
+}
+
+// setCheckpointOperation swaps the identified checkpoint operation witness in
+// memory only, under the instance operation lock. The caller owns making it
+// durable; the record is a comparable value so state comparisons and
+// snapshots keep working unchanged.
+func (instance *firecrackerInstance) setCheckpointOperation(
+	record firecrackerCheckpointOperationRecord,
+) {
+	instance.mu.Lock()
+	instance.state.CheckpointOperation = record
 	instance.mu.Unlock()
 }
 
@@ -354,6 +374,10 @@ type Handler struct {
 var _ runtimecore.Handler = &Handler{}
 var _ runtimecore.CheckpointHandler = &Handler{}
 var _ runtimecore.CheckpointRestoreCapabilitiesProvider = &Handler{}
+
+// The identified checkpoint operation witness is internal optional support:
+// nothing public reaches it until the service-side recovery protocol lands.
+var _ runtimecore.CheckpointOperationWitness = &Handler{}
 
 func (handler *Handler) CheckpointRestoreCapabilities() runtimecore.CheckpointRestoreCapabilities {
 	return runtimecore.CheckpointRestoreCapabilities{
@@ -1021,6 +1045,15 @@ func (handler *Handler) delete(ctx context.Context, sandboxID, expectedGeneratio
 	instance.operationMu.Lock()
 	defer instance.operationMu.Unlock()
 	state := instance.snapshot()
+	// Unacknowledged operation evidence outranks every retirement: removing
+	// the state below would clear the only runtime witness of a prepared or
+	// completed identified checkpoint, so the delete — legacy or strict — is
+	// refused until the service's durable success receipt acknowledges the
+	// operation. The gate runs before markDeleting and every guest request
+	// or signal, so a refused delete leaves the incarnation fully intact.
+	if err := refuseCheckpointOperationEvidence(sandboxID, state); err != nil {
+		return err
+	}
 	if strict {
 		// The runtime's own persisted identity is authoritative, and the
 		// check must precede markDeleting and every guest request or signal
@@ -1472,7 +1505,17 @@ func (handler *Handler) persistInstance(
 ) error {
 	instance.persistMu.Lock()
 	defer instance.persistMu.Unlock()
-	state := instance.snapshot()
+	return writeFirecrackerState(instance.snapshot())
+}
+
+// writeFirecrackerState durably writes one exact incarnation record: the
+// caller supplies the state, not a fresh snapshot, so witness transitions can
+// persist precisely the record they constructed and publish it only after
+// this write and its directory fsync succeeded. The state file is the
+// incarnation record strict deletes compare against, so its rename must be
+// durable: sync the containing directory. The parent entries of a freshly
+// created state directory are synced at its creation site.
+func writeFirecrackerState(state firecrackerPersistedState) error {
 	data, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
 		return err
@@ -1485,10 +1528,6 @@ func (handler *Handler) persistInstance(
 	if err := util.AtomicWriteFile(path, data, 0600); err != nil {
 		return fmt.Errorf("persist Firecracker state %s: %w", path, err)
 	}
-	// The state file is the incarnation record strict deletes compare
-	// against, so its rename must be durable: sync the containing directory.
-	// The parent entries of a freshly created state directory are synced at
-	// its creation site below.
 	if err := syncFirecrackerDirectory(filepath.Dir(path)); err != nil {
 		return fmt.Errorf(
 			"sync Firecracker state directory %s: %w",
@@ -1602,6 +1641,19 @@ func (handler *Handler) validatePersistedState(
 				"Firecracker state uffd socket %q does not match %q",
 				state.Uffd.Socket,
 				handler.uffdSocketPath(sandboxID),
+			)
+		}
+	}
+	// An identified checkpoint operation witness must carry a complete,
+	// self-consistent binding; a partial record can prove nothing about the
+	// operation or its recorded process and is never recovered.
+	if !state.CheckpointOperation.isZero() {
+		if err := validateFirecrackerCheckpointOperationRecord(
+			state.CheckpointOperation,
+		); err != nil {
+			return fmt.Errorf(
+				"Firecracker state checkpoint operation record for %s is unusable: %w: %w",
+				sandboxID, err, errord.ErrFailedPrecondition,
 			)
 		}
 	}

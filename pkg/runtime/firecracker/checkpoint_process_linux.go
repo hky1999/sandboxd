@@ -73,6 +73,100 @@ func stopFirecrackerProcessConfirmed(state firecrackerPersistedState, binary str
 	return fmt.Errorf("Firecracker process pid %d did not exit after SIGKILL", state.PID)
 }
 
+// stopFirecrackerProcessConfirmedBirth stops the exact process whose birth
+// identity (PID plus /proc starttime, captured while it was alive) a
+// checkpoint operation witness recorded, and returns nil only after that
+// process's exit is confirmed. Birth is revalidated through the recorded PID
+// before the pidfd is used to signal and again before every signal, so a
+// PID-reused or next-generation process is never signalled; a recycled PID is
+// not treated as proof of the original's exit either — the recorded process's
+// outcome stays unknown and the caller retains its evidence.
+func stopFirecrackerProcessConfirmedBirth(
+	state firecrackerPersistedState,
+	binary string,
+	pid int,
+	startTime uint64,
+) error {
+	if pid <= 1 {
+		return fmt.Errorf("Firecracker process pid %d is not a valid recorded pid; exit unconfirmed", pid)
+	}
+	fd, err := unix.PidfdOpen(pid, 0)
+	if errors.Is(err, unix.ESRCH) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("open Firecracker process pidfd: %w", err)
+	}
+	defer unix.Close(fd)
+	if err := confirmFirecrackerProcessBirth(pid, startTime, fd); err != nil {
+		return err
+	}
+	if !firecrackerProcessMatches(pid, binary, state.APIPath, state.ID) {
+		// The birth matches but argv/exe identity does not resolve: the
+		// original process may already be tearing down. Never signal an
+		// unrecognized process; wait out its exit notification instead.
+		exited, err := waitProcessExitNotification(fd, 1500*time.Millisecond)
+		if err != nil {
+			return err
+		}
+		if !exited {
+			return fmt.Errorf("Firecracker process pid %d identity unavailable and exit unconfirmed", pid)
+		}
+		return nil
+	}
+	for _, step := range []struct {
+		signal unix.Signal
+		wait   time.Duration
+	}{{unix.SIGTERM, 500 * time.Millisecond}, {unix.SIGKILL, time.Second}} {
+		// The handle continues to refer to the same process even if its
+		// numerical PID is recycled between the identity checks and the
+		// signal, and the birth revalidation refuses to signal any process
+		// the recorded identity no longer describes.
+		if err := confirmFirecrackerProcessBirth(pid, startTime, fd); err != nil {
+			return err
+		}
+		if err := unix.PidfdSendSignal(fd, step.signal, nil, 0); err != nil && !errors.Is(err, unix.ESRCH) {
+			return fmt.Errorf("signal Firecracker process: %w", err)
+		}
+		exited, err := waitProcessExitNotification(fd, step.wait)
+		if err != nil {
+			return err
+		}
+		if exited {
+			return nil
+		}
+	}
+	return fmt.Errorf("Firecracker process pid %d did not exit after SIGKILL", pid)
+}
+
+// confirmFirecrackerProcessBirth proves the PID still carries the recorded
+// start time, consulting the pinned pidfd when the /proc entry has vanished
+// between the two reads.
+func confirmFirecrackerProcessBirth(pid int, startTime uint64, fd int) error {
+	current, err := readFirecrackerProcessStartTime(pid)
+	if err != nil {
+		// The identity vanished between the pidfd open and this read: the
+		// pinned handle still knows the truth.
+		exited, waitErr := waitProcessExitNotification(fd, 0)
+		if waitErr == nil && exited {
+			return nil
+		}
+		return fmt.Errorf(
+			"Firecracker process pid %d birth identity unavailable; exit unconfirmed", pid,
+		)
+	}
+	if current != startTime {
+		// A live process under the recorded PID with a different birth is
+		// not the recorded source. Never signal it, and never treat the
+		// recycling as proof of the original's exit.
+		return fmt.Errorf(
+			"Firecracker process pid %d now carries start time %d, not the recorded %d; refusing to signal a reused pid, recorded process exit unconfirmed",
+			pid, current, startTime,
+		)
+	}
+	return nil
+}
+
 func waitProcessExitNotification(fd int, timeout time.Duration) (bool, error) {
 	deadline := time.Now().Add(timeout)
 	for {
