@@ -99,6 +99,80 @@ type CheckpointRestoreCapabilitiesProvider interface {
 	CheckpointRestoreCapabilities() CheckpointRestoreCapabilities
 }
 
+// CheckpointOperationBinding identifies the runtime half of one identified
+// checkpoint operation. It is internal runtime metadata — not a public
+// checkpoint option — carried by CheckpointConfig so the runtime can bind its
+// durable operation evidence to the exact admitted request. The legacy
+// Checkpoint leaves it zero and nothing enforces it; runtimes that do not
+// implement CheckpointOperationWitness keep ignoring it.
+type CheckpointOperationBinding struct {
+	// OperationID is the caller-chosen durable identity of the operation.
+	OperationID string
+	// RequestDigest is the canonical digest of the complete checkpoint
+	// request the operation was admitted under.
+	RequestDigest string
+	// SourceGeneration is the physical incarnation generation the operation
+	// was admitted against. A runtime that binds a persisted generation
+	// compares it against its own record before any checkpoint side effect,
+	// exactly like ExpectedGeneration.
+	SourceGeneration string
+}
+
+// IsZero reports whether the binding carries no operation identity, i.e. the
+// legacy checkpoint shape.
+func (binding CheckpointOperationBinding) IsZero() bool {
+	return binding == CheckpointOperationBinding{}
+}
+
+// CheckpointOperationCompletion is the durable outcome an identified
+// checkpoint operation's recovery reports. It restates the fact the runtime
+// recorded for the original binding — the sealed content root and that the
+// source stop was confirmed. It is a completion fact, not a claim that the
+// artifact payload is on stable storage: publication durability and
+// integrity remain with the publish gates, and a host power loss after
+// completion must still be refused there rather than masked by this record.
+type CheckpointOperationCompletion struct {
+	// RootDigest is the sealed content root the operation's witness recorded,
+	// under RootScheme.
+	RootDigest string
+	RootScheme string
+}
+
+// CheckpointOperationWitness is an internal optional capability for runtimes
+// that record durable prepared/completed witnesses for identified checkpoint
+// operations and can reconcile them after a daemon crash. It is deliberately
+// NOT wired to any public RPC yet: the server-side recovery protocol and the
+// controller integration are separate stages, and until they land no public
+// request can reach these methods.
+type CheckpointOperationWitness interface {
+	// RecoverCheckpointOperation reconciles one EXISTING operation against
+	// its exact binding. A missing record is NotFound and creates nothing;
+	// a record whose binding, source generation, artifact root record, or
+	// original process identity does not match is refused without touching
+	// the source or its artifacts. Inside the operation lock the recovery
+	// only completes the original stop-source flow — exit confirmation and
+	// the durable completion record — and never allocates artifacts, takes a
+	// snapshot, or resumes the source. The recovery is scoped to daemon
+	// crashes: a record prepared under a different host boot is refused
+	// fail-closed instead of reconciled from metadata.
+	RecoverCheckpointOperation(
+		ctx context.Context,
+		sandboxID string,
+		binding CheckpointOperationBinding,
+	) (CheckpointOperationCompletion, error)
+	// AckCheckpointOperation releases the evidence-retention gate of the
+	// matching operation after the service has durably persisted its
+	// SUCCEEDED receipt. It never resumes or otherwise revives the source;
+	// it only allows the delete that would clear the retained evidence. It
+	// is idempotent, and a lost reply may be retried after a durable
+	// success receipt.
+	AckCheckpointOperation(
+		ctx context.Context,
+		sandboxID string,
+		binding CheckpointOperationBinding,
+	) error
+}
+
 type CheckpointConfig struct {
 	ID        string
 	Directory string
@@ -122,6 +196,14 @@ type CheckpointConfig struct {
 	// compares the exact value against its own record before any checkpoint
 	// side effect; runtimes without a bound generation keep ignoring it.
 	ExpectedGeneration string
+	// Operation optionally identifies this checkpoint as the runtime half of
+	// an identified checkpoint operation. It is internal runtime metadata
+	// rather than a public checkpoint option: the legacy Checkpoint leaves it
+	// zero and nothing enforces it. A runtime implementing
+	// CheckpointOperationWitness uses it to bind durable operation evidence
+	// (stop-and-copy only, with the source generation verified like
+	// ExpectedGeneration); runtimes without that capability keep ignoring it.
+	Operation CheckpointOperationBinding
 }
 
 // HostResourcesProvider maps guest-visible resources to the host cgroup that
