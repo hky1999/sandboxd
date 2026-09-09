@@ -105,10 +105,13 @@ type checkpointHandoff struct {
 	mu              sync.Mutex
 	reader          chan string
 	pendingRestore  bool
-	closed          bool
-	stop            chan struct{}
-	done            chan struct{}
-	stopOnce        sync.Once
+	// aborts records delivered checkpoint abort receipts, keyed by operation
+	// ID, for the lifetime of this agent process.
+	aborts   map[string]firecrackerproto.CheckpointAbortRequest
+	closed   bool
+	stop     chan struct{}
+	done     chan struct{}
+	stopOnce sync.Once
 }
 
 type agentState struct {
@@ -238,6 +241,13 @@ func handleConnection(connection *os.File) {
 			return
 		}
 		writeResponse(connection, releaseCheckpoint(request))
+	case firecrackerproto.MessageCheckpointAbort:
+		var request firecrackerproto.CheckpointAbortRequest
+		if err := firecrackerproto.Decode(payload, &request); err != nil {
+			writeResponse(connection, err)
+			return
+		}
+		writeResponse(connection, abortCheckpoint(request))
 	case firecrackerproto.MessageShutdown:
 		writeResponse(connection, nil)
 		go powerOff()
@@ -829,6 +839,13 @@ func (handoff *checkpointHandoff) clearReader(generation chan string) {
 func (handoff *checkpointHandoff) signal(outcome string) error {
 	handoff.mu.Lock()
 	defer handoff.mu.Unlock()
+	return handoff.signalLocked(outcome)
+}
+
+// signalLocked delivers an outcome to the registered reader. The caller must
+// hold handoff.mu so deduplicated aborts can combine their receipt check and
+// delivery into one atomic step.
+func (handoff *checkpointHandoff) signalLocked(outcome string) error {
 	if handoff.closed {
 		log.Printf("drop checkpoint handoff outcome %q: handoff is closed", outcome)
 		return nil
@@ -846,6 +863,59 @@ func (handoff *checkpointHandoff) signal(outcome string) error {
 	handoff.reader = nil
 	generation <- outcome
 	return nil
+}
+
+// maxAbortReceipts bounds the abort receipt table. The bound refuses new
+// operations without evicting recorded receipts: eviction would let a
+// delayed duplicate of an evicted operation release a future reader.
+const maxAbortReceipts = 1024
+
+// abort delivers the terminal error outcome for an identified checkpoint
+// abort and records its receipt. Deduplication and delivery are one atomic
+// step under the handoff mutex: a retry that matches the recorded binding is
+// acknowledged as success without any further handoff signal — including
+// after a new reader registered — while the same operation ID with a
+// different binding is a hard error. Both receipt answers come first, so
+// they hold even once the handoff is closed. An operation the agent never
+// accepted is refused on a closed handoff before any receipt or outcome,
+// never silently acknowledged. With no reader the outcome is dropped, never
+// queued for a future reader, and the receipt is still recorded. Receipts
+// live only as long as this guest agent process: they survive a host daemon
+// restart but not a guest restart. When the table is full a new operation is
+// refused before any effect; receipts are never evicted.
+func (handoff *checkpointHandoff) abort(request firecrackerproto.CheckpointAbortRequest) error {
+	if err := request.Validate(); err != nil {
+		return err
+	}
+	handoff.mu.Lock()
+	defer handoff.mu.Unlock()
+	if recorded, ok := handoff.aborts[request.OperationID]; ok {
+		if recorded == request {
+			return nil
+		}
+		return fmt.Errorf(
+			"checkpoint abort %q conflicts with its recorded receipt: request digest or source generation differs",
+			request.OperationID,
+		)
+	}
+	if handoff.closed {
+		return fmt.Errorf(
+			"checkpoint handoff is closed, refusing abort %q",
+			request.OperationID,
+		)
+	}
+	if handoff.aborts != nil && len(handoff.aborts) >= maxAbortReceipts {
+		return fmt.Errorf(
+			"checkpoint abort receipt table is full (%d entries), refusing new operation %q",
+			maxAbortReceipts,
+			request.OperationID,
+		)
+	}
+	if handoff.aborts == nil {
+		handoff.aborts = make(map[string]firecrackerproto.CheckpointAbortRequest)
+	}
+	handoff.aborts[request.OperationID] = request
+	return handoff.signalLocked("error")
 }
 
 func (handoff *checkpointHandoff) close() {
@@ -874,6 +944,20 @@ func releaseCheckpoint(request firecrackerproto.CheckpointRequest) error {
 		}
 	}
 	return handoff.signal(request.Outcome)
+}
+
+// abortCheckpoint releases the checkpoint handoff with an identified,
+// retryable abort. The reply travels on this request's own connection, so a
+// host that loses it retries the identical request and the guest receipt
+// makes that retry idempotent.
+func abortCheckpoint(request firecrackerproto.CheckpointAbortRequest) error {
+	state.mu.RLock()
+	handoff := state.handoff
+	state.mu.RUnlock()
+	if handoff == nil {
+		return errors.New("checkpoint handoff is not configured")
+	}
+	return handoff.abort(request)
 }
 
 func mountRuntimeFilesystems() error {

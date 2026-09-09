@@ -154,6 +154,46 @@ func (handler *Handler) Checkpoint(
 	}
 	hasVirtioFS := state.VirtioFS != nil
 
+	// resumeAfterFailure gates the deferred failure cleanup below. An
+	// identified stop-and-copy operation flips it off as soon as its intent
+	// owns the operation — before the pause — because from that point the
+	// operation protocol owns the source's fate and no implicit cleanup may
+	// resume it; the legacy path keeps its resume-on-failure behavior.
+	resumeAfterFailure := true
+	if !operation.IsZero() {
+		// The durable early intent precedes every checkpoint side effect —
+		// layout, guest flush or shrink, pause, snapshot: it canonicalizes and
+		// reserves the output directory, captures the full source birth
+		// identity and directory identity, and only a successful durable
+		// write lets the operation proceed. A failed or ambiguous write ran
+		// no source effect and keeps the conservative in-memory gate.
+		directory := filepath.Clean(config.Directory)
+		directoryDev, directoryInode, err := reserveFirecrackerCheckpointDirectory(directory)
+		if err != nil {
+			return fmt.Errorf(
+				"reserve Firecracker checkpoint output for operation %s of sandbox %s: %w",
+				operation.OperationID, sandboxID, err,
+			)
+		}
+		identity, err := captureFirecrackerVMMBirthIdentity(state)
+		if err != nil {
+			return fmt.Errorf(
+				"capture Firecracker sandbox %s source identity for operation %s: %w; no checkpoint side effect ran",
+				sandboxID, operation.OperationID, err,
+			)
+		}
+		instance.setCheckpointOperation(buildFirecrackerCheckpointOperationIntent(
+			operation, state, identity, directory, directoryDev, directoryInode,
+		))
+		if err := handler.persistInstance(instance); err != nil {
+			return fmt.Errorf(
+				"persist checkpoint operation intent for operation %s of Firecracker sandbox %s: %w; no source side effect ran, the in-memory constraint stays until the operation is aborted or recovered, and the write may have committed",
+				operation.OperationID, sandboxID, err,
+			)
+		}
+		resumeAfterFailure = false
+	}
+
 	api := newFirecrackerAPI(state.APIPath)
 	requestedType, err := resolveRequestedSnapshotType(
 		handler.checkpointMode, config.SnapshotType,
@@ -262,12 +302,6 @@ func (handler *Handler) Checkpoint(
 		return fmt.Errorf("pause Firecracker sandbox %s: %w", sandboxID, err)
 	}
 	handoffReleased := false
-	// resumeAfterFailure gates the deferred failure cleanup below. An
-	// identified stop-and-copy operation flips it off once its artifact is
-	// sealed: from that point a prepared witness write may commit whatever
-	// its return value says, so resuming the source is never safe again and
-	// the operation protocol owns its fate.
-	resumeAfterFailure := true
 	defer func() {
 		if retErr == nil || handoffReleased || !resumeAfterFailure ||
 			!firecrackerProcessMatches(state.PID, handler.binary, state.APIPath, state.ID) {
@@ -392,6 +426,18 @@ func (handler *Handler) Checkpoint(
 		VirtioFS:     hasVirtioFS,
 		Compat:       compat,
 	}
+	if !operation.IsZero() {
+		// The seal carries the exact admission binding so a later
+		// reconciliation of a durable intent attributes the artifact to this
+		// operation alone — never from the manifest's mere presence. The
+		// binding folds into the content root through the manifest's raw
+		// bytes; legacy seals keep omitting it entirely.
+		manifest.Operation = &firecrackerCheckpointOperationBinding{
+			OperationID:      operation.OperationID,
+			RequestDigest:    operation.RequestDigest,
+			SourceGeneration: state.Generation,
+		}
+	}
 	if base != "" {
 		manifest.BaseMemory = filepath.Base(filepath.Dir(base))
 	}
@@ -408,13 +454,13 @@ func (handler *Handler) Checkpoint(
 	tFinalized := time.Now()
 	if !operation.IsZero() {
 		// The artifact is sealed for an identified stop-and-copy operation:
-		// the operation's own tail takes over from here. The deferred failure
-		// cleanup may no longer resume the source — even a failure preparing
-		// or persisting the witness leaves the operation owning a possibly
-		// committed durable record of this sealed snapshot.
-		resumeAfterFailure = false
+		// the operation's own tail takes over from here, promoting the durable
+		// intent into the prepared witness of the same sealed snapshot. The
+		// deferred failure cleanup was already disabled at intent ownership —
+		// even a failure preparing or persisting the witness leaves the
+		// operation owning a possibly committed durable record.
 		if err := handler.finishIdentifiedCheckpointOperation(
-			instance, sandboxID, operation, config.Directory, files,
+			instance, sandboxID, operation, files,
 		); err != nil {
 			return err
 		}

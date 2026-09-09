@@ -52,6 +52,7 @@ type options struct {
 	timeout                  time.Duration
 	checkpointTimeoutSeconds uint
 	recoveryTimeoutSeconds   uint
+	abortTimeoutSeconds      uint
 	memoryMB                 float64
 	cpu                      int
 	storageMB                uint64
@@ -95,8 +96,8 @@ func parseFlags(args []string, errorOutput io.Writer) (options, error) {
 	flags.SetOutput(errorOutput)
 	flags.StringVar(&value.action, "action", "",
 		"start, checkpoint, restore, delete, get-start-operation, "+
-			"get-checkpoint-operation, recover-checkpoint-operation, or "+
-			"checkpoint-root")
+			"get-checkpoint-operation, recover-checkpoint-operation, "+
+			"abort-checkpoint-operation, or checkpoint-root")
 	flags.StringVar(&value.socket, "socket", "", "sandboxd Unix socket")
 	flags.StringVar(&value.runtime, "runtime", "runsc", "runtime handler")
 	flags.StringVar(&value.stdout, "stdout", "/var/log/sandboxd/checkpoint-workload.stdout", "sandbox console output path")
@@ -120,6 +121,15 @@ func parseFlags(args []string, errorOutput io.Writer) (options, error) {
 		"bounded timeout in seconds of one recover-checkpoint-operation "+
 			"attempt (joins a still-running original execution, runs the "+
 			"runtime recovery, and acknowledges; never part of the original "+
+			"request digest)",
+	)
+	flags.UintVar(
+		&value.abortTimeoutSeconds,
+		"abort-timeout-seconds",
+		180,
+		"bounded timeout in seconds of one abort-checkpoint-operation "+
+			"attempt (joins a still-running original execution, runs the "+
+			"runtime abort, and acknowledges; never part of the original "+
 			"request digest)",
 	)
 	flags.Float64Var(&value.memoryMB, "memory-mb", 128, "sandbox memory in MiB")
@@ -203,20 +213,23 @@ func runExitCode(err error) int {
 func validateOptions(value options) error {
 	switch value.action {
 	case "start", "checkpoint", "restore", "delete", "get-start-operation",
-		"get-checkpoint-operation", "recover-checkpoint-operation", "checkpoint-root":
+		"get-checkpoint-operation", "recover-checkpoint-operation",
+		"abort-checkpoint-operation", "checkpoint-root":
 	default:
 		return errors.New("--action must be start, checkpoint, restore, delete, " +
 			"get-start-operation, get-checkpoint-operation, " +
-			"recover-checkpoint-operation, or checkpoint-root")
+			"recover-checkpoint-operation, abort-checkpoint-operation, " +
+			"or checkpoint-root")
 	}
 	if value.action == "checkpoint-root" {
 		return validateCheckpointRootOptions(value)
 	}
 	if value.expectedGeneration != "" &&
 		value.action != "checkpoint" && value.action != "delete" &&
-		value.action != "recover-checkpoint-operation" {
+		value.action != "recover-checkpoint-operation" &&
+		value.action != "abort-checkpoint-operation" {
 		return errors.New("--expected-generation is only valid for checkpoint, delete, " +
-			"and recover-checkpoint-operation")
+			"recover-checkpoint-operation, and abort-checkpoint-operation")
 	}
 	if value.socket == "" {
 		return errors.New("--socket is required")
@@ -382,10 +395,13 @@ func run(value options) error {
 		return getCheckpointOperation(ctx, client, value, os.Stdout)
 	case "recover-checkpoint-operation":
 		return recoverCheckpointOperation(ctx, client, value, os.Stdout)
+	case "abort-checkpoint-operation":
+		return abortCheckpointOperation(ctx, client, value, os.Stdout)
 	default:
 		return errors.New("--action must be start, checkpoint, restore, delete, " +
 			"get-start-operation, get-checkpoint-operation, " +
-			"recover-checkpoint-operation, or checkpoint-root")
+			"recover-checkpoint-operation, abort-checkpoint-operation, " +
+			"or checkpoint-root")
 	}
 }
 
@@ -689,22 +705,67 @@ func validCheckpointOperationState(state runtime.CheckpointOperationState) bool 
 
 // validCheckpointOperationRecoveryProtocol reports whether a reply carries a
 // recovery protocol this build understands. The protocol is a record
-// property, never content: a legacy UNSPECIFIED record and a WITNESS record
-// are both legal history wherever facts are compared, so neither is
-// normalized away — but an out-of-range value is a protocol error. An
-// unsupported protocol must be rejected, never reinterpreted as the legacy
-// one, because whether a record holds runtime evidence decides what may be
-// recovered from it.
+// property, never content: a legacy UNSPECIFIED record, a WITNESS record,
+// and a WITNESS_ABORTABLE record are all legal history wherever facts are
+// compared, so none is normalized away — but an out-of-range value is a
+// protocol error. An unsupported protocol must be rejected, never
+// reinterpreted as the legacy one, because whether a record holds runtime
+// evidence decides what may be recovered from it.
 func validCheckpointOperationRecoveryProtocol(
 	protocol runtime.CheckpointOperationRecoveryProtocol,
 ) bool {
 	switch protocol {
 	case runtime.CheckpointOperationRecoveryProtocol_CHECKPOINT_OPERATION_RECOVERY_PROTOCOL_UNSPECIFIED,
-		runtime.CheckpointOperationRecoveryProtocol_CHECKPOINT_OPERATION_RECOVERY_PROTOCOL_WITNESS:
+		runtime.CheckpointOperationRecoveryProtocol_CHECKPOINT_OPERATION_RECOVERY_PROTOCOL_WITNESS,
+		runtime.CheckpointOperationRecoveryProtocol_CHECKPOINT_OPERATION_RECOVERY_PROTOCOL_WITNESS_ABORTABLE:
 		return true
 	default:
 		return false
 	}
+}
+
+// witnessCapableCheckpointProtocol reports whether a record admitted under
+// this protocol holds runtime evidence an explicit reconciliation can act
+// on: WITNESS and WITNESS_ABORTABLE records are both eligible for
+// RecoverCheckpointOperation, while a legacy record holds no witness and is
+// refused by the service before any reply.
+func witnessCapableCheckpointProtocol(
+	protocol runtime.CheckpointOperationRecoveryProtocol,
+) bool {
+	switch protocol {
+	case runtime.CheckpointOperationRecoveryProtocol_CHECKPOINT_OPERATION_RECOVERY_PROTOCOL_WITNESS,
+		runtime.CheckpointOperationRecoveryProtocol_CHECKPOINT_OPERATION_RECOVERY_PROTOCOL_WITNESS_ABORTABLE:
+		return true
+	default:
+		return false
+	}
+}
+
+// validateAbortConfirmedShape enforces the one structural rule of
+// abort_confirmed across every receipt consumer: the durable abort fact may
+// be restated only by a FAILED record under the WITNESS_ABORTABLE protocol,
+// without a sealed root. A SUCCEEDED record carrying it is contradictory —
+// a confirmed abort never produces a checkpoint success — no matter how
+// valid its root is, and no other state or protocol may claim it. The field
+// is never more than shape here: a legal abort_confirmed=true proves no
+// release, which stays evidence_released's per-call fact.
+func validateAbortConfirmedShape(
+	status *runtime.CheckpointOperationStatus,
+	caller string,
+) error {
+	if !status.GetAbortConfirmed() {
+		return nil
+	}
+	if status.GetState() == runtime.CheckpointOperationState_CHECKPOINT_OPERATION_STATE_FAILED &&
+		status.GetRecoveryProtocol() ==
+			runtime.CheckpointOperationRecoveryProtocol_CHECKPOINT_OPERATION_RECOVERY_PROTOCOL_WITNESS_ABORTABLE &&
+		status.GetArtifactRootDigest() == "" && status.GetArtifactRootScheme() == "" {
+		return nil
+	}
+	return fmt.Errorf(
+		"%s: reply reports abort_confirmed=true on a %s record under recovery protocol %s; malformed reply",
+		caller, status.GetState(), status.GetRecoveryProtocol(),
+	)
 }
 
 // checkpointOperationIdentityConflict names the first way a reply fails to
@@ -791,6 +852,9 @@ func reportCheckpointOperation(
 			"checkpoint: reply reports unrecognized recovery protocol %d; refusing to treat an unknown protocol as legacy",
 			status.GetRecoveryProtocol(),
 		)
+	}
+	if err := validateAbortConfirmedShape(status, "checkpoint"); err != nil {
+		return err
 	}
 	if status.GetState() != runtime.CheckpointOperationState_CHECKPOINT_OPERATION_STATE_SUCCEEDED {
 		if status.GetArtifactRootDigest() != "" || status.GetArtifactRootScheme() != "" {
@@ -961,11 +1025,12 @@ func recoverCheckpointOperation(
 // into the recovery action's entire stdout contract. A zero exit proves the
 // strongest fact this action exists for, all of it from THIS response: the
 // operation is SUCCEEDED for exactly the reconstructed original request, the
-// record reports the WITNESS recovery protocol (explicit recovery is defined
-// for witness records only — the service refuses legacy ones before
-// replying, so a reply claiming otherwise is a protocol error), and this
-// invocation completed the runtime acknowledgment — evidence_released=true —
-// which is the release of the evidence-retention gate the caller recovers
+// record reports a witness-capable recovery protocol — WITNESS or
+// WITNESS_ABORTABLE; explicit recovery is defined for those records only,
+// and the service refuses legacy ones before replying, so a reply claiming
+// otherwise is a protocol error — and this invocation completed the runtime
+// acknowledgment — evidence_released=true — which is the release of the
+// evidence-retention gate the caller recovers
 // for. A SUCCEEDED receipt without that release proof is printed first — the
 // success fact may be durable and worth reconciling — and then reported as
 // an error, exactly like every non-SUCCEEDED state, so a zero exit can never
@@ -989,13 +1054,15 @@ func reportRecoveredCheckpointOperation(
 			caller, status.GetRecoveryProtocol(),
 		)
 	}
-	if status.GetRecoveryProtocol() !=
-		runtime.CheckpointOperationRecoveryProtocol_CHECKPOINT_OPERATION_RECOVERY_PROTOCOL_WITNESS {
+	if !witnessCapableCheckpointProtocol(status.GetRecoveryProtocol()) {
 		return fmt.Errorf(
-			"%s: record reports recovery protocol %s, but explicit recovery is defined for WITNESS records only "+
+			"%s: record reports recovery protocol %s, but explicit recovery is defined for witness-capable records only "+
 				"(legacy records are refused by the service and cannot be recovered)",
 			caller, status.GetRecoveryProtocol(),
 		)
+	}
+	if err := validateAbortConfirmedShape(status, caller); err != nil {
+		return err
 	}
 	if status.GetState() != runtime.CheckpointOperationState_CHECKPOINT_OPERATION_STATE_SUCCEEDED {
 		if status.GetArtifactRootDigest() != "" || status.GetArtifactRootScheme() != "" {
@@ -1035,6 +1102,181 @@ func reportRecoveredCheckpointOperation(
 		return fmt.Errorf(
 			"%s: SUCCEEDED record reports evidence_released=false — this response did not complete the runtime acknowledgment; the release of the retained evidence is unproven, retry the recovery of operation %q",
 			caller, value.operationID,
+		)
+	}
+	return printCheckpointOperationStatus(status, out)
+}
+
+// abortCheckpointOperation runs the explicit abort of one ALREADY recorded
+// checkpoint operation admitted under the witness-abortable protocol. Like
+// the recovery, the request reconstructs the COMPLETE original
+// CheckpointWithOperation payload from the same flags that first issued it —
+// sandbox ID, directory spelling, original checkpoint timeout, compression,
+// leave_running, snapshot type, and the exact expected generation — and
+// carries it unchanged inside AbortCheckpointOperationRequest beside an
+// independent abort timeout. The abort timeout bounds only this attempt; the
+// ORIGINAL checkpoint timeout keeps its role in the request digest, so the
+// two flags are never substituted for one another, and the digest the CLI
+// validates against is computed from the reconstructed original payload
+// alone.
+//
+// There is deliberately no fallback and no structured not-found answer: any
+// RPC failure — Unimplemented from a server that predates the abort RPC or
+// has not wired it yet, a transport error, a deadline, a refused legacy,
+// WITNESS-only, or non-FAILED record included — is terminal, and no other
+// checkpoint or recovery RPC is ever attempted. After one RPC error the only
+// next step is querying the same operation ID again.
+func abortCheckpointOperation(
+	ctx context.Context,
+	client runtime.SandboxServiceClient,
+	value options,
+	out io.Writer,
+) error {
+	if err := validateOperationIDFormat(value.operationID); err != nil {
+		return err
+	}
+	if value.sandboxID == "" || value.checkpointDir == "" {
+		return errors.New("--sandbox-id and --checkpoint-dir are required for " +
+			"abort-checkpoint-operation")
+	}
+	if value.expectedGeneration == "" {
+		return errors.New("--expected-generation is required for " +
+			"abort-checkpoint-operation (it repeats the ORIGINAL operation binding)")
+	}
+	if err := validateExpectedGeneration(value.expectedGeneration); err != nil {
+		return err
+	}
+	if value.leaveRunning {
+		return errors.New("abort-checkpoint-operation requires --leave-running=false " +
+			"(the original identified checkpoint was stop-and-copy, and the abort " +
+			"repeats its exact payload)")
+	}
+	if !filepath.IsAbs(value.checkpointDir) {
+		return errors.New("--checkpoint-dir must be absolute for abort-checkpoint-operation")
+	}
+	if value.checkpointTimeoutSeconds < 1 ||
+		value.checkpointTimeoutSeconds > checkpointOperationMaxTimeoutSeconds {
+		return fmt.Errorf(
+			"--checkpoint-timeout-seconds must be between 1 and %d for "+
+				"abort-checkpoint-operation (it repeats the ORIGINAL checkpoint timeout, "+
+				"which the request digest covers)",
+			checkpointOperationMaxTimeoutSeconds,
+		)
+	}
+	if value.abortTimeoutSeconds < 1 ||
+		value.abortTimeoutSeconds > checkpointOperationMaxTimeoutSeconds {
+		return fmt.Errorf(
+			"--abort-timeout-seconds must be between 1 and %d for "+
+				"abort-checkpoint-operation",
+			checkpointOperationMaxTimeoutSeconds,
+		)
+	}
+	original := &runtime.CheckpointWithOperationRequest{
+		OperationID: value.operationID,
+		Checkpoint: &runtime.CheckpointRequest{
+			ID:             value.sandboxID,
+			CheckpointDir:  value.checkpointDir,
+			TimeoutSeconds: uint32(value.checkpointTimeoutSeconds),
+			Compress:       value.compress,
+			LeaveRunning:   value.leaveRunning,
+			SnapshotType:   value.snapshotType,
+		},
+		ExpectedGeneration: value.expectedGeneration,
+	}
+	digest, err := checkpointOperationRequestDigest(original)
+	if err != nil {
+		return fmt.Errorf("abort-checkpoint-operation: %w", err)
+	}
+	status, err := client.AbortCheckpointOperation(ctx, &runtime.AbortCheckpointOperationRequest{
+		Operation:           original,
+		AbortTimeoutSeconds: uint32(value.abortTimeoutSeconds),
+	})
+	if err != nil {
+		return fmt.Errorf("abort-checkpoint-operation: %w", err)
+	}
+	return reportAbortedCheckpointOperation(status, value, digest, out)
+}
+
+// reportAbortedCheckpointOperation turns an AbortCheckpointOperation reply
+// into the abort action's entire stdout contract. A zero exit proves, all of
+// it from THIS response: the operation is FAILED for exactly the
+// reconstructed original request — an explicit abort never produces a
+// success — the record reports the WITNESS_ABORTABLE recovery protocol (the
+// abort is defined for those records only; the service refuses legacy,
+// WITNESS-only, and non-FAILED records before replying, so a reply claiming
+// otherwise is a protocol error), the durable abort fact is confirmed —
+// abort_confirmed=true — and THIS invocation completed the evidence release
+// — evidence_released=true, the per-call fact. The two are deliberately not
+// interchangeable: abort_confirmed is restated by every later reply and a
+// historical true proves no release, so a FAILED receipt missing either is
+// printed first — the failure fact is worth reconciling — and then reported
+// as an error, exactly like every non-FAILED state, so a zero exit can never
+// be mistaken for anything but a fully acknowledged abort. A confirmed abort
+// stays a failure: it authorizes no checkpoint success and no artifact.
+func reportAbortedCheckpointOperation(
+	status *runtime.CheckpointOperationStatus,
+	value options,
+	digest string,
+	out io.Writer,
+) error {
+	const caller = "abort-checkpoint-operation"
+	if conflict := checkpointOperationIdentityConflict(status, value, digest, caller); conflict != "" {
+		return errors.New(conflict)
+	}
+	if !validCheckpointOperationState(status.GetState()) {
+		return fmt.Errorf("%s: invalid record state %d", caller, status.GetState())
+	}
+	if !validCheckpointOperationRecoveryProtocol(status.GetRecoveryProtocol()) {
+		return fmt.Errorf(
+			"%s: reply reports unrecognized recovery protocol %d; refusing to treat an unknown protocol as legacy",
+			caller, status.GetRecoveryProtocol(),
+		)
+	}
+	if status.GetRecoveryProtocol() !=
+		runtime.CheckpointOperationRecoveryProtocol_CHECKPOINT_OPERATION_RECOVERY_PROTOCOL_WITNESS_ABORTABLE {
+		return fmt.Errorf(
+			"%s: record reports recovery protocol %s, but the explicit abort is defined for WITNESS_ABORTABLE records only "+
+				"(legacy and WITNESS records are refused by the service and cannot be aborted)",
+			caller, status.GetRecoveryProtocol(),
+		)
+	}
+	if status.GetState() != runtime.CheckpointOperationState_CHECKPOINT_OPERATION_STATE_FAILED {
+		// A SUCCEEDED record legitimately carries its sealed root; RUNNING
+		// and UNKNOWN must not. Every non-FAILED answer is printed for
+		// reconciliation — the abort confirmed nothing — and then fails.
+		if status.GetArtifactRootDigest() != "" || status.GetArtifactRootScheme() != "" {
+			if status.GetState() != runtime.CheckpointOperationState_CHECKPOINT_OPERATION_STATE_SUCCEEDED {
+				return fmt.Errorf(
+					"%s: %s record carries a sealed root; malformed reply",
+					caller, status.GetState(),
+				)
+			}
+		}
+		if err := printCheckpointOperationStatus(status, out); err != nil {
+			return err
+		}
+		return fmt.Errorf(
+			"%s: operation state %s is not FAILED; the abort was not confirmed and the operation ID is unchanged",
+			caller, status.GetState(),
+		)
+	}
+	if status.GetArtifactRootDigest() != "" || status.GetArtifactRootScheme() != "" {
+		return fmt.Errorf(
+			"%s: FAILED record carries a sealed root; malformed reply",
+			caller,
+		)
+	}
+	// The durable abort fact and this call's release are deliberately both
+	// demanded: a confirmed abort without the release leaves the evidence
+	// gate held, and a release without the confirmed abort proves no abort
+	// at all. Print the record for reconciliation, then fail.
+	if !status.GetAbortConfirmed() || !status.GetEvidenceReleased() {
+		if err := printCheckpointOperationStatus(status, out); err != nil {
+			return err
+		}
+		return fmt.Errorf(
+			"%s: FAILED record reports abort_confirmed=%t and evidence_released=%t — this response did not complete both the abort acknowledgment and the evidence release; retry the abort of operation %q",
+			caller, status.GetAbortConfirmed(), status.GetEvidenceReleased(), value.operationID,
 		)
 	}
 	return printCheckpointOperationStatus(status, out)
@@ -1081,8 +1323,8 @@ func validateCheckpointOperationRecordReply(
 	if !validCheckpointOperationState(status.GetState()) {
 		return fmt.Errorf("get-checkpoint-operation: invalid record state %d", status.GetState())
 	}
-	// The protocol is reported by every reply, and the two defined values are
-	// both legal history here — legacy records keep querying and replaying
+	// The protocol is reported by every reply, and every defined value is
+	// legal history here — legacy records keep querying and replaying
 	// unchanged. An out-of-range value is a protocol error: an unknown
 	// protocol must not be silently read as the legacy one, because the field
 	// decides which records hold recoverable runtime evidence.
@@ -1091,6 +1333,12 @@ func validateCheckpointOperationRecordReply(
 			"get-checkpoint-operation: reply reports unrecognized recovery protocol %d",
 			status.GetRecoveryProtocol(),
 		)
+	}
+	// abort_confirmed is validated for shape only — a legal historical true
+	// (FAILED, WITNESS_ABORTABLE, no root) is printed as the durable fact it
+	// is, and the query never infers a release or any outcome change from it.
+	if err := validateAbortConfirmedShape(status, "get-checkpoint-operation"); err != nil {
+		return err
 	}
 	// The sealed root is exactly the SUCCEEDED evidence: mandatory with a
 	// strict lowercase hex64 digest under the shared scheme, and absent on
@@ -1316,6 +1564,9 @@ func validateOperationFlags(value options) error {
 		if value.action == "recover-checkpoint-operation" {
 			return errors.New("--operation-id is required for recover-checkpoint-operation")
 		}
+		if value.action == "abort-checkpoint-operation" {
+			return errors.New("--operation-id is required for abort-checkpoint-operation")
+		}
 		return nil
 	}
 	if err := validateOperationIDFormat(value.operationID); err != nil {
@@ -1414,9 +1665,44 @@ func validateOperationFlags(value options) error {
 				checkpointOperationMaxTimeoutSeconds,
 			)
 		}
+	case "abort-checkpoint-operation":
+		// The abort repeats the ORIGINAL identified checkpoint payload too —
+		// the service recomputes the request digest from it and refuses the
+		// operation ID when any field changed — and adds only its own
+		// attempt bound. The original timeout keeps its digest role; the
+		// abort timeout never enters the digest.
+		if value.sandboxID == "" || value.checkpointDir == "" {
+			return errors.New("--sandbox-id and --checkpoint-dir are required for " +
+				"abort-checkpoint-operation")
+		}
+		if value.expectedGeneration == "" {
+			return errors.New("--expected-generation is required for abort-checkpoint-operation")
+		}
+		if value.leaveRunning {
+			return errors.New("abort-checkpoint-operation requires --leave-running=false " +
+				"(the original identified checkpoint was stop-and-copy)")
+		}
+		if !filepath.IsAbs(value.checkpointDir) {
+			return errors.New("--checkpoint-dir must be absolute for abort-checkpoint-operation")
+		}
+		if value.checkpointTimeoutSeconds < 1 ||
+			value.checkpointTimeoutSeconds > checkpointOperationMaxTimeoutSeconds {
+			return fmt.Errorf(
+				"--checkpoint-timeout-seconds must be between 1 and %d for abort-checkpoint-operation",
+				checkpointOperationMaxTimeoutSeconds,
+			)
+		}
+		if value.abortTimeoutSeconds < 1 ||
+			value.abortTimeoutSeconds > checkpointOperationMaxTimeoutSeconds {
+			return fmt.Errorf(
+				"--abort-timeout-seconds must be between 1 and %d for abort-checkpoint-operation",
+				checkpointOperationMaxTimeoutSeconds,
+			)
+		}
 	default:
 		return errors.New("--operation-id is only valid for start, restore, checkpoint, " +
-			"get-start-operation, get-checkpoint-operation, and recover-checkpoint-operation")
+			"get-start-operation, get-checkpoint-operation, recover-checkpoint-operation, " +
+			"and abort-checkpoint-operation")
 	}
 	return nil
 }

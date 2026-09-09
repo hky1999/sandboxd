@@ -19,6 +19,7 @@ import (
 	"bytes"
 	"net"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -95,6 +96,91 @@ func TestDecodeRejectsUnknownFields(t *testing.T) {
 	var request ExecRequest
 	if err := Decode([]byte(`{"command":"true","unexpected":1}`), &request); err == nil {
 		t.Fatal("Decode accepted an unknown field")
+	}
+}
+
+func TestCheckpointAbortRequestRoundTrip(t *testing.T) {
+	var encoded bytes.Buffer
+	request := CheckpointAbortRequest{
+		OperationID:      "op-1145",
+		RequestDigest:    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+		SourceGeneration: "gen-7",
+	}
+	if err := WriteMessage(&encoded, MessageCheckpointAbort, request); err != nil {
+		t.Fatal(err)
+	}
+	messageType, payload, err := ReadMessage(&encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if messageType != MessageCheckpointAbort {
+		t.Fatalf(
+			"message type = %d, want %d (distinct from legacy %d)",
+			messageType,
+			MessageCheckpointAbort,
+			MessageCheckpoint,
+		)
+	}
+	var decoded CheckpointAbortRequest
+	if err := Decode(payload, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded != request {
+		t.Fatalf("decoded request = %+v, want %+v", decoded, request)
+	}
+}
+
+func TestCheckpointAbortRequestValidate(t *testing.T) {
+	valid := CheckpointAbortRequest{
+		OperationID:      "op-1",
+		RequestDigest:    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+		SourceGeneration: "gen-1",
+	}
+	if err := valid.Validate(); err != nil {
+		t.Fatalf("valid request rejected: %v", err)
+	}
+	uppercase := valid
+	uppercase.RequestDigest = strings.ToUpper(uppercase.RequestDigest)
+	if err := uppercase.Validate(); err != nil {
+		t.Fatalf("uppercase digest rejected: %v", err)
+	}
+	atLimits := CheckpointAbortRequest{
+		OperationID:      strings.Repeat("o", CheckpointAbortMaxIdentityBytes),
+		RequestDigest:    valid.RequestDigest,
+		SourceGeneration: strings.Repeat("g", CheckpointAbortMaxIdentityBytes),
+	}
+	if err := atLimits.Validate(); err != nil {
+		t.Fatalf("request at the identity limits rejected: %v", err)
+	}
+	invalid := []func(CheckpointAbortRequest) CheckpointAbortRequest{
+		func(r CheckpointAbortRequest) CheckpointAbortRequest { r.OperationID = ""; return r },
+		func(r CheckpointAbortRequest) CheckpointAbortRequest {
+			r.OperationID = strings.Repeat("o", CheckpointAbortMaxIdentityBytes+1)
+			return r
+		},
+		func(r CheckpointAbortRequest) CheckpointAbortRequest { r.SourceGeneration = ""; return r },
+		func(r CheckpointAbortRequest) CheckpointAbortRequest {
+			r.SourceGeneration = strings.Repeat("g", CheckpointAbortMaxIdentityBytes+1)
+			return r
+		},
+		func(r CheckpointAbortRequest) CheckpointAbortRequest { r.RequestDigest = ""; return r },
+		func(r CheckpointAbortRequest) CheckpointAbortRequest {
+			r.RequestDigest = strings.Repeat("0", CheckpointAbortDigestLength-1)
+			return r
+		},
+		func(r CheckpointAbortRequest) CheckpointAbortRequest {
+			r.RequestDigest = strings.Repeat("0", CheckpointAbortDigestLength+1)
+			return r
+		},
+		func(r CheckpointAbortRequest) CheckpointAbortRequest {
+			r.RequestDigest = strings.Replace(r.RequestDigest, "a", "z", 1)
+			return r
+		},
+	}
+	for index, mutate := range invalid {
+		if err := mutate(valid).Validate(); err == nil {
+			t.Fatalf("case %d: invalid request accepted", index)
+		}
 	}
 }
 

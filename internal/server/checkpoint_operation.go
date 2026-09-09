@@ -80,14 +80,26 @@ const (
 	// before acknowledging the retained evidence. Only these records are
 	// eligible for explicit recovery.
 	//
+	// Version 3 (abortable): the admission additionally verified the runtime
+	// holds the CheckpointOperationAborter capability beside writer and
+	// witness, so the operation's undetermined outcomes may also be retired
+	// through the explicit abort protocol. Every version-2 promise holds
+	// unchanged; version 3 adds exactly one fact — `abort_confirmed`, which
+	// only a FAILED version-3 record may carry (a failure the runtime itself
+	// confirmed as an abort), never a version-1/2 record and never beside a
+	// sealed root. The store stage owns the version-3 admission and the abort
+	// slot; no public surface produces or consumes version 3 yet.
+	//
 	// Rollback refusal: a binary that predates version 2 validates records
 	// with `version != 1` as corrupt and fails startup, so a daemon root that
 	// carries a version-2 record cannot be silently downgraded — it must be
 	// upgraded again before the journal loads. This is deliberate and
 	// documented; the alternative (silently dropping or reinterpreting v2
-	// records) would claim an unproven recovery protocol.
-	checkpointOperationRecordVersionLegacy  = 1
-	checkpointOperationRecordVersionWitness = 2
+	// records) would claim an unproven recovery protocol. The same refusal
+	// covers version-3 records.
+	checkpointOperationRecordVersionLegacy    = 1
+	checkpointOperationRecordVersionWitness   = 2
+	checkpointOperationRecordVersionAbortable = 3
 
 	// checkpointOperationMaxBytes bounds one record. Records carry identity
 	// and outcome text only, so the cap is tight on purpose.
@@ -129,6 +141,11 @@ type checkpointOperationRecord struct {
 	CreatedAt     string                       `json:"created_at"`
 	UpdatedAt     string                       `json:"updated_at"`
 	Message       string                       `json:"message,omitempty"`
+	// AbortConfirmed marks a FAILED version-3 record whose abort the runtime
+	// confirmed. Omitted when false, so version-1/2 JSON — and every ordinary
+	// version-3 outcome — is byte-identical to what those records already
+	// wrote.
+	AbortConfirmed bool `json:"abort_confirmed,omitempty"`
 }
 
 // checkpointOperationExecution is the single executor slot of an admitted
@@ -377,7 +394,8 @@ func validCheckpointOperationDigest(value string) bool {
 
 func validateCheckpointOperationRecord(record *checkpointOperationRecord) error {
 	if record.Version != checkpointOperationRecordVersionLegacy &&
-		record.Version != checkpointOperationRecordVersionWitness {
+		record.Version != checkpointOperationRecordVersionWitness &&
+		record.Version != checkpointOperationRecordVersionAbortable {
 		return fmt.Errorf("unsupported version %d", record.Version)
 	}
 	if !validStartOperationID(record.OperationID) {
@@ -417,6 +435,19 @@ func validateCheckpointOperationRecord(record *checkpointOperationRecord) error 
 		if record.Artifact.Scheme != checkpointroot.Scheme {
 			return fmt.Errorf("invalid artifact root scheme for operation %s", record.OperationID)
 		}
+	}
+	// The abort confirmation is the abortable protocol's failure-side fact:
+	// only a version-3 record may carry it, and only in the failed phase — it
+	// never marks an undetermined record and never coexists with a sealed
+	// root (the artifact binding above already refuses that). Version-1/2
+	// records predate the protocol and are never reinterpreted as carrying
+	// one; an ordinary version-3 failure keeps the flag false.
+	if record.AbortConfirmed &&
+		(record.Version != checkpointOperationRecordVersionAbortable ||
+			record.Phase != checkpointOperationPhaseFailed) {
+		return fmt.Errorf(
+			"abort confirmation on a version-%d %q record for operation %s",
+			record.Version, record.Phase, record.OperationID)
 	}
 	if _, err := time.Parse(time.RFC3339Nano, record.CreatedAt); err != nil {
 		return fmt.Errorf("invalid created_at for operation %s: %w", record.OperationID, err)
@@ -490,7 +521,8 @@ func (s *checkpointOperationStore) executionDone(id string) (<-chan struct{}, bo
 	return nil, false
 }
 
-// admit durably records the operation before any side effect. The returned
+// admit durably records the operation before any side effect, as the
+// version-2 (witness) record every current caller produces. The returned
 // joined channel is non-nil when an executor is already running the
 // operation; the returned execution is non-nil when the caller became the
 // single executor. The fast path (existing record) answers without any
@@ -500,6 +532,20 @@ func (s *checkpointOperationStore) executionDone(id string) (<-chan struct{}, bo
 // always carries its executor. A store that began draining never executes a
 // fresh admission; the raced record is republished as unknown.
 func (s *checkpointOperationStore) admit(draft *checkpointOperationRecord) (
+	execution *checkpointOperationExecution,
+	joined <-chan struct{},
+	err error,
+) {
+	return s.admitVersioned(draft, checkpointOperationRecordVersionWitness)
+}
+
+// admitVersioned is the one admission implementation, shared by the plain
+// (version-2) entry and the explicit abortable (version-3) one. The version
+// is a property of the admission path — the protocol its caller verified —
+// never something an existing record is rewritten into: resolveExisting
+// answers a recorded operation from history unchanged, so no admission
+// upgrades or downgrades a record that already exists.
+func (s *checkpointOperationStore) admitVersioned(draft *checkpointOperationRecord, version int) (
 	execution *checkpointOperationExecution,
 	joined <-chan struct{},
 	err error,
@@ -514,11 +560,14 @@ func (s *checkpointOperationStore) admit(draft *checkpointOperationRecord) (
 		return exec, done, err
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
-	// New admissions are version-2 records: the caller (CheckpointWithOperation)
-	// has already verified the runtime holds both the writer and the witness
-	// capability, and will send the exact operation binding to the runtime so
-	// the witness evidence this version promises actually exists.
-	draft.Version = checkpointOperationRecordVersionWitness
+	// A new admission records the protocol its caller verified: version 2 for
+	// the plain entry — the caller (CheckpointWithOperation) has already
+	// verified the runtime holds both the writer and the witness capability,
+	// and will send the exact operation binding to the runtime so the witness
+	// evidence this version promises actually exists — and version 3 for the
+	// abortable entry, whose caller additionally verified the aborter
+	// capability.
+	draft.Version = version
 	draft.Phase = checkpointOperationPhaseAdmitted
 	draft.CreatedAt = now
 	draft.UpdatedAt = now
@@ -894,7 +943,7 @@ func (s *checkpointOperationStore) assertExecutionOwnership(
 	if !ok || current != exec {
 		return errord.ToGRPCf(
 			errord.ErrFailedPrecondition,
-			"the recovery slot for checkpoint operation %s no longer owns the operation; re-admit the recovery before claiming its outcome",
+			"the execution slot for checkpoint operation %s no longer owns the operation; re-admit it before claiming its outcome",
 			id,
 		)
 	}
@@ -1306,8 +1355,8 @@ func (h *sandboxService) CheckpointWithOperation(
 			sandbox.Metadata.RuntimeHandler,
 		)
 	}
-	// A new admission is a version-2 record, and that version promises the
-	// runtime reconciliation contract: durable prepared/completed witnesses
+	// A new admission is a witness-protocol record, and that version promises
+	// the runtime reconciliation contract: durable prepared/completed witnesses
 	// bound to the exact request, and an acknowledgment that releases the
 	// retained evidence. A runtime with the writer capability but without the
 	// witness capability cannot honor that promise, so it is refused here —
@@ -1321,6 +1370,14 @@ func (h *sandboxService) CheckpointWithOperation(
 			sandbox.Metadata.RuntimeHandler,
 		)
 	}
+	// A runtime that additionally holds the explicit abort capability admits
+	// under the abortable protocol (version 3): every witness promise holds,
+	// and the undetermined outcomes may additionally be retired through
+	// AbortCheckpointOperation. A witness-only runtime keeps admitting
+	// version-2 records — the capability, not the runtime name, decides — and
+	// an already-recorded operation replays with its recorded version, so
+	// nothing is upgraded retroactively.
+	_, abortableRuntime := handler.(svc.CheckpointOperationAborter)
 
 	draft := &checkpointOperationRecord{
 		OperationID:   request.GetOperationID(),
@@ -1330,7 +1387,13 @@ func (h *sandboxService) CheckpointWithOperation(
 		CheckpointDir: canonicalDir,
 		RequestDigest: digest,
 	}
-	exec, joined, err := h.checkpointOperations.admit(draft)
+	var exec *checkpointOperationExecution
+	var joined <-chan struct{}
+	if abortableRuntime {
+		exec, joined, err = h.checkpointOperations.admitAbortable(draft)
+	} else {
+		exec, joined, err = h.checkpointOperations.admit(draft)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -1632,10 +1695,14 @@ func (h *sandboxService) RecoverCheckpointOperation(
 	// record is refused before any slot is taken: its admission predates the
 	// witness protocol, no runtime evidence exists for it, and guessing
 	// recoverability from files or source state is exactly what this RPC must
-	// not do. Historical reads of the record keep working through
-	// GetCheckpointOperation and same-request replay.
+	// not do. Version-2 and version-3 records share the one success-recovery
+	// protocol — an abortable record recovers exactly like a witness one; the
+	// extra abort capability is a separate, explicit flow. Historical reads of
+	// the record keep working through GetCheckpointOperation and
+	// same-request replay.
 	if existing := h.checkpointOperations.snapshot(operation.GetOperationID()); existing != nil &&
-		existing.Version != checkpointOperationRecordVersionWitness {
+		existing.Version != checkpointOperationRecordVersionWitness &&
+		existing.Version != checkpointOperationRecordVersionAbortable {
 		return nil, errord.ToGRPCf(
 			errord.ErrFailedPrecondition,
 			"checkpoint operation %s is a legacy version-%d record without a runtime witness; "+
@@ -1701,8 +1768,10 @@ func (h *sandboxService) RecoverCheckpointOperation(
 	defer recovery.finish()
 	bound := recovery.boundRecord()
 	// Defense in depth beside the pre-admission check: the slot's binding is
-	// the authority for everything below.
-	if bound.Version != checkpointOperationRecordVersionWitness {
+	// the authority for everything below, and both witness protocols recover
+	// the same way.
+	if bound.Version != checkpointOperationRecordVersionWitness &&
+		bound.Version != checkpointOperationRecordVersionAbortable {
 		return nil, errord.ToGRPCf(
 			errord.ErrFailedPrecondition,
 			"checkpoint operation %s is a legacy version-%d record without a runtime witness; recovery is refused",
@@ -1846,14 +1915,19 @@ func (h *sandboxService) checkpointOperationStatus(operationID string) (*runtime
 		RequestDigest:    record.RequestDigest,
 		Message:          record.Message,
 	}
-	// The protocol is a property of the record, reported by every reply.
+	// The protocol is a property of the record, reported by every reply, and
+	// so is abort_confirmed — a durable record fact every later reply restates.
 	// evidence_released is deliberately NOT set here: it is per-invocation —
 	// true only when the call itself completed the runtime acknowledgment
-	// after the durable success — so read-only queries and historical
-	// replays keep reporting false.
-	if record.Version == checkpointOperationRecordVersionWitness {
+	// after the durable success or confirmed abort — so read-only queries and
+	// historical replays keep reporting false.
+	switch record.Version {
+	case checkpointOperationRecordVersionWitness:
 		status.RecoveryProtocol = runtime.CheckpointOperationRecoveryProtocol_CHECKPOINT_OPERATION_RECOVERY_PROTOCOL_WITNESS
+	case checkpointOperationRecordVersionAbortable:
+		status.RecoveryProtocol = runtime.CheckpointOperationRecoveryProtocol_CHECKPOINT_OPERATION_RECOVERY_PROTOCOL_WITNESS_ABORTABLE
 	}
+	status.AbortConfirmed = record.AbortConfirmed
 	switch record.Phase {
 	case checkpointOperationPhaseAdmitted:
 		if _, running := h.checkpointOperations.executionDone(operationID); running {

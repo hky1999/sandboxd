@@ -41,6 +41,7 @@ const (
 	SandboxService_CheckpointWithOperation_FullMethodName    = "/runtime.v1.SandboxService/CheckpointWithOperation"
 	SandboxService_GetCheckpointOperation_FullMethodName     = "/runtime.v1.SandboxService/GetCheckpointOperation"
 	SandboxService_RecoverCheckpointOperation_FullMethodName = "/runtime.v1.SandboxService/RecoverCheckpointOperation"
+	SandboxService_AbortCheckpointOperation_FullMethodName   = "/runtime.v1.SandboxService/AbortCheckpointOperation"
 	SandboxService_Delete_FullMethodName                     = "/runtime.v1.SandboxService/Delete"
 	SandboxService_DeleteIfGeneration_FullMethodName         = "/runtime.v1.SandboxService/DeleteIfGeneration"
 	SandboxService_Wait_FullMethodName                       = "/runtime.v1.SandboxService/Wait"
@@ -103,6 +104,18 @@ type SandboxServiceClient interface {
 	// protocol-0 record, a FAILED record, and any binding mismatch are
 	// refused.
 	RecoverCheckpointOperation(ctx context.Context, in *RecoverCheckpointOperationRequest, opts ...grpc.CallOption) (*CheckpointOperationStatus, error)
+	// AbortCheckpointOperation explicitly aborts one already-recorded
+	// checkpoint operation admitted under the witness-abortable recovery
+	// protocol: it drives the runtime's explicit abort of a never-sealed
+	// operation — resuming the source guest and releasing it from the
+	// checkpoint handoff — and completes the abort acknowledgment that
+	// releases the retained evidence. It never admits a new operation, never
+	// takes a snapshot, and never falls back to Checkpoint,
+	// CheckpointIfGeneration, CheckpointWithOperation, or
+	// RecoverCheckpointOperation. A missing record is NotFound; a legacy
+	// protocol-0 record, a WITNESS-only record, a non-FAILED record, and any
+	// binding mismatch are refused.
+	AbortCheckpointOperation(ctx context.Context, in *AbortCheckpointOperationRequest, opts ...grpc.CallOption) (*CheckpointOperationStatus, error)
 	// Delete force-deletes a sandbox.
 	Delete(ctx context.Context, in *DeleteRequest, opts ...grpc.CallOption) (*DeleteResponse, error)
 	// DeleteIfGeneration retires one physical generation only when the sandbox
@@ -202,6 +215,16 @@ func (c *sandboxServiceClient) RecoverCheckpointOperation(ctx context.Context, i
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(CheckpointOperationStatus)
 	err := c.cc.Invoke(ctx, SandboxService_RecoverCheckpointOperation_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *sandboxServiceClient) AbortCheckpointOperation(ctx context.Context, in *AbortCheckpointOperationRequest, opts ...grpc.CallOption) (*CheckpointOperationStatus, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CheckpointOperationStatus)
+	err := c.cc.Invoke(ctx, SandboxService_AbortCheckpointOperation_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -331,6 +354,18 @@ type SandboxServiceServer interface {
 	// protocol-0 record, a FAILED record, and any binding mismatch are
 	// refused.
 	RecoverCheckpointOperation(context.Context, *RecoverCheckpointOperationRequest) (*CheckpointOperationStatus, error)
+	// AbortCheckpointOperation explicitly aborts one already-recorded
+	// checkpoint operation admitted under the witness-abortable recovery
+	// protocol: it drives the runtime's explicit abort of a never-sealed
+	// operation — resuming the source guest and releasing it from the
+	// checkpoint handoff — and completes the abort acknowledgment that
+	// releases the retained evidence. It never admits a new operation, never
+	// takes a snapshot, and never falls back to Checkpoint,
+	// CheckpointIfGeneration, CheckpointWithOperation, or
+	// RecoverCheckpointOperation. A missing record is NotFound; a legacy
+	// protocol-0 record, a WITNESS-only record, a non-FAILED record, and any
+	// binding mismatch are refused.
+	AbortCheckpointOperation(context.Context, *AbortCheckpointOperationRequest) (*CheckpointOperationStatus, error)
 	// Delete force-deletes a sandbox.
 	Delete(context.Context, *DeleteRequest) (*DeleteResponse, error)
 	// DeleteIfGeneration retires one physical generation only when the sandbox
@@ -379,6 +414,9 @@ func (UnimplementedSandboxServiceServer) GetCheckpointOperation(context.Context,
 }
 func (UnimplementedSandboxServiceServer) RecoverCheckpointOperation(context.Context, *RecoverCheckpointOperationRequest) (*CheckpointOperationStatus, error) {
 	return nil, status.Error(codes.Unimplemented, "method RecoverCheckpointOperation not implemented")
+}
+func (UnimplementedSandboxServiceServer) AbortCheckpointOperation(context.Context, *AbortCheckpointOperationRequest) (*CheckpointOperationStatus, error) {
+	return nil, status.Error(codes.Unimplemented, "method AbortCheckpointOperation not implemented")
 }
 func (UnimplementedSandboxServiceServer) Delete(context.Context, *DeleteRequest) (*DeleteResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Delete not implemented")
@@ -566,6 +604,24 @@ func _SandboxService_RecoverCheckpointOperation_Handler(srv interface{}, ctx con
 	return interceptor(ctx, in, info, handler)
 }
 
+func _SandboxService_AbortCheckpointOperation_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(AbortCheckpointOperationRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SandboxServiceServer).AbortCheckpointOperation(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SandboxService_AbortCheckpointOperation_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SandboxServiceServer).AbortCheckpointOperation(ctx, req.(*AbortCheckpointOperationRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _SandboxService_Delete_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(DeleteRequest)
 	if err := dec(in); err != nil {
@@ -730,6 +786,10 @@ var SandboxService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "RecoverCheckpointOperation",
 			Handler:    _SandboxService_RecoverCheckpointOperation_Handler,
+		},
+		{
+			MethodName: "AbortCheckpointOperation",
+			Handler:    _SandboxService_AbortCheckpointOperation_Handler,
 		},
 		{
 			MethodName: "Delete",

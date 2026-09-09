@@ -67,6 +67,18 @@ service SandboxService {
   // protocol-0 record, a FAILED record, and any binding mismatch are
   // refused.
   rpc RecoverCheckpointOperation(RecoverCheckpointOperationRequest) returns (CheckpointOperationStatus) {}
+  // AbortCheckpointOperation explicitly aborts one already-recorded
+  // checkpoint operation admitted under the witness-abortable recovery
+  // protocol: it drives the runtime's explicit abort of a never-sealed
+  // operation — resuming the source guest and releasing it from the
+  // checkpoint handoff — and completes the abort acknowledgment that
+  // releases the retained evidence. It never admits a new operation, never
+  // takes a snapshot, and never falls back to Checkpoint,
+  // CheckpointIfGeneration, CheckpointWithOperation, or
+  // RecoverCheckpointOperation. A missing record is NotFound; a legacy
+  // protocol-0 record, a WITNESS-only record, a non-FAILED record, and any
+  // binding mismatch are refused.
+  rpc AbortCheckpointOperation(AbortCheckpointOperationRequest) returns (CheckpointOperationStatus) {}
   // Delete force-deletes a sandbox.
   rpc Delete(DeleteRequest) returns (DeleteResponse) {}
   // DeleteIfGeneration retires one physical generation only when the sandbox
@@ -492,9 +504,12 @@ enum CheckpointOperationState {
   // the artifacts still exist unchanged, nor that the source is still absent
   // or still running.
   CHECKPOINT_OPERATION_STATE_SUCCEEDED = 2;
-  // FAILED means the checkpoint was refused or failed before the runtime
-  // checkpoint was entered, so no artifact can exist. The operation ID is
-  // spent; checkpointing again requires a new operation ID.
+  // FAILED means the checkpoint was refused, failed without entering an
+  // unprovable runtime state, or was explicitly aborted through
+  // AbortCheckpointOperation — in every case no artifact can exist and the
+  // operation ID is spent; checkpointing again requires a new operation ID.
+  // A reply's abort_confirmed distinguishes a confirmed explicit abort, and
+  // never converts the failure into any other outcome.
   CHECKPOINT_OPERATION_STATE_FAILED = 3;
   // UNKNOWN means the outcome could not be proven from durable evidence — the
   // runtime was entered and then failed, timed out, or was cancelled, the
@@ -518,12 +533,20 @@ enum CheckpointOperationRecoveryProtocol {
   // WITNESS marks a version-2 record: the admission verified the runtime
   // supports both the sealed-root writer capability and the operation
   // witness, and the exact operation binding was sent to the runtime. These
-  // records — and only these — are eligible for RecoverCheckpointOperation.
+  // and WITNESS_ABORTABLE records are the ones eligible for
+  // RecoverCheckpointOperation.
   CHECKPOINT_OPERATION_RECOVERY_PROTOCOL_WITNESS = 1;
+  // WITNESS_ABORTABLE marks a version-3 record: the admission additionally
+  // verified the runtime supports the explicit abort capability, so besides
+  // every WITNESS recovery flow these records — and only these — are
+  // eligible for AbortCheckpointOperation. Recovery still works unchanged
+  // for them; an undetermined record is never aborted automatically.
+  CHECKPOINT_OPERATION_RECOVERY_PROTOCOL_WITNESS_ABORTABLE = 2;
 }
 
 // CheckpointOperationStatus is the durable state of one checkpoint operation,
-// returned by both CheckpointWithOperation and GetCheckpointOperation.
+// returned by CheckpointWithOperation, GetCheckpointOperation,
+// RecoverCheckpointOperation, and AbortCheckpointOperation.
 message CheckpointOperationStatus {
   // OperationID repeats the queried operation ID.
   string operation_id = 1;
@@ -562,6 +585,18 @@ message CheckpointOperationStatus {
   // must never be compared as a historical fact. A controller that requires
   // released evidence performs one explicit recovery and reads it there.
   bool evidence_released = 11;
+  // AbortConfirmed reports that the record carries a durably confirmed abort
+  // fact: an AbortCheckpointOperation made the FAILED (aborted) outcome
+  // durable before replying. Unlike evidence_released it is a record
+  // property, not a per-call proof — only a FAILED record under the
+  // WITNESS_ABORTABLE protocol may carry it, and every later reply restates
+  // it. A historical abort_confirmed=true proves no release: evidence_released
+  // stays the per-call fact of the one invocation that completed the abort
+  // acknowledgment, and a caller that requires a release performs one
+  // explicit abort or recovery and reads it there. A true value proves the
+  // abort — the source was resumed and the operation spent — never a
+  // checkpoint success: the record stays FAILED.
+  bool abort_confirmed = 12;
 }
 
 // GetCheckpointOperationRequest queries one checkpoint operation by identity.
@@ -589,6 +624,28 @@ message RecoverCheckpointOperationRequest {
   // acknowledgment — and must be between 1 and 600. It is not part of the
   // request digest and never rewrites the recorded operation.
   uint32 recovery_timeout_seconds = 2;
+}
+
+// AbortCheckpointOperationRequest asks for the explicit abort of one
+// already-recorded checkpoint operation admitted under the
+// witness-abortable protocol. The authorization is the original request
+// alone, exactly as for recovery: the service recomputes the request digest
+// from this complete, unrewritten payload and refuses the operation ID when
+// it does not match the recorded binding.
+message AbortCheckpointOperationRequest {
+  // Operation is the complete original CheckpointWithOperationRequest,
+  // exactly as it was first admitted — same checkpoint directory spelling,
+  // same original checkpoint timeout, compression, leave_running, snapshot
+  // type, and the exact expected generation. Rewriting any field changes
+  // the request digest and refuses the abort; the original request timeout
+  // keeps its role in the digest and is never replaced by the abort timeout
+  // below.
+  CheckpointWithOperationRequest operation = 1;
+  // AbortTimeoutSeconds bounds this abort attempt — the join of a
+  // still-running original executor, the runtime abort, and the abort
+  // acknowledgment — and must be between 1 and 600. It is not part of the
+  // request digest and never rewrites the recorded operation.
+  uint32 abort_timeout_seconds = 2;
 }
 
 // DeleteRequest describes a force-delete request.

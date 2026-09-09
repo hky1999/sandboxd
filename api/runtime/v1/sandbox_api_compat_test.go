@@ -272,6 +272,10 @@ func projectCheckpointOperationWire(t *testing.T, d *descriptorpb.FileDescriptor
 			{"operation", descriptorpb.FieldDescriptorProto_TYPE_MESSAGE, pkg + "CheckpointWithOperationRequest"},
 			{"recovery_timeout_seconds", descriptorpb.FieldDescriptorProto_TYPE_UINT32, ""},
 		},
+		"AbortCheckpointOperationRequest": {
+			{"operation", descriptorpb.FieldDescriptorProto_TYPE_MESSAGE, pkg + "CheckpointWithOperationRequest"},
+			{"abort_timeout_seconds", descriptorpb.FieldDescriptorProto_TYPE_UINT32, ""},
+		},
 		"CheckpointOperationStatus": {
 			{"operation_id", str, ""},
 			{"sandbox_id", str, ""},
@@ -284,6 +288,7 @@ func projectCheckpointOperationWire(t *testing.T, d *descriptorpb.FileDescriptor
 			{"message", str, ""},
 			{"recovery_protocol", descriptorpb.FieldDescriptorProto_TYPE_ENUM, pkg + "CheckpointOperationRecoveryProtocol"},
 			{"evidence_released", descriptorpb.FieldDescriptorProto_TYPE_BOOL, ""},
+			{"abort_confirmed", descriptorpb.FieldDescriptorProto_TYPE_BOOL, ""},
 		},
 	}
 	d.MessageType = slices.DeleteFunc(d.MessageType, func(m *descriptorpb.DescriptorProto) bool {
@@ -333,7 +338,7 @@ func projectCheckpointOperationWire(t *testing.T, d *descriptorpb.FileDescriptor
 		if e.GetName() != "CheckpointOperationRecoveryProtocol" {
 			return false
 		}
-		names := []string{"UNSPECIFIED", "WITNESS"}
+		names := []string{"UNSPECIFIED", "WITNESS", "WITNESS_ABORTABLE"}
 		if foundProtocolEnum || len(e.Value) != len(names) || len(e.ReservedRange) != 0 || len(e.ReservedName) != 0 {
 			t.Fatal("unexpected source recovery protocol enum")
 		}
@@ -352,6 +357,7 @@ func projectCheckpointOperationWire(t *testing.T, d *descriptorpb.FileDescriptor
 		"CheckpointWithOperation":    "CheckpointWithOperationRequest",
 		"GetCheckpointOperation":     "GetCheckpointOperationRequest",
 		"RecoverCheckpointOperation": "RecoverCheckpointOperationRequest",
+		"AbortCheckpointOperation":   "AbortCheckpointOperationRequest",
 	}
 	for _, service := range d.Service {
 		service.Method = slices.DeleteFunc(service.Method, func(m *descriptorpb.MethodDescriptorProto) bool {
