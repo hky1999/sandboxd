@@ -39,6 +39,7 @@ import (
 func TestV010WireContract(t *testing.T) {
 	descriptor := protodesc.ToFileDescriptorProto(File_api_runtime_v1_sandbox_api_proto)
 	descriptor.SourceCodeInfo = nil
+	projectCheckpointOperationWire(t, descriptor)
 	for _, message := range descriptor.MessageType {
 		if message.GetName() != "StartResponse" {
 			continue
@@ -250,5 +251,80 @@ func TestV010WireContract(t *testing.T) {
 	const want = "5cbcd4bbad5035b8c2d5224e0f08944f38ee0188d5116e09ac8f16ef5419fc6b"
 	if got := hex.EncodeToString(sum[:]); got != want {
 		t.Fatalf("sandbox API descriptor hash = %s, want %s", got, want)
+	}
+}
+
+// Validate the additive source-operation surface before projecting it out.
+// The legacy descriptor hash must remain unchanged.
+func projectCheckpointOperationWire(t *testing.T, d *descriptorpb.FileDescriptorProto) {
+	t.Helper()
+	type field struct {
+		name     string
+		kind     descriptorpb.FieldDescriptorProto_Type
+		typeName string
+	}
+	str := descriptorpb.FieldDescriptorProto_TYPE_STRING
+	pkg := "." + d.GetPackage() + "."
+	messages := map[string][]field{
+		"CheckpointWithOperationRequest": {{"operation_id", str, ""}, {"checkpoint", descriptorpb.FieldDescriptorProto_TYPE_MESSAGE, pkg + "CheckpointRequest"}, {"expected_generation", str, ""}},
+		"GetCheckpointOperationRequest":  {{"operation_id", str, ""}},
+		"CheckpointOperationStatus":      {{"operation_id", str, ""}, {"sandbox_id", str, ""}, {"state", descriptorpb.FieldDescriptorProto_TYPE_ENUM, pkg + "CheckpointOperationState"}, {"source_generation", str, ""}, {"checkpoint_dir", str, ""}, {"request_digest", str, ""}, {"artifact_root_digest", str, ""}, {"artifact_root_scheme", str, ""}, {"message", str, ""}},
+	}
+	d.MessageType = slices.DeleteFunc(d.MessageType, func(m *descriptorpb.DescriptorProto) bool {
+		want, ok := messages[m.GetName()]
+		if !ok {
+			return false
+		}
+		if len(m.Field) != len(want) || len(m.OneofDecl) != 0 || len(m.NestedType) != 0 || len(m.EnumType) != 0 || len(m.ReservedRange) != 0 || len(m.ReservedName) != 0 {
+			t.Fatalf("unexpected source operation message %s", m.GetName())
+		}
+		for i, w := range want {
+			f := m.Field[i]
+			if f.GetName() != w.name || f.GetNumber() != int32(i+1) || f.GetType() != w.kind || f.GetTypeName() != w.typeName || f.GetLabel() != descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL || f.OneofIndex != nil || f.GetProto3Optional() {
+				t.Fatalf("unexpected source operation field %s.%s", m.GetName(), f.GetName())
+			}
+		}
+		delete(messages, m.GetName())
+		return true
+	})
+	if len(messages) != 0 {
+		t.Fatal("missing source operation messages")
+	}
+	foundEnum := false
+	d.EnumType = slices.DeleteFunc(d.EnumType, func(e *descriptorpb.EnumDescriptorProto) bool {
+		if e.GetName() != "CheckpointOperationState" {
+			return false
+		}
+		names := []string{"UNSPECIFIED", "RUNNING", "SUCCEEDED", "FAILED", "UNKNOWN"}
+		if foundEnum || len(e.Value) != len(names) || len(e.ReservedRange) != 0 || len(e.ReservedName) != 0 {
+			t.Fatal("unexpected source operation enum")
+		}
+		for i, n := range names {
+			if e.Value[i].GetName() != "CHECKPOINT_OPERATION_STATE_"+n || e.Value[i].GetNumber() != int32(i) {
+				t.Fatal("unexpected source operation enum value")
+			}
+		}
+		foundEnum = true
+		return true
+	})
+	if !foundEnum {
+		t.Fatal("missing source operation enum")
+	}
+	rpcs := map[string]string{"CheckpointWithOperation": "CheckpointWithOperationRequest", "GetCheckpointOperation": "GetCheckpointOperationRequest"}
+	for _, service := range d.Service {
+		service.Method = slices.DeleteFunc(service.Method, func(m *descriptorpb.MethodDescriptorProto) bool {
+			input, ok := rpcs[m.GetName()]
+			if !ok {
+				return false
+			}
+			if service.GetName() != "SandboxService" || m.GetInputType() != pkg+input || m.GetOutputType() != pkg+"CheckpointOperationStatus" || m.GetClientStreaming() || m.GetServerStreaming() {
+				t.Fatal("unexpected source operation RPC")
+			}
+			delete(rpcs, m.GetName())
+			return true
+		})
+	}
+	if len(rpcs) != 0 {
+		t.Fatal("missing source operation RPCs")
 	}
 }

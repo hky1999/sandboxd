@@ -33,6 +33,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/inclusionAI/sandboxd/pkg/checkpointroot"
 	"io"
 	"os"
 	"path/filepath"
@@ -42,17 +43,37 @@ import (
 )
 
 const (
-	// journalVersion is the only record schema this build reads and writes.
-	journalVersion = 1
+	// journalVersion is the only record schema this build writes. Version 2
+	// adds the identified source checkpoint (operation identity, pinned
+	// checkpoint options, and the success receipt). Version 1 records are
+	// still READ, but only a terminal `done` replays: every unfinished v1
+	// record predates the durable source operation identity, so no query can
+	// prove its old checkpoint request was not executed, and this build
+	// refuses to resume or rewrite it.
+	journalVersion = 2
+	// journalVersionV1 names the predecessor schema in compatibility checks.
+	journalVersionV1 = 1
 
 	// maxJournalBytes bounds the record read and write. The journal carries
 	// short identity strings only; anything larger is corruption, not data.
 	maxJournalBytes = 64 << 10
 
 	// maxMigrationIDBytes bounds -migration-id so the derived checkpoint
-	// directory and target operation ID stay inside the service's 128-byte
-	// operation identity limit.
+	// directory and both derived operation IDs stay inside the service's
+	// 128-byte operation identity limit.
 	maxMigrationIDBytes = 64
+
+	// identifiedCheckpointTimeoutSeconds is the checkpoint timeout pinned
+	// into every new journal. The value is recorded in the record itself and
+	// every retry replays it from there, so a later change of any CLI or
+	// daemon default can never alter the payload bound to the source
+	// operation ID.
+	identifiedCheckpointTimeoutSeconds = 180
+
+	// identifiedCheckpointMaxTimeoutSeconds mirrors the service ceiling for
+	// identified checkpoint operations; a journal pinning a value outside
+	// 1..600 is corruption, not data.
+	identifiedCheckpointMaxTimeoutSeconds = 600
 )
 
 // Migration stages, in execution order. A stage is recorded only once its
@@ -122,6 +143,17 @@ type migrationIntent struct {
 // reported over --request-file): once pinned at root-bound it is never
 // refreshed, so a retry that finds different bytes at the same path fails
 // instead of quietly re-pinning them.
+//
+// Version 2 additionally binds the source checkpoint to a durable operation
+// identity. SourceOperationID is derived from the migration ID independently
+// of the target OperationID and is pinned at creation, before the first side
+// effect. The pinned Checkpoint* options are the complete identified
+// checkpoint payload besides sandbox, directory, and generation — every retry
+// replays them from the record, so the request bound to the operation ID can
+// never drift with future defaults. The source receipt fields are the success
+// answer of that operation and are kept strictly separate from RequestDigest:
+// SourceOpRequestDigest digests the checkpoint request, RequestDigest digests
+// the restore request file.
 type migrationJournal struct {
 	Version           int    `json:"version"`
 	MigrationID       string `json:"migration_id"`
@@ -134,14 +166,30 @@ type migrationJournal struct {
 	ExpectedSourceGen string `json:"expected_source_generation,omitempty"`
 	CheckpointDir     string `json:"checkpoint_dir"`
 	OperationID       string `json:"operation_id"`
-	SourceGeneration  string `json:"source_generation,omitempty"`
-	RootDigest        string `json:"root_digest,omitempty"`
-	RootScheme        string `json:"root_scheme,omitempty"`
-	RequestDigest     string `json:"request_digest,omitempty"`
-	Target            string `json:"target,omitempty"`
-	TargetGeneration  string `json:"target_generation,omitempty"`
-	Stage             string `json:"stage"`
-	UpdatedAtUnixNano int64  `json:"updated_at_unix_nano"`
+	// SourceOperationID is the durable identity of the source checkpoint
+	// ("checkpoint-<migration-id>"); it is never the target start identity.
+	SourceOperationID string `json:"source_operation_id"`
+	// CheckpointTimeoutSeconds, CheckpointCompress, CheckpointLeaveRunning,
+	// and CheckpointSnapshotType pin the complete identified checkpoint
+	// payload so retries replay byte-stable intent.
+	CheckpointTimeoutSeconds uint32 `json:"checkpoint_timeout_seconds"`
+	CheckpointCompress       bool   `json:"checkpoint_compress"`
+	CheckpointLeaveRunning   bool   `json:"checkpoint_leave_running"`
+	CheckpointSnapshotType   string `json:"checkpoint_snapshot_type"`
+	SourceGeneration         string `json:"source_generation,omitempty"`
+	// SourceOpRequestDigest is the checkpoint request digest the source
+	// receipt reported; SourceRootDigest and SourceRootScheme are the sealed
+	// artifact root that receipt bound at completion time.
+	SourceOpRequestDigest string `json:"source_op_request_digest,omitempty"`
+	SourceRootDigest      string `json:"source_root_digest,omitempty"`
+	SourceRootScheme      string `json:"source_root_scheme,omitempty"`
+	RootDigest            string `json:"root_digest,omitempty"`
+	RootScheme            string `json:"root_scheme,omitempty"`
+	RequestDigest         string `json:"request_digest,omitempty"`
+	Target                string `json:"target,omitempty"`
+	TargetGeneration      string `json:"target_generation,omitempty"`
+	Stage                 string `json:"stage"`
+	UpdatedAtUnixNano     int64  `json:"updated_at_unix_nano"`
 }
 
 // validateMigrationID accepts exactly the identities that keep both derived
@@ -190,6 +238,16 @@ func migrationCheckpointDirFor(sandbox, migrationID string) string {
 // recovered by querying and re-issuing THIS ID, never by minting a new one.
 func migrationOperationIDFor(migrationID string) string {
 	return "migrate-" + migrationID
+}
+
+// sourceOperationIDFor derives the source checkpoint's durable operation ID
+// from the migration identity, independently of the target start operation:
+// the two name different operations on different nodes and must never be
+// reused for one another. Like the target identity it never changes across
+// retries — a lost checkpoint reply is reconciled by querying and re-issuing
+// exactly this ID.
+func sourceOperationIDFor(migrationID string) string {
+	return "checkpoint-" + migrationID
 }
 
 // journalStore owns the journal file and its exclusive lock for the lifetime
@@ -257,8 +315,17 @@ func openJournal(path string, intent migrationIntent) (*migrationJournal, *journ
 			ExpectedSourceGen: intent.ExpectedSourceGen,
 			CheckpointDir:     migrationCheckpointDirFor(intent.Sandbox, intent.MigrationID),
 			OperationID:       migrationOperationIDFor(intent.MigrationID),
-			Stage:             stagePrepared,
-			UpdatedAtUnixNano: time.Now().UnixNano(),
+			// The source checkpoint identity and its complete fixed payload
+			// are durable from the very first record, before any node
+			// command: the first side effect of this migration already names
+			// them, and no retry can retarget either.
+			SourceOperationID:        sourceOperationIDFor(intent.MigrationID),
+			CheckpointTimeoutSeconds: identifiedCheckpointTimeoutSeconds,
+			CheckpointCompress:       false,
+			CheckpointLeaveRunning:   false,
+			CheckpointSnapshotType:   "",
+			Stage:                    stagePrepared,
+			UpdatedAtUnixNano:        time.Now().UnixNano(),
 		}
 		if err := store.save(record); err != nil {
 			return nil, nil, err
@@ -351,13 +418,134 @@ func loadJournal(path string) (*migrationJournal, error) {
 
 // validate enforces the record schema beyond JSON syntax: version, identity,
 // a known stage, and the prerequisites each recorded stage implies.
+//
+// Version 1 compatibility is deliberately one-way and minimal: only a
+// terminal `done` record replays (report-only, zero node commands), because
+// that is the one v1 stage whose checkpoint side effects are provably
+// finished. Every other v1 stage is refused without rewriting the file — its
+// checkpoint was issued through the legacy RPC with no durable operation
+// identity, so a NotFound answer from the new query API proves nothing about
+// whether that old request executed, and re-issuing a checkpoint under a new
+// operation ID could seal a second artifact over an unknown first outcome.
 func (j *migrationJournal) validate(path string) error {
+	if j.Version == journalVersionV1 {
+		return j.validateV1(path)
+	}
 	if j.Version != journalVersion {
 		return fmt.Errorf("journal %s carries version %d, this build writes %d — refusing to guess at a different schema", path, j.Version, journalVersion)
 	}
 	rank := stageRank(j.Stage)
 	if rank < 0 {
 		return fmt.Errorf("journal %s records unknown stage %q — refusing to guess at a corrupt record", path, j.Stage)
+	}
+	for name, value := range map[string]string{
+		"migration_id":        j.MigrationID,
+		"sandbox":             j.Sandbox,
+		"source":              j.Source,
+		"store":               j.Store,
+		"request_file":        j.RequestFile,
+		"exec_template":       j.ExecTemplate,
+		"checkpoint_dir":      j.CheckpointDir,
+		"operation_id":        j.OperationID,
+		"source_operation_id": j.SourceOperationID,
+	} {
+		if strings.TrimSpace(value) == "" {
+			return fmt.Errorf("journal %s is corrupt: empty %s — refusing to recreate it over unknown durable progress", path, name)
+		}
+	}
+	if err := validateMigrationID(j.MigrationID); err != nil {
+		return fmt.Errorf("journal %s records an invalid migration_id: %v", path, err)
+	}
+	if j.OperationID != migrationOperationIDFor(j.MigrationID) ||
+		j.CheckpointDir != migrationCheckpointDirFor(j.Sandbox, j.MigrationID) {
+		return fmt.Errorf(
+			"journal %s records derived identity (checkpoint_dir %q, operation_id %q) inconsistent with migration %q — refusing to run a retargeted migration",
+			path, j.CheckpointDir, j.OperationID, j.MigrationID,
+		)
+	}
+	if j.SourceOperationID != sourceOperationIDFor(j.MigrationID) || j.SourceOperationID == j.OperationID {
+		return fmt.Errorf(
+			"journal %s records source_operation_id %q inconsistent with migration %q — the source checkpoint identity is derived independently and never equals the target operation %q",
+			path, j.SourceOperationID, j.MigrationID, j.OperationID,
+		)
+	}
+	// The pinned identified-checkpoint payload is validated exactly as the
+	// service admits it: stop-and-copy only, a bounded timeout, and a known
+	// snapshot flavor. A record whose pinned payload could never be admitted
+	// is corruption, not a migration to reinterpret.
+	if j.CheckpointLeaveRunning {
+		return fmt.Errorf("journal %s pins a leave-running identified checkpoint — identified checkpoints are stop-and-copy; refusing the record", path)
+	}
+	if j.CheckpointTimeoutSeconds < 1 || j.CheckpointTimeoutSeconds > identifiedCheckpointMaxTimeoutSeconds {
+		return fmt.Errorf("journal %s pins checkpoint_timeout_seconds %d outside 1..%d — refusing the record", path, j.CheckpointTimeoutSeconds, identifiedCheckpointMaxTimeoutSeconds)
+	}
+	switch j.CheckpointSnapshotType {
+	case "", "Full", "Incremental", "SoftDirty":
+	default:
+		return fmt.Errorf("journal %s pins unknown checkpoint_snapshot_type %q — refusing the record", path, j.CheckpointSnapshotType)
+	}
+	if rank >= stageRank(stageSourcePinned) && strings.TrimSpace(j.SourceGeneration) == "" {
+		return fmt.Errorf("journal %s is corrupt: stage %s without a captured source_generation", path, j.Stage)
+	}
+	// checkpoint-sealed means a validated SUCCEEDED receipt is durable: the
+	// checkpoint request digest, the sealed root, and its scheme must all be
+	// present from this stage on.
+	if rank >= stageRank(stageCheckpointSealed) {
+		if err := j.requireReceipt(path); err != nil {
+			return err
+		}
+	}
+	// Root readiness includes the request pin: a migration that is about to
+	// restore must have BOTH the artifact identity and the exact request
+	// bytes it will replay, or the restore would be free to send unpinned
+	// content under the operation ID. The pinned root must also still be the
+	// one the source receipt bound at completion — a record that re-pinned a
+	// different root over the receipt is not this checkpoint's progress.
+	if rank >= stageRank(stageRootBound) {
+		if len(j.RootDigest) != 64 || !isHex(j.RootDigest) || j.RootScheme == "" {
+			return fmt.Errorf("journal %s is corrupt: stage %s without a pinned 64-hex root digest and scheme", path, j.Stage)
+		}
+		if len(j.RequestDigest) != 64 || !isHex(j.RequestDigest) {
+			return fmt.Errorf("journal %s is corrupt: stage %s without a pinned 64-hex request digest", path, j.Stage)
+		}
+		if j.RootDigest != j.SourceRootDigest || j.RootScheme != j.SourceRootScheme {
+			return fmt.Errorf(
+				"journal %s is corrupt: stage %s pins root %s/%s but the source receipt bound %s/%s — refusing to treat a changed artifact as the sealed checkpoint",
+				path, j.Stage, j.RootDigest, j.RootScheme, j.SourceRootDigest, j.SourceRootScheme,
+			)
+		}
+	}
+	if rank >= stageRank(stagePlaced) && strings.TrimSpace(j.Target) == "" {
+		return fmt.Errorf("journal %s is corrupt: stage %s without a chosen target", path, j.Stage)
+	}
+	if rank >= stageRank(stageRestoreSucceeded) && strings.TrimSpace(j.TargetGeneration) == "" {
+		return fmt.Errorf("journal %s is corrupt: stage %s without the receipt's target generation", path, j.Stage)
+	}
+	return nil
+}
+
+// requireReceipt checks the source receipt shape: a 64-hex checkpoint request
+// digest plus the sealed root digest and scheme the receipt reported.
+func (j *migrationJournal) requireReceipt(path string) error {
+	if len(j.SourceOpRequestDigest) != 64 || !isHex(j.SourceOpRequestDigest) || j.SourceOpRequestDigest != strings.ToLower(j.SourceOpRequestDigest) {
+		return fmt.Errorf("journal %s is corrupt: stage %s without the receipt's 64-hex source_op_request_digest", path, j.Stage)
+	}
+	if len(j.SourceRootDigest) != 64 || !isHex(j.SourceRootDigest) || j.SourceRootDigest != strings.ToLower(j.SourceRootDigest) || j.SourceRootScheme != checkpointroot.Scheme {
+		return fmt.Errorf("journal %s is corrupt: stage %s without the receipt's sealed source root digest and scheme", path, j.Stage)
+	}
+	return nil
+}
+
+// validateV1 applies the version 1 compatibility rules: only a terminal done
+// record is loadable, under the same identity discipline v1 enforced. The
+// caller never rewrites the file — an unfinished v1 record stays exactly as
+// it is for manual reconciliation.
+func (j *migrationJournal) validateV1(path string) error {
+	if j.Stage != stageDone {
+		return fmt.Errorf(
+			"journal %s carries an unfinished version %d record at stage %q: that flow issued its checkpoint through the legacy RPC with no durable operation identity, so no query can prove the request was not executed — this build refuses to resume it, reissue it under a new operation ID, or rewrite the file; reconcile the source manually and continue with a fresh -migration-id",
+			path, j.Version, j.Stage,
+		)
 	}
 	for name, value := range map[string]string{
 		"migration_id":   j.MigrationID,
@@ -383,26 +571,15 @@ func (j *migrationJournal) validate(path string) error {
 			path, j.CheckpointDir, j.OperationID, j.MigrationID,
 		)
 	}
-	if rank >= stageRank(stageSourcePinned) && strings.TrimSpace(j.SourceGeneration) == "" {
+	if strings.TrimSpace(j.SourceGeneration) == "" {
 		return fmt.Errorf("journal %s is corrupt: stage %s without a captured source_generation", path, j.Stage)
 	}
-	// Root readiness includes the request pin: a migration that is about to
-	// restore must have BOTH the artifact identity and the exact request
-	// bytes it will replay, or the restore would be free to send unpinned
-	// content under the operation ID.
-	if rank >= stageRank(stageRootBound) {
-		if len(j.RootDigest) != 64 || !isHex(j.RootDigest) || j.RootScheme == "" {
-			return fmt.Errorf("journal %s is corrupt: stage %s without a pinned 64-hex root digest and scheme", path, j.Stage)
-		}
-		if len(j.RequestDigest) != 64 || !isHex(j.RequestDigest) {
-			return fmt.Errorf("journal %s is corrupt: stage %s without a pinned 64-hex request digest", path, j.Stage)
-		}
+	if len(j.RootDigest) != 64 || !isHex(j.RootDigest) || j.RootScheme == "" ||
+		len(j.RequestDigest) != 64 || !isHex(j.RequestDigest) {
+		return fmt.Errorf("journal %s is corrupt: stage %s without pinned root, scheme, and request digests", path, j.Stage)
 	}
-	if rank >= stageRank(stagePlaced) && strings.TrimSpace(j.Target) == "" {
-		return fmt.Errorf("journal %s is corrupt: stage %s without a chosen target", path, j.Stage)
-	}
-	if rank >= stageRank(stageRestoreSucceeded) && strings.TrimSpace(j.TargetGeneration) == "" {
-		return fmt.Errorf("journal %s is corrupt: stage %s without the receipt's target generation", path, j.Stage)
+	if strings.TrimSpace(j.Target) == "" || strings.TrimSpace(j.TargetGeneration) == "" {
+		return fmt.Errorf("journal %s is corrupt: stage %s without a chosen target and its birth generation", path, j.Stage)
 	}
 	return nil
 }
@@ -425,8 +602,16 @@ func isHex(s string) bool {
 // save durably rewrites the journal: temporary file in the same directory,
 // fsync, rename over the record, directory fsync. The caller only continues
 // to the next side effect after the stage naming that side effect has
-// survived this full sequence.
+// survived this full sequence. A loaded version 1 record is never rewritten —
+// bumping its schema in place would silently claim v2 guarantees (a durable
+// source operation identity) for a migration that never had one.
 func (s *journalStore) save(record *migrationJournal) error {
+	if record.Version == journalVersionV1 {
+		return fmt.Errorf(
+			"journal %s is a version %d record — this build never rewrites v1 records; unfinished v1 records are refused at load and a done record replays read-only",
+			s.path, journalVersionV1,
+		)
+	}
 	record.Version = journalVersion
 	record.UpdatedAtUnixNano = time.Now().UnixNano()
 	encoded, err := json.MarshalIndent(record, "", "  ")

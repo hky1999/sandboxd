@@ -797,6 +797,15 @@ func (handler *Handler) SupportsCheckpointRootVerification() bool {
 	return true
 }
 
+// SupportsCheckpointOperations declares the Firecracker capability the server
+// requires before admitting an identified checkpoint operation: stop-and-copy
+// checkpoints write sealed v2 directories whose content root the shared
+// pkg/checkpointroot algorithm binds, which is the evidence the operation's
+// durable success fact is recorded from.
+func (handler *Handler) SupportsCheckpointOperations() bool {
+	return true
+}
+
 func (handler *Handler) Restore(ctx context.Context,
 	startConfig runtimecore.StartConfig,
 ) (retErr error) {

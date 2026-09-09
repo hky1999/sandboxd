@@ -53,6 +53,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -61,6 +63,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -68,6 +71,8 @@ import (
 	"time"
 
 	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
 )
 
 func TestExecutorHelper(t *testing.T) {
@@ -173,6 +178,9 @@ func executorMain(stateDir, node string, args []string) {
 	case has("--action"):
 		switch value("--action") {
 		case "checkpoint":
+			if operation := value("--operation-id"); operation != "" {
+				identifiedCheckpointExecutor(stateDir, args, operation, value)
+			}
 			if controlExists("fail-checkpoint") {
 				os.Exit(1) // the command fails; whether the server executed it is unknowable
 			}
@@ -226,6 +234,39 @@ func executorMain(stateDir, node string, args []string) {
 				identity["request_sha256"] = testSHA(data)
 			}
 			_ = json.NewEncoder(os.Stdout).Encode(identity)
+			os.Exit(0)
+		case "get-checkpoint-operation":
+			// The source-operation query: answers only from the durable
+			// record, never executes work, and uses the CLI's structured
+			// not-found exit code when the record is absent.
+			operation := value("--operation-id")
+			if operation == "" || !strings.HasPrefix(operation, "checkpoint-") {
+				os.Exit(2)
+			}
+			if controlExists("fail-checkpoint-query") {
+				os.Exit(1) // an ambiguous query failure
+			}
+			raw, err := os.ReadFile(fakeCheckpointRecordPath(stateDir, operation))
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "checkpoint operation %s is unknown\n", operation)
+				os.Exit(exitCodeOperationNotFound) // the structured absence signal
+			}
+			var record fakeCheckpointRecord
+			if err := json.Unmarshal(raw, &record); err != nil {
+				os.Exit(1) // a corrupt record is an ambiguous failure
+			}
+			status := &runtime.CheckpointOperationStatus{
+				OperationID:        record.OperationID,
+				SandboxID:          record.SandboxID,
+				State:              fakeCheckpointOpState(record.State),
+				SourceGeneration:   record.SourceGeneration,
+				CheckpointDir:      record.CheckpointDir,
+				RequestDigest:      record.RequestDigest,
+				ArtifactRootDigest: record.ArtifactRootDigest,
+				ArtifactRootScheme: record.ArtifactRootScheme,
+			}
+			fakeApplyReceiptPoison(stateDir, status)
+			fakePrintCheckpointOpStatus(status)
 			os.Exit(0)
 		case "get-start-operation":
 			operation := value("--operation-id")
@@ -336,6 +377,288 @@ func liveGeneration(stateDir string) string {
 	}
 	_ = os.WriteFile(path, []byte("g1"), 0o600)
 	return "g1"
+}
+
+// fakeCheckpointRecord is the fake node's durable checkpoint-operation
+// receipt — the server-side journal entry, persisted independently of any
+// response the CLI does or does not receive.
+type fakeCheckpointRecord struct {
+	OperationID        string `json:"operation_id"`
+	SandboxID          string `json:"sandbox_id"`
+	SourceGeneration   string `json:"source_generation"`
+	CheckpointDir      string `json:"checkpoint_dir"`
+	RequestDigest      string `json:"request_digest"`
+	State              string `json:"state"`
+	ArtifactRootDigest string `json:"artifact_root_digest,omitempty"`
+	ArtifactRootScheme string `json:"artifact_root_scheme,omitempty"`
+}
+
+// fakeCheckpointRecordPath names the durable record of one operation ID.
+func fakeCheckpointRecordPath(stateDir, operation string) string {
+	return filepath.Join(stateDir, "checkpoint-op-"+operation+".json")
+}
+
+// fakeCount appends one tally to a counter file, creating it on first use.
+func fakeCount(stateDir, name string) {
+	f, err := os.OpenFile(filepath.Join(stateDir, name), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return
+	}
+	_, _ = f.Write([]byte("x"))
+	_ = f.Close()
+}
+
+// fakeReadCount reads a counter file the fake node maintains.
+func fakeReadCount(t *testing.T, stateDir, name string) int {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(stateDir, name))
+	if err != nil {
+		return 0
+	}
+	return strings.Count(string(raw), "x")
+}
+
+// fakeBoolFlag reads one boolean flag from an argv, accepting both the
+// "--flag" and "--flag=value" spellings, and reports whether it was present.
+// An absent flag returns the Go zero value (false) plus false.
+func fakeBoolFlag(args []string, flag string) (value, present bool) {
+	for _, arg := range args {
+		if arg == flag {
+			return true, true
+		}
+		if strings.HasPrefix(arg, flag+"=") {
+			switch strings.TrimPrefix(arg, flag+"=") {
+			case "true":
+				return true, true
+			case "false":
+				return false, true
+			}
+		}
+	}
+	return false, false
+}
+
+// fakeCheckpointOpDigest recomputes the deterministic request digest of an
+// identified checkpoint exactly the way the node CLI and the service do:
+// the wrapped request with the operation ID dropped, deterministically
+// marshaled, SHA-256. The fake uses it to bind the record to the payload it
+// actually admitted, so a replay under the same ID with any changed field is
+// refused instead of silently re-answered.
+func fakeCheckpointOpDigest(args []string, value func(string) string) (string, error) {
+	timeout, err := strconv.ParseUint(value("--checkpoint-timeout-seconds"), 10, 32)
+	if err != nil {
+		return "", err
+	}
+	compress, _ := fakeBoolFlag(args, "--compress")
+	leaveRunning, _ := fakeBoolFlag(args, "--leave-running")
+	wrapped := &runtime.CheckpointWithOperationRequest{
+		OperationID: "",
+		Checkpoint: &runtime.CheckpointRequest{
+			ID:             value("--sandbox-id"),
+			CheckpointDir:  value("--checkpoint-dir"),
+			TimeoutSeconds: uint32(timeout),
+			Compress:       compress,
+			LeaveRunning:   leaveRunning,
+			SnapshotType:   value("--snapshot-type"),
+		},
+		ExpectedGeneration: value("--expected-generation"),
+	}
+	data, err := proto.MarshalOptions{Deterministic: true}.Marshal(wrapped)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+// fakeCheckpointOpState maps a control-file state name onto the enum value
+// the protojson receipt carries.
+func fakeCheckpointOpState(state string) runtime.CheckpointOperationState {
+	switch state {
+	case "running":
+		return runtime.CheckpointOperationState_CHECKPOINT_OPERATION_STATE_RUNNING
+	case "succeeded":
+		return runtime.CheckpointOperationState_CHECKPOINT_OPERATION_STATE_SUCCEEDED
+	case "failed":
+		return runtime.CheckpointOperationState_CHECKPOINT_OPERATION_STATE_FAILED
+	case "unknown":
+		return runtime.CheckpointOperationState_CHECKPOINT_OPERATION_STATE_UNKNOWN
+	}
+	return runtime.CheckpointOperationState_CHECKPOINT_OPERATION_STATE_UNSPECIFIED
+}
+
+// fakePrintCheckpointOpStatus prints one CheckpointOperationStatus as the
+// operation-mode CLI does: a single protojson object on stdout.
+func fakePrintCheckpointOpStatus(status *runtime.CheckpointOperationStatus) {
+	data, err := protojson.MarshalOptions{
+		Indent:          "  ",
+		UseProtoNames:   true,
+		EmitUnpopulated: true,
+	}.Marshal(status)
+	if err != nil {
+		os.Exit(2)
+	}
+	fmt.Println(string(data))
+}
+
+// fakeApplyReceiptPoison corrupts exactly one field of a receipt about to be
+// printed, modeling a wrong answer from the record/CLI boundary. The durable
+// record keeps the truth; only the printed reply lies.
+func fakeApplyReceiptPoison(stateDir string, status *runtime.CheckpointOperationStatus) {
+	switch controlFileValue(stateDir, "poison-checkpoint-receipt") {
+	case "operation_id":
+		status.OperationID = "checkpoint-someone-else"
+	case "sandbox_id":
+		status.SandboxID = "sbox-y"
+	case "source_generation":
+		status.SourceGeneration = "g9"
+	case "request_digest":
+		status.RequestDigest = "invalid-request-digest" // controller syntax check; valid but mismatched RPC digests are rejected by the real CLI tests
+	case "artifact_root_digest":
+		status.ArtifactRootDigest = strings.Repeat("cd", 32)
+	case "artifact_root_scheme":
+		status.ArtifactRootScheme = "v9:wrong-scheme"
+	}
+}
+
+// controlFileValue reads a trimmed control file or "" when absent.
+func controlFileValue(stateDir, name string) string {
+	raw, err := os.ReadFile(filepath.Join(stateDir, name))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(raw))
+}
+
+// controlPresent reports whether a staged control file exists.
+func controlPresent(stateDir, name string) bool {
+	_, err := os.Stat(filepath.Join(stateDir, name))
+	return err == nil
+}
+
+// status renders the durable record as the operation receipt.
+func (r fakeCheckpointRecord) status() *runtime.CheckpointOperationStatus {
+	return &runtime.CheckpointOperationStatus{
+		OperationID:        r.OperationID,
+		SandboxID:          r.SandboxID,
+		State:              fakeCheckpointOpState(r.State),
+		SourceGeneration:   r.SourceGeneration,
+		CheckpointDir:      r.CheckpointDir,
+		RequestDigest:      r.RequestDigest,
+		ArtifactRootDigest: r.ArtifactRootDigest,
+		ArtifactRootScheme: r.ArtifactRootScheme,
+	}
+}
+
+// identifiedCheckpointExecutor emulates the node CLI and daemon contract for
+// `--action checkpoint --operation-id ...`. It enforces the same local
+// contract the node CLI does (complete fixed stop-and-copy payload), binds
+// the durable record to the deterministic digest of the payload actually
+// admitted, persists that record BEFORE any response so a lost reply still
+// leaves the reconcilable fact, executes the runtime checkpoint exactly once
+// per operation ID, answers replays from the record while refusing a changed
+// payload, and counts actual executions separately from replays.
+func identifiedCheckpointExecutor(stateDir string, args []string, operation string, value func(string) string) {
+	sandbox := value("--sandbox-id")
+	dir := value("--checkpoint-dir")
+	if controlPresent(stateDir, "map-source-path") {
+		dir = filepath.Join("/physical/source/checkpoints", filepath.Base(dir))
+		originalValue := value
+		value = func(flag string) string {
+			if flag == "--checkpoint-dir" {
+				return dir
+			}
+			return originalValue(flag)
+		}
+	}
+	generation := value("--expected-generation")
+	timeout, timeoutErr := strconv.ParseUint(value("--checkpoint-timeout-seconds"), 10, 32)
+	leaveRunning, leaveSet := fakeBoolFlag(args, "--leave-running")
+	if sandbox == "" || dir == "" || !strings.HasPrefix(dir, "/") || generation == "" ||
+		timeoutErr != nil || timeout < 1 || timeout > 600 || !leaveSet || leaveRunning {
+		_ = os.WriteFile(filepath.Join(stateDir, "bad-identified-checkpoint"), nil, 0o600)
+		os.Exit(1) // the node CLI refuses a malformed or non-stop-and-copy identified checkpoint locally
+	}
+	digest, err := fakeCheckpointOpDigest(args, value)
+	if err != nil {
+		os.Exit(1)
+	}
+	recordPath := fakeCheckpointRecordPath(stateDir, operation)
+	if raw, readErr := os.ReadFile(recordPath); readErr == nil {
+		var record fakeCheckpointRecord
+		if json.Unmarshal(raw, &record) != nil {
+			os.Exit(1)
+		}
+		if record.RequestDigest != digest {
+			_ = os.WriteFile(filepath.Join(stateDir, "checkpoint-op-reuse-refused"), nil, 0o600)
+			os.Exit(1) // the daemon refuses reuse of an operation ID with a different request
+		}
+		fakeCount(stateDir, "source-checkpoint-replays")
+		status := record.status()
+		fakeApplyReceiptPoison(stateDir, status)
+		fakePrintCheckpointOpStatus(status)
+		if record.State != "succeeded" {
+			os.Exit(1) // the CLI reports the recorded non-success outcome, then fails
+		}
+		os.Exit(0)
+	}
+	// A staged refusal models a server that predates or refuses the new RPC
+	// before admission: the command fails, no record exists, and the query
+	// later answers structured not-found. There is never a legacy fallback.
+	if controlPresent(stateDir, "refuse-checkpoint-op") {
+		os.Exit(1)
+	}
+	if generation != liveGeneration(stateDir) {
+		_ = os.WriteFile(filepath.Join(stateDir, "checkpoint-refused"), nil, 0o600)
+		os.Exit(1) // FailedPrecondition: the pinned incarnation is gone; nothing is recorded
+	}
+	state := controlFileValue(stateDir, "checkpoint-operation-state")
+	if state == "" {
+		state = "succeeded"
+	}
+	if fakeCheckpointOpState(state) == runtime.CheckpointOperationState_CHECKPOINT_OPERATION_STATE_UNSPECIFIED {
+		os.Exit(2) // an unrecognized state is a protocol error, not a record
+	}
+	record := fakeCheckpointRecord{
+		OperationID:      operation,
+		SandboxID:        sandbox,
+		SourceGeneration: generation,
+		CheckpointDir:    dir,
+		RequestDigest:    digest,
+		State:            state,
+	}
+	if state == "succeeded" {
+		record.ArtifactRootDigest = sourceRootDigest(stateDir)
+		record.ArtifactRootScheme = "v2:manifest+sidecar-roots"
+	}
+	// The receipt is durable before any response and before the side-effect
+	// markers: it survives a lost reply, and the actual-execution counter
+	// stays separable from every later CLI replay.
+	encoded, marshalErr := json.Marshal(record)
+	if marshalErr != nil || os.WriteFile(recordPath, append(encoded, '\n'), 0o600) != nil {
+		os.Exit(2)
+	}
+	fakeCount(stateDir, "source-checkpoint-executions")
+	if state == "succeeded" {
+		_ = os.WriteFile(filepath.Join(stateDir, "stopped"), nil, 0o600)
+		_ = os.WriteFile(filepath.Join(stateDir, "checkpoint-id"), []byte(filepath.Base(dir)), 0o600)
+		// Optional replacement staged by a test: after the checkpoint seals,
+		// another actor retires that incarnation and starts a fresh one
+		// under the same ID on the source.
+		if raw, replaceErr := os.ReadFile(filepath.Join(stateDir, "replace-source")); replaceErr == nil {
+			_ = os.WriteFile(filepath.Join(stateDir, "source-generation"), bytes.TrimSpace(raw), 0o600)
+		}
+	}
+	if controlPresent(stateDir, "lose-checkpoint-reply") {
+		os.Exit(1) // the node committed; the reply never reached the CLI
+	}
+	status := record.status()
+	fakeApplyReceiptPoison(stateDir, status)
+	fakePrintCheckpointOpStatus(status)
+	if state != "succeeded" {
+		os.Exit(1) // a recorded non-success outcome is reported, then fails
+	}
+	os.Exit(0)
 }
 
 // inspectJSON renders the sandbox exactly the way `sbox inspect` does:

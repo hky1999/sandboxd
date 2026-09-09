@@ -33,18 +33,20 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	SandboxService_Start_FullMethodName                  = "/runtime.v1.SandboxService/Start"
-	SandboxService_StartWithOperation_FullMethodName     = "/runtime.v1.SandboxService/StartWithOperation"
-	SandboxService_GetStartOperation_FullMethodName      = "/runtime.v1.SandboxService/GetStartOperation"
-	SandboxService_Checkpoint_FullMethodName             = "/runtime.v1.SandboxService/Checkpoint"
-	SandboxService_CheckpointIfGeneration_FullMethodName = "/runtime.v1.SandboxService/CheckpointIfGeneration"
-	SandboxService_Delete_FullMethodName                 = "/runtime.v1.SandboxService/Delete"
-	SandboxService_DeleteIfGeneration_FullMethodName     = "/runtime.v1.SandboxService/DeleteIfGeneration"
-	SandboxService_Wait_FullMethodName                   = "/runtime.v1.SandboxService/Wait"
-	SandboxService_List_FullMethodName                   = "/runtime.v1.SandboxService/List"
-	SandboxService_Stats_FullMethodName                  = "/runtime.v1.SandboxService/Stats"
-	SandboxService_ListAvailableRuntimes_FullMethodName  = "/runtime.v1.SandboxService/ListAvailableRuntimes"
-	SandboxService_SetNetworkPolicy_FullMethodName       = "/runtime.v1.SandboxService/SetNetworkPolicy"
+	SandboxService_Start_FullMethodName                   = "/runtime.v1.SandboxService/Start"
+	SandboxService_StartWithOperation_FullMethodName      = "/runtime.v1.SandboxService/StartWithOperation"
+	SandboxService_GetStartOperation_FullMethodName       = "/runtime.v1.SandboxService/GetStartOperation"
+	SandboxService_Checkpoint_FullMethodName              = "/runtime.v1.SandboxService/Checkpoint"
+	SandboxService_CheckpointIfGeneration_FullMethodName  = "/runtime.v1.SandboxService/CheckpointIfGeneration"
+	SandboxService_CheckpointWithOperation_FullMethodName = "/runtime.v1.SandboxService/CheckpointWithOperation"
+	SandboxService_GetCheckpointOperation_FullMethodName  = "/runtime.v1.SandboxService/GetCheckpointOperation"
+	SandboxService_Delete_FullMethodName                  = "/runtime.v1.SandboxService/Delete"
+	SandboxService_DeleteIfGeneration_FullMethodName      = "/runtime.v1.SandboxService/DeleteIfGeneration"
+	SandboxService_Wait_FullMethodName                    = "/runtime.v1.SandboxService/Wait"
+	SandboxService_List_FullMethodName                    = "/runtime.v1.SandboxService/List"
+	SandboxService_Stats_FullMethodName                   = "/runtime.v1.SandboxService/Stats"
+	SandboxService_ListAvailableRuntimes_FullMethodName   = "/runtime.v1.SandboxService/ListAvailableRuntimes"
+	SandboxService_SetNetworkPolicy_FullMethodName        = "/runtime.v1.SandboxService/SetNetworkPolicy"
 )
 
 // SandboxServiceClient is the client API for SandboxService service.
@@ -72,6 +74,19 @@ type SandboxServiceClient interface {
 	// servers that predate the RPC return Unimplemented; callers must not
 	// fall back to the unconditional Checkpoint.
 	CheckpointIfGeneration(ctx context.Context, in *CheckpointIfGenerationRequest, opts ...grpc.CallOption) (*CheckpointResponse, error)
+	// CheckpointWithOperation checkpoints a running sandbox under an explicit,
+	// persistent operation identity so a client that lost the reply can query
+	// or replay the original checkpoint instead of re-running it against an
+	// unproven source state. Only stop-and-copy Firecracker directory
+	// checkpoints are supported; the operation record is node-local
+	// idempotency state, not a cross-node writer lease or fencing token. Old
+	// servers that predate the RPC return Unimplemented; callers must fail
+	// hard instead of falling back to Checkpoint or CheckpointIfGeneration.
+	CheckpointWithOperation(ctx context.Context, in *CheckpointWithOperationRequest, opts ...grpc.CallOption) (*CheckpointOperationStatus, error)
+	// GetCheckpointOperation returns the durable state of one checkpoint
+	// operation. It never starts a checkpoint and never re-executes a past
+	// operation.
+	GetCheckpointOperation(ctx context.Context, in *GetCheckpointOperationRequest, opts ...grpc.CallOption) (*CheckpointOperationStatus, error)
 	// Delete force-deletes a sandbox.
 	Delete(ctx context.Context, in *DeleteRequest, opts ...grpc.CallOption) (*DeleteResponse, error)
 	// DeleteIfGeneration retires one physical generation only when the sandbox
@@ -141,6 +156,26 @@ func (c *sandboxServiceClient) CheckpointIfGeneration(ctx context.Context, in *C
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(CheckpointResponse)
 	err := c.cc.Invoke(ctx, SandboxService_CheckpointIfGeneration_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *sandboxServiceClient) CheckpointWithOperation(ctx context.Context, in *CheckpointWithOperationRequest, opts ...grpc.CallOption) (*CheckpointOperationStatus, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CheckpointOperationStatus)
+	err := c.cc.Invoke(ctx, SandboxService_CheckpointWithOperation_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *sandboxServiceClient) GetCheckpointOperation(ctx context.Context, in *GetCheckpointOperationRequest, opts ...grpc.CallOption) (*CheckpointOperationStatus, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CheckpointOperationStatus)
+	err := c.cc.Invoke(ctx, SandboxService_GetCheckpointOperation_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -242,6 +277,19 @@ type SandboxServiceServer interface {
 	// servers that predate the RPC return Unimplemented; callers must not
 	// fall back to the unconditional Checkpoint.
 	CheckpointIfGeneration(context.Context, *CheckpointIfGenerationRequest) (*CheckpointResponse, error)
+	// CheckpointWithOperation checkpoints a running sandbox under an explicit,
+	// persistent operation identity so a client that lost the reply can query
+	// or replay the original checkpoint instead of re-running it against an
+	// unproven source state. Only stop-and-copy Firecracker directory
+	// checkpoints are supported; the operation record is node-local
+	// idempotency state, not a cross-node writer lease or fencing token. Old
+	// servers that predate the RPC return Unimplemented; callers must fail
+	// hard instead of falling back to Checkpoint or CheckpointIfGeneration.
+	CheckpointWithOperation(context.Context, *CheckpointWithOperationRequest) (*CheckpointOperationStatus, error)
+	// GetCheckpointOperation returns the durable state of one checkpoint
+	// operation. It never starts a checkpoint and never re-executes a past
+	// operation.
+	GetCheckpointOperation(context.Context, *GetCheckpointOperationRequest) (*CheckpointOperationStatus, error)
 	// Delete force-deletes a sandbox.
 	Delete(context.Context, *DeleteRequest) (*DeleteResponse, error)
 	// DeleteIfGeneration retires one physical generation only when the sandbox
@@ -281,6 +329,12 @@ func (UnimplementedSandboxServiceServer) Checkpoint(context.Context, *Checkpoint
 }
 func (UnimplementedSandboxServiceServer) CheckpointIfGeneration(context.Context, *CheckpointIfGenerationRequest) (*CheckpointResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method CheckpointIfGeneration not implemented")
+}
+func (UnimplementedSandboxServiceServer) CheckpointWithOperation(context.Context, *CheckpointWithOperationRequest) (*CheckpointOperationStatus, error) {
+	return nil, status.Error(codes.Unimplemented, "method CheckpointWithOperation not implemented")
+}
+func (UnimplementedSandboxServiceServer) GetCheckpointOperation(context.Context, *GetCheckpointOperationRequest) (*CheckpointOperationStatus, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetCheckpointOperation not implemented")
 }
 func (UnimplementedSandboxServiceServer) Delete(context.Context, *DeleteRequest) (*DeleteResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Delete not implemented")
@@ -410,6 +464,42 @@ func _SandboxService_CheckpointIfGeneration_Handler(srv interface{}, ctx context
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(SandboxServiceServer).CheckpointIfGeneration(ctx, req.(*CheckpointIfGenerationRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SandboxService_CheckpointWithOperation_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CheckpointWithOperationRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SandboxServiceServer).CheckpointWithOperation(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SandboxService_CheckpointWithOperation_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SandboxServiceServer).CheckpointWithOperation(ctx, req.(*CheckpointWithOperationRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SandboxService_GetCheckpointOperation_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetCheckpointOperationRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SandboxServiceServer).GetCheckpointOperation(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SandboxService_GetCheckpointOperation_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SandboxServiceServer).GetCheckpointOperation(ctx, req.(*GetCheckpointOperationRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -566,6 +656,14 @@ var SandboxService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "CheckpointIfGeneration",
 			Handler:    _SandboxService_CheckpointIfGeneration_Handler,
+		},
+		{
+			MethodName: "CheckpointWithOperation",
+			Handler:    _SandboxService_CheckpointWithOperation_Handler,
+		},
+		{
+			MethodName: "GetCheckpointOperation",
+			Handler:    _SandboxService_GetCheckpointOperation_Handler,
 		},
 		{
 			MethodName: "Delete",

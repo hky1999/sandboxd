@@ -39,7 +39,7 @@ func (h *sandboxService) Checkpoint(
 	ctx context.Context,
 	request *runtime.CheckpointRequest,
 ) (*runtime.CheckpointResponse, error) {
-	return h.checkpoint(ctx, request, "")
+	return h.checkpoint(ctx, request, "", nil)
 }
 
 // CheckpointIfGeneration checkpoints the source sandbox only while it still
@@ -75,18 +75,22 @@ func (h *sandboxService) CheckpointIfGeneration(
 			"expected_generation exceeds 256 bytes",
 		)
 	}
-	return h.checkpoint(ctx, request.Checkpoint, request.ExpectedGeneration)
+	return h.checkpoint(ctx, request.Checkpoint, request.ExpectedGeneration, nil)
 }
 
 // checkpoint is the shared implementation of the legacy and conditional RPCs.
 // An empty expectedGeneration keeps the legacy unconditional semantics; when
 // set, the sandbox's current resource generation must equal it exactly (the
 // value is never trimmed), checked after the metadata is read under the
-// physical lock and before any checkpoint side effect.
+// physical lock and before any checkpoint side effect. A non-nil operation
+// binding marks the exact runtime-entry boundary for CheckpointWithOperation
+// and records the durable success fact after the runtime returned nil; the
+// legacy and conditional entries pass nil and behave exactly as before.
 func (h *sandboxService) checkpoint(
 	ctx context.Context,
 	request *runtime.CheckpointRequest,
 	expectedGeneration string,
+	operation *checkpointOperationBinding,
 ) (*runtime.CheckpointResponse, error) {
 	if request == nil {
 		return nil, errord.ToGRPCf(errord.ErrInvalidArgument, "checkpoint request is nil")
@@ -217,6 +221,9 @@ func (h *sandboxService) checkpoint(
 	// the VMM before confirming the uffd handler exit). The callback always
 	// runs synchronously on this goroutine, so the flag is written before
 	// withTransientFirecrackerCheckpointMemory returns and read only after it.
+	// An identified checkpoint operation marks the same boundary on its
+	// binding — never by parsing error text — so its executor resolves later
+	// failures as unknown instead of failed.
 	runtimeCheckpointEntered := false
 	err = h.withTransientFirecrackerCheckpointMemory(
 		checkpointCtx,
@@ -228,6 +235,7 @@ func (h *sandboxService) checkpoint(
 		true,
 		func() error {
 			runtimeCheckpointEntered = true
+			operation.noteRuntimeEntered()
 			return checkpointHandler.Checkpoint(checkpointCtx, svc.CheckpointConfig{
 				ID:           request.ID,
 				Directory:    directory.path,
@@ -277,6 +285,24 @@ func (h *sandboxService) checkpoint(
 			))
 		}
 		return nil, errord.ToGRPC(operationErr)
+	}
+	// An identified checkpoint operation may report success only after the
+	// completion fact is durable: the sealed content root of the directory
+	// the runtime wrote is read here — one shared algorithm, never a re-hash
+	// of artifact payloads — and a SUCCEEDED record is persisted before the
+	// reply is built. A root that cannot be read or a terminal write that
+	// fails keeps the artifacts (the runtime was entered) but reports the
+	// outcome as unknown instead of success.
+	if operation != nil {
+		if recordErr := operation.recordSuccess(directory.path); recordErr != nil {
+			return nil, errord.ToGRPC(fmt.Errorf(
+				"checkpoint sandbox %s completed but its outcome could not be confirmed; "+
+					"artifacts are retained in %s and the outcome must be treated as unknown: %w",
+				request.ID,
+				directory.path,
+				recordErr,
+			))
+		}
 	}
 	return &runtime.CheckpointResponse{}, nil
 }

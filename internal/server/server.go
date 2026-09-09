@@ -128,6 +128,11 @@ type sandboxService struct {
 	// loss, daemon restart, and sandbox deletion. It loads before the intent
 	// journal so committed-intent takeovers can promote operation facts.
 	startOperations *startOperationStore
+	// checkpointOperations is the durable checkpoint-operation journal behind
+	// CheckpointWithOperation: per-operation idempotency records for source
+	// checkpoints that survive reply loss, daemon restart, and source
+	// deletion. Node-local state, never cleaned automatically.
+	checkpointOperations *checkpointOperationStore
 	// allocateStartResourceFn is an in-package test seam; production is nil.
 	allocateStartResourceFn           allocateStartResourceFunc
 	retirementMu                      sync.Mutex
@@ -661,6 +666,12 @@ func (h *sandboxService) Shutdown() {
 	// cancellation therefore holds shutdown until it exits.
 	h.startOperations.shutdown()
 
+	// The same drain contract governs admitted checkpoint operations: their
+	// executors hold the physical lock and the runtime handle, so they must
+	// fully return before the sandbox deletion and manager teardown below
+	// release anything those executions may still be using.
+	h.checkpointOperations.shutdown()
+
 	// 1. Force-delete all running sandboxes with per-sandbox timeout.
 	sandboxes := h.sandboxManager.List()
 	for _, c := range sandboxes {
@@ -929,6 +940,17 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 		return nil, fmt.Errorf("load start operations: %w", err)
 	}
 
+	// The checkpoint-operation journal follows the same discipline: it must
+	// be loaded before any RPC could execute a checkpoint, still-admitted
+	// records resolve to unknown here (their executors are gone), and a
+	// corrupt record fails startup explicitly. Like the start-operation
+	// tombstones, these records survive the pod-identity reset because a
+	// historical checkpoint fact does not require its source to exist.
+	checkpointOperations, err := loadCheckpointOperations(cfg.RootDir)
+	if err != nil {
+		return nil, fmt.Errorf("load checkpoint operations: %w", err)
+	}
+
 	// The start-intent journal loads before any resource module or recovery
 	// pass runs: a pending intent must be known before a manager could
 	// destroy retained state, and a corrupt or contradictory record must fail
@@ -1061,6 +1083,7 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 		xpuMgr:                            xpuMgr,
 		startIntents:                      startIntents,
 		startOperations:                   startOperations,
+		checkpointOperations:              checkpointOperations,
 	}
 
 	// VolumeManager comes up before runtime handlers. An ordinary directory is
