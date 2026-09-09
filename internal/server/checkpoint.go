@@ -82,10 +82,14 @@ func (h *sandboxService) CheckpointIfGeneration(
 // An empty expectedGeneration keeps the legacy unconditional semantics; when
 // set, the sandbox's current resource generation must equal it exactly (the
 // value is never trimmed), checked after the metadata is read under the
-// physical lock and before any checkpoint side effect. A non-nil operation
-// binding marks the exact runtime-entry boundary for CheckpointWithOperation
-// and records the durable success fact after the runtime returned nil; the
-// legacy and conditional entries pass nil and behave exactly as before.
+// physical lock and before any checkpoint side effect. The same value is
+// propagated to the runtime as CheckpointConfig.ExpectedGeneration so a
+// runtime that binds its own persisted generation can re-verify the
+// incarnation at its boundary; the server's label check stays the admission
+// gate. A non-nil operation binding marks the exact runtime-entry boundary
+// for CheckpointWithOperation and records the durable success fact after the
+// runtime returned nil; the legacy and conditional entries pass nil and
+// behave exactly as before.
 func (h *sandboxService) checkpoint(
 	ctx context.Context,
 	request *runtime.CheckpointRequest,
@@ -237,12 +241,13 @@ func (h *sandboxService) checkpoint(
 			runtimeCheckpointEntered = true
 			operation.noteRuntimeEntered()
 			return checkpointHandler.Checkpoint(checkpointCtx, svc.CheckpointConfig{
-				ID:           request.ID,
-				Directory:    directory.path,
-				CgroupPath:   cgroupPath,
-				Compress:     request.Compress,
-				LeaveRunning: request.LeaveRunning,
-				SnapshotType: request.SnapshotType,
+				ID:                 request.ID,
+				Directory:          directory.path,
+				CgroupPath:         cgroupPath,
+				Compress:           request.Compress,
+				LeaveRunning:       request.LeaveRunning,
+				SnapshotType:       request.SnapshotType,
+				ExpectedGeneration: expectedGeneration,
 			})
 		},
 	)

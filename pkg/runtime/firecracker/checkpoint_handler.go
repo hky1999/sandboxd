@@ -32,10 +32,43 @@ import (
 	"github.com/inclusionAI/sandboxd/config"
 	"github.com/inclusionAI/sandboxd/internal/firecrackerproto"
 	"github.com/inclusionAI/sandboxd/pkg/checkpointroot"
+	"github.com/inclusionAI/sandboxd/pkg/errord"
 	runtimecore "github.com/inclusionAI/sandboxd/pkg/runtime"
 	runtimecommon "github.com/inclusionAI/sandboxd/pkg/runtime/internal/common"
 	"github.com/sirupsen/logrus"
 )
+
+// verifyCheckpointExpectedGeneration enforces the incarnation binding of a
+// conditional or identified checkpoint against the runtime's own persisted
+// identity. An empty expectation keeps the legacy unconditional semantics; a
+// record with no bound generation (written before this identity existed)
+// attests no incarnation and is unsupported, mirroring DeleteStrict. The exact
+// strings are compared, never trimmed. It is applied on both the cold lookup
+// path (against the durable state, before any recovery side effect) and under
+// the instance operation lock (against the live state, before any checkpoint
+// side effect).
+func verifyCheckpointExpectedGeneration(sandboxID, expected, generation string) error {
+	if expected == "" {
+		return nil
+	}
+	if generation == "" {
+		return fmt.Errorf(
+			"Firecracker sandbox %s state carries no resource generation; generation-checked checkpoint unsupported: %w",
+			sandboxID,
+			errord.ErrFailedPrecondition,
+		)
+	}
+	if generation != expected {
+		return fmt.Errorf(
+			"Firecracker sandbox %s state generation %q does not match expected %q: %w",
+			sandboxID,
+			generation,
+			expected,
+			errord.ErrFailedPrecondition,
+		)
+	}
+	return nil
+}
 
 // Checkpoint writes a v2 checkpoint directory owned by the caller and keeps
 // the incremental lineage alive across generations:
@@ -58,13 +91,27 @@ func (handler *Handler) Checkpoint(
 ) (retErr error) {
 	sandboxID := config.ID
 	tStarted := time.Now()
-	instance, err := handler.lookupInstance(sandboxID)
+	// The lookup itself enforces the expectation on the cold path: a sandbox
+	// absent from the in-memory map is recovered from durable state only after
+	// that state's bound generation matches, so a stale or unbound record is
+	// refused before recovery's own side effects (lineage reset, monitors, a
+	// recorded-process stop) can touch the incarnation.
+	instance, err := handler.lookupInstanceExpected(sandboxID, config.ExpectedGeneration)
 	if err != nil {
 		return err
 	}
 	instance.operationMu.Lock()
 	defer instance.operationMu.Unlock()
 	state, baseProof := instance.checkpointStateAndProof()
+	// A conditional or identified checkpoint was admitted against one exact
+	// incarnation: re-verify it against this runtime's own persisted identity
+	// under the operation lock — guarding the in-memory hit the cold lookup
+	// never saw on disk and any concurrent change — exactly like DeleteStrict,
+	// before the running check, layout, pause, snapshot, or any other side
+	// effect, so a rejected checkpoint leaves the incarnation fully intact.
+	if err := verifyCheckpointExpectedGeneration(sandboxID, config.ExpectedGeneration, state.Generation); err != nil {
+		return err
+	}
 	if state.Exited || !state.Configured ||
 		!firecrackerProcessMatches(state.PID, handler.binary, state.APIPath, state.ID) {
 		return fmt.Errorf("Firecracker sandbox %s is not running", sandboxID)

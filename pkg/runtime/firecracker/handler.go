@@ -1251,6 +1251,22 @@ func (handler *Handler) Wait(
 func (handler *Handler) lookupInstance(
 	sandboxID string,
 ) (*firecrackerInstance, error) {
+	return handler.lookupInstanceExpected(sandboxID, "")
+}
+
+// lookupInstanceExpected resolves the instance for a caller that may carry an
+// expected incarnation generation. The in-memory hit returns the instance
+// directly and leaves the expectation to the caller's own locked comparison.
+// The cold path reads the durable state and — before recoverState runs, since
+// recovery is not side-effect-free: it resets checkpoint lineage and persists
+// that reset, spawns recovery monitors, and may stop a recorded process —
+// verifies the state's bound generation against the expectation, so a
+// mismatched or unbound record is refused as a pure observation with the
+// on-disk incarnation untouched. An empty expectation keeps the legacy
+// unconditional lookup.
+func (handler *Handler) lookupInstanceExpected(
+	sandboxID, expectedGeneration string,
+) (*firecrackerInstance, error) {
 	handler.mu.RLock()
 	instance := handler.instances[sandboxID]
 	handler.mu.RUnlock()
@@ -1266,6 +1282,9 @@ func (handler *Handler) lookupInstance(
 		return nil, err
 	}
 	if err := handler.validatePersistedState(sandboxID, bundlePath, state); err != nil {
+		return nil, err
+	}
+	if err := verifyCheckpointExpectedGeneration(sandboxID, expectedGeneration, state.Generation); err != nil {
 		return nil, err
 	}
 	instance = handler.recoverState(state)

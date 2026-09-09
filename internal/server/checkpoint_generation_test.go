@@ -116,10 +116,11 @@ func TestCheckpointIfGenerationMatchesCurrentGeneration(t *testing.T) {
 	require.NotNil(t, response)
 	require.Len(t, handler.checkpoints, 1)
 	assert.Equal(t, svc.CheckpointConfig{
-		ID:           id,
-		Directory:    directory,
-		Compress:     true,
-		LeaveRunning: true,
+		ID:                 id,
+		Directory:          directory,
+		Compress:           true,
+		LeaveRunning:       true,
+		ExpectedGeneration: "gen-current",
 	}, handler.checkpoints[0])
 	assert.FileExists(t, filepath.Join(directory, "checkpoint.img"))
 	assert.Zero(t, handler.deleteCalls)
@@ -275,4 +276,81 @@ func TestCheckpointLegacyIgnoresGenerationExpectation(t *testing.T) {
 	require.NotNil(t, response)
 	require.Len(t, handler.checkpoints, 1)
 	assert.FileExists(t, filepath.Join(directory, "checkpoint.img"))
+}
+
+// TestCheckpointPropagatesExpectedGenerationToRuntime pins which server
+// entries hand the admitted incarnation identity to the runtime: the
+// conditional and identified entries propagate the exact expected generation
+// they validated under the physical lock, while the legacy entry keeps the
+// empty (unconditional) value. The runtime re-verifies that value against its
+// own persisted generation; runtimes without one keep ignoring it.
+func TestCheckpointPropagatesExpectedGenerationToRuntime(t *testing.T) {
+	t.Run("legacy checkpoint passes no expectation", func(t *testing.T) {
+		handler := newCheckpointTestHandler()
+		s := newTestService(t, map[string]svc.Handler{"runsc": handler})
+		const id = "sbox-prop-legacy"
+		storeGenerationRunningSandbox(t, s, id, "gen-prop-legacy")
+		directory := filepath.Join(t.TempDir(), "checkpoint")
+
+		response, err := s.Checkpoint(context.Background(), &runtime.CheckpointRequest{
+			ID:             id,
+			CheckpointDir:  directory,
+			TimeoutSeconds: 5,
+		})
+		require.NoError(t, err)
+		require.NotNil(t, response)
+		require.Len(t, handler.checkpoints, 1)
+		assert.Equal(t, svc.CheckpointConfig{
+			ID:        id,
+			Directory: directory,
+		}, handler.checkpoints[0])
+	})
+
+	t.Run("conditional checkpoint passes the validated expectation", func(t *testing.T) {
+		handler := newCheckpointTestHandler()
+		s := newTestService(t, map[string]svc.Handler{"runsc": handler})
+		const id = "sbox-prop-conditional"
+		storeGenerationRunningSandbox(t, s, id, "gen-prop-conditional")
+		directory := filepath.Join(t.TempDir(), "checkpoint")
+
+		response, err := s.CheckpointIfGeneration(context.Background(), &runtime.CheckpointIfGenerationRequest{
+			Checkpoint: &runtime.CheckpointRequest{
+				ID:             id,
+				CheckpointDir:  directory,
+				TimeoutSeconds: 5,
+			},
+			ExpectedGeneration: "gen-prop-conditional",
+		})
+		require.NoError(t, err)
+		require.NotNil(t, response)
+		require.Len(t, handler.checkpoints, 1)
+		assert.Equal(t, svc.CheckpointConfig{
+			ID:                 id,
+			Directory:          directory,
+			ExpectedGeneration: "gen-prop-conditional",
+		}, handler.checkpoints[0])
+	})
+
+	t.Run("identified checkpoint operation passes the validated expectation", func(t *testing.T) {
+		handler := newCheckpointOperationRuntimeHandler()
+		s := newCheckpointOperationService(t, handler, t.TempDir())
+		const id = "sbox-prop-operation"
+		storeCheckpointOperationSandbox(t, s, id, "gen-prop-operation")
+		directory := filepath.Join(t.TempDir(), "checkpoint")
+
+		opStatus, err := s.CheckpointWithOperation(context.Background(),
+			checkpointOperationRequest("op-prop-1", id, directory, "gen-prop-operation", 5))
+		require.NoError(t, err)
+		require.NotNil(t, opStatus)
+		assert.Equal(t, runtime.CheckpointOperationState_CHECKPOINT_OPERATION_STATE_SUCCEEDED, opStatus.GetState())
+
+		handler.mu.Lock()
+		defer handler.mu.Unlock()
+		require.Len(t, handler.checkpoints, 1)
+		assert.Equal(t, svc.CheckpointConfig{
+			ID:                 id,
+			Directory:          directory,
+			ExpectedGeneration: "gen-prop-operation",
+		}, handler.checkpoints[0])
+	})
 }
