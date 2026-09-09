@@ -375,8 +375,10 @@ func liveGeneration(stateDir string) string {
 // fakeCheckpointRecord is the fake node's durable checkpoint-operation
 // receipt — the server-side journal entry, persisted independently of any
 // response the CLI does or does not receive. RecoveryProtocol mirrors the
-// record version the service admits under (0 legacy, 1 WITNESS); it is a
-// record property every reply restates, never per-call evidence.
+// record version the service admits under (0 legacy, 1 WITNESS,
+// 2 WITNESS_ABORTABLE) and AbortConfirmed the durable abort fact a
+// confirmed abort persists; both are record properties every reply
+// restates, never per-call evidence.
 type fakeCheckpointRecord struct {
 	OperationID        string `json:"operation_id"`
 	SandboxID          string `json:"sandbox_id"`
@@ -385,6 +387,7 @@ type fakeCheckpointRecord struct {
 	RequestDigest      string `json:"request_digest"`
 	State              string `json:"state"`
 	RecoveryProtocol   int    `json:"recovery_protocol,omitempty"`
+	AbortConfirmed     bool   `json:"abort_confirmed,omitempty"`
 	ArtifactRootDigest string `json:"artifact_root_digest,omitempty"`
 	ArtifactRootScheme string `json:"artifact_root_scheme,omitempty"`
 }
@@ -545,6 +548,7 @@ func (r fakeCheckpointRecord) status() *runtime.CheckpointOperationStatus {
 		CheckpointDir:      r.CheckpointDir,
 		RequestDigest:      r.RequestDigest,
 		RecoveryProtocol:   runtime.CheckpointOperationRecoveryProtocol(r.RecoveryProtocol),
+		AbortConfirmed:     r.AbortConfirmed,
 		ArtifactRootDigest: r.ArtifactRootDigest,
 		ArtifactRootScheme: r.ArtifactRootScheme,
 	}
@@ -629,9 +633,18 @@ func identifiedCheckpointExecutor(stateDir string, args []string, operation stri
 	}
 	// The staged protocol models the record version the daemon admits
 	// under: witness records are the ones whose runtime holds the operation
-	// evidence (and whose successes owe an acknowledgment).
-	if controlFileValue(stateDir, "checkpoint-op-protocol") == "witness" {
+	// evidence (and whose successes owe an acknowledgment); abortable
+	// records additionally support the explicit abort, whose confirmed
+	// FAILED outcome persists the durable abort fact on the record.
+	switch controlFileValue(stateDir, "checkpoint-op-protocol") {
+	case "witness":
 		record.RecoveryProtocol = 1
+	case "abortable":
+		record.RecoveryProtocol = 2
+	}
+	if state == "failed" && record.RecoveryProtocol == 2 &&
+		controlPresent(stateDir, "checkpoint-op-aborted") {
+		record.AbortConfirmed = true
 	}
 	if state == "succeeded" {
 		record.ArtifactRootDigest = sourceRootDigest(stateDir)
@@ -658,8 +671,9 @@ func identifiedCheckpointExecutor(stateDir string, args []string, operation stri
 		// success, exactly as the service does: its failure keeps the
 		// SUCCEEDED record and returns an explicit RPC error (no receipt
 		// reaches the CLI), its success marks the released evidence, and
-		// only then may the reply report evidence_released=true.
-		if record.RecoveryProtocol == 1 {
+		// only then may the reply report evidence_released=true. Every
+		// witness-capable protocol (WITNESS and WITNESS_ABORTABLE) owes it.
+		if record.RecoveryProtocol >= 1 {
 			if controlPresent(stateDir, "fail-source-ack") {
 				os.Exit(1) // durable success, failed acknowledgment — reconcile through recovery
 			}
@@ -670,7 +684,7 @@ func identifiedCheckpointExecutor(stateDir string, args []string, operation stri
 		os.Exit(1) // the node committed; the reply never reached the CLI
 	}
 	status := record.status()
-	if record.RecoveryProtocol == 1 && state == "succeeded" &&
+	if record.RecoveryProtocol >= 1 && state == "succeeded" &&
 		!controlPresent(stateDir, "checkpoint-receipt-unreleased") {
 		status.EvidenceReleased = true // this call completed the acknowledgment after its durable success
 	}
@@ -739,9 +753,9 @@ func recoverCheckpointOperationExecutor(stateDir string, args []string, operatio
 		_ = os.WriteFile(filepath.Join(stateDir, "checkpoint-op-reuse-refused"), nil, 0o600)
 		os.Exit(1) // the service refuses a recovery whose complete original payload differs from the recorded binding
 	}
-	if record.RecoveryProtocol != 1 {
+	if record.RecoveryProtocol == 0 {
 		_ = os.WriteFile(filepath.Join(stateDir, "recover-protocol-refused"), nil, 0o600)
-		os.Exit(1) // a legacy record holds no runtime witness and cannot be recovered
+		os.Exit(1) // a legacy record holds no runtime witness and cannot be recovered; WITNESS and WITNESS_ABORTABLE both can
 	}
 	switch record.State {
 	case "failed":

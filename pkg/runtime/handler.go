@@ -174,6 +174,38 @@ type CheckpointOperationWitness interface {
 	) error
 }
 
+// CheckpointOperationAborter is an internal optional capability for runtimes
+// that can deterministically retire an identified checkpoint operation which
+// never sealed. It is deliberately separate from CheckpointOperationWitness:
+// an abort is never mixed into the success-recovery semantics. Nothing public
+// invokes it yet — it exists so a later service stage can require it before
+// exposing a failure-side release, and a runtime without it keeps refusing
+// aborts rather than degrading them into a recovery or a resume.
+type CheckpointOperationAborter interface {
+	// AbortCheckpointOperation retires the matching never-sealed operation.
+	// Only a durable intent may be newly aborted — an intent whose artifact
+	// already sealed must be recovered instead — and an abort in flight is
+	// retried as the same recorded decision. The abort decision is durable
+	// before the source is resumed; the exact recorded source birth identity
+	// must be proven live before and after the resume and the guest error
+	// release, so a missing, replaced, or dead source is never claimed
+	// resumed. A nil return proves the durable aborted fact.
+	AbortCheckpointOperation(
+		ctx context.Context,
+		sandboxID string,
+		binding CheckpointOperationBinding,
+	) error
+	// AckAbortedCheckpointOperation releases the evidence-retention gate of
+	// the matching operation after the service has durably persisted its
+	// failure fact. It reads no artifact and touches no source, is
+	// idempotent, and admits only a durable abort fact.
+	AckAbortedCheckpointOperation(
+		ctx context.Context,
+		sandboxID string,
+		binding CheckpointOperationBinding,
+	) error
+}
+
 type CheckpointConfig struct {
 	ID        string
 	Directory string

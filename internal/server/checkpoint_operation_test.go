@@ -1006,12 +1006,12 @@ func TestCheckpointOperationJournalValidation(t *testing.T) {
 
 	t.Run("bad version and phase fail", func(t *testing.T) {
 		for name, mutate := range map[string]func(*checkpointOperationRecord){
-			// Version 2 is a supported record version now (the witness
-			// recovery protocol); a version outside 1 and 2 is corruption —
+			// Versions 2 and 3 are supported record versions now (the witness
+			// and abortable protocols); a version outside 1..3 is corruption —
 			// which is also exactly how a pre-version-2 binary refuses to
 			// load a downgraded journal, fail closed instead of guessing.
 			"version zero":    func(r *checkpointOperationRecord) { r.Version = 0 },
-			"version unknown": func(r *checkpointOperationRecord) { r.Version = 3 },
+			"version unknown": func(r *checkpointOperationRecord) { r.Version = checkpointOperationRecordVersionAbortable + 1 },
 			"phase":           func(r *checkpointOperationRecord) { r.Phase = "maybe" },
 			"digest length":   func(r *checkpointOperationRecord) { r.RequestDigest = "abc" },
 			"artifact without success": func(r *checkpointOperationRecord) {
@@ -1040,6 +1040,13 @@ func TestCheckpointOperationJournalValidation(t *testing.T) {
 			r.OperationID = "op-journal-2"
 			r.Version = checkpointOperationRecordVersionLegacy
 		}))
+		writeRecord(t, root, "op-journal-3.json", validRecord(func(r *checkpointOperationRecord) {
+			r.OperationID = "op-journal-3"
+			r.Version = checkpointOperationRecordVersionAbortable
+			r.Phase = checkpointOperationPhaseFailed
+			r.Artifact = nil
+			r.AbortConfirmed = true
+		}))
 		store, err := loadCheckpointOperations(root)
 		require.NoError(t, err)
 		witness, ok := store.published("op-journal-1")
@@ -1048,6 +1055,11 @@ func TestCheckpointOperationJournalValidation(t *testing.T) {
 		legacy, ok := store.published("op-journal-2")
 		require.True(t, ok)
 		assert.Equal(t, checkpointOperationRecordVersionLegacy, legacy.Version)
+		abortable, ok := store.published("op-journal-3")
+		require.True(t, ok)
+		assert.Equal(t, checkpointOperationRecordVersionAbortable, abortable.Version)
+		assert.True(t, abortable.AbortConfirmed)
+		assert.Equal(t, checkpointOperationPhaseFailed, abortable.Phase)
 	})
 
 	t.Run("mismatched operation ID fails", func(t *testing.T) {

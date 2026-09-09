@@ -59,6 +59,14 @@ type fakeFirecrackerAPI struct {
 
 	mu    sync.Mutex
 	calls []fakeVMMAPICall
+	// onSnapshotCreate runs exactly once inside the FIRST snapshot create
+	// request, before its reply: the deterministic injection point between
+	// the durable intent and the prepared promotion write. The hook must not
+	// touch testing.T — it runs on the server goroutine — so it reports its
+	// error through hookErr for the test goroutine to inspect.
+	onSnapshotCreate func() error
+	hookErr          error
+	hookFired        bool
 }
 
 func startFakeFirecrackerAPI(t *testing.T, socket string) *fakeFirecrackerAPI {
@@ -77,6 +85,27 @@ func startFakeFirecrackerAPI(t *testing.T, socket string) *fakeFirecrackerAPI {
 		_ = os.Remove(socket)
 	})
 	return fake
+}
+
+// snapshotHookError returns the injection hook's result for the test
+// goroutine to assert on.
+func (fake *fakeFirecrackerAPI) snapshotHookError() error {
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	return fake.hookErr
+}
+
+// makeStateDirUnwritableFromHook is the background-safe form of
+// makeStateDirUnwritable for injection hooks that run off the test
+// goroutine: no testing.T, the error is the hook's return value.
+func makeStateDirUnwritableFromHook(instance *firecrackerInstance) func() error {
+	return func() error {
+		dir := checkpointOperationStateDir(instance)
+		if err := os.Chmod(dir, 0500); err != nil {
+			return err
+		}
+		return nil
+	}
 }
 
 func (fake *fakeFirecrackerAPI) serve(
@@ -102,6 +131,20 @@ func (fake *fakeFirecrackerAPI) serve(
 			}
 			if err := os.WriteFile(path, []byte(field+"\n"), 0600); err != nil {
 				fake.t.Errorf("write fake snapshot component %s: %v", path, err)
+			}
+		}
+		fake.mu.Lock()
+		hook, fired := fake.onSnapshotCreate, fake.hookFired
+		fake.hookFired = true
+		fake.mu.Unlock()
+		if hook != nil && !fired {
+			// The hook's error never fails the reply: the injection targets
+			// a later durable write, and the request still completes so the
+			// flow reaches that write deterministically.
+			if err := hook(); err != nil {
+				fake.mu.Lock()
+				fake.hookErr = err
+				fake.mu.Unlock()
 			}
 		}
 	}
@@ -461,7 +504,9 @@ func TestCheckpointOperationRealFlowReachesCompletedWitness(t *testing.T) {
 		t.Fatal("completed operation returned before the kernel exit notification")
 	}
 	// Durable evidence: a sealed artifact root and a completed witness bound
-	// to the exact operation and incarnation.
+	// to the exact operation and incarnation. The witness is the version-2
+	// record promoted from the durable intent: it keeps the directory birth
+	// identity and source birth captured before any side effect.
 	root, err := checkpointroot.Bind(directory)
 	if err != nil {
 		t.Fatal(err)
@@ -473,6 +518,16 @@ func TestCheckpointOperationRealFlowReachesCompletedWitness(t *testing.T) {
 	witness := disk.CheckpointOperation
 	if witness.Phase != firecrackerCheckpointOperationPhaseCompleted {
 		t.Fatalf("durable witness phase = %q, want completed", witness.Phase)
+	}
+	if witness.Version != firecrackerCheckpointOperationRecordVersion2 {
+		t.Fatalf("durable witness version = %d, want %d", witness.Version, firecrackerCheckpointOperationRecordVersion2)
+	}
+	if stat, statErr := os.Stat(directory); statErr != nil {
+		t.Fatal(statErr)
+	} else if unixStat, ok := stat.Sys().(*syscall.Stat_t); !ok ||
+		witness.DirectoryDev != uint64(unixStat.Dev) ||
+		witness.DirectoryInode != unixStat.Ino {
+		t.Fatalf("witness directory identity drifted from the reserved output: %+v", witness)
 	}
 	if witness.OperationID != "op-source-1" ||
 		witness.RequestDigest != strings.Repeat("ab", 32) ||
@@ -505,19 +560,28 @@ func TestCheckpointOperationRealFlowReachesCompletedWitness(t *testing.T) {
 }
 
 // TestCheckpointOperationPreparedWitnessWriteFailureKeepsPauseAndArtifacts
-// injects the ambiguity the prepared write must survive: the state write
-// fails after the artifact is sealed, and its durability is unknown. The
-// source must never be resumed, the sealed artifact must be retained, the
-// in-memory constraint must bind this daemon, and both a new checkpoint and
-// the evidence-clearing delete must stay blocked.
+// injects the ambiguity the prepared write must survive: the durable intent
+// lands first, then the state write fails after the artifact is sealed, and
+// its durability is unknown. The source must never be resumed, the sealed
+// artifact must be retained, the in-memory constraint must bind this daemon,
+// and both a new checkpoint and the evidence-clearing delete must stay
+// blocked.
 func TestCheckpointOperationPreparedWitnessWriteFailureKeepsPauseAndArtifacts(t *testing.T) {
 	handler, instance, api, sandboxID := checkpointOperationFixture(t, "gen-live")
 	directory := filepath.Join(t.TempDir(), "checkpoint")
 	before := instance.snapshot()
 	fd := checkpointTestPidfd(t, before.PID)
-	makeStateDirUnwritable(t, instance)
+	// The injection lands inside the FIRST snapshot request, before its
+	// reply: the intent is already durable at that point and the prepared
+	// promotion write has not run — exactly the 1405 window — without any
+	// phase polling.
+	api.onSnapshotCreate = makeStateDirUnwritableFromHook(instance)
+	t.Cleanup(func() { makeStateDirWritable(instance) })
 
 	err := runIdentifiedCheckpoint(t, handler, sandboxID, "gen-live", directory)
+	if hookErr := api.snapshotHookError(); hookErr != nil {
+		t.Fatalf("snapshot injection failed: %v", hookErr)
+	}
 	if !containsAll(err.Error(), "persist prepared checkpoint operation witness") {
 		t.Fatalf("failure must name the ambiguous prepared write: %v", err)
 	}
@@ -536,11 +600,12 @@ func TestCheckpointOperationPreparedWitnessWriteFailureKeepsPauseAndArtifacts(t 
 	if _, statErr := os.Stat(filepath.Join(directory, firecrackerCheckpointManifestName)); statErr != nil {
 		t.Fatalf("sealed artifact was discarded: %v", statErr)
 	}
-	// The durable state is unchanged — the write never landed — but the
-	// in-memory witness binds this daemon fail-closed.
+	// The prepared-promotion write never landed, but the durable early
+	// intent from before the side effects did: the disk keeps the intent
+	// while the in-memory witness binds this daemon fail-closed at prepared.
 	disk, readErr := readFirecrackerState(before.BundlePath)
-	if readErr != nil || disk.CheckpointOperation != (firecrackerCheckpointOperationRecord{}) {
-		t.Fatalf("durable witness state = %+v %v, want none", disk.CheckpointOperation, readErr)
+	if readErr != nil || disk.CheckpointOperation.Phase != firecrackerCheckpointOperationPhaseIntent {
+		t.Fatalf("durable witness state = %+v %v, want the durable intent", disk.CheckpointOperation, readErr)
 	}
 	if phase := instance.snapshot().CheckpointOperation.Phase; phase != firecrackerCheckpointOperationPhasePrepared {
 		t.Fatalf("in-memory witness phase = %q, want prepared", phase)
@@ -1033,7 +1098,9 @@ func TestRecoverCheckpointOperationRefusesNonMatchingWitness(t *testing.T) {
 		{
 			name: "corrupted record version",
 			mutate: func(record *firecrackerCheckpointOperationRecord) {
-				record.Version = firecrackerCheckpointOperationRecordVersion + 1
+				// Version 2 is the real early-intent schema now; a genuinely
+				// unknown version must stay the unsupported-version refusal.
+				record.Version = firecrackerCheckpointOperationRecordVersion2 + 1
 			},
 			wantErr:   errord.ErrFailedPrecondition,
 			fragments: []string{"unsupported checkpoint operation record version"},
@@ -1684,18 +1751,23 @@ func TestRecoverCheckpointOperationPreparedRetryPersistsBeforeStopping(t *testin
 	directory := filepath.Join(t.TempDir(), "checkpoint")
 	before := instance.snapshot()
 	fd := checkpointTestPidfd(t, before.PID)
-	makeStateDirUnwritable(t, instance)
+	// Same deterministic injection point: durable intent, no prepared write.
+	api.onSnapshotCreate = makeStateDirUnwritableFromHook(instance)
+	t.Cleanup(func() { makeStateDirWritable(instance) })
 
 	// The original checkpoint seals the artifact and then fails the prepared
-	// witness write: the source stays paused and only the in-memory record
-	// binds this daemon.
+	// witness write: the source stays paused, the durable intent stays on
+	// disk, and the in-memory prepared record binds this daemon.
 	err := runIdentifiedCheckpoint(t, handler, sandboxID, "gen-live", directory)
+	if hookErr := api.snapshotHookError(); hookErr != nil {
+		t.Fatalf("snapshot injection failed: %v", hookErr)
+	}
 	if !containsAll(err.Error(), "persist prepared checkpoint operation witness") {
 		t.Fatalf("failure must name the ambiguous prepared write: %v", err)
 	}
 	disk, readErr := readFirecrackerState(before.BundlePath)
-	if readErr != nil || !disk.CheckpointOperation.isZero() {
-		t.Fatalf("durable witness state = %+v %v, want none", disk.CheckpointOperation, readErr)
+	if readErr != nil || disk.CheckpointOperation.Phase != firecrackerCheckpointOperationPhaseIntent {
+		t.Fatalf("durable witness state = %+v %v, want the durable intent", disk.CheckpointOperation, readErr)
 	}
 	if checkpointTestExitReady(t, fd) {
 		t.Fatal("source already stopped before the retry")
@@ -1719,8 +1791,8 @@ func TestRecoverCheckpointOperationPreparedRetryPersistsBeforeStopping(t *testin
 		t.Fatalf("retry re-took snapshots: %d", snapshots)
 	}
 	disk, readErr = readFirecrackerState(before.BundlePath)
-	if readErr != nil || !disk.CheckpointOperation.isZero() {
-		t.Fatalf("failed retry wrote durable evidence: %+v %v", disk.CheckpointOperation, readErr)
+	if readErr != nil || disk.CheckpointOperation.Phase != firecrackerCheckpointOperationPhaseIntent {
+		t.Fatalf("failed retry changed the durable intent: %+v %v", disk.CheckpointOperation, readErr)
 	}
 	if phase := instance.snapshot().CheckpointOperation.Phase; phase != firecrackerCheckpointOperationPhasePrepared {
 		t.Fatalf("failed retry dropped the in-memory witness: %q", phase)

@@ -139,6 +139,48 @@ func stopFirecrackerProcessConfirmedBirth(
 	return fmt.Errorf("Firecracker process pid %d did not exit after SIGKILL", pid)
 }
 
+// pinAliveFirecrackerProcessBirth proves the recorded birth identity still
+// names a LIVE process and returns its pinned pidfd for re-confirmation. A
+// source that is gone, exited, or running under a recycled PID proves no
+// resumption and is refused: the caller must not claim it resumed the source.
+func pinAliveFirecrackerProcessBirth(pid int, startTime uint64) (int, error) {
+	if pid <= 1 {
+		return -1, fmt.Errorf("Firecracker process pid %d is not a valid recorded pid", pid)
+	}
+	fd, err := unix.PidfdOpen(pid, 0)
+	if errors.Is(err, unix.ESRCH) {
+		return -1, fmt.Errorf(
+			"Firecracker process pid %d is gone; the recorded source is not alive", pid,
+		)
+	}
+	if err != nil {
+		return -1, fmt.Errorf("open Firecracker process pidfd: %w", err)
+	}
+	if err := confirmPinnedFirecrackerProcessBirth(pid, startTime, fd); err != nil {
+		unix.Close(fd)
+		return -1, err
+	}
+	return fd, nil
+}
+
+// confirmPinnedFirecrackerProcessBirth re-proves, against a pinned pidfd, that
+// the recorded birth identity still names the same live process.
+func confirmPinnedFirecrackerProcessBirth(pid int, startTime uint64, fd int) error {
+	if err := confirmFirecrackerProcessBirth(pid, startTime, fd); err != nil {
+		return err
+	}
+	exited, err := waitProcessExitNotification(fd, 0)
+	if err != nil {
+		return err
+	}
+	if exited {
+		return fmt.Errorf(
+			"Firecracker process pid %d already exited; the recorded source is not alive", pid,
+		)
+	}
+	return nil
+}
+
 // confirmFirecrackerProcessBirth proves the PID still carries the recorded
 // start time, consulting the pinned pidfd when the /proc entry has vanished
 // between the two reads.

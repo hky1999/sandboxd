@@ -65,13 +65,87 @@ const (
 	// occurred (completed, failed, or restored) so it can signal the
 	// cooperative handoff FIFO inside the guest (PR #30).
 	MessageCheckpoint MessageType = 10
-	MessageResponse   MessageType = 100
+	// MessageCheckpointAbort asks the guest agent to release the cooperative
+	// checkpoint handoff FIFO with a terminal error outcome. Unlike
+	// MessageCheckpoint it carries the abort's operation identity so the
+	// agent can deduplicate retries after a lost reply. The outcome is fixed
+	// to "error", so the request has no outcome field. Agents that predate
+	// this message reject it as unknown; the host must not fall back to the
+	// legacy message for a retryable abort.
+	MessageCheckpointAbort MessageType = 11
+	MessageResponse        MessageType = 100
 )
 
 // CheckpointRequest carries the checkpoint lifecycle event to the guest agent.
 type CheckpointRequest struct {
 	Outcome     string   `json:"outcome"`               // "resume", "error", or "restore"
 	Environment []string `json:"environment,omitempty"` // target env after restore
+}
+
+const (
+	// CheckpointAbortMaxIdentityBytes bounds the OperationID and
+	// SourceGeneration fields; both must also be nonempty.
+	CheckpointAbortMaxIdentityBytes = 256
+	// CheckpointAbortDigestLength is the required length of the hexadecimal
+	// RequestDigest (a SHA-256 digest).
+	CheckpointAbortDigestLength = 64
+)
+
+// CheckpointAbortRequest identifies one retryable checkpoint abort. The agent
+// deduplicates by OperationID and compares the full binding — digest and
+// source generation included — so a retry that matches a recorded receipt is
+// acknowledged without another handoff signal while a conflicting reuse of
+// the ID is rejected.
+type CheckpointAbortRequest struct {
+	OperationID      string `json:"operation_id"`
+	RequestDigest    string `json:"request_digest"`
+	SourceGeneration string `json:"source_generation"`
+}
+
+// Validate checks the bounded request shape the host and the guest agent must
+// agree on before an abort is deduplicated or delivered.
+func (request CheckpointAbortRequest) Validate() error {
+	if request.OperationID == "" {
+		return errors.New("checkpoint abort operation ID is empty")
+	}
+	if len(request.OperationID) > CheckpointAbortMaxIdentityBytes {
+		return fmt.Errorf(
+			"checkpoint abort operation ID is %d bytes, want at most %d",
+			len(request.OperationID),
+			CheckpointAbortMaxIdentityBytes,
+		)
+	}
+	if request.SourceGeneration == "" {
+		return errors.New("checkpoint abort source generation is empty")
+	}
+	if len(request.SourceGeneration) > CheckpointAbortMaxIdentityBytes {
+		return fmt.Errorf(
+			"checkpoint abort source generation is %d bytes, want at most %d",
+			len(request.SourceGeneration),
+			CheckpointAbortMaxIdentityBytes,
+		)
+	}
+	if len(request.RequestDigest) != CheckpointAbortDigestLength {
+		return fmt.Errorf(
+			"checkpoint abort request digest is %d bytes, want %d hexadecimal characters",
+			len(request.RequestDigest),
+			CheckpointAbortDigestLength,
+		)
+	}
+	for index := 0; index < len(request.RequestDigest); index++ {
+		digit := request.RequestDigest[index]
+		if digit >= '0' && digit <= '9' ||
+			digit >= 'a' && digit <= 'f' ||
+			digit >= 'A' && digit <= 'F' {
+			continue
+		}
+		return fmt.Errorf(
+			"checkpoint abort request digest has non-hexadecimal byte %q at %d",
+			digit,
+			index,
+		)
+	}
+	return nil
 }
 
 type Response struct {

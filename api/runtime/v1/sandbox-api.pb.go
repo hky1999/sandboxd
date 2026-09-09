@@ -377,9 +377,12 @@ const (
 	// the artifacts still exist unchanged, nor that the source is still absent
 	// or still running.
 	CheckpointOperationState_CHECKPOINT_OPERATION_STATE_SUCCEEDED CheckpointOperationState = 2
-	// FAILED means the checkpoint was refused or failed before the runtime
-	// checkpoint was entered, so no artifact can exist. The operation ID is
-	// spent; checkpointing again requires a new operation ID.
+	// FAILED means the checkpoint was refused, failed without entering an
+	// unprovable runtime state, or was explicitly aborted through
+	// AbortCheckpointOperation — in every case no artifact can exist and the
+	// operation ID is spent; checkpointing again requires a new operation ID.
+	// A reply's abort_confirmed distinguishes a confirmed explicit abort, and
+	// never converts the failure into any other outcome.
 	CheckpointOperationState_CHECKPOINT_OPERATION_STATE_FAILED CheckpointOperationState = 3
 	// UNKNOWN means the outcome could not be proven from durable evidence — the
 	// runtime was entered and then failed, timed out, or was cancelled, the
@@ -450,8 +453,15 @@ const (
 	// WITNESS marks a version-2 record: the admission verified the runtime
 	// supports both the sealed-root writer capability and the operation
 	// witness, and the exact operation binding was sent to the runtime. These
-	// records — and only these — are eligible for RecoverCheckpointOperation.
+	// and WITNESS_ABORTABLE records are the ones eligible for
+	// RecoverCheckpointOperation.
 	CheckpointOperationRecoveryProtocol_CHECKPOINT_OPERATION_RECOVERY_PROTOCOL_WITNESS CheckpointOperationRecoveryProtocol = 1
+	// WITNESS_ABORTABLE marks a version-3 record: the admission additionally
+	// verified the runtime supports the explicit abort capability, so besides
+	// every WITNESS recovery flow these records — and only these — are
+	// eligible for AbortCheckpointOperation. Recovery still works unchanged
+	// for them; an undetermined record is never aborted automatically.
+	CheckpointOperationRecoveryProtocol_CHECKPOINT_OPERATION_RECOVERY_PROTOCOL_WITNESS_ABORTABLE CheckpointOperationRecoveryProtocol = 2
 )
 
 // Enum value maps for CheckpointOperationRecoveryProtocol.
@@ -459,10 +469,12 @@ var (
 	CheckpointOperationRecoveryProtocol_name = map[int32]string{
 		0: "CHECKPOINT_OPERATION_RECOVERY_PROTOCOL_UNSPECIFIED",
 		1: "CHECKPOINT_OPERATION_RECOVERY_PROTOCOL_WITNESS",
+		2: "CHECKPOINT_OPERATION_RECOVERY_PROTOCOL_WITNESS_ABORTABLE",
 	}
 	CheckpointOperationRecoveryProtocol_value = map[string]int32{
-		"CHECKPOINT_OPERATION_RECOVERY_PROTOCOL_UNSPECIFIED": 0,
-		"CHECKPOINT_OPERATION_RECOVERY_PROTOCOL_WITNESS":     1,
+		"CHECKPOINT_OPERATION_RECOVERY_PROTOCOL_UNSPECIFIED":       0,
+		"CHECKPOINT_OPERATION_RECOVERY_PROTOCOL_WITNESS":           1,
+		"CHECKPOINT_OPERATION_RECOVERY_PROTOCOL_WITNESS_ABORTABLE": 2,
 	}
 )
 
@@ -2425,7 +2437,8 @@ func (x *CheckpointWithOperationRequest) GetExpectedGeneration() string {
 }
 
 // CheckpointOperationStatus is the durable state of one checkpoint operation,
-// returned by both CheckpointWithOperation and GetCheckpointOperation.
+// returned by CheckpointWithOperation, GetCheckpointOperation,
+// RecoverCheckpointOperation, and AbortCheckpointOperation.
 type CheckpointOperationStatus struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// OperationID repeats the queried operation ID.
@@ -2465,8 +2478,20 @@ type CheckpointOperationStatus struct {
 	// must never be compared as a historical fact. A controller that requires
 	// released evidence performs one explicit recovery and reads it there.
 	EvidenceReleased bool `protobuf:"varint,11,opt,name=evidence_released,json=evidenceReleased,proto3" json:"evidence_released,omitempty"`
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	// AbortConfirmed reports that the record carries a durably confirmed abort
+	// fact: an AbortCheckpointOperation made the FAILED (aborted) outcome
+	// durable before replying. Unlike evidence_released it is a record
+	// property, not a per-call proof — only a FAILED record under the
+	// WITNESS_ABORTABLE protocol may carry it, and every later reply restates
+	// it. A historical abort_confirmed=true proves no release: evidence_released
+	// stays the per-call fact of the one invocation that completed the abort
+	// acknowledgment, and a caller that requires a release performs one
+	// explicit abort or recovery and reads it there. A true value proves the
+	// abort — the source was resumed and the operation spent — never a
+	// checkpoint success: the record stays FAILED.
+	AbortConfirmed bool `protobuf:"varint,12,opt,name=abort_confirmed,json=abortConfirmed,proto3" json:"abort_confirmed,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *CheckpointOperationStatus) Reset() {
@@ -2572,6 +2597,13 @@ func (x *CheckpointOperationStatus) GetRecoveryProtocol() CheckpointOperationRec
 func (x *CheckpointOperationStatus) GetEvidenceReleased() bool {
 	if x != nil {
 		return x.EvidenceReleased
+	}
+	return false
+}
+
+func (x *CheckpointOperationStatus) GetAbortConfirmed() bool {
+	if x != nil {
+		return x.AbortConfirmed
 	}
 	return false
 }
@@ -2690,6 +2722,75 @@ func (x *RecoverCheckpointOperationRequest) GetRecoveryTimeoutSeconds() uint32 {
 	return 0
 }
 
+// AbortCheckpointOperationRequest asks for the explicit abort of one
+// already-recorded checkpoint operation admitted under the
+// witness-abortable protocol. The authorization is the original request
+// alone, exactly as for recovery: the service recomputes the request digest
+// from this complete, unrewritten payload and refuses the operation ID when
+// it does not match the recorded binding.
+type AbortCheckpointOperationRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Operation is the complete original CheckpointWithOperationRequest,
+	// exactly as it was first admitted — same checkpoint directory spelling,
+	// same original checkpoint timeout, compression, leave_running, snapshot
+	// type, and the exact expected generation. Rewriting any field changes
+	// the request digest and refuses the abort; the original request timeout
+	// keeps its role in the digest and is never replaced by the abort timeout
+	// below.
+	Operation *CheckpointWithOperationRequest `protobuf:"bytes,1,opt,name=operation,proto3" json:"operation,omitempty"`
+	// AbortTimeoutSeconds bounds this abort attempt — the join of a
+	// still-running original executor, the runtime abort, and the abort
+	// acknowledgment — and must be between 1 and 600. It is not part of the
+	// request digest and never rewrites the recorded operation.
+	AbortTimeoutSeconds uint32 `protobuf:"varint,2,opt,name=abort_timeout_seconds,json=abortTimeoutSeconds,proto3" json:"abort_timeout_seconds,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
+}
+
+func (x *AbortCheckpointOperationRequest) Reset() {
+	*x = AbortCheckpointOperationRequest{}
+	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[27]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *AbortCheckpointOperationRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*AbortCheckpointOperationRequest) ProtoMessage() {}
+
+func (x *AbortCheckpointOperationRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[27]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use AbortCheckpointOperationRequest.ProtoReflect.Descriptor instead.
+func (*AbortCheckpointOperationRequest) Descriptor() ([]byte, []int) {
+	return file_api_runtime_v1_sandbox_api_proto_rawDescGZIP(), []int{27}
+}
+
+func (x *AbortCheckpointOperationRequest) GetOperation() *CheckpointWithOperationRequest {
+	if x != nil {
+		return x.Operation
+	}
+	return nil
+}
+
+func (x *AbortCheckpointOperationRequest) GetAbortTimeoutSeconds() uint32 {
+	if x != nil {
+		return x.AbortTimeoutSeconds
+	}
+	return 0
+}
+
 // DeleteRequest describes a force-delete request.
 type DeleteRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
@@ -2704,7 +2805,7 @@ type DeleteRequest struct {
 
 func (x *DeleteRequest) Reset() {
 	*x = DeleteRequest{}
-	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[27]
+	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[28]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2716,7 +2817,7 @@ func (x *DeleteRequest) String() string {
 func (*DeleteRequest) ProtoMessage() {}
 
 func (x *DeleteRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[27]
+	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[28]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2729,7 +2830,7 @@ func (x *DeleteRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteRequest.ProtoReflect.Descriptor instead.
 func (*DeleteRequest) Descriptor() ([]byte, []int) {
-	return file_api_runtime_v1_sandbox_api_proto_rawDescGZIP(), []int{27}
+	return file_api_runtime_v1_sandbox_api_proto_rawDescGZIP(), []int{28}
 }
 
 func (x *DeleteRequest) GetID() string {
@@ -2755,7 +2856,7 @@ type DeleteResponse struct {
 
 func (x *DeleteResponse) Reset() {
 	*x = DeleteResponse{}
-	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[28]
+	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[29]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2767,7 +2868,7 @@ func (x *DeleteResponse) String() string {
 func (*DeleteResponse) ProtoMessage() {}
 
 func (x *DeleteResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[28]
+	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[29]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2780,7 +2881,7 @@ func (x *DeleteResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteResponse.ProtoReflect.Descriptor instead.
 func (*DeleteResponse) Descriptor() ([]byte, []int) {
-	return file_api_runtime_v1_sandbox_api_proto_rawDescGZIP(), []int{28}
+	return file_api_runtime_v1_sandbox_api_proto_rawDescGZIP(), []int{29}
 }
 
 // DeleteIfGenerationRequest retires exactly one physical incarnation.
@@ -2797,7 +2898,7 @@ type DeleteIfGenerationRequest struct {
 
 func (x *DeleteIfGenerationRequest) Reset() {
 	*x = DeleteIfGenerationRequest{}
-	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[29]
+	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[30]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2809,7 +2910,7 @@ func (x *DeleteIfGenerationRequest) String() string {
 func (*DeleteIfGenerationRequest) ProtoMessage() {}
 
 func (x *DeleteIfGenerationRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[29]
+	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[30]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2822,7 +2923,7 @@ func (x *DeleteIfGenerationRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteIfGenerationRequest.ProtoReflect.Descriptor instead.
 func (*DeleteIfGenerationRequest) Descriptor() ([]byte, []int) {
-	return file_api_runtime_v1_sandbox_api_proto_rawDescGZIP(), []int{29}
+	return file_api_runtime_v1_sandbox_api_proto_rawDescGZIP(), []int{30}
 }
 
 func (x *DeleteIfGenerationRequest) GetID() string {
@@ -2850,7 +2951,7 @@ type DeleteIfGenerationResponse struct {
 
 func (x *DeleteIfGenerationResponse) Reset() {
 	*x = DeleteIfGenerationResponse{}
-	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[30]
+	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[31]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2862,7 +2963,7 @@ func (x *DeleteIfGenerationResponse) String() string {
 func (*DeleteIfGenerationResponse) ProtoMessage() {}
 
 func (x *DeleteIfGenerationResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[30]
+	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[31]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2875,7 +2976,7 @@ func (x *DeleteIfGenerationResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteIfGenerationResponse.ProtoReflect.Descriptor instead.
 func (*DeleteIfGenerationResponse) Descriptor() ([]byte, []int) {
-	return file_api_runtime_v1_sandbox_api_proto_rawDescGZIP(), []int{30}
+	return file_api_runtime_v1_sandbox_api_proto_rawDescGZIP(), []int{31}
 }
 
 func (x *DeleteIfGenerationResponse) GetRetiredGeneration() string {
@@ -2896,7 +2997,7 @@ type WaitRequest struct {
 
 func (x *WaitRequest) Reset() {
 	*x = WaitRequest{}
-	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[31]
+	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[32]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2908,7 +3009,7 @@ func (x *WaitRequest) String() string {
 func (*WaitRequest) ProtoMessage() {}
 
 func (x *WaitRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[31]
+	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[32]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2921,7 +3022,7 @@ func (x *WaitRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WaitRequest.ProtoReflect.Descriptor instead.
 func (*WaitRequest) Descriptor() ([]byte, []int) {
-	return file_api_runtime_v1_sandbox_api_proto_rawDescGZIP(), []int{31}
+	return file_api_runtime_v1_sandbox_api_proto_rawDescGZIP(), []int{32}
 }
 
 func (x *WaitRequest) GetID() string {
@@ -2946,7 +3047,7 @@ type WaitResponse struct {
 
 func (x *WaitResponse) Reset() {
 	*x = WaitResponse{}
-	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[32]
+	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[33]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2958,7 +3059,7 @@ func (x *WaitResponse) String() string {
 func (*WaitResponse) ProtoMessage() {}
 
 func (x *WaitResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[32]
+	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[33]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2971,7 +3072,7 @@ func (x *WaitResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WaitResponse.ProtoReflect.Descriptor instead.
 func (*WaitResponse) Descriptor() ([]byte, []int) {
-	return file_api_runtime_v1_sandbox_api_proto_rawDescGZIP(), []int{32}
+	return file_api_runtime_v1_sandbox_api_proto_rawDescGZIP(), []int{33}
 }
 
 func (x *WaitResponse) GetStatus() int32 {
@@ -3008,7 +3109,7 @@ type ListSandboxesRequest struct {
 
 func (x *ListSandboxesRequest) Reset() {
 	*x = ListSandboxesRequest{}
-	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[33]
+	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[34]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3020,7 +3121,7 @@ func (x *ListSandboxesRequest) String() string {
 func (*ListSandboxesRequest) ProtoMessage() {}
 
 func (x *ListSandboxesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[33]
+	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[34]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3033,7 +3134,7 @@ func (x *ListSandboxesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListSandboxesRequest.ProtoReflect.Descriptor instead.
 func (*ListSandboxesRequest) Descriptor() ([]byte, []int) {
-	return file_api_runtime_v1_sandbox_api_proto_rawDescGZIP(), []int{33}
+	return file_api_runtime_v1_sandbox_api_proto_rawDescGZIP(), []int{34}
 }
 
 func (x *ListSandboxesRequest) GetID() string {
@@ -3061,7 +3162,7 @@ type ListSandboxesResponse struct {
 
 func (x *ListSandboxesResponse) Reset() {
 	*x = ListSandboxesResponse{}
-	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[34]
+	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[35]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3073,7 +3174,7 @@ func (x *ListSandboxesResponse) String() string {
 func (*ListSandboxesResponse) ProtoMessage() {}
 
 func (x *ListSandboxesResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[34]
+	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[35]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3086,7 +3187,7 @@ func (x *ListSandboxesResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListSandboxesResponse.ProtoReflect.Descriptor instead.
 func (*ListSandboxesResponse) Descriptor() ([]byte, []int) {
-	return file_api_runtime_v1_sandbox_api_proto_rawDescGZIP(), []int{34}
+	return file_api_runtime_v1_sandbox_api_proto_rawDescGZIP(), []int{35}
 }
 
 func (x *ListSandboxesResponse) GetSandboxes() []*SandboxStatus {
@@ -3135,7 +3236,7 @@ type SandboxStatus struct {
 
 func (x *SandboxStatus) Reset() {
 	*x = SandboxStatus{}
-	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[35]
+	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[36]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3147,7 +3248,7 @@ func (x *SandboxStatus) String() string {
 func (*SandboxStatus) ProtoMessage() {}
 
 func (x *SandboxStatus) ProtoReflect() protoreflect.Message {
-	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[35]
+	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[36]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3160,7 +3261,7 @@ func (x *SandboxStatus) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SandboxStatus.ProtoReflect.Descriptor instead.
 func (*SandboxStatus) Descriptor() ([]byte, []int) {
-	return file_api_runtime_v1_sandbox_api_proto_rawDescGZIP(), []int{35}
+	return file_api_runtime_v1_sandbox_api_proto_rawDescGZIP(), []int{36}
 }
 
 func (x *SandboxStatus) GetID() string {
@@ -3281,7 +3382,7 @@ type KeyValue struct {
 
 func (x *KeyValue) Reset() {
 	*x = KeyValue{}
-	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[36]
+	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[37]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3293,7 +3394,7 @@ func (x *KeyValue) String() string {
 func (*KeyValue) ProtoMessage() {}
 
 func (x *KeyValue) ProtoReflect() protoreflect.Message {
-	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[36]
+	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[37]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3306,7 +3407,7 @@ func (x *KeyValue) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use KeyValue.ProtoReflect.Descriptor instead.
 func (*KeyValue) Descriptor() ([]byte, []int) {
-	return file_api_runtime_v1_sandbox_api_proto_rawDescGZIP(), []int{36}
+	return file_api_runtime_v1_sandbox_api_proto_rawDescGZIP(), []int{37}
 }
 
 func (x *KeyValue) GetKey() string {
@@ -3352,7 +3453,7 @@ type LinuxSandboxResources struct {
 
 func (x *LinuxSandboxResources) Reset() {
 	*x = LinuxSandboxResources{}
-	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[37]
+	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[38]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3364,7 +3465,7 @@ func (x *LinuxSandboxResources) String() string {
 func (*LinuxSandboxResources) ProtoMessage() {}
 
 func (x *LinuxSandboxResources) ProtoReflect() protoreflect.Message {
-	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[37]
+	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[38]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3377,7 +3478,7 @@ func (x *LinuxSandboxResources) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LinuxSandboxResources.ProtoReflect.Descriptor instead.
 func (*LinuxSandboxResources) Descriptor() ([]byte, []int) {
-	return file_api_runtime_v1_sandbox_api_proto_rawDescGZIP(), []int{37}
+	return file_api_runtime_v1_sandbox_api_proto_rawDescGZIP(), []int{38}
 }
 
 func (x *LinuxSandboxResources) GetCpuPeriod() uint64 {
@@ -3463,7 +3564,7 @@ type HugepageLimit struct {
 
 func (x *HugepageLimit) Reset() {
 	*x = HugepageLimit{}
-	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[38]
+	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[39]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3475,7 +3576,7 @@ func (x *HugepageLimit) String() string {
 func (*HugepageLimit) ProtoMessage() {}
 
 func (x *HugepageLimit) ProtoReflect() protoreflect.Message {
-	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[38]
+	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[39]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3488,7 +3589,7 @@ func (x *HugepageLimit) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HugepageLimit.ProtoReflect.Descriptor instead.
 func (*HugepageLimit) Descriptor() ([]byte, []int) {
-	return file_api_runtime_v1_sandbox_api_proto_rawDescGZIP(), []int{38}
+	return file_api_runtime_v1_sandbox_api_proto_rawDescGZIP(), []int{39}
 }
 
 func (x *HugepageLimit) GetPageSize() string {
@@ -3526,7 +3627,7 @@ type SandboxMetadata struct {
 
 func (x *SandboxMetadata) Reset() {
 	*x = SandboxMetadata{}
-	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[39]
+	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[40]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3538,7 +3639,7 @@ func (x *SandboxMetadata) String() string {
 func (*SandboxMetadata) ProtoMessage() {}
 
 func (x *SandboxMetadata) ProtoReflect() protoreflect.Message {
-	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[39]
+	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[40]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3551,7 +3652,7 @@ func (x *SandboxMetadata) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SandboxMetadata.ProtoReflect.Descriptor instead.
 func (*SandboxMetadata) Descriptor() ([]byte, []int) {
-	return file_api_runtime_v1_sandbox_api_proto_rawDescGZIP(), []int{39}
+	return file_api_runtime_v1_sandbox_api_proto_rawDescGZIP(), []int{40}
 }
 
 func (x *SandboxMetadata) GetID() string {
@@ -3607,7 +3708,7 @@ type SandboxMetadataList struct {
 
 func (x *SandboxMetadataList) Reset() {
 	*x = SandboxMetadataList{}
-	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[40]
+	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[41]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3619,7 +3720,7 @@ func (x *SandboxMetadataList) String() string {
 func (*SandboxMetadataList) ProtoMessage() {}
 
 func (x *SandboxMetadataList) ProtoReflect() protoreflect.Message {
-	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[40]
+	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[41]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3632,7 +3733,7 @@ func (x *SandboxMetadataList) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SandboxMetadataList.ProtoReflect.Descriptor instead.
 func (*SandboxMetadataList) Descriptor() ([]byte, []int) {
-	return file_api_runtime_v1_sandbox_api_proto_rawDescGZIP(), []int{40}
+	return file_api_runtime_v1_sandbox_api_proto_rawDescGZIP(), []int{41}
 }
 
 func (x *SandboxMetadataList) GetSandboxes() map[string]*SandboxMetadata {
@@ -3653,7 +3754,7 @@ type StatsRequest struct {
 
 func (x *StatsRequest) Reset() {
 	*x = StatsRequest{}
-	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[41]
+	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[42]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3665,7 +3766,7 @@ func (x *StatsRequest) String() string {
 func (*StatsRequest) ProtoMessage() {}
 
 func (x *StatsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[41]
+	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[42]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3678,7 +3779,7 @@ func (x *StatsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StatsRequest.ProtoReflect.Descriptor instead.
 func (*StatsRequest) Descriptor() ([]byte, []int) {
-	return file_api_runtime_v1_sandbox_api_proto_rawDescGZIP(), []int{41}
+	return file_api_runtime_v1_sandbox_api_proto_rawDescGZIP(), []int{42}
 }
 
 func (x *StatsRequest) GetID() string {
@@ -3709,7 +3810,7 @@ type StatsResponse struct {
 
 func (x *StatsResponse) Reset() {
 	*x = StatsResponse{}
-	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[42]
+	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[43]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3721,7 +3822,7 @@ func (x *StatsResponse) String() string {
 func (*StatsResponse) ProtoMessage() {}
 
 func (x *StatsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[42]
+	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[43]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3734,7 +3835,7 @@ func (x *StatsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StatsResponse.ProtoReflect.Descriptor instead.
 func (*StatsResponse) Descriptor() ([]byte, []int) {
-	return file_api_runtime_v1_sandbox_api_proto_rawDescGZIP(), []int{42}
+	return file_api_runtime_v1_sandbox_api_proto_rawDescGZIP(), []int{43}
 }
 
 func (x *StatsResponse) GetCpuUsageNs() uint64 {
@@ -3789,7 +3890,7 @@ type ListAvailableRuntimesRequest struct {
 
 func (x *ListAvailableRuntimesRequest) Reset() {
 	*x = ListAvailableRuntimesRequest{}
-	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[43]
+	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[44]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3801,7 +3902,7 @@ func (x *ListAvailableRuntimesRequest) String() string {
 func (*ListAvailableRuntimesRequest) ProtoMessage() {}
 
 func (x *ListAvailableRuntimesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[43]
+	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[44]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3814,7 +3915,7 @@ func (x *ListAvailableRuntimesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListAvailableRuntimesRequest.ProtoReflect.Descriptor instead.
 func (*ListAvailableRuntimesRequest) Descriptor() ([]byte, []int) {
-	return file_api_runtime_v1_sandbox_api_proto_rawDescGZIP(), []int{43}
+	return file_api_runtime_v1_sandbox_api_proto_rawDescGZIP(), []int{44}
 }
 
 // RuntimeInfo describes one initialized runtime handler and its optional
@@ -3835,7 +3936,7 @@ type RuntimeInfo struct {
 
 func (x *RuntimeInfo) Reset() {
 	*x = RuntimeInfo{}
-	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[44]
+	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[45]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3847,7 +3948,7 @@ func (x *RuntimeInfo) String() string {
 func (*RuntimeInfo) ProtoMessage() {}
 
 func (x *RuntimeInfo) ProtoReflect() protoreflect.Message {
-	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[44]
+	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[45]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3860,7 +3961,7 @@ func (x *RuntimeInfo) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RuntimeInfo.ProtoReflect.Descriptor instead.
 func (*RuntimeInfo) Descriptor() ([]byte, []int) {
-	return file_api_runtime_v1_sandbox_api_proto_rawDescGZIP(), []int{44}
+	return file_api_runtime_v1_sandbox_api_proto_rawDescGZIP(), []int{45}
 }
 
 func (x *RuntimeInfo) GetRuntimeClass() string {
@@ -3905,7 +4006,7 @@ type ListAvailableRuntimesResponse struct {
 
 func (x *ListAvailableRuntimesResponse) Reset() {
 	*x = ListAvailableRuntimesResponse{}
-	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[45]
+	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[46]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3917,7 +4018,7 @@ func (x *ListAvailableRuntimesResponse) String() string {
 func (*ListAvailableRuntimesResponse) ProtoMessage() {}
 
 func (x *ListAvailableRuntimesResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[45]
+	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[46]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3930,7 +4031,7 @@ func (x *ListAvailableRuntimesResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListAvailableRuntimesResponse.ProtoReflect.Descriptor instead.
 func (*ListAvailableRuntimesResponse) Descriptor() ([]byte, []int) {
-	return file_api_runtime_v1_sandbox_api_proto_rawDescGZIP(), []int{45}
+	return file_api_runtime_v1_sandbox_api_proto_rawDescGZIP(), []int{46}
 }
 
 func (x *ListAvailableRuntimesResponse) GetRuntimeClasses() []string {
@@ -4100,7 +4201,7 @@ const file_api_runtime_v1_sandbox_api_proto_rawDesc = "" +
 	"\n" +
 	"checkpoint\x18\x02 \x01(\v2\x1d.runtime.v1.CheckpointRequestR\n" +
 	"checkpoint\x12/\n" +
-	"\x13expected_generation\x18\x03 \x01(\tR\x12expectedGeneration\"\x9d\x04\n" +
+	"\x13expected_generation\x18\x03 \x01(\tR\x12expectedGeneration\"\xc6\x04\n" +
 	"\x19CheckpointOperationStatus\x12!\n" +
 	"\foperation_id\x18\x01 \x01(\tR\voperationId\x12\x1d\n" +
 	"\n" +
@@ -4114,12 +4215,16 @@ const file_api_runtime_v1_sandbox_api_proto_rawDesc = "" +
 	"\amessage\x18\t \x01(\tR\amessage\x12\\\n" +
 	"\x11recovery_protocol\x18\n" +
 	" \x01(\x0e2/.runtime.v1.CheckpointOperationRecoveryProtocolR\x10recoveryProtocol\x12+\n" +
-	"\x11evidence_released\x18\v \x01(\bR\x10evidenceReleased\"B\n" +
+	"\x11evidence_released\x18\v \x01(\bR\x10evidenceReleased\x12'\n" +
+	"\x0fabort_confirmed\x18\f \x01(\bR\x0eabortConfirmed\"B\n" +
 	"\x1dGetCheckpointOperationRequest\x12!\n" +
 	"\foperation_id\x18\x01 \x01(\tR\voperationId\"\xa7\x01\n" +
 	"!RecoverCheckpointOperationRequest\x12H\n" +
 	"\toperation\x18\x01 \x01(\v2*.runtime.v1.CheckpointWithOperationRequestR\toperation\x128\n" +
-	"\x18recovery_timeout_seconds\x18\x02 \x01(\rR\x16recoveryTimeoutSeconds\"9\n" +
+	"\x18recovery_timeout_seconds\x18\x02 \x01(\rR\x16recoveryTimeoutSeconds\"\x9f\x01\n" +
+	"\x1fAbortCheckpointOperationRequest\x12H\n" +
+	"\toperation\x18\x01 \x01(\v2*.runtime.v1.CheckpointWithOperationRequestR\toperation\x122\n" +
+	"\x15abort_timeout_seconds\x18\x02 \x01(\rR\x13abortTimeoutSeconds\"9\n" +
 	"\rDeleteRequest\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x18\n" +
 	"\atimeout\x18\x02 \x01(\x03R\atimeout\"\x10\n" +
@@ -4265,15 +4370,15 @@ const file_api_runtime_v1_sandbox_api_proto_rawDesc = "" +
 	"\"CHECKPOINT_OPERATION_STATE_RUNNING\x10\x01\x12(\n" +
 	"$CHECKPOINT_OPERATION_STATE_SUCCEEDED\x10\x02\x12%\n" +
 	"!CHECKPOINT_OPERATION_STATE_FAILED\x10\x03\x12&\n" +
-	"\"CHECKPOINT_OPERATION_STATE_UNKNOWN\x10\x04*\x91\x01\n" +
+	"\"CHECKPOINT_OPERATION_STATE_UNKNOWN\x10\x04*\xcf\x01\n" +
 	"#CheckpointOperationRecoveryProtocol\x126\n" +
 	"2CHECKPOINT_OPERATION_RECOVERY_PROTOCOL_UNSPECIFIED\x10\x00\x122\n" +
-	".CHECKPOINT_OPERATION_RECOVERY_PROTOCOL_WITNESS\x10\x01*^\n" +
+	".CHECKPOINT_OPERATION_RECOVERY_PROTOCOL_WITNESS\x10\x01\x12<\n" +
+	"8CHECKPOINT_OPERATION_RECOVERY_PROTOCOL_WITNESS_ABORTABLE\x10\x02*^\n" +
 	"\fSandboxState\x12\x19\n" +
 	"\x15SANDBOX_STATE_RUNNING\x10\x00\x12\x18\n" +
 	"\x14SANDBOX_STATE_EXITED\x10\x01\x12\x19\n" +
-	"\x15SANDBOX_STATE_UNKNOWN\x10\x022\xe1\n" +
-	"\n" +
+	"\x15SANDBOX_STATE_UNKNOWN\x10\x022\xd3\v\n" +
 	"\x0eSandboxService\x12>\n" +
 	"\x05Start\x12\x18.runtime.v1.StartRequest\x1a\x19.runtime.v1.StartResponse\"\x00\x12_\n" +
 	"\x12StartWithOperation\x12%.runtime.v1.StartWithOperationRequest\x1a .runtime.v1.StartOperationStatus\"\x00\x12]\n" +
@@ -4283,7 +4388,8 @@ const file_api_runtime_v1_sandbox_api_proto_rawDesc = "" +
 	"\x16CheckpointIfGeneration\x12).runtime.v1.CheckpointIfGenerationRequest\x1a\x1e.runtime.v1.CheckpointResponse\"\x00\x12n\n" +
 	"\x17CheckpointWithOperation\x12*.runtime.v1.CheckpointWithOperationRequest\x1a%.runtime.v1.CheckpointOperationStatus\"\x00\x12l\n" +
 	"\x16GetCheckpointOperation\x12).runtime.v1.GetCheckpointOperationRequest\x1a%.runtime.v1.CheckpointOperationStatus\"\x00\x12t\n" +
-	"\x1aRecoverCheckpointOperation\x12-.runtime.v1.RecoverCheckpointOperationRequest\x1a%.runtime.v1.CheckpointOperationStatus\"\x00\x12A\n" +
+	"\x1aRecoverCheckpointOperation\x12-.runtime.v1.RecoverCheckpointOperationRequest\x1a%.runtime.v1.CheckpointOperationStatus\"\x00\x12p\n" +
+	"\x18AbortCheckpointOperation\x12+.runtime.v1.AbortCheckpointOperationRequest\x1a%.runtime.v1.CheckpointOperationStatus\"\x00\x12A\n" +
 	"\x06Delete\x12\x19.runtime.v1.DeleteRequest\x1a\x1a.runtime.v1.DeleteResponse\"\x00\x12e\n" +
 	"\x12DeleteIfGeneration\x12%.runtime.v1.DeleteIfGenerationRequest\x1a&.runtime.v1.DeleteIfGenerationResponse\"\x00\x12;\n" +
 	"\x04Wait\x12\x17.runtime.v1.WaitRequest\x1a\x18.runtime.v1.WaitResponse\"\x00\x12M\n" +
@@ -4305,7 +4411,7 @@ func file_api_runtime_v1_sandbox_api_proto_rawDescGZIP() []byte {
 }
 
 var file_api_runtime_v1_sandbox_api_proto_enumTypes = make([]protoimpl.EnumInfo, 9)
-var file_api_runtime_v1_sandbox_api_proto_msgTypes = make([]protoimpl.MessageInfo, 57)
+var file_api_runtime_v1_sandbox_api_proto_msgTypes = make([]protoimpl.MessageInfo, 58)
 var file_api_runtime_v1_sandbox_api_proto_goTypes = []any{
 	(NetworkPolicyAction)(0),                  // 0: runtime.v1.NetworkPolicyAction
 	(NetworkDirection)(0),                     // 1: runtime.v1.NetworkDirection
@@ -4343,36 +4449,37 @@ var file_api_runtime_v1_sandbox_api_proto_goTypes = []any{
 	(*CheckpointOperationStatus)(nil),         // 33: runtime.v1.CheckpointOperationStatus
 	(*GetCheckpointOperationRequest)(nil),     // 34: runtime.v1.GetCheckpointOperationRequest
 	(*RecoverCheckpointOperationRequest)(nil), // 35: runtime.v1.RecoverCheckpointOperationRequest
-	(*DeleteRequest)(nil),                     // 36: runtime.v1.DeleteRequest
-	(*DeleteResponse)(nil),                    // 37: runtime.v1.DeleteResponse
-	(*DeleteIfGenerationRequest)(nil),         // 38: runtime.v1.DeleteIfGenerationRequest
-	(*DeleteIfGenerationResponse)(nil),        // 39: runtime.v1.DeleteIfGenerationResponse
-	(*WaitRequest)(nil),                       // 40: runtime.v1.WaitRequest
-	(*WaitResponse)(nil),                      // 41: runtime.v1.WaitResponse
-	(*ListSandboxesRequest)(nil),              // 42: runtime.v1.ListSandboxesRequest
-	(*ListSandboxesResponse)(nil),             // 43: runtime.v1.ListSandboxesResponse
-	(*SandboxStatus)(nil),                     // 44: runtime.v1.SandboxStatus
-	(*KeyValue)(nil),                          // 45: runtime.v1.KeyValue
-	(*LinuxSandboxResources)(nil),             // 46: runtime.v1.LinuxSandboxResources
-	(*HugepageLimit)(nil),                     // 47: runtime.v1.HugepageLimit
-	(*SandboxMetadata)(nil),                   // 48: runtime.v1.SandboxMetadata
-	(*SandboxMetadataList)(nil),               // 49: runtime.v1.SandboxMetadataList
-	(*StatsRequest)(nil),                      // 50: runtime.v1.StatsRequest
-	(*StatsResponse)(nil),                     // 51: runtime.v1.StatsResponse
-	(*ListAvailableRuntimesRequest)(nil),      // 52: runtime.v1.ListAvailableRuntimesRequest
-	(*RuntimeInfo)(nil),                       // 53: runtime.v1.RuntimeInfo
-	(*ListAvailableRuntimesResponse)(nil),     // 54: runtime.v1.ListAvailableRuntimesResponse
-	nil,                                       // 55: runtime.v1.StartRequest.EnvsEntry
-	nil,                                       // 56: runtime.v1.StartRequest.ResourcesEntry
-	nil,                                       // 57: runtime.v1.StartRequest.LabelsEntry
-	nil,                                       // 58: runtime.v1.StartRequest.MetricLabelsEntry
-	nil,                                       // 59: runtime.v1.ListSandboxesRequest.SelectorEntry
-	nil,                                       // 60: runtime.v1.SandboxStatus.LabelsEntry
-	nil,                                       // 61: runtime.v1.SandboxStatus.MetricLabelsEntry
-	nil,                                       // 62: runtime.v1.LinuxSandboxResources.UnifiedEntry
-	nil,                                       // 63: runtime.v1.SandboxMetadata.LabelsEntry
-	nil,                                       // 64: runtime.v1.SandboxMetadata.MetricLabelsEntry
-	nil,                                       // 65: runtime.v1.SandboxMetadataList.SandboxesEntry
+	(*AbortCheckpointOperationRequest)(nil),   // 36: runtime.v1.AbortCheckpointOperationRequest
+	(*DeleteRequest)(nil),                     // 37: runtime.v1.DeleteRequest
+	(*DeleteResponse)(nil),                    // 38: runtime.v1.DeleteResponse
+	(*DeleteIfGenerationRequest)(nil),         // 39: runtime.v1.DeleteIfGenerationRequest
+	(*DeleteIfGenerationResponse)(nil),        // 40: runtime.v1.DeleteIfGenerationResponse
+	(*WaitRequest)(nil),                       // 41: runtime.v1.WaitRequest
+	(*WaitResponse)(nil),                      // 42: runtime.v1.WaitResponse
+	(*ListSandboxesRequest)(nil),              // 43: runtime.v1.ListSandboxesRequest
+	(*ListSandboxesResponse)(nil),             // 44: runtime.v1.ListSandboxesResponse
+	(*SandboxStatus)(nil),                     // 45: runtime.v1.SandboxStatus
+	(*KeyValue)(nil),                          // 46: runtime.v1.KeyValue
+	(*LinuxSandboxResources)(nil),             // 47: runtime.v1.LinuxSandboxResources
+	(*HugepageLimit)(nil),                     // 48: runtime.v1.HugepageLimit
+	(*SandboxMetadata)(nil),                   // 49: runtime.v1.SandboxMetadata
+	(*SandboxMetadataList)(nil),               // 50: runtime.v1.SandboxMetadataList
+	(*StatsRequest)(nil),                      // 51: runtime.v1.StatsRequest
+	(*StatsResponse)(nil),                     // 52: runtime.v1.StatsResponse
+	(*ListAvailableRuntimesRequest)(nil),      // 53: runtime.v1.ListAvailableRuntimesRequest
+	(*RuntimeInfo)(nil),                       // 54: runtime.v1.RuntimeInfo
+	(*ListAvailableRuntimesResponse)(nil),     // 55: runtime.v1.ListAvailableRuntimesResponse
+	nil,                                       // 56: runtime.v1.StartRequest.EnvsEntry
+	nil,                                       // 57: runtime.v1.StartRequest.ResourcesEntry
+	nil,                                       // 58: runtime.v1.StartRequest.LabelsEntry
+	nil,                                       // 59: runtime.v1.StartRequest.MetricLabelsEntry
+	nil,                                       // 60: runtime.v1.ListSandboxesRequest.SelectorEntry
+	nil,                                       // 61: runtime.v1.SandboxStatus.LabelsEntry
+	nil,                                       // 62: runtime.v1.SandboxStatus.MetricLabelsEntry
+	nil,                                       // 63: runtime.v1.LinuxSandboxResources.UnifiedEntry
+	nil,                                       // 64: runtime.v1.SandboxMetadata.LabelsEntry
+	nil,                                       // 65: runtime.v1.SandboxMetadata.MetricLabelsEntry
+	nil,                                       // 66: runtime.v1.SandboxMetadataList.SandboxesEntry
 }
 var file_api_runtime_v1_sandbox_api_proto_depIdxs = []int32{
 	10, // 0: runtime.v1.NetworkEndpoint.port_range:type_name -> runtime.v1.PortRange
@@ -4396,11 +4503,11 @@ var file_api_runtime_v1_sandbox_api_proto_depIdxs = []int32{
 	18, // 18: runtime.v1.RootfsConfig.s3_config:type_name -> runtime.v1.S3Config
 	18, // 19: runtime.v1.Mount.s3_config:type_name -> runtime.v1.S3Config
 	19, // 20: runtime.v1.StartRequest.rootfs:type_name -> runtime.v1.RootfsConfig
-	55, // 21: runtime.v1.StartRequest.envs:type_name -> runtime.v1.StartRequest.EnvsEntry
+	56, // 21: runtime.v1.StartRequest.envs:type_name -> runtime.v1.StartRequest.EnvsEntry
 	20, // 22: runtime.v1.StartRequest.mounts:type_name -> runtime.v1.Mount
-	56, // 23: runtime.v1.StartRequest.resources:type_name -> runtime.v1.StartRequest.ResourcesEntry
-	57, // 24: runtime.v1.StartRequest.labels:type_name -> runtime.v1.StartRequest.LabelsEntry
-	58, // 25: runtime.v1.StartRequest.metric_labels:type_name -> runtime.v1.StartRequest.MetricLabelsEntry
+	57, // 23: runtime.v1.StartRequest.resources:type_name -> runtime.v1.StartRequest.ResourcesEntry
+	58, // 24: runtime.v1.StartRequest.labels:type_name -> runtime.v1.StartRequest.LabelsEntry
+	59, // 25: runtime.v1.StartRequest.metric_labels:type_name -> runtime.v1.StartRequest.MetricLabelsEntry
 	21, // 26: runtime.v1.StartRequest.xpu_allocations:type_name -> runtime.v1.XpuAllocation
 	15, // 27: runtime.v1.StartRequest.network_policy:type_name -> runtime.v1.NetworkPolicy
 	22, // 28: runtime.v1.StartRequest.checkpoint_info:type_name -> runtime.v1.CheckpointInfo
@@ -4412,56 +4519,59 @@ var file_api_runtime_v1_sandbox_api_proto_depIdxs = []int32{
 	6,  // 34: runtime.v1.CheckpointOperationStatus.state:type_name -> runtime.v1.CheckpointOperationState
 	7,  // 35: runtime.v1.CheckpointOperationStatus.recovery_protocol:type_name -> runtime.v1.CheckpointOperationRecoveryProtocol
 	32, // 36: runtime.v1.RecoverCheckpointOperationRequest.operation:type_name -> runtime.v1.CheckpointWithOperationRequest
-	59, // 37: runtime.v1.ListSandboxesRequest.selector:type_name -> runtime.v1.ListSandboxesRequest.SelectorEntry
-	44, // 38: runtime.v1.ListSandboxesResponse.sandboxes:type_name -> runtime.v1.SandboxStatus
-	8,  // 39: runtime.v1.SandboxStatus.state:type_name -> runtime.v1.SandboxState
-	60, // 40: runtime.v1.SandboxStatus.labels:type_name -> runtime.v1.SandboxStatus.LabelsEntry
-	20, // 41: runtime.v1.SandboxStatus.mounts:type_name -> runtime.v1.Mount
-	45, // 42: runtime.v1.SandboxStatus.envs:type_name -> runtime.v1.KeyValue
-	46, // 43: runtime.v1.SandboxStatus.resources:type_name -> runtime.v1.LinuxSandboxResources
-	61, // 44: runtime.v1.SandboxStatus.metric_labels:type_name -> runtime.v1.SandboxStatus.MetricLabelsEntry
-	47, // 45: runtime.v1.LinuxSandboxResources.hugepage_limits:type_name -> runtime.v1.HugepageLimit
-	62, // 46: runtime.v1.LinuxSandboxResources.unified:type_name -> runtime.v1.LinuxSandboxResources.UnifiedEntry
-	63, // 47: runtime.v1.SandboxMetadata.labels:type_name -> runtime.v1.SandboxMetadata.LabelsEntry
-	64, // 48: runtime.v1.SandboxMetadata.metric_labels:type_name -> runtime.v1.SandboxMetadata.MetricLabelsEntry
-	65, // 49: runtime.v1.SandboxMetadataList.sandboxes:type_name -> runtime.v1.SandboxMetadataList.SandboxesEntry
-	53, // 50: runtime.v1.ListAvailableRuntimesResponse.runtimes:type_name -> runtime.v1.RuntimeInfo
-	48, // 51: runtime.v1.SandboxMetadataList.SandboxesEntry.value:type_name -> runtime.v1.SandboxMetadata
-	23, // 52: runtime.v1.SandboxService.Start:input_type -> runtime.v1.StartRequest
-	26, // 53: runtime.v1.SandboxService.StartWithOperation:input_type -> runtime.v1.StartWithOperationRequest
-	28, // 54: runtime.v1.SandboxService.GetStartOperation:input_type -> runtime.v1.GetStartOperationRequest
-	29, // 55: runtime.v1.SandboxService.Checkpoint:input_type -> runtime.v1.CheckpointRequest
-	31, // 56: runtime.v1.SandboxService.CheckpointIfGeneration:input_type -> runtime.v1.CheckpointIfGenerationRequest
-	32, // 57: runtime.v1.SandboxService.CheckpointWithOperation:input_type -> runtime.v1.CheckpointWithOperationRequest
-	34, // 58: runtime.v1.SandboxService.GetCheckpointOperation:input_type -> runtime.v1.GetCheckpointOperationRequest
-	35, // 59: runtime.v1.SandboxService.RecoverCheckpointOperation:input_type -> runtime.v1.RecoverCheckpointOperationRequest
-	36, // 60: runtime.v1.SandboxService.Delete:input_type -> runtime.v1.DeleteRequest
-	38, // 61: runtime.v1.SandboxService.DeleteIfGeneration:input_type -> runtime.v1.DeleteIfGenerationRequest
-	40, // 62: runtime.v1.SandboxService.Wait:input_type -> runtime.v1.WaitRequest
-	42, // 63: runtime.v1.SandboxService.List:input_type -> runtime.v1.ListSandboxesRequest
-	50, // 64: runtime.v1.SandboxService.Stats:input_type -> runtime.v1.StatsRequest
-	52, // 65: runtime.v1.SandboxService.ListAvailableRuntimes:input_type -> runtime.v1.ListAvailableRuntimesRequest
-	16, // 66: runtime.v1.SandboxService.SetNetworkPolicy:input_type -> runtime.v1.SetNetworkPolicyRequest
-	24, // 67: runtime.v1.SandboxService.Start:output_type -> runtime.v1.StartResponse
-	27, // 68: runtime.v1.SandboxService.StartWithOperation:output_type -> runtime.v1.StartOperationStatus
-	27, // 69: runtime.v1.SandboxService.GetStartOperation:output_type -> runtime.v1.StartOperationStatus
-	30, // 70: runtime.v1.SandboxService.Checkpoint:output_type -> runtime.v1.CheckpointResponse
-	30, // 71: runtime.v1.SandboxService.CheckpointIfGeneration:output_type -> runtime.v1.CheckpointResponse
-	33, // 72: runtime.v1.SandboxService.CheckpointWithOperation:output_type -> runtime.v1.CheckpointOperationStatus
-	33, // 73: runtime.v1.SandboxService.GetCheckpointOperation:output_type -> runtime.v1.CheckpointOperationStatus
-	33, // 74: runtime.v1.SandboxService.RecoverCheckpointOperation:output_type -> runtime.v1.CheckpointOperationStatus
-	37, // 75: runtime.v1.SandboxService.Delete:output_type -> runtime.v1.DeleteResponse
-	39, // 76: runtime.v1.SandboxService.DeleteIfGeneration:output_type -> runtime.v1.DeleteIfGenerationResponse
-	41, // 77: runtime.v1.SandboxService.Wait:output_type -> runtime.v1.WaitResponse
-	43, // 78: runtime.v1.SandboxService.List:output_type -> runtime.v1.ListSandboxesResponse
-	51, // 79: runtime.v1.SandboxService.Stats:output_type -> runtime.v1.StatsResponse
-	54, // 80: runtime.v1.SandboxService.ListAvailableRuntimes:output_type -> runtime.v1.ListAvailableRuntimesResponse
-	17, // 81: runtime.v1.SandboxService.SetNetworkPolicy:output_type -> runtime.v1.SetNetworkPolicyResponse
-	67, // [67:82] is the sub-list for method output_type
-	52, // [52:67] is the sub-list for method input_type
-	52, // [52:52] is the sub-list for extension type_name
-	52, // [52:52] is the sub-list for extension extendee
-	0,  // [0:52] is the sub-list for field type_name
+	32, // 37: runtime.v1.AbortCheckpointOperationRequest.operation:type_name -> runtime.v1.CheckpointWithOperationRequest
+	60, // 38: runtime.v1.ListSandboxesRequest.selector:type_name -> runtime.v1.ListSandboxesRequest.SelectorEntry
+	45, // 39: runtime.v1.ListSandboxesResponse.sandboxes:type_name -> runtime.v1.SandboxStatus
+	8,  // 40: runtime.v1.SandboxStatus.state:type_name -> runtime.v1.SandboxState
+	61, // 41: runtime.v1.SandboxStatus.labels:type_name -> runtime.v1.SandboxStatus.LabelsEntry
+	20, // 42: runtime.v1.SandboxStatus.mounts:type_name -> runtime.v1.Mount
+	46, // 43: runtime.v1.SandboxStatus.envs:type_name -> runtime.v1.KeyValue
+	47, // 44: runtime.v1.SandboxStatus.resources:type_name -> runtime.v1.LinuxSandboxResources
+	62, // 45: runtime.v1.SandboxStatus.metric_labels:type_name -> runtime.v1.SandboxStatus.MetricLabelsEntry
+	48, // 46: runtime.v1.LinuxSandboxResources.hugepage_limits:type_name -> runtime.v1.HugepageLimit
+	63, // 47: runtime.v1.LinuxSandboxResources.unified:type_name -> runtime.v1.LinuxSandboxResources.UnifiedEntry
+	64, // 48: runtime.v1.SandboxMetadata.labels:type_name -> runtime.v1.SandboxMetadata.LabelsEntry
+	65, // 49: runtime.v1.SandboxMetadata.metric_labels:type_name -> runtime.v1.SandboxMetadata.MetricLabelsEntry
+	66, // 50: runtime.v1.SandboxMetadataList.sandboxes:type_name -> runtime.v1.SandboxMetadataList.SandboxesEntry
+	54, // 51: runtime.v1.ListAvailableRuntimesResponse.runtimes:type_name -> runtime.v1.RuntimeInfo
+	49, // 52: runtime.v1.SandboxMetadataList.SandboxesEntry.value:type_name -> runtime.v1.SandboxMetadata
+	23, // 53: runtime.v1.SandboxService.Start:input_type -> runtime.v1.StartRequest
+	26, // 54: runtime.v1.SandboxService.StartWithOperation:input_type -> runtime.v1.StartWithOperationRequest
+	28, // 55: runtime.v1.SandboxService.GetStartOperation:input_type -> runtime.v1.GetStartOperationRequest
+	29, // 56: runtime.v1.SandboxService.Checkpoint:input_type -> runtime.v1.CheckpointRequest
+	31, // 57: runtime.v1.SandboxService.CheckpointIfGeneration:input_type -> runtime.v1.CheckpointIfGenerationRequest
+	32, // 58: runtime.v1.SandboxService.CheckpointWithOperation:input_type -> runtime.v1.CheckpointWithOperationRequest
+	34, // 59: runtime.v1.SandboxService.GetCheckpointOperation:input_type -> runtime.v1.GetCheckpointOperationRequest
+	35, // 60: runtime.v1.SandboxService.RecoverCheckpointOperation:input_type -> runtime.v1.RecoverCheckpointOperationRequest
+	36, // 61: runtime.v1.SandboxService.AbortCheckpointOperation:input_type -> runtime.v1.AbortCheckpointOperationRequest
+	37, // 62: runtime.v1.SandboxService.Delete:input_type -> runtime.v1.DeleteRequest
+	39, // 63: runtime.v1.SandboxService.DeleteIfGeneration:input_type -> runtime.v1.DeleteIfGenerationRequest
+	41, // 64: runtime.v1.SandboxService.Wait:input_type -> runtime.v1.WaitRequest
+	43, // 65: runtime.v1.SandboxService.List:input_type -> runtime.v1.ListSandboxesRequest
+	51, // 66: runtime.v1.SandboxService.Stats:input_type -> runtime.v1.StatsRequest
+	53, // 67: runtime.v1.SandboxService.ListAvailableRuntimes:input_type -> runtime.v1.ListAvailableRuntimesRequest
+	16, // 68: runtime.v1.SandboxService.SetNetworkPolicy:input_type -> runtime.v1.SetNetworkPolicyRequest
+	24, // 69: runtime.v1.SandboxService.Start:output_type -> runtime.v1.StartResponse
+	27, // 70: runtime.v1.SandboxService.StartWithOperation:output_type -> runtime.v1.StartOperationStatus
+	27, // 71: runtime.v1.SandboxService.GetStartOperation:output_type -> runtime.v1.StartOperationStatus
+	30, // 72: runtime.v1.SandboxService.Checkpoint:output_type -> runtime.v1.CheckpointResponse
+	30, // 73: runtime.v1.SandboxService.CheckpointIfGeneration:output_type -> runtime.v1.CheckpointResponse
+	33, // 74: runtime.v1.SandboxService.CheckpointWithOperation:output_type -> runtime.v1.CheckpointOperationStatus
+	33, // 75: runtime.v1.SandboxService.GetCheckpointOperation:output_type -> runtime.v1.CheckpointOperationStatus
+	33, // 76: runtime.v1.SandboxService.RecoverCheckpointOperation:output_type -> runtime.v1.CheckpointOperationStatus
+	33, // 77: runtime.v1.SandboxService.AbortCheckpointOperation:output_type -> runtime.v1.CheckpointOperationStatus
+	38, // 78: runtime.v1.SandboxService.Delete:output_type -> runtime.v1.DeleteResponse
+	40, // 79: runtime.v1.SandboxService.DeleteIfGeneration:output_type -> runtime.v1.DeleteIfGenerationResponse
+	42, // 80: runtime.v1.SandboxService.Wait:output_type -> runtime.v1.WaitResponse
+	44, // 81: runtime.v1.SandboxService.List:output_type -> runtime.v1.ListSandboxesResponse
+	52, // 82: runtime.v1.SandboxService.Stats:output_type -> runtime.v1.StatsResponse
+	55, // 83: runtime.v1.SandboxService.ListAvailableRuntimes:output_type -> runtime.v1.ListAvailableRuntimesResponse
+	17, // 84: runtime.v1.SandboxService.SetNetworkPolicy:output_type -> runtime.v1.SetNetworkPolicyResponse
+	69, // [69:85] is the sub-list for method output_type
+	53, // [53:69] is the sub-list for method input_type
+	53, // [53:53] is the sub-list for extension type_name
+	53, // [53:53] is the sub-list for extension extendee
+	0,  // [0:53] is the sub-list for field type_name
 }
 
 func init() { file_api_runtime_v1_sandbox_api_proto_init() }
@@ -4485,7 +4595,7 @@ func file_api_runtime_v1_sandbox_api_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_api_runtime_v1_sandbox_api_proto_rawDesc), len(file_api_runtime_v1_sandbox_api_proto_rawDesc)),
 			NumEnums:      9,
-			NumMessages:   57,
+			NumMessages:   58,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

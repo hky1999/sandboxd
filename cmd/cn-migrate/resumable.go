@@ -42,12 +42,17 @@ package main
 //     exactly one explicit recover-checkpoint-operation carrying the
 //     COMPLETE original payload, which the service re-digests against the
 //     record and which must repeat the same op/sandbox/generation/request
-//     digest/root/scheme and complete the acknowledgment. A SUCCEEDED
-//     protocol-0 record keeps the historical same-payload replay; an
-//     UNKNOWN WITNESS record may be reconciled by the same single explicit
-//     recovery; UNKNOWN protocol-0, RUNNING, FAILED, and ambiguous answers
-//     fail closed: no source rollback, no legacy checkpoint RPC, no new
-//     operation ID, no target start;
+//     digest/root/scheme and complete the acknowledgment. A record admitted
+//     under a witness-capable protocol — WITNESS or WITNESS_ABORTABLE —
+//     owes that same release proof (explicit recovery succeeds under either
+//     protocol); a SUCCEEDED protocol-0 record keeps the historical
+//     same-payload replay; an UNKNOWN witness-capable record may be
+//     reconciled by the same single explicit recovery; UNKNOWN protocol-0,
+//     RUNNING, FAILED — including a durably confirmed abort, which is never
+//     a migration success — and ambiguous answers fail closed: no source
+//     rollback, no legacy checkpoint RPC, no new operation ID, no target
+//     start, and no automatic abort — the explicit abort belongs to the
+//     node CLI, never this controller;
 //   - the checkpoint receipt's sealed root is preserved durably before the
 //     checkpoint-sealed stage, and the later root binding must re-derive
 //     exactly that root and scheme from the artifact — a directory whose
@@ -319,16 +324,21 @@ func runResumableMigration(cfg resumableConfig) {
 	// releaseProven reports whether a success receipt itself proves the
 	// release of the retained evidence. A protocol-0 record keeps its
 	// historical meaning — it predates the witness, holds no runtime
-	// evidence, and has no release gate — while every WITNESS success must
-	// carry evidence_released=true from THIS response: the field is
-	// per-call, a query or replay answer reports false by construction, and
-	// a false answer proves nothing about any past or lost acknowledgment.
+	// evidence, and has no release gate — while every witness-capable
+	// success (WITNESS or WITNESS_ABORTABLE) must carry
+	// evidence_released=true from THIS response: the field is per-call, a
+	// query or replay answer reports false by construction, and a false
+	// answer proves nothing about any past or lost acknowledgment.
 	releaseProven := func(status *runtime.CheckpointOperationStatus) bool {
-		if status.GetRecoveryProtocol() !=
-			runtime.CheckpointOperationRecoveryProtocol_CHECKPOINT_OPERATION_RECOVERY_PROTOCOL_WITNESS {
+		switch status.GetRecoveryProtocol() {
+		case runtime.CheckpointOperationRecoveryProtocol_CHECKPOINT_OPERATION_RECOVERY_PROTOCOL_UNSPECIFIED:
 			return true
+		case runtime.CheckpointOperationRecoveryProtocol_CHECKPOINT_OPERATION_RECOVERY_PROTOCOL_WITNESS,
+			runtime.CheckpointOperationRecoveryProtocol_CHECKPOINT_OPERATION_RECOVERY_PROTOCOL_WITNESS_ABORTABLE:
+			return status.GetEvidenceReleased()
+		default:
+			return false
 		}
-		return status.GetEvidenceReleased()
 	}
 	// recoveryConflict validates one explicit recovery receipt against the
 	// success fact this process already observed: the recovery must repeat
@@ -354,10 +364,9 @@ func runResumableMigration(cfg resumableConfig) {
 				prior.GetArtifactRootDigest(), prior.GetArtifactRootScheme(),
 			)
 		}
-		if recovered.GetRecoveryProtocol() !=
-			runtime.CheckpointOperationRecoveryProtocol_CHECKPOINT_OPERATION_RECOVERY_PROTOCOL_WITNESS {
+		if !witnessCapableRecoveryProtocol(recovered.GetRecoveryProtocol()) {
 			return fmt.Sprintf(
-				"the recovery receipt reports recovery protocol %s — an explicit recovery is defined for WITNESS records only, and a legacy or unknown protocol cannot be recovered",
+				"the recovery receipt reports recovery protocol %s — an explicit recovery is defined for witness-capable records only, and a legacy or unknown protocol cannot be recovered",
 				recovered.GetRecoveryProtocol(),
 			)
 		}
@@ -512,13 +521,14 @@ func runResumableMigration(cfg resumableConfig) {
 			}
 			switch queried.GetState() {
 			case runtime.CheckpointOperationState_CHECKPOINT_OPERATION_STATE_UNKNOWN:
-				// Only a WITNESS record may be recovered: its admission
-				// verified the runtime holds the operation evidence, so one
-				// explicit recovery can complete the stop-source flow and
-				// release it. A protocol-0 UNKNOWN stays unprovable — the
-				// same refusal as before this protocol existed.
-				if queried.GetRecoveryProtocol() ==
-					runtime.CheckpointOperationRecoveryProtocol_CHECKPOINT_OPERATION_RECOVERY_PROTOCOL_WITNESS {
+				// Only a witness-capable record (WITNESS or WITNESS_ABORTABLE)
+				// may be recovered: its admission verified the runtime holds
+				// the operation evidence, so one explicit recovery can
+				// complete the stop-source flow and release it. A protocol-0
+				// UNKNOWN stays unprovable — the same refusal as before these
+				// protocols existed. An UNKNOWN record is never aborted
+				// automatically; the explicit abort is node-CLI only.
+				if witnessCapableRecoveryProtocol(queried.GetRecoveryProtocol()) {
 					recoverReleased(nil)
 					return
 				}
@@ -530,8 +540,12 @@ func runResumableMigration(cfg resumableConfig) {
 					"source checkpoint operation %q on %s is still RUNNING — its outcome is pending and authorizes nothing yet: the journal stays at checkpoint-issued and the operation ID is spent; no re-execution, no recovery beside a live execution, no rollback, no legacy checkpoint, no new operation ID, no target start; retry this migration once the execution finishes, or reconcile the record and then continue with a new -migration-id",
 					journal.SourceOperationID, cfg.source))
 			case runtime.CheckpointOperationState_CHECKPOINT_OPERATION_STATE_FAILED:
+				// A FAILED record stays a migration failure even when it
+				// carries a durably confirmed abort: the confirmed abort
+				// releases runtime evidence, never this migration — nothing
+				// is published, restored, or retired on its account.
 				fail("checkpoint", fmt.Sprintf(
-					"source checkpoint operation %q on %s is %s — its outcome does not authorize this migration: the journal stays at checkpoint-issued and the operation ID is spent; no re-execution, no recovery, no rollback, no legacy checkpoint, no new operation ID, no target start; reconcile the record and the source, then continue with a new -migration-id",
+					"source checkpoint operation %q on %s is %s (a confirmed abort included) — its outcome does not authorize this migration: the journal stays at checkpoint-issued and the operation ID is spent; no re-execution, no recovery, no rollback, no legacy checkpoint, no new operation ID, no target start; reconcile the record and the source, then continue with a new -migration-id",
 					journal.SourceOperationID, cfg.source, queried.GetState()))
 			default:
 				// SUCCEEDED: the release gate decides how the historical
@@ -539,8 +553,7 @@ func runResumableMigration(cfg resumableConfig) {
 				if conflict := persistReceiptConflict(queried); conflict != "" {
 					fail("checkpoint", fmt.Sprintf("%s — failing closed at checkpoint-issued; reconcile operation %q on %s manually", conflict, journal.SourceOperationID, cfg.source))
 				}
-				if queried.GetRecoveryProtocol() ==
-					runtime.CheckpointOperationRecoveryProtocol_CHECKPOINT_OPERATION_RECOVERY_PROTOCOL_WITNESS {
+				if witnessCapableRecoveryProtocol(queried.GetRecoveryProtocol()) {
 					// The query proves the success but never the release,
 					// and a same-payload replay would prove the binding yet
 					// still answer evidence_released=false. One explicit
@@ -1017,18 +1030,39 @@ func parseStartOperationStatus(output string) (*runtime.StartOperationStatus, er
 	return status, nil
 }
 
+// witnessCapableRecoveryProtocol reports whether a record admitted under
+// this protocol holds runtime evidence an explicit recovery can act on.
+// WITNESS and WITNESS_ABORTABLE records are both recoverable and both owe
+// the release proof; a legacy protocol-0 record holds no witness and is
+// refused by the service before any reply.
+func witnessCapableRecoveryProtocol(
+	protocol runtime.CheckpointOperationRecoveryProtocol,
+) bool {
+	switch protocol {
+	case runtime.CheckpointOperationRecoveryProtocol_CHECKPOINT_OPERATION_RECOVERY_PROTOCOL_WITNESS,
+		runtime.CheckpointOperationRecoveryProtocol_CHECKPOINT_OPERATION_RECOVERY_PROTOCOL_WITNESS_ABORTABLE:
+		return true
+	default:
+		return false
+	}
+}
+
 // parseCheckpointOperationStatus strictly decodes the protojson
 // CheckpointOperationStatus the operation-mode CLI prints for the identified
 // source checkpoint, its query, and its explicit recovery: one document, no
 // unknown fields, no trailing content. UNSPECIFIED states are rejected — a
 // healthy daemon never reports one, so it is a protocol error rather than a
-// state to guess about. The recovery protocol is accepted in both of its
-// defined values (legacy records and witness records are equally legal
-// history) while an out-of-range value is rejected: an unsupported protocol
-// must never be reinterpreted as the legacy protocol, because the field
-// decides whether the record holds recoverable runtime evidence.
-// evidence_released is decoded but never trusted as history — it is a fact
-// about the response that carried it, nothing more.
+// state to guess about. The recovery protocol is accepted in all three of
+// its defined values (legacy, witness, and witness-abortable records are
+// equally legal history) while an out-of-range value is rejected: an
+// unsupported protocol must never be reinterpreted as the legacy protocol,
+// because the field decides whether the record holds recoverable runtime
+// evidence. evidence_released is decoded but never trusted as history — it
+// is a fact about the response that carried it, nothing more.
+// abort_confirmed is validated for shape only — a durable abort fact may be
+// restated solely by a FAILED record under WITNESS_ABORTABLE without a
+// sealed root — and never infers anything: a historical confirmation
+// releases no gate and converts no failure into a migration success.
 func parseCheckpointOperationStatus(output string) (*runtime.CheckpointOperationStatus, error) {
 	trimmed := strings.TrimSpace(output)
 	if trimmed == "" {
@@ -1051,11 +1085,22 @@ func parseCheckpointOperationStatus(output string) (*runtime.CheckpointOperation
 	}
 	switch status.GetRecoveryProtocol() {
 	case runtime.CheckpointOperationRecoveryProtocol_CHECKPOINT_OPERATION_RECOVERY_PROTOCOL_UNSPECIFIED,
-		runtime.CheckpointOperationRecoveryProtocol_CHECKPOINT_OPERATION_RECOVERY_PROTOCOL_WITNESS:
+		runtime.CheckpointOperationRecoveryProtocol_CHECKPOINT_OPERATION_RECOVERY_PROTOCOL_WITNESS,
+		runtime.CheckpointOperationRecoveryProtocol_CHECKPOINT_OPERATION_RECOVERY_PROTOCOL_WITNESS_ABORTABLE:
 	default:
 		return nil, fmt.Errorf(
 			"receipt reports unrecognized recovery protocol %s; refusing to treat an unknown protocol as legacy",
 			status.GetRecoveryProtocol(),
+		)
+	}
+	if status.GetAbortConfirmed() &&
+		(status.GetState() != runtime.CheckpointOperationState_CHECKPOINT_OPERATION_STATE_FAILED ||
+			status.GetRecoveryProtocol() !=
+				runtime.CheckpointOperationRecoveryProtocol_CHECKPOINT_OPERATION_RECOVERY_PROTOCOL_WITNESS_ABORTABLE ||
+			status.GetArtifactRootDigest() != "" ||
+			status.GetArtifactRootScheme() != "") {
+		return nil, fmt.Errorf(
+			"receipt reports abort_confirmed=true outside a FAILED WITNESS_ABORTABLE record without a sealed root; malformed reply",
 		)
 	}
 	return status, nil

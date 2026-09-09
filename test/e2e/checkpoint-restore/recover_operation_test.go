@@ -179,7 +179,7 @@ func TestRecoverCheckpointOperationReceiptContract(t *testing.T) {
 				return s
 			}(),
 			wantOutput:  false,
-			wantErrText: "WITNESS records only",
+			wantErrText: "witness-capable records only",
 		},
 		{
 			name: "unrecognized protocol enum",

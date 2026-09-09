@@ -21,19 +21,38 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"syscall"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/inclusionAI/sandboxd/internal/firecrackerproto"
 	"github.com/inclusionAI/sandboxd/internal/util"
 	"github.com/inclusionAI/sandboxd/pkg/checkpointroot"
 	"github.com/inclusionAI/sandboxd/pkg/errord"
 	runtimecore "github.com/inclusionAI/sandboxd/pkg/runtime"
+	"golang.org/x/sys/unix"
 )
 
-// firecrackerCheckpointOperationRecordVersion is the schema of
-// firecrackerCheckpointOperationRecord. Records carrying any other version
-// are rejected, never reinterpreted.
+// firecrackerCheckpointOperationRecordVersion is the version-1 schema of
+// firecrackerCheckpointOperationRecord: the sealed-operation witness every
+// production path writes today (prepared/completed/acked phases, a bound
+// sealed root, no directory identity). Version-1 validation keeps its exact
+// historical shape; see firecrackerCheckpointOperationRecordVersion2 for the
+// early-intent extension.
 const firecrackerCheckpointOperationRecordVersion = 1
+
+// firecrackerCheckpointOperationRecordVersion2 is the early-intent schema of
+// firecrackerCheckpointOperationRecord, a protocol draft: it adds the
+// unsealed intent/aborting/aborted/abort-acked phases and the directory birth
+// identity, and also admits the version-1 phases under their existing sealed
+// root validation, so a later step can promote a durable intent into a
+// prepared witness in place — same record, same directory identity — instead
+// of rewriting the evidence. No production path writes version 2 yet; the
+// schema exists so that adoption needs no further on-disk change. Validation
+// is strict: every version-2 phase requires the complete common operation and
+// source identity plus a complete directory identity, and the root shape must
+// match the phase exactly.
+const firecrackerCheckpointOperationRecordVersion2 = 2
 
 // Identified checkpoint operation witness phases. The witness lives inside the
 // single persisted instance state so the evidence and the constraints it
@@ -49,7 +68,49 @@ const (
 	// firecrackerCheckpointOperationPhaseAcked marks the service's durable
 	// SUCCEEDED receipt having released the evidence-retention gate.
 	firecrackerCheckpointOperationPhaseAcked = "acked"
+	// firecrackerCheckpointOperationPhaseIntent (version 2 only) marks a
+	// durably recorded early intent captured before layout, quiesce, pause,
+	// or snapshot: the operation owns the source, the source and directory
+	// identity are already bound, and no sealed root exists — an intent is
+	// operation ownership, never a success witness. Schema foundation only:
+	// no production path writes this phase yet, and this step attaches no
+	// runtime behavior to it.
+	firecrackerCheckpointOperationPhaseIntent = "intent"
+	// firecrackerCheckpointOperationPhaseAborting (version 2 only) marks the
+	// durably recorded decision to abort an intent that never sealed: the
+	// abort's source handback is in progress and its evidence must be
+	// retained until the abort is confirmed. Schema foundation only; no
+	// production path writes this phase yet.
+	firecrackerCheckpointOperationPhaseAborting = "aborting"
+	// firecrackerCheckpointOperationPhaseAborted (version 2 only) marks a
+	// confirmed abort fact durable in the state. Schema foundation only; no
+	// production path writes this phase yet, and the explicit abort
+	// acknowledgment that would release its evidence is a later protocol
+	// step — the success Ack refuses it.
+	firecrackerCheckpointOperationPhaseAborted = "aborted"
+	// firecrackerCheckpointOperationPhaseAbortAcked (version 2 only) marks
+	// the abort-side acknowledgment having released the abort evidence
+	// retention gate. Schema foundation only; no production path writes or
+	// acknowledges this phase yet.
+	firecrackerCheckpointOperationPhaseAbortAcked = "abort-acked"
 )
+
+// firecrackerCheckpointOperationPhaseRequiresSealedRoot reports whether a
+// phase's witness must carry the bound sealed content root. The version-1
+// phases always do; the version-2 early-intent phases never do — an intent or
+// abort record proves operation ownership and an abort fact, never a sealed
+// artifact, and a root on such a record would misread it as a success
+// witness.
+func firecrackerCheckpointOperationPhaseRequiresSealedRoot(phase string) bool {
+	switch phase {
+	case firecrackerCheckpointOperationPhasePrepared,
+		firecrackerCheckpointOperationPhaseCompleted,
+		firecrackerCheckpointOperationPhaseAcked:
+		return true
+	default:
+		return false
+	}
+}
 
 // firecrackerCheckpointOperationRecord is the durable witness of an identified
 // stop-and-copy checkpoint operation. It is a comparable value type held
@@ -61,6 +122,12 @@ const (
 // The zero record means no operation evidence is retained: a legacy
 // checkpoint, or a state written before this record existed. Such states keep
 // the legacy lifecycle behavior unchanged.
+//
+// Version 2 (the early-intent schema draft) extends the same value type with
+// the unsealed intent/aborting/aborted/abort-acked phases and the directory
+// birth identity. No production path writes a version-2 record yet; see
+// firecrackerCheckpointOperationRecordVersion2 and the schema subsection in
+// doc/checkpoint-restore.md.
 type firecrackerCheckpointOperationRecord struct {
 	// Version is the record schema version.
 	Version int `json:"version,omitempty"`
@@ -81,6 +148,19 @@ type firecrackerCheckpointOperationRecord struct {
 	RootDigest string `json:"root_digest,omitempty"`
 	RootScheme string `json:"root_scheme,omitempty"`
 	Directory  string `json:"directory,omitempty"`
+	// DirectoryDev and DirectoryInode are the birth identity of the canonical
+	// output directory itself: the containing filesystem's device number and
+	// the directory's inode number as Linux reports them through
+	// statx/stat — DirectoryDev is stx_dev (the ID of the filesystem holding
+	// the directory, never stx_rdev, which only character and block special
+	// files carry), DirectoryInode is stx_ino. A same-path directory removed
+	// and recreated underneath an operation gets a new inode, so a later
+	// reconciliation can refuse a binding whose directory identity drifted
+	// even when the path string still matches. They are version-2 fields:
+	// required complete in every version-2 record, absent from every valid
+	// version-1 record, and no production path captures them yet.
+	DirectoryDev   uint64 `json:"directory_dev,omitempty"`
+	DirectoryInode uint64 `json:"directory_inode,omitempty"`
 	// VMMPID, VMMStartTime, VMMBootID and VMMAPIPath are the immutable birth
 	// identity of the source VMM, captured while it was still alive and
 	// BEFORE any stop step, so a later reconciliation stops the exact
@@ -103,37 +183,71 @@ func (record firecrackerCheckpointOperationRecord) isZero() bool {
 }
 
 // retainsEvidence reports whether the record still holds unacknowledged
-// operation evidence: a prepared or completed witness blocks every new
-// checkpoint and the delete that would clear the only runtime evidence of the
-// operation, including legacy calls. An acked record keeps its fields for
-// audit but retains nothing the service still owes an answer for.
+// operation evidence: a prepared, completed, intent, aborting, or aborted
+// witness blocks every new checkpoint and the delete that would clear the
+// only runtime evidence of the operation, including legacy calls. Only an
+// acked or abort-acked record — and the zero record — may retain nothing,
+// and even then only when the record fully validates: a malformed
+// acknowledgment (an unknown version, an incomplete binding, a half root or
+// directory identity) proves no release, so it keeps the gate like every
+// other unreadable witness. Any other phase value, including one a future
+// schema adds, keeps the gate for the same reason.
 func (record firecrackerCheckpointOperationRecord) retainsEvidence() bool {
-	switch record.Phase {
-	case firecrackerCheckpointOperationPhasePrepared,
-		firecrackerCheckpointOperationPhaseCompleted:
-		return true
-	default:
+	if record.isZero() {
 		return false
+	}
+	switch record.Phase {
+	case firecrackerCheckpointOperationPhaseAcked,
+		firecrackerCheckpointOperationPhaseAbortAcked:
+		return validateFirecrackerCheckpointOperationRecord(record) != nil
+	default:
+		return true
 	}
 }
 
 // validateFirecrackerCheckpointOperationRecord accepts only complete,
 // self-consistent witnesses; anything partial can prove nothing and is never
-// recovered as a claim about an operation or a process.
+// recovered as a claim about an operation or a process. Each schema version
+// validates strictly within its own field set — a version-1 record never
+// borrows version-2 fields and vice versa — and an unknown version is
+// rejected, never reinterpreted.
 func validateFirecrackerCheckpointOperationRecord(
 	record firecrackerCheckpointOperationRecord,
 ) error {
-	if record.Version != firecrackerCheckpointOperationRecordVersion {
+	switch record.Version {
+	case firecrackerCheckpointOperationRecordVersion:
+		return validateFirecrackerCheckpointOperationRecordV1(record)
+	case firecrackerCheckpointOperationRecordVersion2:
+		return validateFirecrackerCheckpointOperationRecordV2(record)
+	default:
 		return fmt.Errorf(
 			"unsupported checkpoint operation record version %d", record.Version,
 		)
 	}
+}
+
+// validateFirecrackerCheckpointOperationRecordV1 enforces the exact
+// version-1 sealed-operation shape every existing record and writer uses: a
+// prepared/completed/acked phase with a bound sealed root and the complete
+// operation and source identity. The version-2-only phases and directory
+// identity fields are mixed-schema corruption here — a version-1 record with
+// either is rejected rather than reinterpreted as a richer schema.
+func validateFirecrackerCheckpointOperationRecordV1(
+	record firecrackerCheckpointOperationRecord,
+) error {
 	switch record.Phase {
 	case firecrackerCheckpointOperationPhasePrepared,
 		firecrackerCheckpointOperationPhaseCompleted,
 		firecrackerCheckpointOperationPhaseAcked:
 	default:
 		return fmt.Errorf("invalid checkpoint operation record phase %q", record.Phase)
+	}
+	if record.DirectoryDev != 0 || record.DirectoryInode != 0 {
+		return fmt.Errorf(
+			"version %d checkpoint operation record must not carry directory identity (dev=%d inode=%d)",
+			firecrackerCheckpointOperationRecordVersion,
+			record.DirectoryDev, record.DirectoryInode,
+		)
 	}
 	for _, field := range []struct{ name, value string }{
 		{"operation id", record.OperationID},
@@ -149,6 +263,76 @@ func validateFirecrackerCheckpointOperationRecord(
 			)
 		}
 	}
+	if err := validateFirecrackerCheckpointOperationRoot(record); err != nil {
+		return err
+	}
+	return validateFirecrackerCheckpointOperationSourceIdentity(record)
+}
+
+// validateFirecrackerCheckpointOperationRecordV2 enforces the version-2
+// early-intent schema draft. Every phase — sealed or unsealed — requires the
+// complete common binding (operation ID, request digest, source generation),
+// the canonical directory, and the complete source birth identity under the
+// same constraints version 1 already imposed, plus the complete directory
+// birth identity. The root shape must match the phase exactly: the sealed
+// phases keep the version-1 root validation, and the unsealed early-intent
+// phases carry no root at all, because a root on an intent or abort record
+// would misread ownership or an abort fact as a success witness.
+func validateFirecrackerCheckpointOperationRecordV2(
+	record firecrackerCheckpointOperationRecord,
+) error {
+	switch record.Phase {
+	case firecrackerCheckpointOperationPhasePrepared,
+		firecrackerCheckpointOperationPhaseCompleted,
+		firecrackerCheckpointOperationPhaseAcked,
+		firecrackerCheckpointOperationPhaseIntent,
+		firecrackerCheckpointOperationPhaseAborting,
+		firecrackerCheckpointOperationPhaseAborted,
+		firecrackerCheckpointOperationPhaseAbortAcked:
+	default:
+		return fmt.Errorf("invalid checkpoint operation record phase %q", record.Phase)
+	}
+	for _, field := range []struct{ name, value string }{
+		{"operation id", record.OperationID},
+		{"request digest", record.RequestDigest},
+		{"source generation", record.SourceGeneration},
+		{"directory", record.Directory},
+		{"vmm api path", record.VMMAPIPath},
+	} {
+		if field.value == "" {
+			return fmt.Errorf(
+				"checkpoint operation record carries no %s", field.name,
+			)
+		}
+	}
+	if record.DirectoryDev == 0 || record.DirectoryInode == 0 {
+		return fmt.Errorf(
+			"checkpoint operation record carries no complete directory identity (dev=%d inode=%d)",
+			record.DirectoryDev, record.DirectoryInode,
+		)
+	}
+	if firecrackerCheckpointOperationPhaseRequiresSealedRoot(record.Phase) {
+		if err := validateFirecrackerCheckpointOperationRoot(record); err != nil {
+			return err
+		}
+	} else if record.RootDigest != "" || record.RootScheme != "" {
+		return fmt.Errorf(
+			"unsealed checkpoint operation record phase %q must carry no root (digest %q scheme %q)",
+			record.Phase, record.RootDigest, record.RootScheme,
+		)
+	}
+	return validateFirecrackerCheckpointOperationSourceIdentity(record)
+}
+
+// validateFirecrackerCheckpointOperationRoot enforces the sealed-root shape
+// shared by every phase that carries one: a nonempty scheme and a digest that
+// is exactly the shared root algorithm's hex length and valid hex.
+func validateFirecrackerCheckpointOperationRoot(
+	record firecrackerCheckpointOperationRecord,
+) error {
+	if record.RootScheme == "" {
+		return errors.New("checkpoint operation record carries no root scheme")
+	}
 	if len(record.RootDigest) != checkpointroot.DigestHexLen {
 		return fmt.Errorf(
 			"checkpoint operation record root digest is not %d hex characters",
@@ -158,6 +342,16 @@ func validateFirecrackerCheckpointOperationRecord(
 	if _, err := hex.DecodeString(record.RootDigest); err != nil {
 		return errors.New("checkpoint operation record root digest is not hex")
 	}
+	return nil
+}
+
+// validateFirecrackerCheckpointOperationSourceIdentity enforces the immutable
+// source birth identity every phase of every schema version must carry
+// completely: the VMM's PID and /proc start time, a canonical nonzero boot
+// UUID, and — when a uffd handler was tracked — a usable frozen uffd record.
+func validateFirecrackerCheckpointOperationSourceIdentity(
+	record firecrackerCheckpointOperationRecord,
+) error {
 	if record.VMMPID <= 1 || record.VMMStartTime == 0 {
 		return fmt.Errorf(
 			"checkpoint operation record carries no complete vmm identity (pid=%d start_time=%d)",
@@ -195,9 +389,15 @@ func refuseCheckpointOperationEvidence(
 	if !record.retainsEvidence() {
 		return nil
 	}
+	rootDigest := record.RootDigest
+	if rootDigest == "" {
+		// The unsealed early-intent phases carry no root by schema; report
+		// that instead of an empty binding.
+		rootDigest = "none"
+	}
 	return fmt.Errorf(
 		"Firecracker sandbox %s retains %s checkpoint operation %s evidence (root %s); new checkpoints are blocked until the operation is recovered or acknowledged: %w",
-		sandboxID, record.Phase, record.OperationID, record.RootDigest,
+		sandboxID, record.Phase, record.OperationID, rootDigest,
 		errord.ErrFailedPrecondition,
 	)
 }
@@ -340,57 +540,292 @@ func captureFirecrackerVMMBirthIdentity(
 	}, nil
 }
 
-// finishIdentifiedCheckpointOperation runs the post-seal tail of an identified
-// stop-and-copy checkpoint: bind the sealed root, capture the source VMM's
-// birth identity while it is still alive, and make the prepared witness
-// durable. From the caller's seal onward the source may never be resumed
-// again; a failure in this tail — including an ambiguous prepared-write
-// result — keeps the source paused and the sealed artifact in place, because a
-// returned error does not prove the witness write did not land.
-func (handler *Handler) finishIdentifiedCheckpointOperation(
-	instance *firecrackerInstance,
-	sandboxID string,
-	binding runtimecore.CheckpointOperationBinding,
+// reserveFirecrackerCheckpointDirectory canonicalizes and reserves the
+// caller-owned output directory of an identified operation: the path must be
+// absolute, clean, and not the filesystem root (matching the service
+// contract's absolute-output requirement); a symlink at the final component is
+// refused, never resolved — filepath.Clean is lexical only and the runtime
+// must not claim it canonicalizes away a link. The directory must be newly
+// created or already existing and empty, and its birth identity (containing
+// filesystem device and inode, the statx stx_dev/stx_ino pair) is captured
+// for the intent record. Creating the directory is reservation metadata only
+// — no snapshot component may be written into it before the intent is
+// durable. A preexisting nonempty directory is refused: the operation never
+// adopts artifacts it did not seal itself. The reservation is not an
+// exclusive cross-operation claim: it enforces emptiness, not ownership — a
+// path whose operation died before its intent write leaves an empty
+// reservation another operation may reserve, and the later binding and
+// directory-identity checks keep that interference fail-closed.
+func reserveFirecrackerCheckpointDirectory(
 	directory string,
-	files firecrackerCheckpointFiles,
-) error {
-	// Bind the sealed content root through the shared root algorithm: small
-	// metadata reads over the manifest and sidecars the seal just wrote,
-	// never a payload re-hash or fsync. Publication durability stays with the
-	// publish gates.
-	root, err := checkpointroot.Bind(directory)
-	if err != nil {
-		return fmt.Errorf(
-			"bind Firecracker checkpoint root for operation %s of sandbox %s: %w; the source stays paused and the sealed artifact is retained",
-			binding.OperationID, sandboxID, err,
+) (dev, inode uint64, err error) {
+	canonical := filepath.Clean(directory)
+	if !filepath.IsAbs(canonical) || canonical == "." || canonical == string(filepath.Separator) {
+		return 0, 0, fmt.Errorf(
+			"checkpoint output %q is not an absolute non-root canonical directory path", directory,
 		)
 	}
-	state := instance.snapshot()
-	identity, err := captureFirecrackerVMMBirthIdentity(state)
-	if err != nil {
-		return fmt.Errorf(
-			"capture Firecracker sandbox %s source identity for operation %s: %w; the source stays paused and the sealed artifact is retained",
-			sandboxID, binding.OperationID, err,
+	created := false
+	info, statErr := os.Lstat(canonical)
+	if statErr != nil {
+		if !os.IsNotExist(statErr) {
+			return 0, 0, fmt.Errorf(
+				"inspect Firecracker checkpoint output %s: %w", canonical, statErr,
+			)
+		}
+		if err := os.Mkdir(canonical, 0700); err != nil {
+			return 0, 0, fmt.Errorf(
+				"reserve Firecracker checkpoint output %s: %w", canonical, err,
+			)
+		}
+		created = true
+		if info, statErr = os.Lstat(canonical); statErr != nil {
+			return 0, 0, fmt.Errorf(
+				"inspect reserved Firecracker checkpoint output %s: %w", canonical, statErr,
+			)
+		}
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return 0, 0, fmt.Errorf(
+			"Firecracker checkpoint output %s is a symbolic link; a link is refused, never resolved: %w",
+			canonical, errord.ErrFailedPrecondition,
 		)
 	}
-	record := firecrackerCheckpointOperationRecord{
-		Version:          firecrackerCheckpointOperationRecordVersion,
-		Phase:            firecrackerCheckpointOperationPhasePrepared,
+	if !info.IsDir() {
+		return 0, 0, fmt.Errorf(
+			"Firecracker checkpoint output %s is not a directory", canonical,
+		)
+	}
+	entries, readErr := os.ReadDir(canonical)
+	if readErr != nil {
+		return 0, 0, fmt.Errorf(
+			"inspect Firecracker checkpoint output %s: %w", canonical, readErr,
+		)
+	}
+	if len(entries) != 0 {
+		return 0, 0, fmt.Errorf(
+			"Firecracker checkpoint output %s is not an empty reserved directory (%d entries): %w",
+			canonical, len(entries), errord.ErrFailedPrecondition,
+		)
+	}
+	if created {
+		// The reservation entry itself must survive a crash for the recorded
+		// directory identity to stay meaningful.
+		if err := syncFirecrackerDirectory(filepath.Dir(canonical)); err != nil {
+			return 0, 0, fmt.Errorf(
+				"sync Firecracker checkpoint output reservation %s: %w", canonical, err,
+			)
+		}
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0, 0, fmt.Errorf(
+			"Firecracker checkpoint output %s carries no unix directory identity", canonical,
+		)
+	}
+	return uint64(stat.Dev), stat.Ino, nil
+}
+
+// buildFirecrackerCheckpointOperationIntent assembles the durable early intent
+// of an identified operation from the exact admission binding, the runtime's
+// own incarnation state, and the source birth identity captured while the
+// source is still alive and unpaused. The intent carries no root by schema: it
+// proves operation ownership, never a sealed artifact.
+func buildFirecrackerCheckpointOperationIntent(
+	binding runtimecore.CheckpointOperationBinding,
+	state firecrackerPersistedState,
+	identity firecrackerVMMBirthIdentity,
+	directory string,
+	directoryDev, directoryInode uint64,
+) firecrackerCheckpointOperationRecord {
+	return firecrackerCheckpointOperationRecord{
+		Version:          firecrackerCheckpointOperationRecordVersion2,
+		Phase:            firecrackerCheckpointOperationPhaseIntent,
 		OperationID:      binding.OperationID,
 		RequestDigest:    binding.RequestDigest,
 		SourceGeneration: state.Generation,
-		RootDigest:       root.RootDigest,
-		RootScheme:       root.Scheme,
 		Directory:        directory,
+		DirectoryDev:     directoryDev,
+		DirectoryInode:   directoryInode,
 		VMMPID:           identity.pid,
 		VMMStartTime:     identity.startTime,
 		VMMBootID:        identity.bootID,
 		VMMAPIPath:       state.APIPath,
 		Uffd:             state.Uffd,
 	}
+}
+
+// verifyCheckpointOperationDirectoryIdentity proves the recorded canonical
+// directory is still the exact directory the intent reserved, through its
+// birth identity rather than the path string alone: a same-path replacement
+// gets a new inode and is refused.
+func verifyCheckpointOperationDirectoryIdentity(
+	sandboxID string,
+	record firecrackerCheckpointOperationRecord,
+) error {
+	info, err := os.Lstat(record.Directory)
+	if err != nil {
+		return fmt.Errorf(
+			"checkpoint operation %s of Firecracker sandbox %s records directory %s that can no longer be inspected: %w; refusing to reconcile: %w",
+			record.OperationID, sandboxID, record.Directory, err, errord.ErrFailedPrecondition,
+		)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf(
+			"checkpoint operation %s of Firecracker sandbox %s records directory %s that is now a symbolic link; a link is never reconciled through its target: %w",
+			record.OperationID, sandboxID, record.Directory, errord.ErrFailedPrecondition,
+		)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf(
+			"checkpoint operation %s of Firecracker sandbox %s records directory %s that is no longer a directory: %w",
+			record.OperationID, sandboxID, record.Directory, errord.ErrFailedPrecondition,
+		)
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || uint64(stat.Dev) != record.DirectoryDev || stat.Ino != record.DirectoryInode {
+		return fmt.Errorf(
+			"checkpoint operation %s of Firecracker sandbox %s records directory identity (dev=%d inode=%d) but %s now carries (dev=%d inode=%d); a replaced output directory is never reconciled: %w",
+			record.OperationID, sandboxID, record.DirectoryDev, record.DirectoryInode,
+			record.Directory, uint64(stat.Dev), stat.Ino, errord.ErrFailedPrecondition,
+		)
+	}
+	return nil
+}
+
+// verifyCheckpointOperationIntentSeal proves the recorded directory of a
+// durable intent now holds the complete sealed artifact of THE SAME
+// operation: the exact directory identity, a fully openable seal, and a
+// manifest operation binding equal to the intent's own binding — a shared root
+// whose manifest bytes were overwritten, or a legacy manifest with no binding,
+// proves nothing. It returns the content root the promotion records, derived
+// through the shared root algorithm from the manifest view it just opened
+// (metadata-only, never a payload re-hash).
+func verifyCheckpointOperationIntentSeal(
+	sandboxID string,
+	record firecrackerCheckpointOperationRecord,
+) (*checkpointroot.Binding, error) {
+	if err := verifyCheckpointOperationDirectoryIdentity(sandboxID, record); err != nil {
+		return nil, err
+	}
+	artifact, err := openFirecrackerCheckpoint(record.Directory)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"checkpoint operation %s of Firecracker sandbox %s records directory %s whose seal is not a complete verifiable artifact: %w; an intent is promoted only from its own operation's complete seal: %w",
+			record.OperationID, sandboxID, record.Directory, err, errord.ErrFailedPrecondition,
+		)
+	}
+	if artifact.Layout != firecrackerCheckpointLayoutV2Directory || artifact.Manifest == nil {
+		return nil, fmt.Errorf("checkpoint operation %s of Firecracker sandbox %s requires a v2 directory seal, not a legacy archive: %w", record.OperationID, sandboxID, errord.ErrFailedPrecondition)
+	}
+	if artifact.Manifest.Operation == nil {
+		return nil, fmt.Errorf(
+			"checkpoint operation %s of Firecracker sandbox %s found a sealed manifest in %s carrying no operation binding; a legacy or foreign seal never proves this intent sealed: %w",
+			record.OperationID, sandboxID, record.Directory, errord.ErrFailedPrecondition,
+		)
+	}
+	if artifact.Manifest.Operation.OperationID != record.OperationID ||
+		artifact.Manifest.Operation.RequestDigest != record.RequestDigest ||
+		artifact.Manifest.Operation.SourceGeneration != record.SourceGeneration {
+		return nil, fmt.Errorf(
+			"checkpoint operation %s of Firecracker sandbox %s found a sealed manifest in %s binding operation %s (request %s, generation %s), not the intent's own operation: %w",
+			record.OperationID, sandboxID, record.Directory,
+			artifact.Manifest.Operation.OperationID,
+			artifact.Manifest.Operation.RequestDigest,
+			artifact.Manifest.Operation.SourceGeneration,
+			errord.ErrFailedPrecondition,
+		)
+	}
+	root, err := checkpointroot.RootFromView(record.Directory, artifact.ManifestRaw)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"checkpoint operation %s of Firecracker sandbox %s records directory %s whose content root is no longer verifiable: %w; refusing to promote the intent: %w",
+			record.OperationID, sandboxID, record.Directory, err, errord.ErrFailedPrecondition,
+		)
+	}
+	return root, nil
+}
+
+// refuseAbortCheckpointOperationSealedIntent enforces the new-abort decision
+// boundary: a durable intent whose recorded directory holds the verifiable
+// complete seal of the SAME operation must be recovered, not aborted — the
+// artifact is exactly the success the operation owes. A directory holding a
+// sealed manifest that cannot be attributed to the intent fails closed: the
+// abort never destroys or ignores evidence it cannot classify. Only a
+// directory with no sealed manifest (an unsealed or partially laid-out
+// reservation) may proceed to the abort.
+func refuseAbortCheckpointOperationSealedIntent(
+	sandboxID string,
+	record firecrackerCheckpointOperationRecord,
+) error {
+	if _, err := os.Lstat(filepath.Join(
+		record.Directory, firecrackerCheckpointManifestName,
+	)); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf(
+			"inspect Firecracker checkpoint output %s of operation %s: %w; refusing to abort fail-closed: %w",
+			record.Directory, record.OperationID, err, errord.ErrFailedPrecondition,
+		)
+	}
+	if _, err := verifyCheckpointOperationIntentSeal(sandboxID, record); err == nil {
+		return fmt.Errorf(
+			"checkpoint operation %s of Firecracker sandbox %s already holds its own complete sealed artifact in %s; recover the operation instead of aborting it: %w",
+			record.OperationID, sandboxID, record.Directory, errord.ErrFailedPrecondition,
+		)
+	} else {
+		return fmt.Errorf(
+			"checkpoint operation %s of Firecracker sandbox %s records directory %s holding a sealed manifest that is not this operation's verifiable seal: %w; refusing to abort fail-closed: %w",
+			record.OperationID, sandboxID, record.Directory, err, errord.ErrFailedPrecondition,
+		)
+	}
+}
+
+// finishIdentifiedCheckpointOperation runs the post-seal tail of an identified
+// stop-and-copy checkpoint: bind the sealed root and promote the durable
+// intent into the prepared witness of the SAME record — the birth and
+// directory identity captured before any side effect are the operation's
+// identity, and nothing is recaptured or replaced after the seal. From the
+// caller's seal onward the source may never be resumed again; a failure in
+// this tail — including an ambiguous prepared-write result — keeps the source
+// paused and the sealed artifact in place, because a returned error does not
+// prove the witness write did not land.
+func (handler *Handler) finishIdentifiedCheckpointOperation(
+	instance *firecrackerInstance,
+	sandboxID string,
+	binding runtimecore.CheckpointOperationBinding,
+	files firecrackerCheckpointFiles,
+) error {
+	state := instance.snapshot()
+	record := state.CheckpointOperation
+	if record.Phase != firecrackerCheckpointOperationPhaseIntent ||
+		record.OperationID != binding.OperationID ||
+		record.RequestDigest != binding.RequestDigest ||
+		record.SourceGeneration != state.Generation {
+		return fmt.Errorf(
+			"Firecracker sandbox %s carries no durable intent of operation %s to promote after the seal; refusing to fabricate a prepared witness: %w",
+			sandboxID, binding.OperationID, errord.ErrFailedPrecondition,
+		)
+	}
+	// Bind the sealed content root through the shared root algorithm: small
+	// metadata reads over the manifest and sidecars the seal just wrote,
+	// never a payload re-hash or fsync. Publication durability stays with the
+	// publish gates.
+	root, err := checkpointroot.Bind(record.Directory)
+	if err != nil {
+		return fmt.Errorf(
+			"bind Firecracker checkpoint root for operation %s of sandbox %s: %w; the source stays paused and the sealed artifact is retained",
+			binding.OperationID, sandboxID, err,
+		)
+	}
+	prepared := record
+	prepared.Phase = firecrackerCheckpointOperationPhasePrepared
+	prepared.RootDigest = root.RootDigest
+	prepared.RootScheme = root.Scheme
 	// The in-memory record is set before the write so the constraint binds
 	// this daemon even when the write's result is ambiguous.
-	instance.setCheckpointOperation(record)
+	instance.setCheckpointOperation(prepared)
 	if err := handler.persistInstance(instance); err != nil {
 		return fmt.Errorf(
 			"persist prepared checkpoint operation witness for operation %s of Firecracker sandbox %s: %w; the write may have committed, the source stays paused, the sealed artifact is retained, and the operation must be recovered or retired explicitly",
@@ -401,7 +836,7 @@ func (handler *Handler) finishIdentifiedCheckpointOperation(
 	// witness: queue the memory writeback best effort, completion outcome
 	// notwithstanding.
 	defer handler.scheduleCheckpointMemoryWriteback(files.Memory)
-	return handler.completeIdentifiedCheckpointOperation(instance, record)
+	return handler.completeIdentifiedCheckpointOperation(instance, prepared)
 }
 
 // completeIdentifiedCheckpointOperation finishes the original operation's
@@ -600,6 +1035,29 @@ func verifyCheckpointOperationWitnessScope(
 	return nil
 }
 
+// refuseUnrecoverableAbortPhase keeps the success-recovery path away from the
+// abort protocol's phases. A record being aborted, durably aborted, or
+// abort-acked proves no sealed artifact and no success: it is retired only
+// through AbortCheckpointOperation and its own abort acknowledgment, never
+// guessed into a completion. The durable intent phase is the one early-intent
+// phase this recovery reconciles — by promoting a verified same-operation
+// seal, never by taking a new snapshot.
+func refuseUnrecoverableAbortPhase(
+	sandboxID string,
+	record firecrackerCheckpointOperationRecord,
+) error {
+	switch record.Phase {
+	case firecrackerCheckpointOperationPhaseAborting,
+		firecrackerCheckpointOperationPhaseAborted,
+		firecrackerCheckpointOperationPhaseAbortAcked:
+		return fmt.Errorf(
+			"checkpoint operation %s of Firecracker sandbox %s is %s, a phase of the explicit abort protocol; this recovery reconciles sealed operations and a never-sealed intent only, and an aborted operation is retired through AbortCheckpointOperation and its own acknowledgment: %w",
+			record.OperationID, sandboxID, record.Phase, errord.ErrFailedPrecondition,
+		)
+	}
+	return nil
+}
+
 // RecoverCheckpointOperation reconciles one existing identified checkpoint
 // operation. It is an internal capability method (see
 // runtimecore.CheckpointOperationWitness): nothing public invokes it yet.
@@ -613,7 +1071,11 @@ func verifyCheckpointOperationWitnessScope(
 // only completes the original stop-source flow: a prepared witness is first
 // made durable again — the in-memory record alone does not prove the original
 // write landed — and then it never allocates artifacts, takes a snapshot,
-// resumes the source, or modifies the artifact root. A
+// resumes the source, or modifies the artifact root. A durable intent whose
+// recorded directory holds the complete same-operation seal is promoted to
+// that prepared witness in place — same binding, birth identity, and
+// directory identity — and follows the same stop-source tail; an intent
+// without its own verifiable seal is refused, never re-snapshotted. A
 // durable completion is returned as the original binding's recorded result
 // with zero further work. The returned completion is a fact about the sealed
 // root and the confirmed stop, not a payload-durability claim.
@@ -634,12 +1096,16 @@ func (handler *Handler) RecoverCheckpointOperation(
 		// recovery side effect: a released operation must not run recovery
 		// only to be refused under the lock.
 		if record.Phase == firecrackerCheckpointOperationPhaseAcked {
-			return runtimecore.CheckpointOperationCompletion{}, fmt.Errorf(
-				"checkpoint operation %s of Firecracker sandbox %s is already acknowledged; its evidence retention is released and recovery is not this path's to redo: %w",
-				record.OperationID, sandboxID, errord.ErrFailedPrecondition,
-			)
+			return runtimecore.CheckpointOperationCompletion{}, ackedRefusal(sandboxID, record)
 		}
-		if err := verifyCheckpointOperationWitnessRoot(sandboxID, record); err != nil {
+		if err := refuseUnrecoverableAbortPhase(sandboxID, record); err != nil {
+			return runtimecore.CheckpointOperationCompletion{}, err
+		}
+		if record.Phase == firecrackerCheckpointOperationPhaseIntent {
+			if _, err := verifyCheckpointOperationIntentSeal(sandboxID, record); err != nil {
+				return runtimecore.CheckpointOperationCompletion{}, err
+			}
+		} else if err := verifyCheckpointOperationWitnessRoot(sandboxID, record); err != nil {
 			return runtimecore.CheckpointOperationCompletion{}, err
 		}
 	}
@@ -654,17 +1120,23 @@ func (handler *Handler) RecoverCheckpointOperation(
 	if err != nil {
 		return runtimecore.CheckpointOperationCompletion{}, err
 	}
-	if err := verifyCheckpointOperationWitnessRoot(sandboxID, record); err != nil {
+	if err := refuseUnrecoverableAbortPhase(sandboxID, record); err != nil {
+		return runtimecore.CheckpointOperationCompletion{}, err
+	}
+	if record.Phase == firecrackerCheckpointOperationPhaseIntent {
+		// The seal proof is the intent's only recoverable evidence: check it
+		// before the boot scope so the refusal names the missing seal.
+		if _, err := verifyCheckpointOperationIntentSeal(sandboxID, record); err != nil {
+			return runtimecore.CheckpointOperationCompletion{}, err
+		}
+	} else if err := verifyCheckpointOperationWitnessRoot(sandboxID, record); err != nil {
 		return runtimecore.CheckpointOperationCompletion{}, err
 	}
 	if err := verifyCheckpointOperationWitnessScope(sandboxID, record); err != nil {
 		return runtimecore.CheckpointOperationCompletion{}, err
 	}
 	if record.Phase == firecrackerCheckpointOperationPhaseAcked {
-		return runtimecore.CheckpointOperationCompletion{}, fmt.Errorf(
-			"checkpoint operation %s of Firecracker sandbox %s is already acknowledged; its evidence retention is released and recovery is not this path's to redo: %w",
-			record.OperationID, sandboxID, errord.ErrFailedPrecondition,
-		)
+		return runtimecore.CheckpointOperationCompletion{}, ackedRefusal(sandboxID, record)
 	}
 	if record.Phase == firecrackerCheckpointOperationPhaseCompleted {
 		// The durable completion already carries the original binding's
@@ -673,6 +1145,32 @@ func (handler *Handler) RecoverCheckpointOperation(
 			RootDigest: record.RootDigest,
 			RootScheme: record.RootScheme,
 		}, nil
+	}
+	if record.Phase == firecrackerCheckpointOperationPhaseIntent {
+		// A daemon crash after the seal but before the promotion left the
+		// durable intent plus the sealed artifact: promote the SAME record —
+		// the binding, birth identity, and directory identity captured before
+		// any side effect — never a recaptured or replaced identity, and
+		// never a new snapshot or resume. The promotion write is the durable
+		// prepared boundary: it must land before any stop-source work, and a
+		// failure keeps the intent, the source, and the sealed artifact
+		// exactly as they were.
+		root, sealErr := verifyCheckpointOperationIntentSeal(sandboxID, record)
+		if sealErr != nil {
+			return runtimecore.CheckpointOperationCompletion{}, sealErr
+		}
+		prepared := record
+		prepared.Phase = firecrackerCheckpointOperationPhasePrepared
+		prepared.RootDigest = root.RootDigest
+		prepared.RootScheme = root.Scheme
+		instance.setCheckpointOperation(prepared)
+		if err := handler.persistInstance(instance); err != nil {
+			return runtimecore.CheckpointOperationCompletion{}, fmt.Errorf(
+				"persist prepared checkpoint operation witness promoted from the intent of operation %s of Firecracker sandbox %s: %w; the write may have committed, no stop was attempted, the source and the sealed artifact are retained, and the recovery must be retried once the state storage is writable",
+				record.OperationID, sandboxID, err,
+			)
+		}
+		return handler.completeIntentPromotion(instance, prepared)
 	}
 	// The prepared witness held in daemon memory is not proof of its own
 	// durability: the original write may have failed with an unknown result,
@@ -700,12 +1198,44 @@ func (handler *Handler) RecoverCheckpointOperation(
 	}, nil
 }
 
-// refuseUnacknowledgablePhase enforces the acknowledgment's phase policy: only
-// a durable completion may be acknowledged. A prepared witness still owes the
-// source's stop — its evidence constraint is not the service's to release,
-// and no internal caller may turn an unfinished operation into an acked one.
-// An already-acknowledged record stays idempotently acknowledgeable so a lost
-// reply can be retried after a durable success receipt.
+// ackedRefusal is the shared already-acknowledged refusal of the recovery
+// path.
+func ackedRefusal(
+	sandboxID string,
+	record firecrackerCheckpointOperationRecord,
+) error {
+	return fmt.Errorf(
+		"checkpoint operation %s of Firecracker sandbox %s is already acknowledged; its evidence retention is released and recovery is not this path's to redo: %w",
+		record.OperationID, sandboxID, errord.ErrFailedPrecondition,
+	)
+}
+
+// completeIntentPromotion finishes a promoted prepared witness through the
+// ordinary stop-source tail and answers with the root the promotion recorded.
+func (handler *Handler) completeIntentPromotion(
+	instance *firecrackerInstance,
+	prepared firecrackerCheckpointOperationRecord,
+) (runtimecore.CheckpointOperationCompletion, error) {
+	if err := handler.completeIdentifiedCheckpointOperation(instance, prepared); err != nil {
+		return runtimecore.CheckpointOperationCompletion{}, err
+	}
+	return runtimecore.CheckpointOperationCompletion{
+		RootDigest: prepared.RootDigest,
+		RootScheme: prepared.RootScheme,
+	}, nil
+}
+
+// refuseUnacknowledgablePhase enforces the success acknowledgment's phase
+// policy: only a durable completion may be acknowledged. A prepared witness
+// still owes the source's stop — its evidence constraint is not the service's
+// to release, and no internal caller may turn an unfinished operation into an
+// acked one. The version-2 early-intent phases are refused here too: this is
+// the SUCCESS acknowledgment, and an intent that never sealed, an abort in
+// flight, an aborted fact, or an abort already acknowledged is never released
+// through it — the explicit abort acknowledgment that retires those records
+// is a later protocol step. An already-acknowledged record stays idempotently
+// acknowledgeable so a lost reply can be retried after a durable success
+// receipt.
 func refuseUnacknowledgablePhase(
 	sandboxID string,
 	record firecrackerCheckpointOperationRecord,
@@ -716,7 +1246,7 @@ func refuseUnacknowledgablePhase(
 		return nil
 	default:
 		return fmt.Errorf(
-			"checkpoint operation %s of Firecracker sandbox %s is %s, not completed; recover the operation's stop before acknowledging it: %w",
+			"checkpoint operation %s of Firecracker sandbox %s is %s, not completed; recover the operation's stop before acknowledging it, and retire an aborted operation only through its own explicit abort acknowledgment, which this success acknowledgment never is: %w",
 			record.OperationID, sandboxID, record.Phase,
 			errord.ErrFailedPrecondition,
 		)
@@ -794,6 +1324,341 @@ func (handler *Handler) publishCheckpointOperationAcknowledgment(
 	}
 	acknowledged := state.CheckpointOperation
 	acknowledged.Phase = firecrackerCheckpointOperationPhaseAcked
+	persisted := state
+	persisted.CheckpointOperation = acknowledged
+	if err := writeFirecrackerState(persisted); err != nil {
+		return err
+	}
+	instance.setCheckpointOperation(acknowledged)
+	return nil
+}
+
+// refuseAbortablePhase enforces which witness phases an explicit abort may
+// act on. Only a never-sealed intent may be newly aborted, an abort already
+// in flight is retried, and a durable abort fact is idempotently confirmed.
+// Everything else — a sealed prepared or completed witness, a
+// success-acknowledged record, and a released abort-acked record — is
+// refused: those operations owe (or owed) their outcome through the recovery
+// protocol instead.
+func refuseAbortablePhase(
+	sandboxID string,
+	record firecrackerCheckpointOperationRecord,
+) error {
+	switch record.Phase {
+	case firecrackerCheckpointOperationPhaseIntent,
+		firecrackerCheckpointOperationPhaseAborting,
+		firecrackerCheckpointOperationPhaseAborted:
+		return nil
+	case firecrackerCheckpointOperationPhaseAbortAcked:
+		return fmt.Errorf(
+			"checkpoint operation %s of Firecracker sandbox %s is already abort-acknowledged; its evidence retention is released and the abort is not this path's to redo: %w",
+			record.OperationID, sandboxID, errord.ErrFailedPrecondition,
+		)
+	default:
+		return fmt.Errorf(
+			"checkpoint operation %s of Firecracker sandbox %s is %s; a sealed or success-acknowledged operation cannot be aborted — recover or acknowledge it instead: %w",
+			record.OperationID, sandboxID, record.Phase, errord.ErrFailedPrecondition,
+		)
+	}
+}
+
+// verifyCheckpointOperationAbortScope proves, before any abort decision,
+// resume, or lookup side effect, that the record still describes THIS
+// runtime's incarnation and canonical output directory — the binding match
+// alone proves none of it. The recorded host boot must still be current, the
+// recorded source process must still be the executable this handler owns
+// under its recorded API socket, and the version-2 directory identity must
+// still describe the recorded directory; the no-seal case checks the
+// directory identity exactly like the sealed one. Both the hot and the cold
+// abort path run it, so an in-memory witness whose recorded identity drifted
+// (a foreign boot id, a replaced source, a recreated output directory) is
+// refused without touching the source.
+func (handler *Handler) verifyCheckpointOperationAbortScope(
+	sandboxID string,
+	record firecrackerCheckpointOperationRecord,
+) error {
+	if err := verifyCheckpointOperationWitnessScope(sandboxID, record); err != nil {
+		return err
+	}
+	if !firecrackerProcessMatches(
+		record.VMMPID, handler.binary, record.VMMAPIPath, sandboxID,
+	) {
+		return fmt.Errorf(
+			"checkpoint operation %s of Firecracker sandbox %s records source pid %d that is not the Firecracker executable this handler owns at %s; the abort cannot prove it resumes the recorded source and the evidence is retained: %w",
+			record.OperationID, sandboxID, record.VMMPID, record.VMMAPIPath,
+			errord.ErrFailedPrecondition,
+		)
+	}
+	return verifyCheckpointOperationDirectoryIdentity(sandboxID, record)
+}
+
+// AbortCheckpointOperation deterministically retires an identified checkpoint
+// operation that never sealed. It is an internal capability method (see
+// runtimecore.CheckpointOperationAborter): nothing public invokes it yet, and
+// it is deliberately separate from the success recovery — an abort is never
+// mixed into RecoverCheckpointOperation's completion semantics.
+//
+// Only a durable intent may be newly aborted, and not while its recorded
+// directory holds the verifiable complete seal of the same operation — that
+// artifact is exactly the success the operation owes and must be recovered
+// instead; a seal that cannot be attributed fails closed. Before any decision
+// or resume, on both the hot and the cold path, the record's boot, source
+// executable, and directory identity are verified against the current
+// runtime. The abort decision is made durable (`aborting`) BEFORE EVERY
+// resume attempt — including the retry after an ambiguous first write, whose
+// in-memory `aborting` witness is not proof its write landed — so a crash or
+// timeout retries the same decision instead of silently re-owning the source.
+// The handback then proves the exact recorded birth identity is live before
+// and after the resume and the guest error release; a missing, replaced, or
+// dead source is never claimed resumed. Only after that proof is the source's
+// incremental lineage invalidated — a failed snapshot may have reset the VMM's
+// dirty accounting — and the `aborted` fact made durable. Every failure
+// retains the evidence and reports honestly what did and did not happen; an
+// ambiguous aborted write is re-persisted by the retry before success is
+// reported.
+func (handler *Handler) AbortCheckpointOperation(
+	ctx context.Context,
+	sandboxID string,
+	binding runtimecore.CheckpointOperationBinding,
+) error {
+	handler.mu.RLock()
+	instance := handler.instances[sandboxID]
+	handler.mu.RUnlock()
+	if instance == nil {
+		record, err := handler.verifyCheckpointOperationColdState(sandboxID, binding)
+		if err != nil {
+			return err
+		}
+		if err := refuseAbortablePhase(sandboxID, record); err != nil {
+			return err
+		}
+		// The identity and new-abort seal boundaries also hold before any
+		// cold recovery side effect: a drifted or sealed intent must not run
+		// recovery only to be refused under the lock.
+		if err := handler.verifyCheckpointOperationAbortScope(sandboxID, record); err != nil {
+			return err
+		}
+		if record.Phase == firecrackerCheckpointOperationPhaseIntent {
+			if err := refuseAbortCheckpointOperationSealedIntent(sandboxID, record); err != nil {
+				return err
+			}
+		}
+	}
+	instance, err := handler.lookupInstance(sandboxID)
+	if err != nil {
+		return err
+	}
+	instance.operationMu.Lock()
+	defer instance.operationMu.Unlock()
+	state := instance.snapshot()
+	record, err := matchCheckpointOperationWitness(sandboxID, binding, state)
+	if err != nil {
+		return err
+	}
+	if err := refuseAbortablePhase(sandboxID, record); err != nil {
+		return err
+	}
+	if record.Phase != firecrackerCheckpointOperationPhaseAborted {
+		// The same identity gate the cold path runs, against the hot record
+		// too: an in-memory witness whose recorded boot, source executable,
+		// or directory identity drifted is refused before any abort decision
+		// or resume.
+		if err := handler.verifyCheckpointOperationAbortScope(sandboxID, record); err != nil {
+			return err
+		}
+	}
+	if record.Phase == firecrackerCheckpointOperationPhaseAborted {
+		// The abort fact may not have been durable when it was first claimed:
+		// re-persist before reporting success, exactly like the idempotent
+		// success acknowledgment.
+		if err := handler.persistInstance(instance); err != nil {
+			return fmt.Errorf(
+				"persist aborted checkpoint operation %s of Firecracker sandbox %s: %w; the durable abort fact is unproven and the evidence gate stays in force",
+				record.OperationID, sandboxID, err,
+			)
+		}
+		return nil
+	}
+	if record.Phase == firecrackerCheckpointOperationPhaseIntent {
+		if err := refuseAbortCheckpointOperationSealedIntent(sandboxID, record); err != nil {
+			return err
+		}
+		aborting := record
+		aborting.Phase = firecrackerCheckpointOperationPhaseAborting
+		// The in-memory record is set before the write so the abort decision
+		// binds this daemon even when the write's result is ambiguous.
+		instance.setCheckpointOperation(aborting)
+		record = aborting
+	}
+	// record.Phase is now aborting — a fresh decision or a retry. Re-establish
+	// the durable aborting boundary before EVERY resume attempt: a hot witness
+	// that already says aborting is not proof its write landed, and the source
+	// is never resumed against a decision that may only exist in memory.
+	// persistInstance serializes on the same persistMu as every other state
+	// writer and has no unchanged-state shortcut, so a nil result has re-proven
+	// the aborting record on disk.
+	if err := handler.persistInstance(instance); err != nil {
+		return fmt.Errorf(
+			"persist aborting checkpoint operation witness for operation %s of Firecracker sandbox %s: %w; the source was not resumed and the evidence is retained",
+			record.OperationID, sandboxID, err,
+		)
+	}
+	return handler.resumeCheckpointOperationForAbort(ctx, instance, record)
+}
+
+// resumeCheckpointOperationForAbort performs the abort's source handback for
+// an `aborting` witness: prove the exact recorded birth identity live, resume
+// the source, release the guest checkpoint error handoff, re-prove the same
+// birth still live, invalidate the incremental lineage, and only then make
+// the `aborted` fact durable. Every failure returns an explicit error with
+// the `aborting` evidence retained and never claims the source was resumed
+// when that is unproven.
+func (handler *Handler) resumeCheckpointOperationForAbort(
+	ctx context.Context,
+	instance *firecrackerInstance,
+	record firecrackerCheckpointOperationRecord,
+) error {
+	sandboxID := instance.snapshot().ID
+	fd, err := pinAliveFirecrackerProcessBirth(record.VMMPID, record.VMMStartTime)
+	if err != nil {
+		return fmt.Errorf(
+			"confirm the recorded source of aborting checkpoint operation %s of Firecracker sandbox %s before resuming: %w; the source's resumption is unproven, the evidence is retained, and the abort must be retried or reconciled explicitly",
+			record.OperationID, sandboxID, err,
+		)
+	}
+	defer unix.Close(fd)
+	api := newFirecrackerAPI(instance.snapshot().APIPath)
+	if err := api.resume(ctx); err != nil {
+		return fmt.Errorf(
+			"resume Firecracker sandbox %s for the abort of checkpoint operation %s: %w; the resumption is unconfirmed, the evidence is retained, and the abort must be retried",
+			sandboxID, record.OperationID, err,
+		)
+	}
+	// Guest release through the retryable abort message: the full record
+	// binding lets the guest agent deduplicate a retry after a lost reply,
+	// which the legacy one-shot error outcome cannot. An agent that predates
+	// the message rejects it, and this path has no legacy fallback — the
+	// abort simply stays retryable with its evidence retained.
+	if err := requestFirecrackerAgent(
+		ctx,
+		instance.snapshot().VsockPath,
+		firecrackerproto.MessageCheckpointAbort,
+		firecrackerproto.CheckpointAbortRequest{OperationID: record.OperationID, RequestDigest: record.RequestDigest, SourceGeneration: record.SourceGeneration},
+	); err != nil {
+		return fmt.Errorf(
+			"release Firecracker sandbox %s after the abort of checkpoint operation %s: %w; the source was resumed but the guest error handoff is unconfirmed, the evidence is retained, and the abort must be retried",
+			sandboxID, record.OperationID, err,
+		)
+	}
+	if err := confirmPinnedFirecrackerProcessBirth(record.VMMPID, record.VMMStartTime, fd); err != nil {
+		return fmt.Errorf(
+			"re-confirm the resumed source of aborting checkpoint operation %s of Firecracker sandbox %s: %w; the source's continued resumption is unproven and the evidence is retained",
+			record.OperationID, sandboxID, err,
+		)
+	}
+	// The failed operation may have disturbed the VMM's dirty-page ledger
+	// against a base it never sealed: force the next checkpoint to Full.
+	instance.markBaseMemoryLineageLost()
+	aborted := record
+	aborted.Phase = firecrackerCheckpointOperationPhaseAborted
+	// The in-memory record is set before the write so the abort fact binds
+	// this daemon even when the write's result is ambiguous; the retry
+	// re-persists before reporting success.
+	instance.setCheckpointOperation(aborted)
+	if err := handler.persistInstance(instance); err != nil {
+		return fmt.Errorf(
+			"persist aborted checkpoint operation witness for operation %s of Firecracker sandbox %s: %w; the source was resumed and released but the abort fact is not durable, the evidence is retained, and the retry must not claim a fresh resume",
+			record.OperationID, sandboxID, err,
+		)
+	}
+	return nil
+}
+
+// refuseUnacknowledgableAbortPhase enforces the abort acknowledgment's phase
+// policy: only a durable abort fact may be abort-acknowledged, and an already
+// abort-acknowledged record stays idempotently acknowledgeable so a lost
+// reply can be retried.
+func refuseUnacknowledgableAbortPhase(
+	sandboxID string,
+	record firecrackerCheckpointOperationRecord,
+) error {
+	switch record.Phase {
+	case firecrackerCheckpointOperationPhaseAborted,
+		firecrackerCheckpointOperationPhaseAbortAcked:
+		return nil
+	default:
+		return fmt.Errorf(
+			"checkpoint operation %s of Firecracker sandbox %s is %s, not aborted; the abort acknowledgment releases only a durable abort fact, and the success acknowledgment never releases an abort: %w",
+			record.OperationID, sandboxID, record.Phase, errord.ErrFailedPrecondition,
+		)
+	}
+}
+
+// AckAbortedCheckpointOperation releases the evidence-retention gate of a
+// durably aborted operation after the service has persisted its failure fact.
+// It is an internal capability method (see
+// runtimecore.CheckpointOperationAborter): nothing public invokes it yet. It
+// reads no artifact and touches no source — an aborted operation retains no
+// success claim, so a legitimately removed artifact directory must not wedge
+// the retirement — and the release becomes claimable exclusively from a
+// durable write, exactly like the success acknowledgment.
+func (handler *Handler) AckAbortedCheckpointOperation(
+	ctx context.Context,
+	sandboxID string,
+	binding runtimecore.CheckpointOperationBinding,
+) error {
+	handler.mu.RLock()
+	instance := handler.instances[sandboxID]
+	handler.mu.RUnlock()
+	if instance == nil {
+		record, err := handler.verifyCheckpointOperationColdState(sandboxID, binding)
+		if err != nil {
+			return err
+		}
+		if err := refuseUnacknowledgableAbortPhase(sandboxID, record); err != nil {
+			return err
+		}
+	}
+	instance, err := handler.lookupInstance(sandboxID)
+	if err != nil {
+		return err
+	}
+	instance.operationMu.Lock()
+	defer instance.operationMu.Unlock()
+	state := instance.snapshot()
+	record, err := matchCheckpointOperationWitness(sandboxID, binding, state)
+	if err != nil {
+		return err
+	}
+	if err := refuseUnacknowledgableAbortPhase(sandboxID, record); err != nil {
+		return err
+	}
+	if err := handler.publishCheckpointOperationAbortAcknowledgment(instance); err != nil {
+		return fmt.Errorf(
+			"persist abort acknowledgment of checkpoint operation %s for Firecracker sandbox %s: %w; the evidence-retaining Delete gate stays in force until the abort acknowledgment is durable",
+			record.OperationID, sandboxID, err,
+		)
+	}
+	return nil
+}
+
+// publishCheckpointOperationAbortAcknowledgment makes the abort-acked fact
+// durable under persistMu and publishes it only afterwards — the same
+// construct, write, fsync, then publish ordering as the success
+// acknowledgment, so an unpersisted release is never visible to callers or
+// carried to disk by a concurrent state writer. The idempotent retry persists
+// again deliberately.
+func (handler *Handler) publishCheckpointOperationAbortAcknowledgment(
+	instance *firecrackerInstance,
+) error {
+	instance.persistMu.Lock()
+	defer instance.persistMu.Unlock()
+	state := instance.snapshot()
+	if err := refuseUnacknowledgableAbortPhase(state.ID, state.CheckpointOperation); err != nil {
+		return err
+	}
+	acknowledged := state.CheckpointOperation
+	acknowledged.Phase = firecrackerCheckpointOperationPhaseAbortAcked
 	persisted := state
 	persisted.CheckpointOperation = acknowledged
 	if err := writeFirecrackerState(persisted); err != nil {

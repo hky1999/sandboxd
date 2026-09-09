@@ -525,8 +525,9 @@ func TestParseCheckpointOperationStatusProtocol(t *testing.T) {
 	digest := strings.Repeat("0a", 32)
 	root := strings.Repeat("1b", 32)
 	for name, protocol := range map[string]string{
-		"legacy":  `"CHECKPOINT_OPERATION_RECOVERY_PROTOCOL_UNSPECIFIED"`,
-		"witness": `"CHECKPOINT_OPERATION_RECOVERY_PROTOCOL_WITNESS"`,
+		"legacy":    `"CHECKPOINT_OPERATION_RECOVERY_PROTOCOL_UNSPECIFIED"`,
+		"witness":   `"CHECKPOINT_OPERATION_RECOVERY_PROTOCOL_WITNESS"`,
+		"abortable": `"CHECKPOINT_OPERATION_RECOVERY_PROTOCOL_WITNESS_ABORTABLE"`,
 	} {
 		status, err := parseCheckpointOperationStatus(fmt.Sprintf(base, digest, root, protocol, "false"))
 		if err != nil {

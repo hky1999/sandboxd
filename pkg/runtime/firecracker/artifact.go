@@ -66,6 +66,16 @@ type firecrackerCheckpointCompat struct {
 	KernelArgs  string `json:"kernel_args,omitempty"`
 }
 
+// firecrackerCheckpointOperationBinding is the operation identity a sealed
+// manifest optionally carries: the exact binding the identified checkpoint was
+// admitted under, folded into the content root through the manifest's raw
+// bytes. Legacy seals omit it entirely.
+type firecrackerCheckpointOperationBinding struct {
+	OperationID      string `json:"operation_id,omitempty"`
+	RequestDigest    string `json:"request_digest,omitempty"`
+	SourceGeneration string `json:"source_generation,omitempty"`
+}
+
 // firecrackerCheckpointManifest describes the contents of a v2 checkpoint
 // directory. It is written last so that its presence marks a self-consistent
 // artifact: a restore never sees a half-written checkpoint.
@@ -76,8 +86,13 @@ type firecrackerCheckpointManifest struct {
 	BaseMemory   string                       `json:"base_memory,omitempty"`
 	VirtioFS     bool                         `json:"virtio_fs,omitempty"`
 	Compat       *firecrackerCheckpointCompat `json:"compat,omitempty"`
-	CreatedAt    time.Time                    `json:"created_at"`
-	Digests      map[string]string            `json:"digests"`
+	// Operation binds the seal to the identified checkpoint operation that
+	// produced it; a legacy or foreign seal carries none. A later
+	// reconciliation of a durable intent accepts the artifact only through
+	// this binding, never from the manifest's mere presence.
+	Operation *firecrackerCheckpointOperationBinding `json:"operation,omitempty"`
+	CreatedAt time.Time                              `json:"created_at"`
+	Digests   map[string]string                      `json:"digests"`
 	// MemoryDigestMode records how the memory digest was derived:
 	// "" or "sha256" — a plain sequential whole-file hash; "chunks" —
 	// the chunk root (sha256 over concatenated chunk digests), verified
@@ -399,6 +414,17 @@ func readFirecrackerCheckpointManifest(dir string) (*firecrackerCheckpointManife
 			"Firecracker checkpoint manifest has unbounded memory size %d",
 			manifest.MemorySize,
 		)
+	}
+	// An operation binding is all-or-nothing: a manifest carrying only part
+	// of one is corrupt, never a weaker form of attribution.
+	if manifest.Operation != nil {
+		if manifest.Operation.OperationID == "" ||
+			manifest.Operation.RequestDigest == "" ||
+			manifest.Operation.SourceGeneration == "" {
+			return nil, nil, fmt.Errorf(
+				"Firecracker checkpoint manifest carries an incomplete operation binding",
+			)
+		}
 	}
 	if manifest.Compat != nil {
 		for name, digest := range map[string]string{
