@@ -1237,6 +1237,8 @@ func main() {
 			for _, r := range regions {
 				totalChunks += (r.Size + walk - 1) / walk
 			}
+			log.Printf("prefetch: starting walk=%dKiB totalChunks=%d workers=%d manifest=%v",
+				walk>>10, totalChunks, *prefetch, source.chunkManifest != nil)
 			if budgetBytes > 0 {
 				maxByBudget := budgetBytes / walk
 				if maxByBudget < totalChunks {
