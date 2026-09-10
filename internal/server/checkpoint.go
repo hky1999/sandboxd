@@ -201,7 +201,7 @@ func (h *sandboxService) checkpoint(
 		operationCtx := h.checkpointOperationContext(ctx)
 		go func() {
 			defer releaseOperation()
-			h.executeCheckpoint(operationCtx, checkpointDir, key, checkpointHandler, source,
+			h.executeCheckpoint(operationCtx, checkpointDir, key, handler, checkpointHandler, source,
 				svc.CheckpointOptions{
 					LeaveRunning:      request.LeaveRunning,
 					IncludeFilesystem: request.IncludeFilesystem,
@@ -798,10 +798,60 @@ func (h *sandboxService) checkpointOperationContext(requestCtx context.Context) 
 	return context.WithValue(ctx, trace.ContextKeySpanId, spanID.String())
 }
 
+// checkpointSourceExitTimeout bounds how long a completed park dump waits for
+// the source runtime to exit on its own before the daemon forces its
+// retirement. Package variable so tests can shorten it.
+var checkpointSourceExitTimeout = 30 * time.Second
+
+// checkpointForcedRetireTimeout bounds the forced runtime delete and the final
+// exit confirmation of a park retirement.
+var checkpointForcedRetireTimeout = 60 * time.Second
+
+// retireParkedSource ends the runtime lifetime of a sandbox whose state dump
+// just completed with leaveRunning=false. Upstream runsc terminates the
+// sandbox itself, but the deployed scheduler-line build resumes tasks after
+// the save ("Tasks resumed after save", observed 2026-09-11) and keeps the
+// Sentry alive, so a passive wait on the daemon-lifetime operation context
+// wedges the checkpoint attempt forever and fences every delete. The natural
+// exit therefore gets a bounded window; a timeout falls through to a forced
+// runtime retirement. Returns nil only once the manager observed the terminal
+// state. The blocking-timeout-to-force branch needs a live monitor (the exit
+// notifier is registered by the start path) and is covered by the BM1 park
+// smoke rather than a unit test.
+func (h *sandboxService) retireParkedSource(ctx context.Context, sandboxID string, runtimeHandler svc.Handler) error {
+	exitCtx, cancel := context.WithTimeout(ctx, checkpointSourceExitTimeout)
+	defer cancel()
+	if _, err := h.sandboxManager.WaitForExit(exitCtx, sandboxID); err == nil {
+		return nil
+	} else if !errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("wait for sandbox exit after checkpoint: %w", err)
+	}
+	return h.forceRetireParkedSource(ctx, sandboxID, runtimeHandler)
+}
+
+// forceRetireParkedSource destroys the source runtime directly and confirms
+// the manager observed the exit. The caller already holds the sandbox's
+// physical resource lock, so the daemon-level delete path — which re-acquires
+// it — must not be used here.
+func (h *sandboxService) forceRetireParkedSource(ctx context.Context, sandboxID string, runtimeHandler svc.Handler) error {
+	logrus.Warnf("parked source %s did not exit after checkpoint; forcing runtime retirement", sandboxID)
+	destroyCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), checkpointForcedRetireTimeout)
+	defer cancel()
+	if err := runtimeHandler.Delete(destroyCtx, sandboxID); err != nil {
+		return fmt.Errorf("parked source %s did not exit after checkpoint and forced retirement failed: %w", sandboxID, err)
+	}
+	if _, err := h.sandboxManager.WaitForExit(destroyCtx, sandboxID); err != nil {
+		return fmt.Errorf("parked source %s did not observe exit after forced retirement: %w", sandboxID, err)
+	}
+	logrus.Infof("parked source %s retired after checkpoint", sandboxID)
+	return nil
+}
+
 func (h *sandboxService) executeCheckpoint(
 	ctx context.Context,
 	checkpointDir string,
 	key checkpointstate.CheckpointKey,
+	runtimeHandler svc.Handler,
 	checkpointHandler svc.ManagedCheckpointHandler,
 	source checkpoint.SourceIdentity,
 	options svc.CheckpointOptions,
@@ -856,6 +906,11 @@ func (h *sandboxService) executeCheckpoint(
 		if options.LeaveRunning {
 			return nil
 		}
+		if err := h.retireParkedSource(ctx, key.SandboxID, runtimeHandler); err != nil {
+			return err
+		}
+		// retireParkedSource observed the terminal state; this wait takes the
+		// fast path and only re-reads it for the EXITED check below.
 		status, err := h.sandboxManager.WaitForExit(ctx, key.SandboxID)
 		if err != nil {
 			return fmt.Errorf("wait for sandbox exit after checkpoint: %w", err)

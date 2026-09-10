@@ -27,9 +27,9 @@ func TestCheckpointRevalidatesQueuedPhysicalGenerationBeforePublishing(t *testin
 	}
 	dir := filepath.Join(t.TempDir(), "checkpoint")
 	source := checkpoint.SourceIdentity{CheckpointID: key.CheckpointID, SourceID: key.SandboxID, Runtime: "runsc", RootfsSHA256: strings.Repeat("a", 64), SourceGeneration: "generation-before-replacement"}
-	// The command captured an old generation before acquiring the lock. A nil
-	// runtime handler also ensures rejection happens before any physical call.
-	h.executeCheckpoint(context.Background(), dir, key, nil, source, svc.CheckpointOptions{}, attempt)
+	// The command captured an old generation before acquiring the lock. Nil
+	// runtime handlers also ensure rejection happens before any physical call.
+	h.executeCheckpoint(context.Background(), dir, key, nil, nil, source, svc.CheckpointOptions{}, attempt)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	if err := attempt.Wait(ctx); !errors.Is(err, errord.ErrFailedPrecondition) {
