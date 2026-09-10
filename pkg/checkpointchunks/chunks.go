@@ -386,6 +386,18 @@ func verifyContents(ctx context.Context, reader io.Reader, manifest *Manifest) e
 			return err
 		}
 		length := expectedChunkLen(manifest, i)
+		if chunk.Inherited {
+			// Hole-chunk entry by construction (digest inheritance): its
+			// bytes live in the content-addressed store under this very
+			// digest, not in the local sparse artifact — reading them here
+			// yields zeros and would false-fail. Consumers verify inherited
+			// chunks per fetch; the root below still binds them in order.
+			// Discard the range so the stream stays aligned.
+			if _, err := io.CopyN(io.Discard, reader, length); err != nil {
+				return fmt.Errorf("skip inherited chunk %d: %w", i, err)
+			}
+			continue
+		}
 		if manifest.FileDigestMode == FileDigestChunks && chunk.Digest == ZeroChunkDigest(int(length)) {
 			if holes, ok := reader.(interface{ skipZeroHole(int64) (bool, error) }); ok {
 				skipped, err := holes.skipZeroHole(length)

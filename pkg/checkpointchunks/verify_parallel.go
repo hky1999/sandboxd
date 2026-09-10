@@ -105,6 +105,16 @@ func verifyContentsParallel(ctx context.Context, reader io.Reader, m *Manifest, 
 			return err
 		}
 		length := expectedChunkLen(m, i)
+		if chunk.Inherited {
+			// Digest-inherited hole: bytes live in the store under this
+			// digest, not in the local sparse artifact. Keep the stream
+			// aligned without hashing local zeros; the root check below
+			// still binds the entry.
+			if _, err := io.CopyN(io.Discard, reader, length); err != nil {
+				return fmt.Errorf("skip inherited chunk %d: %w", i, err)
+			}
+			continue
+		}
 		if chunk.Digest == ZeroChunkDigest(int(length)) {
 			if holes, ok := reader.(interface{ skipZeroHole(int64) (bool, error) }); ok {
 				skipped, err := holes.skipZeroHole(length)
