@@ -55,6 +55,7 @@ func main() {
 	jsonOut := flag.Bool("json", false, "machine-readable round summaries")
 	timeout := flag.Duration("timeout", 10*time.Minute, "per-publish deadline")
 	stale := flag.Duration("stale", 10*time.Minute, "publishing state older than this is a crash leftover and is re-queued")
+	compressChunks := flag.Bool("compress-chunks", false, "publish standalone memory chunks as zstd transport bodies (digests keep naming uncompressed bytes)")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "usage: cn-publishd -roots DIR[,DIR...] -store SPEC [-interval 30s] [-once] [-json]\n")
 		flag.PrintDefaults()
@@ -71,7 +72,7 @@ func main() {
 	}
 
 	for {
-		outcome := scanAndPublish(*roots, store, *timeout, *stale)
+		outcome := scanAndPublish(*roots, store, *timeout, *stale, *compressChunks)
 		if *jsonOut {
 			encoded, _ := json.Marshal(outcome)
 			fmt.Println(string(encoded))
@@ -99,7 +100,7 @@ func main() {
 // re-queued — publishing is idempotent, so the rerun only puts objects
 // the store still lacks. Young publishing records may belong to a
 // concurrent publisher and are left untouched.
-func scanAndPublish(roots string, store chunkstore.Store, timeout, staleAfter time.Duration) roundOutcome {
+func scanAndPublish(roots string, store chunkstore.Store, timeout, staleAfter time.Duration, compressChunks bool) roundOutcome {
 	outcome := roundOutcome{
 		StartedAt: time.Now().UTC(),
 		Failed:    map[string]string{},
@@ -190,7 +191,7 @@ func scanAndPublish(roots string, store chunkstore.Store, timeout, staleAfter ti
 
 	for _, artifact := range pending {
 		ctx, cancel := context.WithTimeout(context.Background(), timeout)
-		_, err := checkpointpublish.Run(ctx, artifact.dir, artifact.id, store, storeSpecName(store))
+		_, err := checkpointpublish.RunWithOptions(ctx, artifact.dir, artifact.id, store, storeSpecName(store), checkpointpublish.Options{CompressChunks: compressChunks})
 		cancel()
 		if err != nil {
 			outcome.Failed[artifact.id] = err.Error()
