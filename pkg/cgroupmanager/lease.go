@@ -70,6 +70,7 @@ func (c *CgroupManager) ReadMemoryLimit(name string) (int64, error) {
 		return 0, err
 	}
 	return int64(stats.MemoryLimitBytes), nil
+}
 
 // SupportsMemoryShrink reports whether the detected backend can run the
 // freeze-guarded memory decrease: only cgroup v2 has cgroup.freeze and

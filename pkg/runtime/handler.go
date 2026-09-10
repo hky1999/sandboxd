@@ -114,7 +114,6 @@ type CheckpointOptions struct {
 	// are taken at one paused consistency point.
 	IncludeFilesystem bool
 }
-}
 
 type StartConfig struct {
 	ID                      string

@@ -339,7 +339,7 @@ func (r *Handler) Restore(
 // directory recorded in the sandbox OCI spec annotation, fenced to stay
 // below the daemon-owned checkpoint root.
 func (r *Handler) checkpointCoordinationDir(bundlePath string) (string, error) {
-	spec, err := LoadSpec(filepath.Join(bundlePath, config.SandboxSpecFile))
+	spec, err := runtimecore.LoadSpec(filepath.Join(bundlePath, config.SandboxSpecFile))
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return "", nil
