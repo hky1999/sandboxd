@@ -1522,6 +1522,9 @@ func (handler *Handler) launchUffdHandler(
 	if handler.uffdChunkKB > 0 {
 		args = append(args, "-chunk-kb", strconv.FormatUint(uint64(handler.uffdChunkKB), 10))
 	}
+	if handler.uffdCopyKB > 4 {
+		args = append(args, "-copy-kb", strconv.FormatUint(uint64(handler.uffdCopyKB), 10))
+	}
 	if handler.uffdPersistWorkers > 0 {
 		args = append(args, "-persist-workers", strconv.Itoa(handler.uffdPersistWorkers))
 	}

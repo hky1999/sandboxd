@@ -374,6 +374,7 @@ type Handler struct {
 	uffdRemoteURL      string
 	uffdCacheDir       string
 	uffdChunkKB        uint
+	uffdCopyKB         uint
 	uffdPersistWorkers int
 
 	// digestMemory records a sha256 of the memory artifact in the sealed
