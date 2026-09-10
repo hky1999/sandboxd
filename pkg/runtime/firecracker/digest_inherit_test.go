@@ -130,20 +130,22 @@ func TestScanFileChunksInheritRequiresParentEntry(t *testing.T) {
 }
 
 func TestTierSelectsInheritedIncrementalWindow(t *testing.T) {
-	// The inherited first window is gated off until the VMM can restore a
-	// baseless SoftDirty vmstate; with the gate closed the Full fallback
-	// must hold even when a chunk manifest is available.
+	// With a chunk manifest recording the parent's digests, a lost byte
+	// lineage routes to the digest-inherited SoftDirty first window: the
+	// dump is chunk-aligned, so every written chunk is locally
+	// representable and holes inherit the parent's bytes.
 	snapshotType, base, incremental, layoutSize, err := selectFirecrackerSnapshotTierUsable(
 		64<<10, "", false, true, "", false, true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if snapshotType != firecrackerSnapshotTypeFull || base != "" ||
-		incremental || layoutSize != 0 {
-		t.Fatalf("gated inherited window must fall back to Full: type=%q base=%q incr=%v layout=%d",
+	if snapshotType != firecrackerSnapshotTypeSoftDirty || base != "" ||
+		incremental || layoutSize != 64<<10 {
+		t.Fatalf("inherited window not selected: type=%q base=%q incr=%v layout=%d",
 			snapshotType, base, incremental, layoutSize)
 	}
-	// Without a chunk manifest the Full fallback stands.
+	// Without a chunk manifest the Full fallback stands: holes without a
+	// digest lineage are zeros, which would corrupt a restored guest.
 	snapshotType, _, _, layoutSize, err = selectFirecrackerSnapshotTierUsable(
 		64<<10, "", false, true, "", false, false)
 	if err != nil {
@@ -152,5 +154,45 @@ func TestTierSelectsInheritedIncrementalWindow(t *testing.T) {
 	if snapshotType != firecrackerSnapshotTypeFull || layoutSize != 0 {
 		t.Fatalf("lost lineage without chunk manifest must stay Full: type=%q layout=%d",
 			snapshotType, layoutSize)
+	}
+}
+
+func TestScanFileChunksRejectsPartialChunkUnderInheritance(t *testing.T) {
+	parent := &checkpointchunks.Manifest{
+		Version: 1, File: "memory", FileSize: 4 * checkpointchunks.DefaultChunkBytes,
+		ChunkBytes: checkpointchunks.DefaultChunkBytes,
+	}
+	for i := 0; i < 4; i++ {
+		block := make([]byte, checkpointchunks.DefaultChunkBytes)
+		block[0] = byte(i + 9)
+		sum := sha256.Sum256(block)
+		parent.Entries = append(parent.Entries, checkpointchunks.Chunk{
+			Offset: int64(i) * checkpointchunks.DefaultChunkBytes, Digest: hex.EncodeToString(sum[:])})
+	}
+	parent.ChunkCount = 4
+	parent.FileDigest = checkpointchunks.RootDigest(parent.Entries)
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "memory")
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A dirty range that starts and ends strictly inside chunk 1: chunk 1
+	// is PARTIALLY written, which inheritance cannot represent.
+	partial := make([]byte, checkpointchunks.DefaultChunkBytes/3)
+	for i := range partial {
+		partial[i] = byte(i%251 + 1)
+	}
+	if _, err := f.WriteAt(partial, checkpointchunks.DefaultChunkBytes+777); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Truncate(4 * checkpointchunks.DefaultChunkBytes); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	_, err = scanFileChunks(context.Background(), path, "memory", parent)
+	if err == nil || !strings.Contains(err.Error(), "partially written") {
+		t.Fatalf("expected partial-chunk refusal under inheritance, got %v", err)
 	}
 }

@@ -718,15 +718,17 @@ func selectFirecrackerSnapshotTierUsable(memorySize int64, basePath string, base
 		layoutMemorySize = memorySize
 		if memorySize <= 0 || base == "" || lineageLost {
 			_ = inheritedChunks
-			// Digest-inherited first window is DISABLED pending VMM support:
-			// both baseless shapes proved unrestorable — an Incremental
-			// (pagemap) dump kills the guest after resume, and a SoftDirty
-			// window's vmstate cannot be restored without its base (proven
-			// by a solid-memory + SoftDirty-vmstate control that also dies,
-			// while the store-side bytes audit shows perfect data). The
-			// seal/publish/verify inheritance machinery stays: it is
-			// correct for any future dump path the VMM does support.
-			if false && lineageLost && inheritedChunks && memorySize > 0 {
+			// Digest-inherited first window: the dump writes into a fresh
+			// sparse target with chunk-aligned ranges (chunk_align_bytes),
+			// so every written chunk is locally representable and holes
+			// carry the parent's digests. The unaligned write this gate
+			// once shipped left partially written chunks whose hole tails
+			// sealed as zeros instead of the parent's bytes — restored
+			// guests died in a kernel panic (found via a standalone-VMM
+			// serial capture; the ground-truth Full diff showed ~146
+			// corrupted chunks). Older VMMs without the field reject the
+			// request and the checkpoint fails closed into a Full retry.
+			if lineageLost && inheritedChunks && memorySize > 0 {
 				return firecrackerSnapshotTypeSoftDirty, "", false, memorySize, nil
 			}
 			snapshotType = firecrackerSnapshotTypeFull

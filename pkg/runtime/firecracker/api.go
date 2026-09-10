@@ -228,8 +228,20 @@ func (api *firecrackerAPI) createSnapshotWithMemoryOptions(ctx context.Context, 
 }
 
 func (api *firecrackerAPI) createSnapshotWithMemoryAudit(ctx context.Context, statePath, memoryPath, snapshotType string, sparseFull, skipUnchanged, verifyIncrementalMemory bool) error {
+	return api.createSnapshotWithChunkAlign(ctx, statePath, memoryPath, snapshotType, sparseFull, skipUnchanged, verifyIncrementalMemory, 0)
+}
+
+// createSnapshotWithChunkAlign adds chunk_align_bytes: incremental writes
+// round OUT to this grid so every written chunk is complete. A baseless
+// window target is sparse and its holes mean "parent-owned bytes"; an
+// unaligned dirty range would leave a partially written chunk that no local
+// digest can represent (the seal refuses those — see scanFileChunks).
+func (api *firecrackerAPI) createSnapshotWithChunkAlign(ctx context.Context, statePath, memoryPath, snapshotType string, sparseFull, skipUnchanged, verifyIncrementalMemory bool, chunkAlignBytes int64) error {
 	if verifyIncrementalMemory && snapshotType != firecrackerSnapshotTypeSoftDirty && snapshotType != firecrackerSnapshotTypeIncremental {
 		return fmt.Errorf("verify_incremental_memory requires Incremental or SoftDirty")
+	}
+	if chunkAlignBytes != 0 && snapshotType != firecrackerSnapshotTypeSoftDirty && snapshotType != firecrackerSnapshotTypeIncremental {
+		return fmt.Errorf("chunk_align_bytes requires Incremental or SoftDirty")
 	}
 	if skipUnchanged && snapshotType != firecrackerSnapshotTypeSoftDirty && snapshotType != firecrackerSnapshotTypeIncremental {
 		return fmt.Errorf("skip_unchanged requires Incremental or SoftDirty")
@@ -251,6 +263,9 @@ func (api *firecrackerAPI) createSnapshotWithMemoryAudit(ctx context.Context, st
 	}
 	if verifyIncrementalMemory {
 		body["verify_incremental_memory"] = true
+	}
+	if chunkAlignBytes != 0 {
+		body["chunk_align_bytes"] = chunkAlignBytes
 	}
 	// Checkpoint artifacts deliberately remain in the host page cache. The
 	// caller accepts that success does not imply immediate power-loss
