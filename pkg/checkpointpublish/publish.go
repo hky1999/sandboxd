@@ -196,6 +196,13 @@ type Options struct {
 	Workers            int
 	PackBytes          int    // zero keeps version-1 single-chunk publication
 	BaseID             string // optional verified published baseline in the same store
+	// CompressChunks uploads standalone memory chunk objects as zstd
+	// bodies under the ".z" content key and marks the transport sidecar
+	// accordingly. Digests keep naming uncompressed bytes, and readers
+	// fall back to the plain object when a chunk predates compression,
+	// so verification and cross-format reuse are unchanged. Packs carry
+	// range-readable payloads and are never compressed by this option.
+	CompressChunks bool
 }
 
 // RunWithOptions is Run with an explicit memory-upload concurrency bound.
@@ -209,6 +216,9 @@ func RunWithOptions(ctx context.Context, checkpointDir, id string, store chunkst
 	}
 	if opts.PackIdentity != "" && (opts.PackIdentity != checkpointchunks.PackIdentityChunks || opts.PackBytes == 0) {
 		return Result{}, fmt.Errorf("pack identity requires packing and must be chunks-v1 or empty")
+	}
+	if opts.CompressChunks && opts.PackBytes != 0 {
+		return Result{}, fmt.Errorf("compressed standalone chunks require unpacked publication; packs are range-readable and stay uncompressed")
 	}
 	if opts.Workers < 0 || opts.Workers > 64 {
 		return Result{}, fmt.Errorf("publish workers must be between 0 and 64, got %d", opts.Workers)
@@ -262,6 +272,14 @@ func RunWithOptions(ctx context.Context, checkpointDir, id string, store chunkst
 	state.ChunksTotal = manifest.ChunkCount
 	if opts.PackBytes > 0 {
 		return runPacked(ctx, checkpointDir, id, store, manifest, state, result, opts)
+	}
+	if opts.CompressChunks {
+		// Compressed chunk objects live under explicit keys; a backend
+		// without keyed access cannot host them. Fail before any state
+		// or object changes.
+		if _, ok := store.(chunkstore.Keyed); !ok {
+			return failState(state, errors.New("compressed chunk publication requires a keyed store"))
+		}
 	}
 
 	if err := writeStateMeasured(state, &result.StateTimings.Publishing); err != nil {
@@ -336,6 +354,21 @@ func RunWithOptions(ctx context.Context, checkpointDir, id string, store chunkst
 					atomic.AddInt64(&skippedCount, 1)
 					continue
 				}
+				keyed := store.(chunkstore.Keyed)
+				if opts.CompressChunks {
+					// Resume and cross-run idempotence: a compressed
+					// object from an interrupted earlier run already
+					// satisfies this digest. Only the plain probe above
+					// stays global — a chunk that exists uncompressed
+					// is reused as-is and a reader's fallback finds it.
+					if ok, err := keyed.HasKey(ctx, chunkstore.CompressedKey(job.chunk.Digest)); err != nil {
+						failUpload(fmt.Errorf("has compressed chunk %s: %w", job.chunk.Digest[:12], err))
+						continue
+					} else if ok {
+						atomic.AddInt64(&skippedCount, 1)
+						continue
+					}
+				}
 				if job.chunk.Inherited {
 					// The local artifact is a hole here (digest-inherited
 					// generation): its real bytes live in the store under
@@ -357,7 +390,20 @@ func RunWithOptions(ctx context.Context, checkpointDir, id string, store chunkst
 				if end > manifest.ChunkBytes {
 					end = manifest.ChunkBytes
 				}
-				if err := store.Put(ctx, job.chunk.Digest, bytes.NewReader(buf[:end])); err != nil {
+				if opts.CompressChunks {
+					// The object body is a zstd stream; the digest still
+					// names the uncompressed bytes and the transport
+					// sidecar carries the compression marker.
+					body, err := chunkstore.CompressChunkBody(buf[:end])
+					if err != nil {
+						failUpload(fmt.Errorf("compress chunk at %d: %w", job.chunk.Offset, err))
+						continue
+					}
+					if err := keyed.PutKey(ctx, chunkstore.CompressedKey(job.chunk.Digest), bytes.NewReader(body)); err != nil {
+						failUpload(fmt.Errorf("put compressed chunk at %d: %w", job.chunk.Offset, err))
+						continue
+					}
+				} else if err := store.Put(ctx, job.chunk.Digest, bytes.NewReader(buf[:end])); err != nil {
 					failUpload(fmt.Errorf("put chunk at %d: %w", job.chunk.Offset, err))
 					continue
 				}
@@ -393,7 +439,16 @@ func RunWithOptions(ctx context.Context, checkpointDir, id string, store chunkst
 	// Artifact set: everything a blind node needs to materialize the
 	// checkpoint except the memory bytes themselves.
 	if keyed, ok := store.(chunkstore.Keyed); ok {
-		if err := publishArtifactSet(ctx, checkpointDir, id, keyed, &state); err != nil {
+		// Compressed publication advertises itself on the transport
+		// sidecar (the sealed file is never rewritten): same entries,
+		// same root, plus the compression marker readers consult.
+		var transport *checkpointchunks.Manifest
+		if opts.CompressChunks {
+			view := *manifest
+			view.Compression = checkpointchunks.CompressionZstd
+			transport = &view
+		}
+		if err := publishArtifactSetWithTransport(ctx, checkpointDir, id, keyed, &state, transport); err != nil {
 			return failState(state, err)
 		}
 	} else {

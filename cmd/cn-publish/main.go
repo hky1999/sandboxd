@@ -52,6 +52,7 @@ func main() {
 	packPayloadMiB := flag.Int("pack-payload-mib", 0, "active pack payload budget (0 = 16MiB; up to 64MiB, requires packing)")
 	packMiB := flag.Int("pack-mib", 0, "pack memory into 1-8MiB objects (0 disables; candidate 4)")
 	baseID := flag.String("base-id", "", "verified published baseline in the same store for pack reuse")
+	compressChunks := flag.Bool("compress-chunks", false, "upload standalone memory chunks as zstd bodies (digests keep naming uncompressed bytes; requires unpacked publication)")
 	workers := flag.Int("workers", 0, "memory upload concurrency (1-64; 0 = at most 8 GOMAXPROCS workers)")
 	timeout := flag.Duration("timeout", 10*time.Minute, "overall deadline")
 	flag.Usage = func() {
@@ -81,6 +82,10 @@ func main() {
 	}
 	if *workers < 0 || *workers > 64 {
 		fmt.Fprintln(os.Stderr, "error: -workers must be between 0 and 64")
+		os.Exit(2)
+	}
+	if *compressChunks && *packMiB != 0 {
+		fmt.Fprintln(os.Stderr, "error: -compress-chunks requires unpacked publication (-pack-mib 0)")
 		os.Exit(2)
 	}
 	if *checkpointDir == "" || (!*status && *storePath == "") {
@@ -128,7 +133,7 @@ func main() {
 		stopProfile = func() { pprof.StopCPUProfile(); file.Close() }
 	}
 	start := time.Now()
-	result, err := checkpointpublish.RunWithOptions(ctx, *checkpointDir, id, store, *storePath, checkpointpublish.Options{PackBatchHash: *packBatchHash, PackSkipChunkProbe: *packSkipChunkProbe, PackPayloadBytes: *packPayloadMiB << 20, PackIdentity: *packIdentity, Workers: *workers, PackBytes: *packMiB << 20, BaseID: *baseID})
+	result, err := checkpointpublish.RunWithOptions(ctx, *checkpointDir, id, store, *storePath, checkpointpublish.Options{PackBatchHash: *packBatchHash, PackSkipChunkProbe: *packSkipChunkProbe, PackPayloadBytes: *packPayloadMiB << 20, PackIdentity: *packIdentity, Workers: *workers, PackBytes: *packMiB << 20, BaseID: *baseID, CompressChunks: *compressChunks})
 	elapsed := time.Since(start)
 	stopProfile()
 	if err != nil {
@@ -149,8 +154,8 @@ func main() {
 		encoded, _ := json.Marshal(result.PackTimings)
 		fmt.Printf("pack_timings=%s\n", encoded)
 	}
-	fmt.Printf("published %s: %d logical chunks, %d unique (%d written, %d reused), artifact_set=%v workers=%d in %s\n",
+	fmt.Printf("published %s: %d logical chunks, %d unique (%d written, %d reused), artifact_set=%v workers=%d compressed=%v in %s\n",
 		id, result.State.ChunksTotal, result.State.ChunksPut,
-		result.ChunksPut, result.ChunksSkip, result.State.ArtifactSet, result.Workers,
+		result.ChunksPut, result.ChunksSkip, result.State.ArtifactSet, result.Workers, *compressChunks,
 		elapsed.Round(time.Millisecond))
 }

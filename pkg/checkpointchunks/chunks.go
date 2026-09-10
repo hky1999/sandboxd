@@ -52,6 +52,15 @@ const (
 	FileDigestChunks = "chunks"
 )
 
+// CompressionZstd marks (on a transport sidecar) that standalone memory
+// chunk objects were published compressed: the object lives at the
+// content key with a ".z" suffix and holds a zstd stream whose decoded
+// bytes hash to the chunk digest. The digest itself always names the
+// UNCOMPRESSED content — compression changes only the transport body,
+// never the addressing or verification semantics. Sealed sidecars never
+// carry the field; only publisher-built transport views do.
+const CompressionZstd = "zstd"
+
 // Chunk is one content-addressed slice of the memory file.
 type Chunk struct {
 	Offset int64  `json:"offset"`
@@ -82,6 +91,11 @@ type Manifest struct {
 	// manifest the inherited entries were copied from (audit trail for
 	// digest-inheritance sealing; absent on ordinary generations).
 	InheritedFromRoot string `json:"inherited_from_root,omitempty"`
+	// Compression names the transport body encoding of standalone chunk
+	// objects (see CompressionZstd). Empty means uncompressed objects.
+	// It is transport metadata: sealed sidecars never set it, and every
+	// digest still names uncompressed bytes.
+	Compression string `json:"compression,omitempty"`
 }
 
 // RootDigest derives the "chunks"-mode file digest from ordered chunk
@@ -297,6 +311,11 @@ func validateManifest(manifest *Manifest) error {
 		}
 	} else if manifest.FileSize != 0 {
 		return fmt.Errorf("chunk manifest with no entries must have file_size 0, got %d", manifest.FileSize)
+	}
+	switch manifest.Compression {
+	case "", CompressionZstd:
+	default:
+		return fmt.Errorf("chunk manifest names unsupported compression %q", manifest.Compression)
 	}
 	return nil
 }

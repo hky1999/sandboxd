@@ -24,6 +24,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/inclusionAI/sandboxd/pkg/chunkstore"
 )
 
 type gcReport struct {
@@ -88,6 +90,12 @@ func main() {
 		}
 		report.ObjectsTotal++
 		digest := filepath.Base(path)
+		// Compressed transport bodies share the content digest with the
+		// plaintext object they replace; both forms keep a referenced
+		// chunk alive.
+		if plain, compressed := chunkstore.CompressedKeyDigest(digest); compressed {
+			digest = plain
+		}
 		if live[digest] {
 			report.ObjectsLive++
 			return nil

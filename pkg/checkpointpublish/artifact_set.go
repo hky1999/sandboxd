@@ -232,15 +232,6 @@ func publishOverlayChunks(
 
 // publishArtifactSet uploads vmstate, overlay, manifest, chunk sidecar and
 // the INDEX that binds them, skipping objects the store already holds.
-func publishArtifactSet(
-	ctx context.Context,
-	checkpointDir, id string,
-	store chunkstore.Keyed,
-	state *State,
-) error {
-	return publishArtifactSetWithTransport(ctx, checkpointDir, id, store, state, nil)
-}
-
 func publishArtifactSetWithTransport(ctx context.Context, checkpointDir, id string, store chunkstore.Keyed, state *State, transport *checkpointchunks.Manifest) error {
 	// A directory carrying only a memory file (chunk-scan fixtures, or
 	// callers publishing bare memory layers) publishes its chunks without
