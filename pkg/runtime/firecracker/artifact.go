@@ -246,6 +246,21 @@ func finalizeFirecrackerCheckpointV2(
 	// the publish path can ship the writable layer chunk-by-chunk instead
 	// of as one object. The overlay itself stays undigested (policy
 	// unchanged); this only records how its bytes chunk.
+	// Digest inheritance reads hole/data extents to decide which chunks
+	// carry parent bytes. Firecracker writes Incremental dump pages
+	// through an mmap, and extent queries describe on-disk allocation —
+	// not page-cache contents — so a not-yet-written-back dirty page would
+	// look like a hole and seal as the parent's (stale) digest. Flush the
+	// mapping to allocation before the scan; the ordinary (non-inherited)
+	// path keeps its deferred-sync semantics.
+	if inheritedChunkManifest != nil && manifest.MemoryDigestMode == checkpointchunks.FileDigestChunks {
+		if f, err := os.OpenFile(files.Memory, os.O_RDWR, 0o600); err == nil {
+			if err := f.Sync(); err != nil {
+				logrus.Warnf("firecracker: fsync inherited dump %s before seal: %v", files.Memory, err)
+			}
+			f.Close()
+		}
+	}
 	if manifest.MemoryDigestMode == checkpointchunks.FileDigestChunks {
 		started := time.Now()
 		if scan, serr := scanFileChunks(ctx, files.Overlay, firecrackerCheckpointOverlayName, nil); serr == nil {
