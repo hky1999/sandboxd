@@ -135,9 +135,9 @@ func TestTierSelectsInheritedIncrementalWindow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if snapshotType != firecrackerSnapshotTypeIncremental || base != "" ||
-		!incremental || layoutSize != 64<<10 {
-		t.Fatalf("lost lineage with chunk manifest did not take the inherited incremental window: type=%q base=%q incr=%v layout=%d",
+	if snapshotType != firecrackerSnapshotTypeSoftDirty || base != "" ||
+		incremental || layoutSize != 64<<10 {
+		t.Fatalf("lost lineage with chunk manifest did not take the inherited SoftDirty window: type=%q base=%q incr=%v layout=%d",
 			snapshotType, base, incremental, layoutSize)
 	}
 	// Without a chunk manifest the Full fallback stands.

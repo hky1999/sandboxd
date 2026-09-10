@@ -720,10 +720,13 @@ func selectFirecrackerSnapshotTierUsable(memorySize int64, basePath string, base
 			if lineageLost && inheritedChunks && memorySize > 0 {
 				// Digest inheritance: the byte base is a sparse placeholder
 				// (materialized or inherited), but its chunk manifest pins
-				// what every hole must contain. The pagemap ledger a restore
-				// arms writes only the pages the guest actually touched into
-				// a fresh sparse file; holes seal as the parent's digests.
-				return firecrackerSnapshotTypeIncremental, "", true, memorySize, nil
+				// what every hole must contain. Take the ordinary first
+				// SoftDirty window into a fresh sparse file — Firecracker
+				// writes only window pages, holes seal as the parent's
+				// digests. An Incremental (pagemap) request without a base
+				// file is not a shape the VMM supports and was observed
+				// killing the guest after the dump.
+				return firecrackerSnapshotTypeSoftDirty, "", false, memorySize, nil
 			}
 			snapshotType = firecrackerSnapshotTypeFull
 			if memorySize > 0 {
