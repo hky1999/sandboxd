@@ -54,7 +54,7 @@ func TestScanFileChunksBufferOwnership(t *testing.T) {
 	for _, workers := range []int{1, 8} {
 		t.Run(fmt.Sprint(workers), func(t *testing.T) {
 			runtime.GOMAXPROCS(workers)
-			got, err := scanFileChunks(context.Background(), path, "memory")
+			got, err := scanFileChunks(context.Background(), path, "memory", nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -106,7 +106,7 @@ func TestScanFileChunksLogicalBytes(t *testing.T) {
 			if err = f.Close(); err != nil {
 				t.Fatal(err)
 			}
-			m, err := scanFileChunks(context.Background(), path, "overlay")
+			m, err := scanFileChunks(context.Background(), path, "overlay", nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -158,7 +158,7 @@ func BenchmarkScanFileChunks(b *testing.B) {
 	b.ResetTimer()
 	var root string
 	for i := 0; i < b.N; i++ {
-		m, err := scanFileChunks(context.Background(), path, "overlay")
+		m, err := scanFileChunks(context.Background(), path, "overlay", nil)
 		if err != nil {
 			b.Fatal(err)
 		}

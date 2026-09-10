@@ -220,6 +220,7 @@ func finalizeFirecrackerCheckpointV2(
 	files firecrackerCheckpointFiles,
 	manifest *firecrackerCheckpointManifest,
 	digestMemory bool,
+	inheritedChunkManifest *checkpointchunks.Manifest,
 ) (retErr error) {
 	manifest.Version = firecrackerCheckpointVersion2
 	manifest.CreatedAt = time.Now().UTC()
@@ -247,7 +248,7 @@ func finalizeFirecrackerCheckpointV2(
 	// unchanged); this only records how its bytes chunk.
 	if manifest.MemoryDigestMode == checkpointchunks.FileDigestChunks {
 		started := time.Now()
-		if scan, serr := scanFileChunks(ctx, files.Overlay, firecrackerCheckpointOverlayName); serr == nil {
+		if scan, serr := scanFileChunks(ctx, files.Overlay, firecrackerCheckpointOverlayName, nil); serr == nil {
 			if werr := checkpointchunks.WriteNamed(filepath.Dir(files.Overlay),
 				firecrackerCheckpointOverlayName+"."+checkpointchunks.ManifestName, scan); werr != nil {
 				return werr
@@ -270,7 +271,7 @@ func finalizeFirecrackerCheckpointV2(
 			// chunks and the chunks.json sidecar is written from the same
 			// pass. Publishing no longer re-reads the artifact either way.
 			started := time.Now()
-			fileDigest, derr := digestMemoryWithChunkScan(ctx, files.Memory, manifest.MemoryDigestMode)
+			fileDigest, derr := digestMemoryWithChunkScan(ctx, files.Memory, manifest.MemoryDigestMode, inheritedChunkManifest)
 			if derr != nil {
 				return derr
 			}
@@ -643,6 +644,19 @@ type chunkExtentReader struct {
 	unsupported        bool
 }
 
+// probe forces the extent-support detection up front. Ordinary scans can
+// degrade to reads when queries are unsupported; digest-inheritance sealing
+// cannot (holes would silently read as zeros), so its caller refuses first.
+func (r *chunkExtentReader) probe() {
+	if r.unsupported {
+		return
+	}
+	if _, err := unix.Seek(int(r.f.Fd()), 0, unix.SEEK_DATA); errors.Is(err, unix.EINVAL) ||
+		errors.Is(err, unix.ENOTSUP) || errors.Is(err, unix.ENOSYS) {
+		r.unsupported = true
+	}
+}
+
 func (r *chunkExtentReader) hasData(offset, end int64) (bool, error) {
 	if r.unsupported {
 		return true, nil
@@ -682,7 +696,14 @@ func (r *chunkExtentReader) hasData(offset, end int64) (bool, error) {
 
 // scanFileChunks preserves byte-for-byte chunk digests while avoiding reads of
 // complete hole chunks and redundant hashing/copying of allocated zero chunks.
-func scanFileChunks(ctx context.Context, path, name string) (*checkpointchunks.Manifest, error) {
+//
+// With a non-nil inherit manifest, hole chunks are NOT zero: they are bytes
+// the parent generation still owns (digest inheritance). A hole inherits the
+// parent entry's digest on the same chunk grid and is marked Inherited so
+// readers fetch it from the store instead of the local file. A hole without
+// a matching parent entry fails the seal — silently zeroing it would corrupt
+// the artifact (the C2 invariant, now expressed at chunk granularity).
+func scanFileChunks(ctx context.Context, path, name string, inherit *checkpointchunks.Manifest) (*checkpointchunks.Manifest, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -728,6 +749,17 @@ func scanFileChunks(ctx context.Context, path, name string) (*checkpointchunks.M
 	finish := func() { finishOnce.Do(func() { close(jobs); wg.Wait() }) }
 	defer finish()
 	extents := chunkExtentReader{f: f}
+	if inherit != nil {
+		// Extent queries are the only thing distinguishing "untouched,
+		// parent-owned bytes" from "allocated zeros" here; without them a
+		// hole would read back as zeros and the seal would silently drop
+		// the parent's data. Refuse rather than guess.
+		extents.probe()
+		if extents.unsupported {
+			return nil, fmt.Errorf("%s: digest inheritance needs extent queries (unavailable on this filesystem)", name)
+		}
+	}
+	inherited := 0
 	var buf []byte
 	for i := range scan.Entries {
 		if err := ctx.Err(); err != nil {
@@ -740,6 +772,18 @@ func scanFileChunks(ctx context.Context, path, name string) (*checkpointchunks.M
 			return nil, fmt.Errorf("query %s extents: %w", name, err)
 		}
 		if !hasData {
+			if inherit != nil {
+				parent, ok := inherit.EntryAt(offset, int(length))
+				if !ok {
+					return nil, fmt.Errorf(
+						"%s hole chunk at %d (len %d) has no parent entry to inherit (parent root %s covers %d entries on %d-byte grid)",
+						name, offset, length, inherit.FileDigest, len(inherit.Entries), inherit.ChunkBytes)
+				}
+				scan.Entries[i].Digest = parent.Digest
+				scan.Entries[i].Inherited = true
+				inherited++
+				continue
+			}
 			scan.Entries[i].Digest = zeroChunkDigest(int(length))
 			continue
 		}
@@ -768,15 +812,20 @@ func scanFileChunks(ctx context.Context, path, name string) (*checkpointchunks.M
 	scan.ChunkCount = len(scan.Entries)
 	scan.FileDigestMode = checkpointchunks.FileDigestChunks
 	scan.FileDigest = checkpointchunks.RootDigest(scan.Entries)
+	if inherited > 0 {
+		scan.InheritedFromRoot = inherit.FileDigest
+	}
 	return scan, nil
 }
 
-func digestMemoryWithChunkScan(ctx context.Context, memoryPath, digestMode string) (string, error) {
+func digestMemoryWithChunkScan(ctx context.Context, memoryPath, digestMode string, inherit *checkpointchunks.Manifest) (string, error) {
 	if digestMode == checkpointchunks.FileDigestChunks {
 		// A sealed local file's actual holes read as zero. Use extent queries
-		// to avoid reading those bytes; unsupported filesystems fall back to
+		// to avoid reading those bytes; unsupported filesystem fall back to
 		// ordinary reads. This generates content metadata, not a backing proof.
-		scan, err := scanFileChunks(ctx, memoryPath, "memory")
+		// With an inherit manifest the holes instead carry the parent's bytes
+		// (see scanFileChunks).
+		scan, err := scanFileChunks(ctx, memoryPath, "memory", inherit)
 		if err != nil {
 			return "", fmt.Errorf("scan Firecracker checkpoint memory: %w", err)
 		}

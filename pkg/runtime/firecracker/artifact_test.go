@@ -88,7 +88,7 @@ func TestPrepareCheckpointV2FullDiscoversMemorySize(t *testing.T) {
 	writeArtifactComponent(t, files.Memory, 96<<10)
 	writeArtifactComponent(t, files.Overlay, 32<<10)
 	manifest := &firecrackerCheckpointManifest{SnapshotType: firecrackerSnapshotTypeFull}
-	if err := finalizeFirecrackerCheckpointV2(context.Background(), files, manifest, true); err != nil {
+	if err := finalizeFirecrackerCheckpointV2(context.Background(), files, manifest, true, nil); err != nil {
 		t.Fatalf("finalize v2 full checkpoint: %v", err)
 	}
 	if manifest.MemorySize != 96<<10 {
@@ -132,6 +132,7 @@ func TestPrepareCheckpointV2RejectsSealedDirectory(t *testing.T) {
 			MemorySize:   64 << 10,
 		},
 		true,
+		nil,
 	); err != nil {
 		t.Fatalf("finalize v2 checkpoint: %v", err)
 	}
@@ -156,7 +157,7 @@ func TestFinalizeCheckpointV2ManifestIsSealedOnce(t *testing.T) {
 		SnapshotType: firecrackerSnapshotTypeSoftDirty,
 		MemorySize:   64 << 10,
 	}
-	if err := finalizeFirecrackerCheckpointV2(context.Background(), files, manifest, true); err != nil {
+	if err := finalizeFirecrackerCheckpointV2(context.Background(), files, manifest, true, nil); err != nil {
 		t.Fatalf("finalize v2 checkpoint: %v", err)
 	}
 	if manifest.Version != firecrackerCheckpointVersion2 {
@@ -171,6 +172,7 @@ func TestFinalizeCheckpointV2ManifestIsSealedOnce(t *testing.T) {
 			MemorySize:   64 << 10,
 		},
 		true,
+		nil,
 	); err == nil {
 		t.Fatal("finalize v2 checkpoint over an existing manifest succeeded")
 	}
@@ -212,6 +214,7 @@ func TestOpenCheckpointV2AndVerifyDigests(t *testing.T) {
 			BaseMemory:   "gen0/memory",
 		},
 		true,
+		nil,
 	); err != nil {
 		t.Fatalf("finalize v2 checkpoint: %v", err)
 	}
@@ -278,6 +281,7 @@ func TestVerifyCheckpointDigestsMemoized(t *testing.T) {
 			MemorySize:   64 << 10,
 		},
 		true,
+		nil,
 	); err != nil {
 		t.Fatalf("finalize v2 checkpoint: %v", err)
 	}
@@ -365,6 +369,7 @@ func TestOpenCheckpointV2RejectsMissingComponent(t *testing.T) {
 			MemorySize:   64 << 10,
 		},
 		true,
+		nil,
 	); err != nil {
 		t.Fatalf("finalize v2 checkpoint: %v", err)
 	}
@@ -383,7 +388,7 @@ func TestFinalizeCheckpointV2DigestPolicy(t *testing.T) {
 		SnapshotType: firecrackerSnapshotTypeFull,
 		MemorySize:   64 << 10,
 	}
-	if err := finalizeFirecrackerCheckpointV2(context.Background(), files, manifest, true); err != nil {
+	if err := finalizeFirecrackerCheckpointV2(context.Background(), files, manifest, true, nil); err != nil {
 		t.Fatalf("finalize v2 checkpoint: %v", err)
 	}
 	if _, recorded := manifest.Digests[firecrackerCheckpointOverlayName]; recorded {
@@ -414,7 +419,7 @@ func TestFinalizeCheckpointV2DigestPolicy(t *testing.T) {
 		SnapshotType: firecrackerSnapshotTypeFull,
 		MemorySize:   64 << 10,
 	}
-	if err := finalizeFirecrackerCheckpointV2(context.Background(), files, manifest, false); err != nil {
+	if err := finalizeFirecrackerCheckpointV2(context.Background(), files, manifest, false, nil); err != nil {
 		t.Fatalf("finalize v2 checkpoint (digest off): %v", err)
 	}
 	if _, recorded := manifest.Digests[firecrackerCheckpointMemoryName]; recorded {

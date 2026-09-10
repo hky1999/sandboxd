@@ -46,6 +46,16 @@ func (p *verifiedBaseMemory) matches(path string, size int64) bool {
 }
 
 func adoptSealedCheckpointMemory(ctx context.Context, instance *firecrackerInstance, path string, manifest *firecrackerCheckpointManifest) {
+	// Digest lineage propagation: an inherited (sparse-holed) generation
+	// keeps the manifest-side lineage alive so the NEXT generation can
+	// inherit again; a solid generation returns to the byte-base world.
+	if sealed, err := checkpointchunks.Load(filepath.Dir(path)); err == nil {
+		if sealed.InheritedFromRoot != "" {
+			instance.setBaseChunkManifest(filepath.Join(filepath.Dir(path), checkpointchunks.ManifestName))
+		} else {
+			instance.setBaseChunkManifest("")
+		}
+	}
 	info, err := os.Lstat(path)
 	if err != nil || !info.Mode().IsRegular() || !firecrackerMemoryHasHoles(info) {
 		adoptCheckpointMemory(instance, path, false)
@@ -72,7 +82,8 @@ func selectCheckpointTierWithProof(state firecrackerPersistedState, requested st
 	if proof != nil {
 		usable = proof.matches(state.BaseMemoryPath, size)
 	}
-	return selectFirecrackerSnapshotTierUsable(size, state.BaseMemoryPath, state.BaseMemoryIncremental, state.BaseMemoryLineageLost, requested, usable)
+	chunksOK := state.BaseChunkManifestPath != ""
+	return selectFirecrackerSnapshotTierUsable(size, state.BaseMemoryPath, state.BaseMemoryIncremental, state.BaseMemoryLineageLost, requested, usable, chunksOK)
 }
 
 func prepareCheckpointWithProof(ctx context.Context, dir, base string, size int64, proof *verifiedBaseMemory) (firecrackerCheckpointFiles, error) {

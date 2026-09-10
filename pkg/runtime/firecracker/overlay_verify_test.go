@@ -47,7 +47,7 @@ func sealOverlaySidecarArtifact(t *testing.T, dir string) *firecrackerCheckpoint
 		SnapshotType:     firecrackerSnapshotTypeFull,
 		MemorySize:       memorySize,
 		MemoryDigestMode: checkpointchunks.FileDigestChunks,
-	}, true); err != nil {
+	}, true, nil); err != nil {
 		t.Fatalf("finalize chunks-mode v2 checkpoint: %v", err)
 	}
 	artifact, err := openFirecrackerCheckpoint(dir)

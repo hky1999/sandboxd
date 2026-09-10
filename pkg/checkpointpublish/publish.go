@@ -336,6 +336,18 @@ func RunWithOptions(ctx context.Context, checkpointDir, id string, store chunkst
 					atomic.AddInt64(&skippedCount, 1)
 					continue
 				}
+				if job.chunk.Inherited {
+					// The local artifact is a hole here (digest-inherited
+					// generation): its real bytes live in the store under
+					// this very digest. A store miss means the parent
+					// object is gone — NEVER upload local hole bytes under
+					// the parent's key, that would poison the namespace
+					// with zeros the digest vouches against.
+					failUpload(fmt.Errorf(
+						"inherited chunk %s at %d missing from the store; the parent generation's object must be republished before this artifact",
+						job.chunk.Digest[:12], job.chunk.Offset))
+					continue
+				}
 				if _, err := memory.ReadAt(buf, job.chunk.Offset); err != nil &&
 					!errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
 					failUpload(fmt.Errorf("read chunk at %d: %w", job.chunk.Offset, err))

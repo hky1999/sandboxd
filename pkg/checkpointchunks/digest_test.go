@@ -32,11 +32,11 @@ var originalDigestPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
 func TestManifestDigestAcceptance(t *testing.T) {
 	valid := strings.Repeat("a", 64)
 	for _, digest := range []string{"", valid, strings.Repeat("0", 64), strings.Repeat("F", 64), valid + "\n", valid[:63], valid + "0", strings.Repeat("é", 32), strings.Repeat("\xff", 64)} {
-		for _, entries := range [][]Chunk{{{0, digest}, {4, digest}}, {{0, valid}, {4, digest}}, {{0, digest}, {4, valid}}} {
+		for _, entries := range [][]Chunk{{{Offset: 0, Digest: digest}, {Offset: 4, Digest: digest}}, {{Offset: 0, Digest: valid}, {Offset: 4, Digest: digest}}, {{Offset: 0, Digest: digest}, {Offset: 4, Digest: valid}}} {
 			m := &Manifest{Version: 1, File: "overlay.ext4", FileSize: 8, ChunkBytes: 4, ChunkCount: 2, Entries: entries}
 			want := originalDigestPattern.MatchString(digest)
 			if err := ValidateTransport(m); (err == nil) != want {
-				t.Fatalf("entries=%q: err=%v want valid=%v", entries, err, want)
+				t.Fatalf("entries=%v: err=%v want valid=%v", entries, err, want)
 			}
 			raw, err := json.Marshal(m)
 			if err != nil {
@@ -59,7 +59,7 @@ func benchmarkDigestManifest(unique bool) *Manifest {
 			sum := sha256.Sum256([]byte{byte(i), byte(i >> 8), byte(i >> 16)})
 			digest = hex.EncodeToString(sum[:])
 		}
-		m.Entries[i] = Chunk{int64(i) * DefaultChunkBytes, digest}
+		m.Entries[i] = Chunk{Offset: int64(i) * DefaultChunkBytes, Digest: digest}
 	}
 	m.FileDigestMode = FileDigestChunks
 	m.FileDigest = RootDigest(m.Entries)

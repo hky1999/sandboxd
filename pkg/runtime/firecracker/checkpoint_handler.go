@@ -31,6 +31,7 @@ import (
 
 	"github.com/inclusionAI/sandboxd/config"
 	"github.com/inclusionAI/sandboxd/internal/firecrackerproto"
+	"github.com/inclusionAI/sandboxd/pkg/checkpointchunks"
 	"github.com/inclusionAI/sandboxd/pkg/checkpointroot"
 	"github.com/inclusionAI/sandboxd/pkg/errord"
 	runtimecore "github.com/inclusionAI/sandboxd/pkg/runtime"
@@ -469,7 +470,8 @@ func (handler *Handler) Checkpoint(
 	if handler.digestMemoryMode != "" {
 		manifest.MemoryDigestMode = handler.digestMemoryMode
 	}
-	if err := finalizeFirecrackerCheckpointV2(ctx, files, manifest, handler.digestMemory); err != nil {
+	inheritedChunks := handler.loadInheritedChunkManifest(instance)
+	if err := finalizeFirecrackerCheckpointV2(ctx, files, manifest, handler.digestMemory, inheritedChunks); err != nil {
 		instance.markBaseMemoryLineageLost()
 		discardUnsealedFirecrackerCheckpoint(files)
 		return errors.Join(resumeErr, fmt.Errorf(
@@ -652,6 +654,26 @@ func resolveRequestedSnapshotType(mode, requested string) (string, error) {
 	return requested, nil
 }
 
+// loadInheritedChunkManifest returns the digest lineage for a checkpoint on a
+// sparse base (materialized placeholder or inherited generation), or nil when
+// none is recorded or usable — the caller then takes the ordinary Full path.
+// A manifest that fails validation never participates in sealing: inheritance
+// is an optimization over a correctness-preserving fallback.
+func (handler *Handler) loadInheritedChunkManifest(instance *firecrackerInstance) *checkpointchunks.Manifest {
+	path := instance.baseChunkManifest()
+	if path == "" {
+		return nil
+	}
+	manifest, err := checkpointchunks.Load(filepath.Dir(path))
+	if err != nil {
+		logrus.Warnf(
+			"firecracker: inherited chunk manifest %s unusable (%v); taking Full",
+			path, err)
+		return nil
+	}
+	return manifest
+}
+
 // selectFirecrackerSnapshotTier resolves how the next generation is taken.
 // An empty request leaves the automatic three-tier choice to the recorded
 // lineage: Full establishes the first baseline, Incremental follows a restore,
@@ -671,11 +693,12 @@ func selectFirecrackerSnapshotTier(
 	baseIncremental bool,
 	lineageLost bool,
 	requested string,
+	inheritedChunks bool,
 ) (snapshotType, base string, incremental bool, layoutMemorySize int64, err error) {
-	return selectFirecrackerSnapshotTierUsable(memorySize, basePath, baseIncremental, lineageLost, requested, firecrackerBaseMemoryUsable(basePath, memorySize))
+	return selectFirecrackerSnapshotTierUsable(memorySize, basePath, baseIncremental, lineageLost, requested, firecrackerBaseMemoryUsable(basePath, memorySize), inheritedChunks)
 }
 
-func selectFirecrackerSnapshotTierUsable(memorySize int64, basePath string, baseIncremental, lineageLost bool, requested string, baseUsable bool) (snapshotType, base string, incremental bool, layoutMemorySize int64, err error) {
+func selectFirecrackerSnapshotTierUsable(memorySize int64, basePath string, baseIncremental, lineageLost bool, requested string, baseUsable, inheritedChunks bool) (snapshotType, base string, incremental bool, layoutMemorySize int64, err error) {
 	base, incremental = basePath, baseIncremental
 	if memorySize > 0 && base != "" && !baseUsable {
 		// The base drifted (crash cleanup, operator interference): the VMM
@@ -694,6 +717,14 @@ func selectFirecrackerSnapshotTierUsable(memorySize int64, basePath string, base
 		snapshotType = firecrackerSnapshotTypeSoftDirty
 		layoutMemorySize = memorySize
 		if memorySize <= 0 || base == "" || lineageLost {
+			if lineageLost && inheritedChunks && memorySize > 0 {
+				// Digest inheritance: the byte base is a sparse placeholder
+				// (materialized or inherited), but its chunk manifest pins
+				// what every hole must contain. The pagemap ledger a restore
+				// arms writes only the pages the guest actually touched into
+				// a fresh sparse file; holes seal as the parent's digests.
+				return firecrackerSnapshotTypeIncremental, "", true, memorySize, nil
+			}
 			snapshotType = firecrackerSnapshotTypeFull
 			if memorySize > 0 {
 				layoutMemorySize = 0
@@ -904,14 +935,30 @@ func adoptCheckpointMemory(
 	// holes are the secondary signal for unmarked files.
 	if _, markerErr := os.Lstat(filepath.Join(filepath.Dir(memoryPath), ".materialized")); !os.IsNotExist(markerErr) ||
 		firecrackerMemoryHasHoles(info) {
-		logrus.Warnf(
-			"firecracker: checkpoint base %s is a materialized placeholder (unfetched chunks live in the store); adopting it would lose every unfaulted page in later incremental generations — forcing Full until the image is complete",
-			memoryPath,
-		)
+		// Digest inheritance: the file cannot be a byte base, but a usable
+		// chunk manifest beside it pins what every hole contains. Record
+		// that manifest-side lineage so the next generation can seal an
+		// incremental artifact whose hole chunks copy the parent digests
+		// instead of zeroing them; without a manifest the Full fallback
+		// stands.
+		if manifest, err := checkpointchunks.Load(filepath.Dir(memoryPath)); err == nil && manifest.ChunkCount > 0 {
+			instance.setBaseChunkManifest(filepath.Join(filepath.Dir(memoryPath), checkpointchunks.ManifestName))
+			logrus.Warnf(
+				"firecracker: checkpoint base %s is a sparse placeholder; byte lineage refused, digest lineage recorded from %s (%d chunks) — next generation inherits hole chunks",
+				memoryPath, checkpointchunks.ManifestName, manifest.ChunkCount,
+			)
+		} else {
+			instance.setBaseChunkManifest("")
+			logrus.Warnf(
+				"firecracker: checkpoint base %s is a materialized placeholder with no usable chunk manifest (%v); forcing Full until the image is complete",
+				memoryPath, err,
+			)
+		}
 		instance.markBaseMemoryLineageLost()
 		return
 	}
 	instance.setBaseMemory(memoryPath, incremental)
+	instance.setBaseChunkManifest("")
 }
 
 // instantiateFirecrackerCheckpoint materializes the runtime-side pieces of an

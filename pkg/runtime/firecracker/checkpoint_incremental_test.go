@@ -163,7 +163,7 @@ func TestSelectFirecrackerSnapshotTier(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			snapshotType, base, _, layoutSize, err := selectFirecrackerSnapshotTier(
-				tc.memorySize, tc.base, tc.baseIncremental, tc.lineageLost, tc.requested,
+				tc.memorySize, tc.base, tc.baseIncremental, tc.lineageLost, tc.requested, false,
 			)
 			if tc.wantErr {
 				if err == nil {
@@ -314,7 +314,7 @@ func TestBaseMemoryLineageLostSurvivesRestart(t *testing.T) {
 	// The marker forces the Full recovery tier until a new base is adopted.
 	snapshotType, base, _, layoutSize, err := selectFirecrackerSnapshotTier(
 		64<<10, reloaded.BaseMemoryPath, reloaded.BaseMemoryIncremental,
-		reloaded.BaseMemoryLineageLost, "",
+		reloaded.BaseMemoryLineageLost, "", false,
 	)
 	if err != nil || snapshotType != firecrackerSnapshotTypeFull ||
 		base != "" || layoutSize != 0 {

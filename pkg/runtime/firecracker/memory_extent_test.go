@@ -84,7 +84,7 @@ func TestMemorySealExtentLogicalOracle(t *testing.T) {
 				if err = f.Sync(); err != nil {
 					t.Fatal(err)
 				}
-				got, err := digestMemoryWithChunkScan(context.Background(), path, mode)
+				got, err := digestMemoryWithChunkScan(context.Background(), path, mode, nil)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -133,7 +133,7 @@ func TestMemorySealCancellationPreservesSidecar(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := digestMemoryWithChunkScan(ctx, path, checkpointchunks.FileDigestChunks); !errors.Is(err, context.Canceled) {
+	if _, err := digestMemoryWithChunkScan(ctx, path, checkpointchunks.FileDigestChunks, nil); !errors.Is(err, context.Canceled) {
 		t.Fatalf("got %v", err)
 	}
 	after, err := os.ReadFile(sidecar)
@@ -178,7 +178,7 @@ func BenchmarkMemorySealExtent(b *testing.B) {
 	b.ResetTimer()
 	var root string
 	for i := 0; i < b.N; i++ {
-		root, err = digestMemoryWithChunkScan(context.Background(), path, checkpointchunks.FileDigestChunks)
+		root, err = digestMemoryWithChunkScan(context.Background(), path, checkpointchunks.FileDigestChunks, nil)
 		if err != nil {
 			b.Fatal(err)
 		}

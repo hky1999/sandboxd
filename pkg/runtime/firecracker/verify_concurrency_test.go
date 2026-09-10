@@ -46,7 +46,7 @@ func TestRestoreVerificationIndependentPaths(t *testing.T) {
 			if err := os.WriteFile(memory, []byte("verified local memory"), 0600); err != nil {
 				t.Fatal(err)
 			}
-			root, err := digestMemoryWithChunkScan(context.Background(), memory, checkpointchunks.FileDigestChunks)
+			root, err := digestMemoryWithChunkScan(context.Background(), memory, checkpointchunks.FileDigestChunks, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
