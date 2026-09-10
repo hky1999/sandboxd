@@ -498,6 +498,68 @@ func (s *faultServer) fetchChunkFromStore(chunkIdx uint64) error {
 		if buf == nil {
 			buf = make([]byte, length)
 		}
+		if manifest.Compression == checkpointchunks.CompressionZstd {
+			// Compressed transport body: the object at the ".z" key holds
+			// a zstd stream decoding to exactly this chunk's bytes. A
+			// missing compressed object is not an error — chunks shared
+			// with pre-compression generations keep their plain objects,
+			// so fall through to the plain fetch. Verification below
+			// still hashes the DECODED bytes against the digest.
+			fillCompressed := func() (bool, error) {
+				land := func(compressed []byte) error {
+					plain, err := chunkstore.DecompressChunkBody(compressed, int(length))
+					if err != nil {
+						return fmt.Errorf("decompress store chunk %s: %w", entry.Digest, err)
+					}
+					copy(buf, plain)
+					return nil
+				}
+				limit := chunkstore.MaxCompressedChunkBytes(int64(length))
+				if httpSource {
+					req, err := http.NewRequestWithContext(src.requestContext(), http.MethodGet,
+						strings.TrimRight(src.chunkStore, "/")+"/"+chunkstore.CompressedKey(entry.Digest), nil)
+					if err != nil {
+						return false, fmt.Errorf("build compressed chunk request %s: %w", entry.Digest, err)
+					}
+					resp, err := storeHTTPClient.Do(req)
+					if err != nil {
+						return false, fmt.Errorf("fetch compressed chunk %s: %w", entry.Digest, err)
+					}
+					defer resp.Body.Close()
+					if resp.StatusCode == http.StatusNotFound {
+						return false, nil
+					}
+					if resp.StatusCode != http.StatusOK {
+						return false, fmt.Errorf("fetch compressed chunk %s: status %d", entry.Digest, resp.StatusCode)
+					}
+					compressed, err := chunkstore.ReadBounded(resp.Body, limit)
+					if err != nil {
+						return false, fmt.Errorf("read compressed chunk %s: %w", entry.Digest, err)
+					}
+					return true, land(compressed)
+				}
+				f, err := os.Open(filepath.Join(src.chunkStore, chunkstore.CompressedKey(entry.Digest)))
+				if err != nil {
+					if os.IsNotExist(err) {
+						return false, nil
+					}
+					return false, fmt.Errorf("open compressed chunk %s: %w", entry.Digest, err)
+				}
+				defer f.Close()
+				compressed, err := chunkstore.ReadBounded(f, limit)
+				if err != nil {
+					return false, fmt.Errorf("read compressed chunk %s: %w", entry.Digest, err)
+				}
+				return true, land(compressed)
+			}
+			done, err := fillCompressed()
+			if err != nil {
+				return err
+			}
+			if done {
+				return nil
+			}
+		}
 		if httpSource {
 			req, err := http.NewRequestWithContext(src.requestContext(), http.MethodGet,
 				strings.TrimRight(src.chunkStore, "/")+"/"+entry.Digest[:2]+"/"+entry.Digest, nil)

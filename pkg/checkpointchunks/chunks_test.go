@@ -101,3 +101,29 @@ func TestLoadRejectsMalformedDigests(t *testing.T) {
 		t.Fatalf("valid manifest rejected: %v", err)
 	}
 }
+
+func TestManifestCompressionMarkerValidation(t *testing.T) {
+	dir := t.TempDir()
+	build := func(compression string) string {
+		m := &Manifest{Version: 1, File: "memory", FileSize: 8, ChunkBytes: 8,
+			ChunkCount: 1, Compression: compression,
+			Entries: []Chunk{{Offset: 0, Digest: strings.Repeat("0a", 32)}}}
+		if err := WriteNamed(dir, "probe.json", m); err != nil {
+			t.Fatal(err)
+		}
+		p := filepath.Join(dir, "probe.json")
+		return p
+	}
+	for _, ok := range []string{"", CompressionZstd} {
+		build(ok)
+		if _, err := LoadNamed(dir, "probe.json"); err != nil {
+			t.Fatalf("compression %q rejected: %v", ok, err)
+		}
+	}
+	if err := os.WriteFile(build("lz4"), []byte(`{"version":1,"file":"memory","file_size":8,"chunk_bytes":8,"chunk_count":1,"entries":[{"offset":0,"digest":"`+strings.Repeat("0a", 32)+`"}],"compression":"lz4"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadNamed(dir, "probe.json"); err == nil {
+		t.Fatal("unsupported compression marker accepted")
+	}
+}
