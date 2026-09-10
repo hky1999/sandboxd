@@ -709,6 +709,42 @@ func (r *chunkExtentReader) hasData(offset, end int64) (bool, error) {
 	return start < end, nil
 }
 
+// hasHoleWithin reports whether [offset, end) contains at least one byte of
+// a hole after its first data extent — i.e. the chunk is only partially
+// written. The caller hasData already proved data exists somewhere in the
+// span.
+func (r *chunkExtentReader) hasHoleWithin(offset, end int64) (bool, error) {
+	if r.unsupported {
+		return false, nil
+	}
+	// Walk extents from the first data at/after offset; a hole starting
+	// before end (and after that first data) makes the span partial.
+	at := offset
+	for at < end {
+		start, err := unix.Seek(int(r.f.Fd()), at, unix.SEEK_DATA)
+		if errors.Is(err, unix.ENXIO) {
+			// No data from `at` on: the tail is a hole. hasData proved
+			// data exists in the span, so the span is partial.
+			return true, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		if start >= end {
+			return false, nil
+		}
+		hole, err := unix.Seek(int(r.f.Fd()), start, unix.SEEK_HOLE)
+		if err != nil {
+			return false, err
+		}
+		if hole < end {
+			return true, nil
+		}
+		return false, nil
+	}
+	return false, nil
+}
+
 // scanFileChunks preserves byte-for-byte chunk digests while avoiding reads of
 // complete hole chunks and redundant hashing/copying of allocated zero chunks.
 //
@@ -801,6 +837,24 @@ func scanFileChunks(ctx context.Context, path, name string, inherit *checkpointc
 			}
 			scan.Entries[i].Digest = zeroChunkDigest(int(length))
 			continue
+		}
+		if inherit != nil {
+			// A chunk with data on only PART of its span is unrepresentable:
+			// the local hole is parent-owned bytes, but a plain read sees
+			// zeros there, so hashing the chunk would seal a digest for
+			// (data ++ zeros) that neither matches the guest nor the parent
+			// — a restored guest would boot into corrupted memory and die.
+			// Refuse; the VMM's chunk-aligned window writes make this
+			// unreachable, and the failure degrades the caller to Full.
+			holeWithin, err := extents.hasHoleWithin(offset, offset+length)
+			if err != nil {
+				return nil, fmt.Errorf("query %s extents for partial chunk at %d: %w", name, offset, err)
+			}
+			if holeWithin {
+				return nil, fmt.Errorf(
+					"%s chunk at %d (len %d) is partially written: its hole spans parent-owned bytes the local file cannot represent — the window dump must write whole %d-byte chunks (chunk_align_bytes)",
+					name, offset, length, chunkBytes)
+			}
 		}
 		if buf == nil {
 			select {
