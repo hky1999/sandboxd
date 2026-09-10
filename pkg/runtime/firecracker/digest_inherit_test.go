@@ -130,14 +130,17 @@ func TestScanFileChunksInheritRequiresParentEntry(t *testing.T) {
 }
 
 func TestTierSelectsInheritedIncrementalWindow(t *testing.T) {
+	// The inherited first window is gated off until the VMM can restore a
+	// baseless SoftDirty vmstate; with the gate closed the Full fallback
+	// must hold even when a chunk manifest is available.
 	snapshotType, base, incremental, layoutSize, err := selectFirecrackerSnapshotTierUsable(
 		64<<10, "", false, true, "", false, true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if snapshotType != firecrackerSnapshotTypeSoftDirty || base != "" ||
-		incremental || layoutSize != 64<<10 {
-		t.Fatalf("lost lineage with chunk manifest did not take the inherited SoftDirty window: type=%q base=%q incr=%v layout=%d",
+	if snapshotType != firecrackerSnapshotTypeFull || base != "" ||
+		incremental || layoutSize != 0 {
+		t.Fatalf("gated inherited window must fall back to Full: type=%q base=%q incr=%v layout=%d",
 			snapshotType, base, incremental, layoutSize)
 	}
 	// Without a chunk manifest the Full fallback stands.

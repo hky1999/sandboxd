@@ -717,15 +717,16 @@ func selectFirecrackerSnapshotTierUsable(memorySize int64, basePath string, base
 		snapshotType = firecrackerSnapshotTypeSoftDirty
 		layoutMemorySize = memorySize
 		if memorySize <= 0 || base == "" || lineageLost {
-			if lineageLost && inheritedChunks && memorySize > 0 {
-				// Digest inheritance: the byte base is a sparse placeholder
-				// (materialized or inherited), but its chunk manifest pins
-				// what every hole must contain. Take the ordinary first
-				// SoftDirty window into a fresh sparse file — Firecracker
-				// writes only window pages, holes seal as the parent's
-				// digests. An Incremental (pagemap) request without a base
-				// file is not a shape the VMM supports and was observed
-				// killing the guest after the dump.
+			_ = inheritedChunks
+			// Digest-inherited first window is DISABLED pending VMM support:
+			// both baseless shapes proved unrestorable — an Incremental
+			// (pagemap) dump kills the guest after resume, and a SoftDirty
+			// window's vmstate cannot be restored without its base (proven
+			// by a solid-memory + SoftDirty-vmstate control that also dies,
+			// while the store-side bytes audit shows perfect data). The
+			// seal/publish/verify inheritance machinery stays: it is
+			// correct for any future dump path the VMM does support.
+			if false && lineageLost && inheritedChunks && memorySize > 0 {
 				return firecrackerSnapshotTypeSoftDirty, "", false, memorySize, nil
 			}
 			snapshotType = firecrackerSnapshotTypeFull
