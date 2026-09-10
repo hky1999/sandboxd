@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -57,6 +58,30 @@ type ArtifactIndex struct {
 	// materialization reassembles it from the overlay sidecar.
 	OverlayChunks bool              `json:"overlay_chunks,omitempty"`
 	Files         map[string]string `json:"files"` // file name -> sha256
+	// Bundle names a single object carrying all the small artifact-set
+	// files concatenated with 8-byte big-endian length prefixes — one PUT
+	// on publish, one GET on materialize. Parts keep per-file digests so
+	// verification is unchanged; pre-bundle artifacts carry no field and
+	// materialization falls back to per-file fetches.
+	Bundle *BundleInfo `json:"bundle,omitempty"`
+}
+
+// BundleName is the bundle object's name inside the artifact namespace.
+const BundleName = "BUNDLE"
+
+// BundleInfo describes one concatenated small-file object.
+type BundleInfo struct {
+	Digest string       `json:"digest"` // sha256 of the whole bundle object
+	Size   int64        `json:"size"`
+	Parts  []BundlePart `json:"parts"`
+}
+
+// BundlePart locates one file inside the bundle.
+type BundlePart struct {
+	Name   string `json:"name"`
+	Offset int64  `json:"offset"`
+	Length int64  `json:"length"`
+	Digest string `json:"digest"`
 }
 
 func ArtifactKey(id, name string) string {
@@ -260,41 +285,46 @@ func publishArtifactSetWithTransport(ctx context.Context, checkpointDir, id stri
 	} else {
 		files = append(files, "overlay.ext4")
 	}
-	for _, name := range files {
+	// Artifact-set files ship as ONE bundle object (8-byte big-endian
+	// length prefix per file): one PUT here and one GET at materialize
+	// time, instead of one per file. The bundle keeps the ID-named
+	// always-upload semantics that protect against checkpoint-ID reuse,
+	// and every part carries its own digest so per-file verification is
+	// unchanged. Pre-bundle artifacts carry per-file objects and no
+	// index.Bundle; materialization falls back to per-file fetches.
+	var bundle []byte
+	info := &BundleInfo{}
+	body := func(name string) ([]byte, error) {
 		path := filepath.Join(checkpointDir, name)
 		if _, err := os.Stat(path); os.IsNotExist(err) {
-			return fmt.Errorf("artifact set file %s missing", name)
+			return nil, fmt.Errorf("artifact set file %s missing", name)
 		}
 		if name == checkpointchunks.ManifestName && transportRaw != nil {
-			digest := sha256.Sum256(transportRaw)
-			index.Files[name] = hex.EncodeToString(digest[:])
-			if err := store.PutKey(ctx, ArtifactKey(id, name), bytes.NewReader(transportRaw)); err != nil {
-				return fmt.Errorf("upload packed sidecar: %w", err)
-			}
-			continue
+			return transportRaw, nil
 		}
-		digest, err := digestFile(ctx, path)
+		return os.ReadFile(path)
+	}
+	for _, name := range files {
+		raw, err := body(name)
 		if err != nil {
 			return err
 		}
+		sum := sha256.Sum256(raw)
+		digest := hex.EncodeToString(sum[:])
 		index.Files[name] = digest
-
-		// Artifact-set files are named by checkpoint ID, not by content
-		// digest: re-publishing the same ID after the local directory
-		// was recreated (bench reruns, ID reuse) produces a different
-		// manifest under the same key. The immutability skip is only
-		// sound for digest-keyed objects, so these files always upload.
-		// The one large file (overlay) ships as digest-keyed chunks
-		// where the key IS the content hash and the skip stays correct.
-		f, err := os.Open(path)
-		if err != nil {
-			return err
-		}
-		err = store.PutKey(ctx, ArtifactKey(id, name), f)
-		f.Close()
-		if err != nil {
-			return fmt.Errorf("upload %s: %w", name, err)
-		}
+		var prefix [8]byte
+		binary.BigEndian.PutUint64(prefix[:], uint64(len(raw)))
+		part := BundlePart{Name: name, Offset: int64(len(bundle)) + 8, Length: int64(len(raw)), Digest: digest}
+		bundle = append(bundle, prefix[:]...)
+		bundle = append(bundle, raw...)
+		info.Parts = append(info.Parts, part)
+	}
+	sum := sha256.Sum256(bundle)
+	info.Digest = hex.EncodeToString(sum[:])
+	info.Size = int64(len(bundle))
+	index.Bundle = info
+	if err := store.PutKey(ctx, ArtifactKey(id, BundleName), bytes.NewReader(bundle)); err != nil {
+		return fmt.Errorf("upload bundle: %w", err)
 	}
 	encoded, err := json.MarshalIndent(index, "", "  ")
 	if err != nil {
@@ -362,22 +392,59 @@ func Materialize(ctx context.Context, targetDir, id string, store chunkstore.Key
 	} else {
 		files = append(files, "overlay.ext4")
 	}
-	for _, name := range files {
-		want, recorded := index.Files[name]
-		if !recorded {
-			return fmt.Errorf("index has no entry for %s", name)
-		}
-		body, err := fetchKey(ctx, store, ArtifactKey(id, name))
+	switch {
+	case index.Bundle != nil:
+		// One GET for every small file: split by the recorded spans,
+		// verify each part's own digest against the INDEX, land it.
+		bundle, err := fetchKey(ctx, store, ArtifactKey(id, BundleName))
 		if err != nil {
-			return fmt.Errorf("fetch %s: %w", name, err)
+			return fmt.Errorf("fetch bundle: %w", err)
 		}
-		got := sha256.Sum256(body)
-		if hex.EncodeToString(got[:]) != want {
-			return fmt.Errorf("artifact %s digest mismatch: index %s fetched %s",
-				name, want, hex.EncodeToString(got[:]))
+		if int64(len(bundle)) != index.Bundle.Size {
+			return fmt.Errorf("bundle size %d, index says %d", len(bundle), index.Bundle.Size)
 		}
-		if err := os.WriteFile(filepath.Join(staging, name), body, 0o600); err != nil {
-			return err
+		sum := sha256.Sum256(bundle)
+		if hex.EncodeToString(sum[:]) != index.Bundle.Digest {
+			return fmt.Errorf("bundle digest mismatch: index %s fetched %s",
+				index.Bundle.Digest, hex.EncodeToString(sum[:]))
+		}
+		for _, part := range index.Bundle.Parts {
+			want, recorded := index.Files[part.Name]
+			if !recorded {
+				return fmt.Errorf("index has no entry for %s", part.Name)
+			}
+			if part.Offset < 8 || part.Offset+part.Length > int64(len(bundle)) {
+				return fmt.Errorf("bundle part %s span out of range", part.Name)
+			}
+			body := bundle[part.Offset : part.Offset+part.Length]
+			got := sha256.Sum256(body)
+			if hex.EncodeToString(got[:]) != want {
+				return fmt.Errorf("artifact %s digest mismatch: index %s bundle %s",
+					part.Name, want, hex.EncodeToString(got[:]))
+			}
+			if err := os.WriteFile(filepath.Join(staging, part.Name), body, 0o600); err != nil {
+				return err
+			}
+		}
+	default:
+		// Pre-bundle artifact: per-file objects under the ID namespace.
+		for _, name := range files {
+			want, recorded := index.Files[name]
+			if !recorded {
+				return fmt.Errorf("index has no entry for %s", name)
+			}
+			body, err := fetchKey(ctx, store, ArtifactKey(id, name))
+			if err != nil {
+				return fmt.Errorf("fetch %s: %w", name, err)
+			}
+			got := sha256.Sum256(body)
+			if hex.EncodeToString(got[:]) != want {
+				return fmt.Errorf("artifact %s digest mismatch: index %s fetched %s",
+					name, want, hex.EncodeToString(got[:]))
+			}
+			if err := os.WriteFile(filepath.Join(staging, name), body, 0o600); err != nil {
+				return err
+			}
 		}
 	}
 	// Closure check (F5): three authorities must agree before the artifact
@@ -526,7 +593,7 @@ func materializeOverlayChunks(
 			// the global one.
 			rc2, err2 := store.GetKey(ctx, legacyOverlayChunkKey(id, digest))
 			if err2 != nil {
-				failJob(fmt.Errorf("fetch overlay chunk %s: %v (legacy: %v)", digest[:12], err, err2))
+				failJob(fmt.Errorf("fetch overlay chunk %s: %w (legacy: %w)", digest[:12], err, err2))
 				return nil, false
 			}
 			rc = rc2

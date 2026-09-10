@@ -254,7 +254,10 @@ func TestPackRejectsBadBaselineAndSource(t *testing.T) {
 				if _, err := RunWithOptions(ctx, source, "base", store, "local", opts); err != nil {
 					t.Fatal(err)
 				}
-				if err := store.PutKey(ctx, ArtifactKey("base", "chunks.json"), strings.NewReader("{}")); err != nil {
+				// Bundle-era baselines carry the small files in one
+				// object; corrupting it must fail the baseline load
+				// (bundle digest check) instead of being bypassed.
+				if err := store.PutKey(ctx, ArtifactKey("base", BundleName), strings.NewReader("{}")); err != nil {
 					t.Fatal(err)
 				}
 				opts.BaseID = "base"

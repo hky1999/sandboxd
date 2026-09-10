@@ -154,9 +154,42 @@ func loadPackBaseline(ctx context.Context, store chunkstore.Keyed, id string) (*
 	if index.CheckpointID != id {
 		return nil, fmt.Errorf("baseline index names %q instead of %q", index.CheckpointID, id)
 	}
+	// Bundle-era baselines land every small file in one object: a single
+	// GET and one whole-bundle digest check serve both metadata reads,
+	// with each part's span checked against the INDEX before any byte is
+	// trusted. Pre-bundle baselines keep the bounded per-file reads.
+	fileAt := func(name string) ([]byte, error) {
+		return boundedPackMetadata(ctx, store, ArtifactKey(id, name))
+	}
+	if index.Bundle != nil {
+		bundle, err := fetchKey(ctx, store, ArtifactKey(id, BundleName))
+		if err != nil {
+			return nil, err
+		}
+		if int64(len(bundle)) != index.Bundle.Size {
+			return nil, fmt.Errorf("baseline bundle size %d, index says %d", len(bundle), index.Bundle.Size)
+		}
+		sum := sha256.Sum256(bundle)
+		if hex.EncodeToString(sum[:]) != index.Bundle.Digest {
+			return nil, fmt.Errorf("baseline bundle digest mismatch: index %s fetched %s",
+				index.Bundle.Digest, hex.EncodeToString(sum[:]))
+		}
+		fileAt = func(name string) ([]byte, error) {
+			for _, part := range index.Bundle.Parts {
+				if part.Name != name {
+					continue
+				}
+				if part.Offset < 8 || part.Offset+part.Length > int64(len(bundle)) {
+					return nil, fmt.Errorf("baseline bundle part %s span out of range", name)
+				}
+				return bundle[part.Offset : part.Offset+part.Length], nil
+			}
+			return nil, fmt.Errorf("baseline bundle has no part %s", name)
+		}
+	}
 	files := map[string][]byte{}
 	for _, name := range []string{checkpointchunks.ManifestName, "manifest.json"} {
-		raw, err := boundedPackMetadata(ctx, store, ArtifactKey(id, name))
+		raw, err := fileAt(name)
 		if err != nil {
 			return nil, err
 		}
