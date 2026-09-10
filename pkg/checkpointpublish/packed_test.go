@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"os"
@@ -66,6 +67,11 @@ func TestMaterializePackedTransportClosure(t *testing.T) {
 		m.Packs[c.Digest] = checkpointchunks.PackReference{Digest: packDigest, Offset: c.Offset, Length: min(int64(m.ChunkBytes), m.FileSize-c.Offset), ObjectSize: m.FileSize}
 	}
 	index.MemoryRoot = m.FileDigest
+	// The bundle era lands the small files in one object, so the packed
+	// views this test builds must ride that object: put() records the
+	// body, commit() rebuilds the bundle from the overrides plus the
+	// files publish produced (vmstate, overlay sidecar) and re-digests.
+	overrides := map[string][]byte{}
 	put := func(name string, v any) {
 		t.Helper()
 		data, err := json.Marshal(v)
@@ -74,14 +80,40 @@ func TestMaterializePackedTransportClosure(t *testing.T) {
 		}
 		h := sha256.Sum256(data)
 		index.Files[name] = hex.EncodeToString(h[:])
-		if err := store.PutKey(ctx, ArtifactKey(id, name), bytes.NewReader(data)); err != nil {
-			t.Fatal(err)
-		}
+		overrides[name] = data
 	}
 	put("manifest.json", map[string]any{"version": 2, "snapshot_type": "SoftDirty", "memory_size": m.FileSize, "memory_digest_mode": "chunks", "digests": map[string]string{"memory": m.FileDigest}})
 	put(checkpointchunks.ManifestName, m)
 	commit := func() {
 		t.Helper()
+		var bundle []byte
+		parts := make([]BundlePart, 0, len(index.Bundle.Parts))
+		for _, part := range index.Bundle.Parts {
+			body, ok := overrides[part.Name]
+			if !ok {
+				var err error
+				body, err = os.ReadFile(filepath.Join(source, part.Name))
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			h := sha256.Sum256(body)
+			var prefix [8]byte
+			binary.BigEndian.PutUint64(prefix[:], uint64(len(body)))
+			parts = append(parts, BundlePart{
+				Name: part.Name, Offset: int64(len(bundle)) + 8,
+				Length: int64(len(body)), Digest: hex.EncodeToString(h[:]),
+			})
+			bundle = append(bundle, prefix[:]...)
+			bundle = append(bundle, body...)
+		}
+		index.Bundle = &BundleInfo{Parts: parts}
+		index.Bundle.Size = int64(len(bundle))
+		sum := sha256.Sum256(bundle)
+		index.Bundle.Digest = hex.EncodeToString(sum[:])
+		if err := store.PutKey(ctx, ArtifactKey(id, BundleName), bytes.NewReader(bundle)); err != nil {
+			t.Fatal(err)
+		}
 		data, _ := json.Marshal(index)
 		if err := store.PutKey(ctx, ArtifactKey(id, IndexName), bytes.NewReader(data)); err != nil {
 			t.Fatal(err)

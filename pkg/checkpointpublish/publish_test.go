@@ -167,13 +167,16 @@ func TestPublishMaterializeRoundtrip(t *testing.T) {
 		t.Fatalf("placeholder allocated %d blocks; want sparse", sys.Blocks)
 	}
 
-	// A tampered INDEX digest must fail materialization of a second copy.
-	tamperKey := ArtifactKey(id, "vmstate")
+	// A tampered object must fail materialization of a second copy.
+	// Bundle-era artifact sets land the small files in one object, so the
+	// tamper point is the bundle itself (part digests stay checked).
+	tamperKey := ArtifactKey(id, BundleName)
 	_ = local.PutKey(context.Background(), tamperKey, strings.NewReader("tampered"))
 	second := filepath.Join(filepath.Dir(source), "blind-copy-2")
 	if err := Materialize(context.Background(), second, id, keyed); err == nil {
 		t.Fatal("tampered artifact set materialized")
-	} else if !strings.Contains(err.Error(), "digest mismatch") {
+	} else if !strings.Contains(err.Error(), "digest mismatch") &&
+		!strings.Contains(err.Error(), "bundle size") {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
@@ -195,6 +198,25 @@ func writeFullArtifact(t *testing.T, dir string) {
 		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o600); err != nil {
 			t.Fatal(err)
 		}
+	}
+	// Chunks-digest deployments ship the writable layer from a sidecar
+	// (digest-keyed chunk objects instead of one whole-file object). With
+	// the bundle era collapsing the small files into a single GET, those
+	// overlay chunk fetches are the remaining mid-materialization boundary.
+	overlay := []byte("overlay-bytes")
+	sum := sha256.Sum256(overlay)
+	scan := &checkpointchunks.Manifest{
+		Version:        1,
+		File:           "overlay.ext4",
+		FileSize:       int64(len(overlay)),
+		ChunkBytes:     checkpointchunks.DefaultChunkBytes,
+		FileDigestMode: checkpointchunks.FileDigestChunks,
+		Entries:        []checkpointchunks.Chunk{{Offset: 0, Digest: hex.EncodeToString(sum[:])}},
+	}
+	scan.ChunkCount = len(scan.Entries)
+	scan.FileDigest = checkpointchunks.RootDigest(scan.Entries)
+	if err := checkpointchunks.WriteNamed(dir, OverlaySidecarName, scan); err != nil {
+		t.Fatal(err)
 	}
 	if _, err := checkpointchunks.Compute(context.Background(), dir, checkpointchunks.DefaultChunkBytes); err != nil {
 		t.Fatal(err)

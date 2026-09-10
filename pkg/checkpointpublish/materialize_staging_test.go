@@ -134,10 +134,14 @@ func TestMaterializeStagingVisibilityAndFailureCleanup(t *testing.T) {
 	if err := os.WriteFile(sentinel, []byte("untouched"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	injected := errors.New("injected vmstate fetch failure")
+	injected := errors.New("injected overlay chunk fetch failure")
 	observed := false
 	wrapped := stagingObservationStore{Keyed: store, beforeGet: func(key string) error {
-		if key != ArtifactKey(filepath.Base(source), "vmstate") {
+		// The bundle era lands every small file in one GET, so the probe's
+		// "partially materialized" moment is the overlay reassembly that
+		// follows: the sidecar is staged, later chunks are not. Match both
+		// the global namespace and the legacy per-ID fallback prefix.
+		if !strings.Contains(key, "overlay-chunks/") {
 			return nil
 		}
 		if _, err := os.Stat(target); !os.IsNotExist(err) {

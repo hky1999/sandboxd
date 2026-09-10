@@ -575,6 +575,8 @@ id in the key), so unchanged overlay blocks are shared across generations
 and nodes. Materialization recognizes the all-zero chunk digests by length
 and synthesizes those blocks as sparse holes — no GET, no write. Each reference must match the exact object length, including the final short chunk; a digest cannot be reused for different reference lengths. Materialization rejects both short and oversized objects before writing them, and the zero shortcut applies only to the digest of that reference’s exact length.
 
+The artifact set's small files — `manifest.json`, `chunks.json`, `vmstate`, and the overlay sidecar when the chunked path is taken — ship as one bundle object (`artifacts/<id>/BUNDLE`): each file is prefixed with an 8-byte big-endian length, and the INDEX records the bundle's whole-object sha256, size, and per-part spans alongside the unchanged per-file digests. Publication lands one PUT instead of one per file; materialization lands one GET whose parts are each digest-checked against the INDEX before being staged. The ID-named always-upload semantics that protect against checkpoint-ID reuse carry over to the bundle object. Artifacts published before bundles carry per-file objects and no INDEX bundle field; materialization and pack-baseline loads fall back to per-file fetches for them, while bundle-aware baseline loads verify the whole bundle digest and each part's span before trusting any byte.
+
 `Materialize` (cn-fetch) rebuilds a restorable directory on a node that
 never saw the source. Every file is digest-verified against the INDEX, the
 INDEX's memory root is cross-checked against the chunk sidecar, and the
