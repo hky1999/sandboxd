@@ -103,6 +103,14 @@ type firecrackerPersistedState struct {
 	// BaseMemoryIncremental marks a base that came from a restore, which the
 	// Firecracker pagemap ledger (not the soft-dirty window) diffs against.
 	BaseMemoryIncremental bool `json:"base_memory_incremental,omitempty"`
+	// BaseChunkManifestPath names a chunk manifest standing in for a byte
+	// base the local artifact cannot provide (a materialized placeholder or
+	// an inherited sparse generation). Sealing against it copies hole-chunk
+	// digests from it instead of zeroing them; empty means no inheritance
+	// is available and the generation takes the Full path. In-memory only:
+	// a daemon restart loses it and the next checkpoint safely degrades to
+	// Full.
+	BaseChunkManifestPath string `json:"base_chunk_manifest_path,omitempty"`
 	// BaseMemoryLineageLost marks that the VMM dirty-page ledger may be
 	// armed against a base sandboxd no longer holds: a checkpoint failed
 	// after the VMM wrote and re-armed its window, or the daemon restarted
@@ -239,6 +247,22 @@ func (instance *firecrackerInstance) setBaseMemoryProof(path string, incremental
 	instance.state.BaseMemoryIncremental = incremental
 	instance.state.BaseMemoryLineageLost = false
 	instance.mu.Unlock()
+}
+
+// setBaseChunkManifest records the manifest-side (digest) lineage used when
+// the byte-level base is a sparse placeholder. It never clears lineageLost:
+// VMM ledger semantics are unchanged; inheritance only governs how the next
+// seal interprets hole chunks.
+func (instance *firecrackerInstance) setBaseChunkManifest(path string) {
+	instance.mu.Lock()
+	instance.state.BaseChunkManifestPath = path
+	instance.mu.Unlock()
+}
+
+func (instance *firecrackerInstance) baseChunkManifest() string {
+	instance.mu.Lock()
+	defer instance.mu.Unlock()
+	return instance.state.BaseChunkManifestPath
 }
 
 // markBaseMemoryLineageLost drops the incremental lineage and records that

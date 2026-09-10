@@ -23,7 +23,7 @@ import (
 
 func transportFixture() *Manifest {
 	a, b := strings.Repeat("a", 64), strings.Repeat("b", 64)
-	m := &Manifest{Version: 2, File: "memory", FileSize: 10, ChunkBytes: 4, ChunkCount: 3, FileDigestMode: FileDigestChunks, Entries: []Chunk{{0, a}, {4, a}, {8, b}}, Packs: map[string]PackReference{a: {Digest: strings.Repeat("c", 64), Offset: 2, Length: 4, ObjectSize: 10}, b: {Digest: strings.Repeat("c", 64), Offset: 8, Length: 2, ObjectSize: 10}}}
+	m := &Manifest{Version: 2, File: "memory", FileSize: 10, ChunkBytes: 4, ChunkCount: 3, FileDigestMode: FileDigestChunks, Entries: []Chunk{{Offset: 0, Digest: a}, {Offset: 4, Digest: a}, {Offset: 8, Digest: b}}, Packs: map[string]PackReference{a: {Digest: strings.Repeat("c", 64), Offset: 2, Length: 4, ObjectSize: 10}, b: {Digest: strings.Repeat("c", 64), Offset: 8, Length: 2, ObjectSize: 10}}}
 	m.FileDigest = RootDigest(m.Entries)
 	return m
 }

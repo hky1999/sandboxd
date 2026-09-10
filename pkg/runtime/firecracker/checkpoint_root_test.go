@@ -46,7 +46,7 @@ func sealV2ChunksModeArtifactFixture(t *testing.T, dir string, memorySize int64)
 		SnapshotType:     firecrackerSnapshotTypeSoftDirty,
 		MemorySize:       memorySize,
 		MemoryDigestMode: checkpointchunks.FileDigestChunks,
-	}, true); err != nil {
+	}, true, nil); err != nil {
 		t.Fatalf("seal v2 checkpoint: %v", err)
 	}
 	return files

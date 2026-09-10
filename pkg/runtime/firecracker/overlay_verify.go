@@ -131,7 +131,7 @@ func verifyFirecrackerCheckpointOverlayContents(
 	sidecar *checkpointchunks.Manifest,
 ) error {
 	if sidecar.ChunkBytes == checkpointchunks.DefaultChunkBytes {
-		scan, err := scanFileChunks(ctx, path, firecrackerCheckpointOverlayName)
+		scan, err := scanFileChunks(ctx, path, firecrackerCheckpointOverlayName, nil)
 		if err != nil {
 			return fmt.Errorf("scan Firecracker checkpoint overlay: %w", err)
 		}

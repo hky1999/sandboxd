@@ -37,7 +37,7 @@ func TestLocalRestoreVerificationClosure(t *testing.T) {
 			if err := os.WriteFile(path, data, 0600); err != nil {
 				t.Fatal(err)
 			}
-			root, err := digestMemoryWithChunkScan(context.Background(), path, checkpointchunks.FileDigestChunks)
+			root, err := digestMemoryWithChunkScan(context.Background(), path, checkpointchunks.FileDigestChunks, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -100,7 +100,7 @@ func TestLocalRestoreVerifierFailureJoinsWorkers(t *testing.T) {
 		if err := os.WriteFile(path, data, 0600); err != nil {
 			t.Fatal(err)
 		}
-		root, err := digestMemoryWithChunkScan(context.Background(), path, checkpointchunks.FileDigestChunks)
+		root, err := digestMemoryWithChunkScan(context.Background(), path, checkpointchunks.FileDigestChunks, nil)
 		if err != nil {
 			t.Fatal(err)
 		}

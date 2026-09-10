@@ -56,6 +56,12 @@ const (
 type Chunk struct {
 	Offset int64  `json:"offset"`
 	Digest string `json:"digest"`
+	// Inherited marks a chunk whose bytes are not present in the local
+	// sparse artifact: its content still lives under the parent
+	// generation's object (same digest, content-addressed store). Readers
+	// must fetch it by digest instead of reading the local file at this
+	// offset; a hole in the file is exactly the bytes of the parent chunk.
+	Inherited bool `json:"inherited,omitempty"`
 }
 
 // Manifest is the chunk description of one memory file.
@@ -72,6 +78,10 @@ type Manifest struct {
 	ChunkCount     int                      `json:"chunk_count"`
 	Entries        []Chunk                  `json:"entries"`
 	Packs          map[string]PackReference `json:"packs,omitempty"`
+	// InheritedFromRoot names the parent generation's file digest whose
+	// manifest the inherited entries were copied from (audit trail for
+	// digest-inheritance sealing; absent on ordinary generations).
+	InheritedFromRoot string `json:"inherited_from_root,omitempty"`
 }
 
 // RootDigest derives the "chunks"-mode file digest from ordered chunk
@@ -225,6 +235,26 @@ func loadNamedBounded(dir, name string, limit int64, transport bool) (*Manifest,
 // overlay.ext4.chunks.json), bounded by MaxManifestBytes.
 func LoadNamed(dir, name string) (*Manifest, error) {
 	return LoadNamedBounded(dir, name, MaxManifestBytes)
+}
+
+// EntryAt returns the parent manifest's entry covering [offset, offset+length)
+// on the same chunk grid, for digest-inheritance sealing of holes.
+func (m *Manifest) EntryAt(offset int64, length int) (Chunk, bool) {
+	if m == nil || m.ChunkBytes <= 0 {
+		return Chunk{}, false
+	}
+	idx := int(offset / int64(m.ChunkBytes))
+	if idx < 0 || idx >= len(m.Entries) {
+		return Chunk{}, false
+	}
+	e := m.Entries[idx]
+	if e.Offset != offset {
+		return Chunk{}, false
+	}
+	if int64(length) > int64(m.ChunkBytes) {
+		return Chunk{}, false
+	}
+	return e, true
 }
 
 // SidecarName is the chunk sidecar file name for an artifact file.
