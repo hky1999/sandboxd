@@ -80,7 +80,9 @@ func TestExistingRestorePhysicalFact_ParkLeftoverRetainedReadonly(t *testing.T) 
 // still returns the existing physical fact. RUNNING is staged as an explicit
 // durable status, not the load-time default for a missing status file.
 func TestExistingRestorePhysicalFact_IdempotentReplay(t *testing.T) {
-	s := newTestService(t, map[string]svc.Handler{"runsc": svc.NewFakeRuntimeHandler()})
+	handler := &recordingDeleteHandler{FakeRuntimeHandler: svc.NewFakeRuntimeHandler()}
+	s := newTestService(t, map[string]svc.Handler{"runsc": handler})
+	handler.reflectManager = s.sandboxManager
 	const id = "sbox-restored"
 	identity := &runtime.RestoreIdentity{CheckpointID: "ckpt-1", RequestSha256: "abc"}
 	assert.NoError(t, s.sandboxManager.StoreMetadata(id, &runtime.SandboxMetadata{

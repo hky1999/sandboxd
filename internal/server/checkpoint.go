@@ -435,16 +435,18 @@ func (h *sandboxService) existingRestorePhysicalFact(
 		return nil, true, err
 	}
 	defer unlock()
-	return h.existingRestorePhysicalFactLocked(request, expectedIdentity)
+	return h.existingRestorePhysicalFactLocked(ctx, request, expectedIdentity)
 }
 
 // existingRestorePhysicalFactLocked is the lock-held core of the replay
 // lookup. The caller must already hold the target ID's physical resource
 // lock — the post-wait revalidation reuses it without double locking. It
 // never mutates and answers success only for a COMMITTED, RUNNING record with
-// a nonempty generation under exactly the requested ID; the reply is
-// immutable, with cloned ports.
+// a nonempty generation under exactly the requested ID whose runtime fact
+// confirms the sandbox is actually running; the reply is immutable, with
+// cloned ports.
 func (h *sandboxService) existingRestorePhysicalFactLocked(
+	ctx context.Context,
 	request *runtime.StartRequest,
 	expectedIdentity *runtime.RestoreIdentity,
 ) (*runtime.StartResponse, bool, error) {
@@ -480,6 +482,22 @@ func (h *sandboxService) existingRestorePhysicalFactLocked(
 	case runtime.SandboxState_SANDBOX_STATE_RUNNING:
 		if !identityMatches {
 			return nil, true, fmt.Errorf("sandbox %s is RUNNING; cannot restore onto a live sandbox: %w",
+				request.SandboxID, errord.ErrFailedPrecondition)
+		}
+		// F8 runtime-liveness: the cached status can be a fabricated RUNNING
+		// (LoadStatus invents one when the status file is missing) or a stale
+		// one from before a daemon restart, so an authoritative replay answer
+		// additionally requires the read-only runtime fact. Refusal proves
+		// nothing else and mutates nothing: no cleanup, no state change.
+		running, obsErr := h.observeRuntimeRunning(ctx, metadata.ID, metadata.RuntimeHandler)
+		if obsErr != nil {
+			return nil, true, fmt.Errorf(
+				"sandbox %s runtime liveness is unobservable for the replay answer: %w",
+				request.SandboxID, errors.Join(errord.ErrFailedPrecondition, obsErr))
+		}
+		if !running {
+			return nil, true, fmt.Errorf(
+				"sandbox %s runtime fact does not confirm a running replay target: %w",
 				request.SandboxID, errord.ErrFailedPrecondition)
 		}
 	case runtime.SandboxState_SANDBOX_STATE_EXITED:
@@ -549,7 +567,7 @@ func (h *sandboxService) validateRestoredPhysicalFact(
 		return nil, err
 	}
 	defer unlock()
-	current, found, factErr := h.existingRestorePhysicalFactLocked(startConfig, restoreIdentity)
+	current, found, factErr := h.existingRestorePhysicalFactLocked(ctx, startConfig, restoreIdentity)
 	if factErr != nil {
 		// A parked candidate is meaningful only before dispatch. The reply
 		// path never admits cleanup and reports a failed identity check.

@@ -674,6 +674,43 @@ type recordingDeleteHandler struct {
 	*svc.FakeRuntimeHandler
 	calls     int
 	sandboxID string
+	// listStates, when non-nil, is the read-only runtime fact List reports
+	// (the authoritative replay answer requires a live runtime observation).
+	listStates []*svc.State
+	// reflectManager, when set, mirrors the manager's RUNNING sandboxes as
+	// the runtime fact (see reflectManagerRunning).
+	reflectManager *sandbox.Manager
+}
+
+func (h *recordingDeleteHandler) List(ctx context.Context) ([]*svc.State, error) {
+	if h.listStates != nil {
+		return h.listStates, nil
+	}
+	if h.reflectManager != nil {
+		return reflectManagerRunning(h.reflectManager), nil
+	}
+	return h.FakeRuntimeHandler.List(ctx)
+}
+
+// reflectManagerRunning mirrors every sandbox the manager currently holds in
+// RUNNING status as a running runtime fact, so ownership tests exercise
+// identity semantics without staging a real runtime. The restore replay's
+// authoritative answer requires this read-only fact.
+func reflectManagerRunning(manager *sandbox.Manager) []*svc.State {
+	if manager == nil {
+		return nil
+	}
+	states := make([]*svc.State, 0, 4)
+	for _, sb := range manager.List() {
+		if sb == nil || sb.Metadata == nil || sb.Status == nil {
+			continue
+		}
+		if sb.Status.Get().State() != runtime.SandboxState_SANDBOX_STATE_RUNNING {
+			continue
+		}
+		states = append(states, &svc.State{ID: sb.Metadata.ID, Status: svc.SandboxStatusRunning})
+	}
+	return states
 }
 
 func (h *recordingDeleteHandler) Delete(

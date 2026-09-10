@@ -53,6 +53,9 @@ func newRestoreCleanupService(t *testing.T) (*sandboxService, *recordingDeleteHa
 	// The restore RPC coordinates in-flight operations through the checkpoint
 	// coordinator, which newTestService does not wire.
 	s.checkpointState = checkpointstate.NewCoordinator()
+	// Runtime fact mirror: the read-only liveness observation answers from the
+	// manager's staged RUNNING records.
+	handler.reflectManager = s.sandboxManager
 	return s, handler
 }
 
@@ -409,6 +412,9 @@ func TestRestoreConditionalDeleteRechecksReplacementUnderPhysicalLock(t *testing
 func TestRestoreReplaysMatchingRunningSandboxWithoutArtifact(t *testing.T) {
 	s, handler := newRestoreCleanupService(t)
 	const id = "sbox-restore-replay"
+	// The replay answer is authoritative: it must also observe the runtime
+	// holding this sandbox running, not just a cached RUNNING status.
+	handler.listStates = []*svc.State{{ID: id, Status: svc.SandboxStatusRunning}}
 	directory := filepath.Join(s.config.RootDir, "checkpoints", "case")
 	request := &runtime.RestoreRequest{
 		Config: &runtime.StartRequest{
