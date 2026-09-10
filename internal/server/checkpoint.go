@@ -24,6 +24,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
 	"github.com/inclusionAI/sandboxd/config"
@@ -33,6 +34,7 @@ import (
 	"github.com/inclusionAI/sandboxd/internal/trace"
 	"github.com/inclusionAI/sandboxd/pkg/errord"
 	svc "github.com/inclusionAI/sandboxd/pkg/runtime"
+	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
@@ -805,12 +807,23 @@ func (h *sandboxService) executeCheckpoint(
 	options svc.CheckpointOptions,
 	attempt *checkpointstate.Attempt,
 ) {
-	unlock, lockErr := h.resourceLocks.acquire(ctx, key.SandboxID)
+	// The physical-lock acquisition below was a silent wedge in the field:
+	// nothing logged before it, and the per-sandbox lock is not reentrant,
+	// so an unbounded wait here left the coordinator attempt open forever
+	// (only a daemon restart unwedged it, force-deleting the sandbox). Log
+	// entry and bound the wait so a stuck holder becomes a visible error
+	// instead of an hours-long silent hang.
+	logrus.Infof("checkpoint execute start sandbox %s artifact %s (waiting for physical lock)", key.SandboxID, key.CheckpointID)
+	lockCtx, cancelLock := context.WithTimeout(ctx, 10*time.Minute)
+	defer cancelLock()
+	unlock, lockErr := h.resourceLocks.acquire(lockCtx, key.SandboxID)
 	if lockErr != nil {
+		logrus.Warnf("checkpoint physical lock unavailable sandbox %s: %v", key.SandboxID, lockErr)
 		h.checkpointState.Complete(attempt, lockErr)
 		return
 	}
 	defer unlock()
+	logrus.Infof("checkpoint execute acquired physical lock sandbox %s", key.SandboxID)
 	// Source metadata was read before waiting for the physical operation lock.
 	// Revalidate the lifetime while replacement/resize/delete are excluded.
 	current, identityErr := h.sandboxManager.Get(key.SandboxID)
