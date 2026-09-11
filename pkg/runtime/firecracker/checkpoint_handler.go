@@ -367,11 +367,19 @@ func (handler *Handler) Checkpoint(
 	// a 4GiB snapshot). Cloning first runs with a cache that does not yet hold
 	// the snapshot, removing the interaction. No in-clone fsync is needed because
 	// checkpoint artifacts deliberately remain in the page cache.
-	if _, err := cloneFileNoSync(state.OverlayPath, files.Overlay); err != nil {
-		discardUnsealedFirecrackerCheckpoint(files)
-		// The deferred handoff cleanup above resumes the guest and sends
-		// the error outcome; an explicit resume here would race with it.
-		return fmt.Errorf("snapshot Firecracker writable layer for %s: %w", sandboxID, err)
+	// Deferred window dump: the writable layer must be cloned at the TRUE
+	// checkpoint instant (the second, short pause after the background
+	// pass), because the guest keeps writing it while the dump runs.
+	useDefer := handler.deferWindowDump && config.LeaveRunning &&
+		(snapshotType == firecrackerSnapshotTypeSoftDirty ||
+			snapshotType == firecrackerSnapshotTypeIncremental)
+	if !useDefer {
+		if _, err := cloneFileNoSync(state.OverlayPath, files.Overlay); err != nil {
+			discardUnsealedFirecrackerCheckpoint(files)
+			// The deferred handoff cleanup above resumes the guest and sends
+			// the error outcome; an explicit resume here would race with it.
+			return fmt.Errorf("snapshot Firecracker writable layer for %s: %w", sandboxID, err)
+		}
 	}
 	tOverlay := time.Now()
 	snapshotAttempted := false
@@ -428,6 +436,63 @@ func (handler *Handler) Checkpoint(
 		}
 	}
 	tResumed := time.Now()
+
+	if useDefer {
+		// Phase B runs inside the VMM while the guest executes. Wait for the
+		// background writer to finish, then take the second (short) pause:
+		// clone the writable layer at this instant, write the state file and
+		// the residual re-dirtied ranges, and resume. The artifact describes
+		// this later instant, not the create call — live-migration semantics.
+		for {
+			if err := ctx.Err(); err != nil {
+				instance.markBaseMemoryLineageLost()
+				discardUnsealedFirecrackerCheckpoint(files)
+				return fmt.Errorf("deferred dump for %s aborted: %w", sandboxID, err)
+			}
+			status, err := api.snapshotDeferStatus(ctx)
+			if err != nil {
+				instance.markBaseMemoryLineageLost()
+				discardUnsealedFirecrackerCheckpoint(files)
+				return fmt.Errorf("deferred dump status for %s: %w", sandboxID, err)
+			}
+			if status.Failed != nil {
+				instance.markBaseMemoryLineageLost()
+				discardUnsealedFirecrackerCheckpoint(files)
+				return fmt.Errorf("deferred dump for %s failed: %s", sandboxID, *status.Failed)
+			}
+			if status.Written {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		if err := api.pause(ctx); err != nil {
+			instance.markBaseMemoryLineageLost()
+			discardUnsealedFirecrackerCheckpoint(files)
+			return fmt.Errorf("pause Firecracker sandbox %s for deferred finish: %w", sandboxID, err)
+		}
+		deferFinishErr := error(nil)
+		if _, err := cloneFileNoSync(state.OverlayPath, files.Overlay); err != nil {
+			deferFinishErr = fmt.Errorf("snapshot Firecracker writable layer for %s: %w", sandboxID, err)
+		} else if err := api.snapshotDeferFinish(ctx, files.State); err != nil {
+			deferFinishErr = fmt.Errorf("deferred finish for %s: %w", sandboxID, err)
+		}
+		if deferFinishErr != nil {
+			instance.markBaseMemoryLineageLost()
+			discardUnsealedFirecrackerCheckpoint(files)
+			// Best-effort resume: the handoff defer below is skipped for the
+			// success path only, so resume explicitly before returning.
+			if err := api.resume(ctx); err != nil {
+				deferFinishErr = errors.Join(deferFinishErr, fmt.Errorf(
+					"resume Firecracker sandbox %s after deferred-finish failure: %w", sandboxID, err))
+			}
+			return deferFinishErr
+		}
+		if err := api.resume(ctx); err != nil {
+			instance.markBaseMemoryLineageLost()
+			discardUnsealedFirecrackerCheckpoint(files)
+			return fmt.Errorf("resume Firecracker sandbox %s after deferred finish: %w", sandboxID, err)
+		}
+	}
 
 	// Post-resume tail: seal the logical generation and adopt its base without
 	// forcing dirty checkpoint pages to stable storage. Hashing and manifest

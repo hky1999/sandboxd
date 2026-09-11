@@ -357,6 +357,7 @@ type Handler struct {
 	checkpointMode                  string
 	sparseFull                      bool
 	skipUnchanged                   bool
+	deferWindowDump                 bool
 	verifyIncrementalMemory         bool
 	verifyIncrementalMemoryStopOnly bool
 

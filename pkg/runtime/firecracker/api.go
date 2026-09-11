@@ -228,7 +228,48 @@ func (api *firecrackerAPI) createSnapshotWithMemoryOptions(ctx context.Context, 
 }
 
 func (api *firecrackerAPI) createSnapshotWithMemoryAudit(ctx context.Context, statePath, memoryPath, snapshotType string, sparseFull, skipUnchanged, verifyIncrementalMemory bool) error {
-	return api.createSnapshotWithChunkAlign(ctx, statePath, memoryPath, snapshotType, sparseFull, skipUnchanged, verifyIncrementalMemory, 0)
+	return api.createSnapshotWithChunkAlign(ctx, statePath, memoryPath, snapshotType, sparseFull, skipUnchanged, verifyIncrementalMemory, 0, false)
+}
+
+// DeferDumpStatus is the Phase-B progress view of a deferred dump.
+type DeferDumpStatus struct {
+	Active  bool    `json:"active"`
+	Written bool    `json:"written"`
+	Failed  *string `json:"failed"`
+}
+
+func (api *firecrackerAPI) snapshotDeferStatus(ctx context.Context) (*DeferDumpStatus, error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		"http://localhost/snapshot/defer-status", nil)
+	if err != nil {
+		return nil, err
+	}
+	response, err := api.client.Do(request)
+	if err != nil {
+		return nil, fmt.Errorf("Firecracker GET /snapshot/defer-status: %w", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
+		return nil, fmt.Errorf(
+			"Firecracker GET /snapshot/defer-status returned %s: %s",
+			response.Status, bytes.TrimSpace(body))
+	}
+	body, err := io.ReadAll(io.LimitReader(response.Body, 1<<16))
+	if err != nil {
+		return nil, err
+	}
+	var status DeferDumpStatus
+	if err := json.Unmarshal(body, &status); err != nil {
+		return nil, err
+	}
+	return &status, nil
+}
+
+func (api *firecrackerAPI) snapshotDeferFinish(ctx context.Context, statePath string) error {
+	return api.put(ctx, "/snapshot/defer-finish", map[string]any{
+		"snapshot_path": statePath,
+	})
 }
 
 // createSnapshotWithChunkAlign adds chunk_align_bytes: incremental writes
@@ -236,7 +277,7 @@ func (api *firecrackerAPI) createSnapshotWithMemoryAudit(ctx context.Context, st
 // window target is sparse and its holes mean "parent-owned bytes"; an
 // unaligned dirty range would leave a partially written chunk that no local
 // digest can represent (the seal refuses those — see scanFileChunks).
-func (api *firecrackerAPI) createSnapshotWithChunkAlign(ctx context.Context, statePath, memoryPath, snapshotType string, sparseFull, skipUnchanged, verifyIncrementalMemory bool, chunkAlignBytes int64) error {
+func (api *firecrackerAPI) createSnapshotWithChunkAlign(ctx context.Context, statePath, memoryPath, snapshotType string, sparseFull, skipUnchanged, verifyIncrementalMemory bool, chunkAlignBytes int64, deferDump bool) error {
 	if verifyIncrementalMemory && snapshotType != firecrackerSnapshotTypeSoftDirty && snapshotType != firecrackerSnapshotTypeIncremental {
 		return fmt.Errorf("verify_incremental_memory requires Incremental or SoftDirty")
 	}
@@ -266,6 +307,9 @@ func (api *firecrackerAPI) createSnapshotWithChunkAlign(ctx context.Context, sta
 	}
 	if chunkAlignBytes != 0 {
 		body["chunk_align_bytes"] = chunkAlignBytes
+	}
+	if deferDump {
+		body["defer_dump"] = true
 	}
 	// Checkpoint artifacts deliberately remain in the host page cache. The
 	// caller accepts that success does not imply immediate power-loss
