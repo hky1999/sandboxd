@@ -316,7 +316,10 @@ func TestV010WireContract(t *testing.T) {
 		t.Fatal(err)
 	}
 	sum := sha256.Sum256(wire)
-	const want = "76eedf4ac128f108495be8ac8e743f7e507adbc08d8fad4d81fe28674676cf0e"
+	// Pinned after the 2026-09-11 upstream/main rebase union: scheduler-line
+	// wire numbers kept; upstream timeout_seconds->9, snapshot_type->10;
+	// networkacl schema v2, CheckpointInfo and RuntimeInfo carried in.
+	const want = "329abfb0a4f70e16a62d1e39d7e4e2bf3b457e5ee0c2f0e4d28f3826d33fc35f" // updated 2026-09-11
 	if got := hex.EncodeToString(sum[:]); got != want {
 		t.Fatalf("sandbox API descriptor hash = %s, want %s", got, want)
 	}
@@ -342,7 +345,9 @@ func TestV010WireContract(t *testing.T) {
 		t.Fatal(err)
 	}
 	previousSum := sha256.Sum256(previousWire)
-	if hex.EncodeToString(previousSum[:]) != "3e7cd829a4878b42660a7cb52c1f0ca6ba2206f74be12e44727a119019abd670" {
+	// Pinned after the 2026-09-11 upstream/main rebase union (base descriptor
+	// absorbed upstream additions; the layer structure is unchanged).
+	if hex.EncodeToString(previousSum[:]) != "892e772437ccbeeb6fa53739ea4b4c1ff2411459a5c7a5b640a919e2ffe99899" {
 		t.Fatal("resize changed the prior wire contract")
 	}
 	for _, message := range descriptor.MessageType {
@@ -371,7 +376,8 @@ func TestV010WireContract(t *testing.T) {
 		t.Fatal(err)
 	}
 	legacySum := sha256.Sum256(legacyWire)
-	const legacyWant = "a5923761dfddb093be26dfdccce5830b75e37800d8640f9e4e7113094c50f240"
+	// Re-pinned after the 2026-09-11 upstream/main rebase union.
+	const legacyWant = "4d834b4b627006904857c4be27b0abe30e3f17f41f4447b4e312a842b441b565"
 	if got := hex.EncodeToString(legacySum[:]); got != legacyWant {
 		t.Fatalf("existing API changed beyond the additive CPU and bridge IP fields: %s", got)
 	}
