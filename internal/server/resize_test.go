@@ -56,6 +56,8 @@ type resizeCgroups struct {
 	onWriteFreeze     func(frozen bool)
 }
 
+func (c *resizeCgroups) ReadMemoryLimit(string) (int64, error) { return 0, nil }
+
 func (*resizeCgroups) Allocate() (string, error)    { return "/sandbox/lease", nil }
 func (*resizeCgroups) Recycle(string) error         { return nil }
 func (*resizeCgroups) ShutDown() error              { return nil }

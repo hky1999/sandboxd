@@ -328,7 +328,7 @@ func TestStartSandboxRuntimeDispatchesRestore(t *testing.T) {
 		CheckpointDir: "/checkpoints/one",
 	}
 
-	require.NoError(t, service.startSandboxRuntime(context.Background(), "runsc", config))
+	require.NoError(t, service.startSandboxRuntime(context.Background(), "runsc", config, nil))
 	require.Len(t, handler.restores, 1)
 	assert.Equal(t, config, handler.restores[0])
 	assert.Equal(t, "/checkpoints/one", handler.restoreDirs[0])
@@ -340,7 +340,7 @@ func TestStartSandboxRuntimeUsesStartWithoutCheckpoint(t *testing.T) {
 	service := buildServiceWithOptions(AddHandler("runsc", handler))
 	config := svc.StartConfig{ID: "sbox-started"}
 
-	require.NoError(t, service.startSandboxRuntime(context.Background(), "runsc", config))
+	require.NoError(t, service.startSandboxRuntime(context.Background(), "runsc", config, nil))
 	require.Len(t, handler.starts, 1)
 	assert.Equal(t, config, handler.starts[0])
 	assert.Empty(t, handler.restores)
@@ -351,6 +351,6 @@ func TestStartSandboxRuntimeRejectsUnsupportedRestore(t *testing.T) {
 	err := service.startSandboxRuntime(context.Background(), "runc", svc.StartConfig{
 		ID:            "sbox-restored",
 		CheckpointDir: "/checkpoints/one",
-	})
+	}, nil)
 	assert.Equal(t, codes.Unimplemented, status.Code(err))
 }

@@ -101,9 +101,21 @@ message NetworkEndpoint {
   string address = 1;
   // Port is an exact TCP or UDP port. Zero matches any port.
   uint32 port = 2;
+  // Cidr is an IPv4 address or CIDR prefix in network policy schema v2.
+  string cidr = 3;
+  // Domain is an exact DNS name or a leading "*." suffix pattern in schema
+  // v2. Domain peers are valid only for egress rules.
+  string domain = 4;
+  // PortRange selects a contiguous remote TCP or UDP port range in schema v2.
+  PortRange port_range = 5;
 }
 
 // TrafficRule describes one ingress or egress packet rule.
+message PortRange {
+  uint32 first = 1;
+  uint32 last  = 2;
+}
+
 message TrafficRule {
   NetworkPolicyAction action = 1;
   NetworkDirection direction = 2;
@@ -113,6 +125,11 @@ message TrafficRule {
   // egress. Zero matches any sandbox port. An omitted peer matches any
   // remote address and port.
   uint32 sandbox_port = 5;
+  // SandboxPortRange selects an inclusive local port interval in schema v2.
+  PortRange sandbox_port_range = 6;
+  // Priority orders schema v2 rules. Higher values win and DENY wins a tie.
+  // Zero selects the default user priority of 100.
+  uint32 priority = 7;
 }
 
 // TrafficPolicy controls IPv4 packets crossing a sandbox's host veth.
@@ -120,6 +137,9 @@ message TrafficPolicy {
   NetworkPolicyAction default_action = 1;
   repeated TrafficRule rules         = 2;
   TrafficPolicyMode mode             = 3;
+  // IngressDefaultAction and EgressDefaultAction are required by schema v2.
+  NetworkPolicyAction ingress_default_action = 4;
+  NetworkPolicyAction egress_default_action  = 5;
 }
 
 // DNSRule matches either an exact DNS name or a leading "*." suffix pattern.
@@ -138,6 +158,7 @@ message DNSPolicy {
 message NetworkPolicy {
   TrafficPolicy traffic = 1;
   DNSPolicy dns         = 2;
+  uint32 schema_version = 3;
 }
 
 // SetNetworkPolicyRequest replaces a running sandbox's complete policy.
@@ -213,6 +234,12 @@ message XpuAllocation {
 }
 
 // StartRequest describes a sandbox start request.
+// CheckpointInfo references a previously published checkpoint for a
+// cooperative restore during Start (upstream contract).
+message CheckpointInfo {
+  string checkpoint_dir = 1;
+}
+
 message StartRequest {
   // SandboxID is an optional caller-provided sandbox ID. sandboxd generates one when empty.
   string sandbox_id = 1;
@@ -259,6 +286,8 @@ message StartRequest {
   // NetworkPolicy is the sandbox's initial packet and DNS policy. It can be
   // replaced while the sandbox is running with SetNetworkPolicy.
   NetworkPolicy network_policy = 20;
+  CheckpointInfo checkpoint_info = 21;
+  string inject_entrypoint = 22;
 }
 
 // StartResponse is returned after sandbox start.
@@ -294,6 +323,14 @@ message CheckpointRequest {
   // reproduces the workload's on-disk state. Both artifacts are taken at
   // one paused consistency point and the manifest binds them together.
   bool include_filesystem = 8;
+  // TimeoutSeconds bounds the complete checkpoint operation (upstream
+  // contract, seconds). The scheduler line's int64 Timeout at 3 keeps its
+  // wire number; this variant takes the next free slot.
+  uint32 timeout_seconds = 9;
+  // SnapshotType requests a specific checkpoint flavor (upstream contract):
+  // Full, Incremental, or SoftDirty. Empty leaves automatic tier selection
+  // to the runtime; runtimes without incremental checkpoints ignore it.
+  string snapshot_type = 10;
 }
 
 // CheckpointResponse is returned after the checkpoint artifact is published.
@@ -624,10 +661,24 @@ message StatsResponse {
 message ListAvailableRuntimesRequest {}
 
 // ListAvailableRuntimesResponse contains the available runtime class snapshot.
+// RuntimeInfo describes one runtime handler's capabilities.
+message RuntimeInfo {
+  // RuntimeClass is the handler name accepted by sandbox start requests.
+  string runtime_class = 1;
+  // SupportsCheckpointRestore reports whether the handler implements both operations.
+  bool supports_checkpoint_restore = 2;
+  // CheckpointHandoffPath is the guest-visible resume/restore/error endpoint.
+  string checkpoint_handoff_path = 3;
+  // RestoreEnvPath exposes the target OCI process environment after restore.
+  string restore_env_path = 4;
+}
+
 message ListAvailableRuntimesResponse {
   // RuntimeClasses contains the sorted handler names accepted by sandbox start requests.
   // Configured runtime classes whose handlers failed to initialize are excluded.
   repeated string runtime_classes = 1;
+  // Runtimes contains detailed capabilities in runtime_classes order.
+  repeated RuntimeInfo runtimes = 2;
 }
 
 // RestoreIdentity binds a deterministic target sandbox to one exact restore request.

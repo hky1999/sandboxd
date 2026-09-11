@@ -38,6 +38,8 @@ type retirementCgroups struct {
 	recycled  []string
 }
 
+func (c *retirementCgroups) ReadMemoryLimit(string) (int64, error) { return 0, nil }
+
 func (*retirementCgroups) Allocate() (string, error)  { return "/sandbox/lease", nil }
 func (*retirementCgroups) ShutDown() error            { return nil }
 func (*retirementCgroups) SupportsMemoryShrink() bool { return false }

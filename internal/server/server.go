@@ -83,6 +83,7 @@ type sandboxCgroups interface {
 	Prepare(string, *runtime.LinuxSandboxResources) error
 	Stats(string) (cgroupmanager.Stats, error)
 	CgroupIdentity(string) (cgroupmanager.CgroupIdentity, error)
+	ReadMemoryLimit(string) (int64, error)
 	ReadFreeze(string) (cgroupmanager.FreezeState, error)
 	WriteFreeze(string, bool) error
 	WriteMemoryLimits(string, uint64, uint64) error
@@ -328,7 +329,10 @@ func (h *sandboxService) restoreSandboxRuntime(
 		if h.cgroupMgr == nil {
 			return errors.New("cgroup manager is not configured")
 		}
-		hostResources := svc.HostCgroupResources(runtimeName, startConfig.Resources)
+		hostResources := startConfig.Resources
+		if provider, ok := handler.(svc.HostResourcesProvider); ok {
+			hostResources = provider.HostResources(startConfig.Resources)
+		}
 		if err = h.cgroupMgr.Prepare(startConfig.CgroupPath, hostResources); err != nil {
 			return fmt.Errorf("prepare cgroup %s: %w", startConfig.CgroupPath, err)
 		}
@@ -1702,7 +1706,7 @@ func (h *sandboxService) createSandbox(
 	}
 	if portsReserved {
 		h.networkMgr.releaseDnatPorts(sandboxID)
-	}		}
+	}
 		aclCleanupFailed := aclAttempted && !aclRegistered
 		if aclAttempted && h.aclMgr != nil {
 			h.aclMu.Lock()
@@ -1815,7 +1819,8 @@ func (h *sandboxService) createSandbox(
 		}, err
 	}
 	filesystemCommitted = true
-	runtimeRootfs := preparedFilesystem.RootfsPath()	var specUpdates *svc.SpecUpdates
+	runtimeRootfs := preparedFilesystem.RootfsPath()
+	var specUpdates *svc.SpecUpdates
 	if len(startReq.XpuAllocations) > 0 {
 		if h.xpuMgr == nil {
 			err := errors.New("XPU manager is not configured")

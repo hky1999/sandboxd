@@ -15,6 +15,7 @@
 package server
 
 import (
+	runtimeSpec "github.com/opencontainers/runtime-spec/specs-go"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -224,6 +225,153 @@ func (h *sandboxService) checkpoint(
 		return nil, checkpointGRPCError(err)
 	}
 	return checkpointResponse(fact), nil
+}
+
+// validateCheckpointInputDirectory verifies a caller-supplied checkpoint
+// directory for cooperative Start restores (upstream contract).
+// checkpointGuestMemoryResources reads the guest-facing memory booking from
+// a sandbox OCI spec (upstream contract; their tests exercise it).
+func checkpointGuestMemoryResources(
+	sandboxSpec *runtimeSpec.Spec,
+) *runtime.LinuxSandboxResources {
+	if sandboxSpec == nil || sandboxSpec.Linux == nil ||
+		sandboxSpec.Linux.Resources == nil ||
+		sandboxSpec.Linux.Resources.Memory == nil ||
+		sandboxSpec.Linux.Resources.Memory.Limit == nil ||
+		*sandboxSpec.Linux.Resources.Memory.Limit <= 0 {
+		return nil
+	}
+	resources := &runtime.LinuxSandboxResources{
+		MemoryLimitInBytes: *sandboxSpec.Linux.Resources.Memory.Limit,
+	}
+	if swap := sandboxSpec.Linux.Resources.Memory.Swap; swap != nil {
+		resources.MemorySwapLimitInBytes = *swap
+	}
+	return resources
+}
+
+func validateCheckpointInputDirectory(path string) (string, error) {
+	clean, err := validateCheckpointPath(path, true)
+	if err != nil {
+		return "", err
+	}
+	entries, err := os.ReadDir(clean)
+	if err != nil {
+		return "", fmt.Errorf("read checkpoint directory %s: %w", clean, err)
+	}
+	if len(entries) == 0 {
+		return "", fmt.Errorf(
+			"checkpoint directory %s is empty: %w",
+			clean,
+			errord.ErrFailedPrecondition,
+		)
+	}
+	return clean, nil
+}
+
+func validateCheckpointPath(path string, mustExist bool) (string, error) {
+	if strings.TrimSpace(path) == "" || !filepath.IsAbs(path) {
+		return "", fmt.Errorf(
+			"checkpoint directory must be an absolute path: %w",
+			errord.ErrInvalidArgument,
+		)
+	}
+	clean := filepath.Clean(path)
+	if clean == string(filepath.Separator) {
+		return "", fmt.Errorf("checkpoint directory cannot be root: %w", errord.ErrInvalidArgument)
+	}
+	current := string(filepath.Separator)
+	parts := strings.Split(strings.TrimPrefix(clean, string(filepath.Separator)), string(filepath.Separator))
+	for index, part := range parts {
+		current = filepath.Join(current, part)
+		info, err := os.Lstat(current)
+		if errors.Is(err, os.ErrNotExist) && !mustExist && index == len(parts)-1 {
+			return clean, nil
+		}
+		if err != nil {
+			return "", fmt.Errorf("inspect checkpoint path %s: %w", current, err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return "", fmt.Errorf("checkpoint path %s is a symbolic link: %w", current, errord.ErrInvalidArgument)
+		}
+		if !info.IsDir() {
+			return "", fmt.Errorf("checkpoint path %s is not a directory: %w", current, errord.ErrInvalidArgument)
+		}
+	}
+	return clean, nil
+}
+
+type checkpointDirectory struct {
+	path    string
+	created bool
+}
+
+func (directory *checkpointDirectory) cleanup() error {
+	if directory.created {
+		return os.RemoveAll(directory.path)
+	}
+	info, err := os.Lstat(directory.path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("checkpoint path changed during cleanup")
+	}
+	entries, err := os.ReadDir(directory.path)
+	if err != nil {
+		return err
+	}
+	var cleanupErr error
+	for _, entry := range entries {
+		cleanupErr = errors.Join(cleanupErr, os.RemoveAll(filepath.Join(directory.path, entry.Name())))
+	}
+	return cleanupErr
+}
+
+// prepareCheckpointOutputDirectory verifies or creates a caller-supplied
+// checkpoint output directory (upstream contract; their tests exercise it).
+func prepareCheckpointOutputDirectory(path string) (*checkpointDirectory, error) {
+	clean, err := validateCheckpointPath(path, false)
+	if err != nil {
+		return nil, err
+	}
+	info, err := os.Lstat(clean)
+	switch {
+	case err == nil:
+		if !info.IsDir() {
+			return nil, fmt.Errorf(
+				"checkpoint directory %s is not a directory: %w",
+				clean,
+				errord.ErrInvalidArgument,
+			)
+		}
+		entries, readErr := os.ReadDir(clean)
+		if readErr != nil {
+			return nil, fmt.Errorf("read checkpoint directory %s: %w", clean, readErr)
+		}
+		if len(entries) != 0 {
+			return nil, fmt.Errorf(
+				"checkpoint directory %s is not empty: %w",
+				clean,
+				errord.ErrFailedPrecondition,
+			)
+		}
+		return &checkpointDirectory{path: clean}, nil
+	case errors.Is(err, os.ErrNotExist):
+		parent := filepath.Dir(clean)
+		if _, parentErr := validateCheckpointPath(parent, true); parentErr != nil {
+			return nil, fmt.Errorf("invalid checkpoint parent directory: %w", parentErr)
+		}
+		if mkdirErr := os.Mkdir(clean, 0700); mkdirErr != nil {
+			return nil, fmt.Errorf("create checkpoint directory %s: %w", clean, mkdirErr)
+		}
+		return &checkpointDirectory{path: clean, created: true}, nil
+	default:
+		return nil, fmt.Errorf("inspect checkpoint directory %s: %w", clean, err)
+	}
 }
 
 func checkpointResponse(fact checkpoint.Fact) *runtime.CheckpointResponse {

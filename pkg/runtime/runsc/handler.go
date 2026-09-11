@@ -116,8 +116,8 @@ func NewHandler(cfg config.Config, bin string, loader runtimecore.OciLoader) (*H
 		rootfsOverlayTmpfsSize: cfg.RuntimeConfig.OverlayTmpfsSize,
 		filestoreDir:           cfg.RuntimeConfig.FilestoreDir,
 		sandboxRoot:            filepath.Join(root, "containers"),
-		mountEROFS:             mountEROFS,,
-		checkpointRoot:         checkpointRoot
+		mountEROFS:             mountEROFS,
+		checkpointRoot:         checkpointRoot,
 	}, nil
 }
 
@@ -178,7 +178,6 @@ func (r *Handler) Start(ctx context.Context, config runtimecore.StartConfig) err
 		UserStdout:  config.Stdout,
 		UserStderr:  config.Stderr,
 		RootOverlay:         rootOverlay,
-		FsRestoreImagePath:  fsImagePath,
 		Network: NetworkConfig{
 			Interface:   config.Network.Interface,
 			LinkAddress: config.Network.GuestHardwareAddr(),
@@ -312,6 +311,7 @@ func (r *Handler) Restore(
 		UserStdout:  config.Stdout,
 		UserStderr:  config.Stderr,
 		RootOverlay: rootOverlay,
+		FsRestoreImagePath:  fsImagePath,
 		Network: NetworkConfig{
 			Interface:   config.Network.Interface,
 			LinkAddress: config.Network.GuestHardwareAddr(),
