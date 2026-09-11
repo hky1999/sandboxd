@@ -183,6 +183,78 @@ type RuncConfig struct {
 
 // FirecrackerConfig contains immutable guest boot artifacts and VM defaults.
 type FirecrackerConfig struct {
+
+	// CheckpointConcurrency bounds node-wide checkpoint and restore operations.
+	// Zero retains the historical single-operation limit; explicit values are 1..8.
+	CheckpointConcurrency int `toml:"checkpoint_concurrency" json:"checkpointConcurrency"`
+	// SparseFull requires the experimental fork and verified sparse UFFD support.
+	SparseFull bool `toml:"sparse_full" json:"sparseFull"`
+	// SkipUnchanged requires the experimental fork; only incremental snapshots use it.
+	SkipUnchanged bool `toml:"skip_unchanged" json:"skipUnchanged"`
+	// DeferWindowDump splits incremental checkpoints around the pause: the
+	// create request only captures dirty accounting, a background VMM
+	// thread writes the pages while the guest runs, and a second short
+	// pause writes the state file plus the residual re-dirtied ranges.
+	// Guest-visible stall drops to the accounting plus residual cost.
+	DeferWindowDump bool `toml:"defer_window_dump" json:"deferWindowDump"`
+	// VerifyIncrementalMemory adds a full paused-RAM comparison for diagnosis.
+	// It requires the matching experimental VMM and is disabled by default.
+	VerifyIncrementalMemory bool `toml:"verify_incremental_memory" json:"verifyIncrementalMemory"`
+	// VerifyIncrementalMemoryStopOnly avoids diagnostic RAM reads on continuing checkpoints.
+	// It restricts VerifyIncrementalMemory and has no effect when that option is disabled.
+	VerifyIncrementalMemoryStopOnly bool `toml:"verify_incremental_memory_stop_only" json:"verifyIncrementalMemoryStopOnly"`
+	// OCIRootfsEnabled permits an OCI image rootfs to be materialized as a
+	// local EROFS image before the Firecracker VM starts. It is opt-in because
+	// conversion eagerly reads the complete merged image.
+	OCIRootfsEnabled bool `toml:"oci_rootfs_enabled" json:"ociRootfsEnabled"`
+	// MkfsEROFSPath selects the mkfs.erofs executable used for materialization.
+	MkfsEROFSPath string `toml:"mkfs_erofs_path" json:"mkfsEROFSPath"`
+
+	// MemBackend selects how a restore maps guest memory: "file" maps the
+	// checkpoint memory file directly (default), "uffd" restores through a
+	// userfaultfd handler process that populates guest memory on demand.
+	MemBackend string `toml:"mem_backend" json:"memBackend,omitempty"`
+	// UffdHandlerBin is the page-fault handler executable spawned for uffd
+	// restores. Empty looks for firecracker-uffd-handler next to the
+	// sandboxd binary.
+	UffdHandlerBin string `toml:"uffd_handler_bin" json:"uffdHandlerBin,omitempty"`
+	// UffdRemoteURLTemplate builds the source URL for remote uffd restores.
+	// The artifact memory file path is substituted for %s; empty serves the
+	// pages directly from the local artifact file.
+	UffdRemoteURLTemplate string `toml:"uffd_remote_url" json:"uffdRemoteUrl,omitempty"`
+	// UffdCacheDir holds per-sandbox sparse cache files in remote mode.
+	// Empty disables the cache-backed remote chain (falls back to local).
+	UffdCacheDir string `toml:"uffd_cache_dir" json:"uffdCacheDir,omitempty"`
+	// UffdChunkKB is the fetch/copy granularity of the uffd handler.
+	UffdChunkKB uint `toml:"uffd_chunk_kb" json:"uffdChunkKB,omitempty"`
+	// UffdCopyKB is the forward UFFDIO_COPY population span passed to the
+	// handler (-copy-kb). Zero/4 keeps the historical page-granularity
+	// default; larger values (experimental) amortize fault round trips
+	// for bulk consumers like a full-memory dump walk.
+	UffdCopyKB uint `toml:"uffd_copy_kb" json:"uffdCopyKB,omitempty"`
+	// UffdPersistWorkers overrides the handler's persistent-cache IO budget.
+	// Zero inherits the handler default; explicit values must be 1-64.
+	UffdPersistWorkers int `toml:"uffd_persist_workers" json:"uffdPersistWorkers,omitempty"`
+
+	// DigestMemory seals a sha256 of the memory artifact into the
+	// checkpoint manifest so restores reject corrupted artifacts up front
+	// instead of failing inside the restored guest. The hash runs in the
+	// post-resume tail (outside the pause window) and costs roughly a
+	// second per GiB of checkpointed memory. Nil (key absent) means true;
+	// set digest_memory=false to opt out for latency-sensitive setups.
+	DigestMemory *bool `toml:"digest_memory" json:"digestMemory,omitempty"`
+	// DigestMemoryMode selects how the memory digest is derived when
+	// digest_memory is enabled: "sha256" (default, plain sequential
+	// whole-file hash) or "chunks" (per-chunk digests in parallel; the
+	// recorded digest becomes the chunk root and verification follows the
+	// manifest's recorded mode). Chunks mode trades a format marker for a
+	// multi-core seal; enable it cluster-wide so every verifier knows it.
+	DigestMemoryMode string `toml:"digest_memory_mode" json:"digestMemoryMode,omitempty"`
+	// UffdChunkStore points uffd restores at a content-addressed chunk
+	// store. Artifacts carrying a chunks.json next to their memory file are
+	// then served per-chunk by digest (verified while copying); artifacts
+	// without one fall back to the plain backing file.
+	UffdChunkStore string `toml:"uffd_chunk_store" json:"uffdChunkStore,omitempty"`
 	// WritableIOEngine selects Sync, Async, SyncDirect, or AsyncDirect for
 	// the private ext4 disk. Direct engines require a compatible VMM.
 	// The host must provide STATX_DIOALIGN for direct engines and io_uring
@@ -210,6 +282,9 @@ type FirecrackerConfig struct {
 	// generation as a Full snapshot. "incremental" enables the three-tier
 	// chain against a VMM that supports Incremental and SoftDirty snapshots.
 	CheckpointMode string `toml:"checkpoint_mode" json:"checkpointMode"`
+	// VMMLogLevel selects the native VMM startup log level (empty keeps the
+	// VMM default; validated against the fork's --level values).
+	VMMLogLevel string `toml:"vmm_log_level" json:"vmmLogLevel"`
 	// VirtioFSEnabled allows directory-backed root filesystems and read-only
 	// directory mounts to be exported through one sandbox-scoped virtiofsd.
 	// It requires the migration-capable Firecracker build and guest kernel.
@@ -217,6 +292,15 @@ type FirecrackerConfig struct {
 	// VirtioFSDPath selects the upstream virtiofsd executable. The runtime
 	// requires vhost-user DEVICE_STATE and LOG_SHMFD support.
 	VirtioFSDPath string `toml:"virtiofsd_path" json:"virtiofsdPath"`
+}
+
+// DigestMemoryOrDefault resolves the tri-state digest_memory knob with the
+// enabled default.
+func (c FirecrackerConfig) DigestMemoryOrDefault() bool {
+	if c.DigestMemory == nil {
+		return true
+	}
+	return *c.DigestMemory
 }
 
 type ResourceConfig struct {

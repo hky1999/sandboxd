@@ -198,6 +198,8 @@ func TestFirecrackerSnapshotAPI(t *testing.T) {
 		"/run/firecracker/restored.vsock",
 		"",
 		"",
+		"",
+		"",
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -219,6 +221,8 @@ func TestFirecrackerSnapshotAPI(t *testing.T) {
 		"/run/firecracker/virtiofs.vsock",
 		"/run/firecracker/virtiofs.sock",
 		"/checkpoint/virtiofs.state",
+		"",
+		"",
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -331,7 +335,7 @@ func TestSparseFullRequestOptIn(t *testing.T) {
 				}
 				return &http.Response{StatusCode: http.StatusNoContent, Body: http.NoBody}, nil
 			})}}
-			err := api.createSnapshotWithSparse(context.Background(), "state", "memory", tc.typ, tc.enabled)
+			err := api.createSnapshotWithSparse(context.Background(), "state", "memory", "", tc.typ, tc.enabled)
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("error: %v", err)
 			}
@@ -366,7 +370,7 @@ func TestSkipUnchangedRequestOptIn(t *testing.T) {
 				}
 				return &http.Response{StatusCode: http.StatusNoContent, Body: http.NoBody}, nil
 			})}}
-			err := api.createSnapshotWithMemoryOptions(context.Background(), "state", "memory", typ, false, enabled)
+			err := api.createSnapshotWithMemoryAudit(context.Background(), "state", "memory", "", typ, false, enabled, false)
 			invalid := enabled && typ != "Incremental" && typ != "SoftDirty"
 			if (err != nil) != invalid || (invalid && calls != 0) || (!invalid && calls != 1) {
 				t.Fatalf("type=%s enabled=%v err=%v calls=%d", typ, enabled, err, calls)
@@ -395,7 +399,7 @@ func TestVerifyIncrementalMemoryRequestOptIn(t *testing.T) {
 				}
 				return &http.Response{StatusCode: http.StatusNoContent, Body: http.NoBody}, nil
 			})}}
-			err := api.createSnapshotWithMemoryAudit(context.Background(), "state", "memory", typ, false, false, enabled)
+			err := api.createSnapshotWithMemoryAudit(context.Background(), "state", "memory", "", typ, false, false, enabled)
 			invalid := enabled && typ != "Incremental" && typ != "SoftDirty"
 			if (err != nil) != invalid || (invalid && calls != 0) || (!invalid && calls != 1) {
 				t.Fatalf("type=%s enabled=%v err=%v calls=%d", typ, enabled, err, calls)

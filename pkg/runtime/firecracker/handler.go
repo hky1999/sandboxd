@@ -96,6 +96,9 @@ type firecrackerPersistedState struct {
 	// can stamp the compatibility tuple (the vmstate itself pins the count
 	// for a restore).
 	Vcpus uint32 `json:"vcpus,omitempty"`
+	// Generation is the resource generation the instance was admitted on;
+	// conditional checkpoint/delete RPCs fail when it drifted.
+	Generation string `json:"generation,omitempty"`
 	// BaseMemoryPath points at the memory image the Firecracker dirty-page
 	// ledger currently tracks — the previous artifact's own memory file, or
 	// the file a restore loaded.
@@ -322,6 +325,10 @@ func (instance *firecrackerInstance) shouldPersist() bool {
 
 // Handler manages the Firecracker microVM lifecycle.
 type Handler struct {
+	vmmLogLevel string
+	// ociRootfsEnabled allows the server-side image preparation path to
+	// materialize an OCI rootfs directory as EROFS before Start is called.
+	ociRootfsEnabled  bool
 	writableIOEngine  string
 	writableCacheType string
 	binary            string

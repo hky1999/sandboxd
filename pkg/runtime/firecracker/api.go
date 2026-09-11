@@ -216,19 +216,15 @@ func (api *firecrackerAPI) createSnapshot(
 	fsStatePath,
 	snapshotType string,
 ) error {
-	return api.createSnapshotWithSparse(ctx, statePath, memoryPath, snapshotType, false)
+	return api.createSnapshotWithSparse(ctx, statePath, memoryPath, fsStatePath, snapshotType, false)
 }
 
-func (api *firecrackerAPI) createSnapshotWithSparse(ctx context.Context, statePath, memoryPath, snapshotType string, sparseFull bool) error {
-	return api.createSnapshotWithMemoryOptions(ctx, statePath, memoryPath, snapshotType, sparseFull, false)
+func (api *firecrackerAPI) createSnapshotWithSparse(ctx context.Context, statePath, memoryPath, fsStatePath, snapshotType string, sparseFull bool) error {
+	return api.createSnapshotWithMemoryAudit(ctx, statePath, memoryPath, fsStatePath, snapshotType, sparseFull, false, false)
 }
 
-func (api *firecrackerAPI) createSnapshotWithMemoryOptions(ctx context.Context, statePath, memoryPath, snapshotType string, sparseFull, skipUnchanged bool) error {
-	return api.createSnapshotWithMemoryAudit(ctx, statePath, memoryPath, snapshotType, sparseFull, skipUnchanged, false)
-}
-
-func (api *firecrackerAPI) createSnapshotWithMemoryAudit(ctx context.Context, statePath, memoryPath, snapshotType string, sparseFull, skipUnchanged, verifyIncrementalMemory bool) error {
-	return api.createSnapshotWithChunkAlign(ctx, statePath, memoryPath, snapshotType, sparseFull, skipUnchanged, verifyIncrementalMemory, 0, false)
+func (api *firecrackerAPI) createSnapshotWithMemoryAudit(ctx context.Context, statePath, memoryPath, fsStatePath, snapshotType string, sparseFull, skipUnchanged, verifyIncrementalMemory bool) error {
+	return api.createSnapshotWithChunkAlign(ctx, statePath, memoryPath, fsStatePath, snapshotType, sparseFull, skipUnchanged, verifyIncrementalMemory, 0, false)
 }
 
 // DeferDumpStatus is the Phase-B progress view of a deferred dump.
@@ -277,7 +273,7 @@ func (api *firecrackerAPI) snapshotDeferFinish(ctx context.Context, statePath st
 // window target is sparse and its holes mean "parent-owned bytes"; an
 // unaligned dirty range would leave a partially written chunk that no local
 // digest can represent (the seal refuses those — see scanFileChunks).
-func (api *firecrackerAPI) createSnapshotWithChunkAlign(ctx context.Context, statePath, memoryPath, snapshotType string, sparseFull, skipUnchanged, verifyIncrementalMemory bool, chunkAlignBytes int64, deferDump bool) error {
+func (api *firecrackerAPI) createSnapshotWithChunkAlign(ctx context.Context, statePath, memoryPath, fsStatePath, snapshotType string, sparseFull, skipUnchanged, verifyIncrementalMemory bool, chunkAlignBytes int64, deferDump bool) error {
 	if verifyIncrementalMemory && snapshotType != firecrackerSnapshotTypeSoftDirty && snapshotType != firecrackerSnapshotTypeIncremental {
 		return fmt.Errorf("verify_incremental_memory requires Incremental or SoftDirty")
 	}
@@ -325,11 +321,21 @@ func (api *firecrackerAPI) loadSnapshot(
 	tapName,
 	vsockPath,
 	virtioFSSocketPath,
-	virtioFSStatePath string,
+	virtioFSStatePath,
+	memBackendType,
+	memBackendPath string,
 ) error {
+	// The UFFD backend takes precedence over both file backends: lazy page
+	// supply replaces loading bytes at restore time.
 	backend := map[string]string{
 		"backend_type": "File",
 		"backend_path": memoryPath,
+	}
+	if memBackendType != "" {
+		backend = map[string]string{
+			"backend_type": memBackendType,
+			"backend_path": memBackendPath,
+		}
 	}
 	if virtioFSSocketPath != "" {
 		backend = map[string]string{

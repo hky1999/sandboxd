@@ -16,15 +16,12 @@ package firecracker
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
+
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/inclusionAI/sandboxd/pkg/checkpointchunks"
 )
 
 func writeArtifactComponent(t *testing.T, path string, size int) {
@@ -449,6 +446,8 @@ func TestCheckpointV2CarriesVirtioFSState(t *testing.T) {
 		context.Background(),
 		files,
 		manifest,
+		false,
+		nil,
 	); err != nil {
 		t.Fatalf("finalize virtio-fs checkpoint: %v", err)
 	}
@@ -491,6 +490,8 @@ func TestFinalizeCheckpointV2RejectsVirtioFSMismatch(t *testing.T) {
 			MemorySize:   64 << 10,
 			VirtioFS:     true,
 		},
+		false,
+		nil,
 	); err == nil {
 		t.Fatal("sealed a virtio-fs manifest without device state")
 	}
