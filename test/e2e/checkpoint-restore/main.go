@@ -162,6 +162,8 @@ func parseFlags(args []string, errorOutput io.Writer) (options, error) {
 	flag.Var(&value.mounts, "mount",
 		"repeatable mount formatted as host_path:target[:type[:opt1,opt2]]")
 	flag.Parse()
+	return value, nil
+}
 
 func main() {
 	value, err := parseFlags(os.Args[1:], os.Stderr)
@@ -447,7 +449,7 @@ func buildStartRequest(value options) (*runtime.StartRequest, error) {
 	}
 	mounts, err := parseMountFlags(value.mounts)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	request := &runtime.StartRequest{
 		SandboxID: value.sandboxID,

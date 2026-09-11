@@ -15,8 +15,24 @@
 package main
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"os"
+	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
+	"time"
+
+	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
+	"github.com/inclusionAI/sandboxd/pkg/checkpointroot"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/encoding/protojson"
 )
 
 func TestParseMountFlags(t *testing.T) {
@@ -766,5 +782,245 @@ func TestParseFlagsCheckpointOperationModes(t *testing.T) {
 	}
 	if err := validateOptions(value); err != nil {
 		t.Fatalf("legacy checkpoint argv must stay valid: %v", err)
+	}
+}
+
+type fakeClient struct {
+	runtime.SandboxServiceClient
+
+	startCalls              []*runtime.StartRequest
+	checkpointCalls         []*runtime.CheckpointRequest
+	checkpointIfCalls       []*runtime.CheckpointIfGenerationRequest
+	deleteCalls             []*runtime.DeleteRequest
+	deleteIfCalls           []*runtime.DeleteIfGenerationRequest
+	startWithOperationCalls []*runtime.StartWithOperationRequest
+	getStartOperationCalls  []*runtime.GetStartOperationRequest
+
+	checkpointWithOperationCalls []*runtime.CheckpointWithOperationRequest
+	getCheckpointOperationCalls  []*runtime.GetCheckpointOperationRequest
+	recoverCheckpointCalls       []*runtime.RecoverCheckpointOperationRequest
+	abortCheckpointCalls         []*runtime.AbortCheckpointOperationRequest
+
+	startErr              error
+	checkpointErr         error
+	checkpointIfErr       error
+	deleteErr             error
+	deleteIfErr           error
+	startWithOperationErr error
+	getStartOperationErr  error
+
+	checkpointWithOperationErr error
+	getCheckpointOperationErr  error
+	recoverCheckpointErr       error
+	abortCheckpointErr         error
+
+	startWithOperationStatus      *runtime.StartOperationStatus
+	getStartOperationStatus       *runtime.StartOperationStatus
+	checkpointWithOperationStatus *runtime.CheckpointOperationStatus
+	getCheckpointOperationStatus  *runtime.CheckpointOperationStatus
+	recoverCheckpointStatus       *runtime.CheckpointOperationStatus
+	abortCheckpointStatus         *runtime.CheckpointOperationStatus
+
+	retiredGeneration string
+}
+
+func (f *fakeClient) Start(
+	_ context.Context,
+	request *runtime.StartRequest,
+	_ ...grpc.CallOption,
+) (*runtime.StartResponse, error) {
+	f.startCalls = append(f.startCalls, request)
+	return &runtime.StartResponse{ID: request.GetSandboxID()}, f.startErr
+}
+
+func (f *fakeClient) StartWithOperation(
+	_ context.Context,
+	request *runtime.StartWithOperationRequest,
+	_ ...grpc.CallOption,
+) (*runtime.StartOperationStatus, error) {
+	f.startWithOperationCalls = append(f.startWithOperationCalls, request)
+	return f.startWithOperationStatus, f.startWithOperationErr
+}
+
+func (f *fakeClient) GetStartOperation(
+	_ context.Context,
+	request *runtime.GetStartOperationRequest,
+	_ ...grpc.CallOption,
+) (*runtime.StartOperationStatus, error) {
+	f.getStartOperationCalls = append(f.getStartOperationCalls, request)
+	return f.getStartOperationStatus, f.getStartOperationErr
+}
+
+func (f *fakeClient) Checkpoint(
+	_ context.Context,
+	request *runtime.CheckpointRequest,
+	_ ...grpc.CallOption,
+) (*runtime.CheckpointResponse, error) {
+	f.checkpointCalls = append(f.checkpointCalls, request)
+	return new(runtime.CheckpointResponse), f.checkpointErr
+}
+
+func (f *fakeClient) CheckpointIfGeneration(
+	_ context.Context,
+	request *runtime.CheckpointIfGenerationRequest,
+	_ ...grpc.CallOption,
+) (*runtime.CheckpointResponse, error) {
+	f.checkpointIfCalls = append(f.checkpointIfCalls, request)
+	return new(runtime.CheckpointResponse), f.checkpointIfErr
+}
+
+func (f *fakeClient) Delete(
+	_ context.Context,
+	request *runtime.DeleteRequest,
+	_ ...grpc.CallOption,
+) (*runtime.DeleteResponse, error) {
+	f.deleteCalls = append(f.deleteCalls, request)
+	return new(runtime.DeleteResponse), f.deleteErr
+}
+
+func (f *fakeClient) DeleteIfGeneration(
+	_ context.Context,
+	request *runtime.DeleteIfGenerationRequest,
+	_ ...grpc.CallOption,
+) (*runtime.DeleteIfGenerationResponse, error) {
+	f.deleteIfCalls = append(f.deleteIfCalls, request)
+	return &runtime.DeleteIfGenerationResponse{RetiredGeneration: f.retiredGeneration}, f.deleteIfErr
+}
+
+func (f *fakeClient) CheckpointWithOperation(
+	_ context.Context,
+	request *runtime.CheckpointWithOperationRequest,
+	_ ...grpc.CallOption,
+) (*runtime.CheckpointOperationStatus, error) {
+	f.checkpointWithOperationCalls = append(f.checkpointWithOperationCalls, request)
+	return f.checkpointWithOperationStatus, f.checkpointWithOperationErr
+}
+
+func (f *fakeClient) GetCheckpointOperation(
+	_ context.Context,
+	request *runtime.GetCheckpointOperationRequest,
+	_ ...grpc.CallOption,
+) (*runtime.CheckpointOperationStatus, error) {
+	f.getCheckpointOperationCalls = append(f.getCheckpointOperationCalls, request)
+	return f.getCheckpointOperationStatus, f.getCheckpointOperationErr
+}
+
+// RecoverCheckpointOperation is implemented explicitly so tests can prove
+// the recovery action's own RPC selection — and every other action's
+// avoidance of it.
+func (f *fakeClient) RecoverCheckpointOperation(
+	_ context.Context,
+	request *runtime.RecoverCheckpointOperationRequest,
+	_ ...grpc.CallOption,
+) (*runtime.CheckpointOperationStatus, error) {
+	f.recoverCheckpointCalls = append(f.recoverCheckpointCalls, request)
+	return f.recoverCheckpointStatus, f.recoverCheckpointErr
+}
+
+// AbortCheckpointOperation is implemented explicitly so tests can prove the
+// abort action's own RPC selection — and every other action's avoidance of
+// it, the recovery included.
+func (f *fakeClient) AbortCheckpointOperation(
+	_ context.Context,
+	request *runtime.AbortCheckpointOperationRequest,
+	_ ...grpc.CallOption,
+) (*runtime.CheckpointOperationStatus, error) {
+	f.abortCheckpointCalls = append(f.abortCheckpointCalls, request)
+	return f.abortCheckpointStatus, f.abortCheckpointErr
+}
+
+func (f *fakeClient) totalCalls() int {
+	return len(f.startCalls) + len(f.checkpointCalls) + len(f.checkpointIfCalls) +
+		len(f.deleteCalls) + len(f.deleteIfCalls) +
+		len(f.startWithOperationCalls) + len(f.getStartOperationCalls) +
+		len(f.checkpointWithOperationCalls) + len(f.getCheckpointOperationCalls) +
+		len(f.recoverCheckpointCalls) + len(f.abortCheckpointCalls)
+}
+
+func checkpointOptions() options {
+	return options{
+		sandboxID:                "sbx-1",
+		checkpointDir:            "/tmp/cp",
+		checkpointTimeoutSeconds: 30,
+		compress:                 true,
+		leaveRunning:             true,
+		snapshotType:             "Full",
+	}
+}
+
+func captureStdout(t *testing.T, fn func() error) (string, error) {
+	t.Helper()
+	original := os.Stdout
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("stdout pipe: %v", err)
+	}
+	os.Stdout = writer
+	collected := make(chan string, 1)
+	go func() {
+		data, _ := io.ReadAll(reader)
+		collected <- string(data)
+	}()
+	fnErr := fn()
+	writer.Close()
+	os.Stdout = original
+	return <-collected, fnErr
+}
+
+// parseOperationStatus asserts the CLI printed exactly one protojson
+// StartOperationStatus with snake_case field names and nothing else — a mixed
+// human success line or a camelCase field fails the unmarshal or the key set.
+func parseOperationStatus(t *testing.T, output string) *runtime.StartOperationStatus {
+	t.Helper()
+	fields := make(map[string]json.RawMessage)
+	if err := json.Unmarshal([]byte(output), &fields); err != nil {
+		t.Fatalf("stdout %q is not one JSON object: %v", output, err)
+	}
+	for _, key := range []string{"operation_id", "sandbox_id", "state", "resource_generation"} {
+		if _, ok := fields[key]; !ok {
+			t.Fatalf("stdout %q lacks the %q field", output, key)
+		}
+	}
+	status := new(runtime.StartOperationStatus)
+	if err := (protojson.UnmarshalOptions{}).Unmarshal([]byte(output), status); err != nil {
+		t.Fatalf("stdout %q is not one protojson StartOperationStatus: %v", output, err)
+	}
+	return status
+}
+
+func startOptions(t *testing.T) options {
+	t.Helper()
+	return options{
+		rootfs:      "/tmp/rootfs",
+		sandboxID:   "sbx-1",
+		requestFile: filepath.Join(t.TempDir(), "start.json"),
+	}
+}
+
+func restoreOptions(t *testing.T) options {
+	t.Helper()
+	value := options{
+		targetID:           "sbx-2",
+		checkpointDir:      "/tmp/cp",
+		requestFile:        filepath.Join(t.TempDir(), "start.json"),
+		operationID:        "op-restore-1",
+		expectedRootDigest: strings.Repeat("a1", 32),
+	}
+	if err := os.WriteFile(
+		value.requestFile,
+		[]byte(`{"sandbox_id":"sbx-1","runtime":"runsc"}`+"\n"),
+		0600,
+	); err != nil {
+		t.Fatalf("write request file: %v", err)
+	}
+	return value
+}
+
+func succeededStatus(operationID, sandboxID string) *runtime.StartOperationStatus {
+	return &runtime.StartOperationStatus{
+		OperationID:        operationID,
+		SandboxID:          sandboxID,
+		State:              runtime.StartOperationState_START_OPERATION_STATE_SUCCEEDED,
+		ResourceGeneration: "gen-9",
 	}
 }

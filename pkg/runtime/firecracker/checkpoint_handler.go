@@ -241,9 +241,23 @@ func (handler *Handler) Checkpoint(
 
 	// Layout happens before the pause: cloning the base is pure host-side
 	// work the guest should not wait for. A tier-1/2 layout failure degrades
-	// to a Full snapshot; anything else is unrecoverable.
-	files, err := prepareFirecrackerCheckpointV2(config.Directory, base, layoutMemorySize)
-	if hasVirtioFS {
+	// to a Full snapshot; anything else is unrecoverable. It is also the
+	// FIRST component side effect of an identified operation, so the claimed
+	// directory is re-verified immediately before it: the durable intent
+	// proves this operation owns the source, and only the exact claim — the
+	// directory birth identity plus this binding — proves it still owns the
+	// output a missing, replaced, or foreign claim must never lay out into.
+	if !operation.IsZero() {
+		if hook := handler.onCheckpointIntentDurable; hook != nil {
+			hook(operationDirectory)
+		}
+		if err := verifyCheckpointOperationDirectoryOwnership(sandboxID, intentRecord); err != nil {
+			return fmt.Errorf("verify Firecracker checkpoint output ownership for operation %s of sandbox %s before layout: %w",
+				operation.OperationID, sandboxID, err)
+		}
+	}
+	files, err := prepareCheckpointWithProof(ctx, config.Directory, base, layoutMemorySize, baseProof)
+	if err == nil && hasVirtioFS {
 		files.VirtioFSState = filepath.Join(
 			config.Directory,
 			firecrackerCheckpointVirtioFSName,
@@ -1353,11 +1367,7 @@ func (handler *Handler) Restore(ctx context.Context,
 			return fmt.Errorf("attach restored virtiofsd to cgroup: %w", err)
 		}
 	}
-	command := exec.Command(
-		handler.binary,
-		"--api-sock", apiPath,
-		"--id", startConfig.ID,
-	)
+	command := handler.vmmCommand(apiPath, startConfig.ID)
 	command.Dir = stateDir
 	command.Stdout = stdout
 	command.Stderr = stderr
@@ -1447,6 +1457,8 @@ func (handler *Handler) Restore(ctx context.Context,
 		vsockPath,
 		virtioFSSocketPathIfConfigured(virtioFSState),
 		checkpointFiles.VirtioFSState,
+		memBackendType,
+		memBackendPath,
 	); err != nil {
 		return fmt.Errorf("load Firecracker checkpoint for %s: %w", startConfig.ID, err)
 	}
