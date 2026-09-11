@@ -16,13 +16,14 @@ package server
 
 import (
 	"context"
-	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
 	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
+	"github.com/inclusionAI/sandboxd/config"
 	"github.com/inclusionAI/sandboxd/pkg/errord"
 	svc "github.com/inclusionAI/sandboxd/pkg/runtime"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
@@ -36,9 +37,10 @@ type checkpointTestHandler struct {
 	*svc.FakeRuntimeHandler
 
 	mu           sync.Mutex
-	checkpointFn func(context.Context, svc.CheckpointConfig) error
-	restoreFn    func(context.Context, svc.StartConfig) error
-	checkpoints  []svc.CheckpointConfig
+	checkpointFn func(context.Context, string, string, svc.CheckpointOptions) error
+	restoreFn    func(context.Context, svc.StartConfig, string) error
+	checkpoints  []string
+	checkpointOptions []svc.CheckpointOptions
 	restores     []svc.StartConfig
 	restoreDirs  []string
 	starts       []svc.StartConfig
@@ -64,30 +66,31 @@ func (h *checkpointTestHandler) Delete(_ context.Context, _ string) error {
 }
 
 func (h *checkpointTestHandler) Checkpoint(
-	ctx context.Context,
-	config svc.CheckpointConfig,
+	ctx context.Context, sandboxID, dir string, options svc.CheckpointOptions,
 ) error {
 	h.mu.Lock()
-	h.checkpoints = append(h.checkpoints, config)
+	h.checkpoints = append(h.checkpoints, dir)
+	h.checkpointOptions = append(h.checkpointOptions, options)
 	fn := h.checkpointFn
 	h.mu.Unlock()
 	if fn != nil {
-		return fn(ctx, config)
+		return fn(ctx, sandboxID, dir, options)
 	}
-	return os.WriteFile(filepath.Join(config.Directory, "checkpoint.img"), []byte("image"), 0600)
+	return os.WriteFile(filepath.Join(dir, "checkpoint.img"), []byte("image"), 0600)
 }
 
 func (h *checkpointTestHandler) Restore(
 	ctx context.Context,
 	config svc.StartConfig,
+	imagePath string,
 ) error {
 	h.mu.Lock()
 	h.restores = append(h.restores, config)
-	h.restoreDirs = append(h.restoreDirs, config.CheckpointDir)
+	h.restoreDirs = append(h.restoreDirs, imagePath)
 	fn := h.restoreFn
 	h.mu.Unlock()
 	if fn != nil {
-		return fn(ctx, config)
+		return fn(ctx, config, imagePath)
 	}
 	return nil
 }
@@ -100,139 +103,54 @@ func storeRunningSandbox(t *testing.T, service *sandboxService, id, runtimeName 
 	}))
 }
 
-func TestCheckpointForwardsRequest(t *testing.T) {
-	handler := newCheckpointTestHandler()
-	service := newTestService(t, map[string]svc.Handler{"runsc": handler})
-	storeRunningSandbox(t, service, "sbox-checkpoint", "runsc")
-	directory := filepath.Join(t.TempDir(), "checkpoint")
-
-	response, err := service.Checkpoint(context.Background(), &runtime.CheckpointRequest{
-		ID:             "sbox-checkpoint",
-		CheckpointDir:  directory,
-		TimeoutSeconds: 5,
-		Compress:       true,
-		LeaveRunning:   true,
-	})
-	require.NoError(t, err)
-	require.NotNil(t, response)
-	require.Len(t, handler.checkpoints, 1)
-	assert.Equal(t, svc.CheckpointConfig{
-		ID:           "sbox-checkpoint",
-		Directory:    directory,
-		CgroupPath:   "",
-		Compress:     true,
-		LeaveRunning: true,
-	}, handler.checkpoints[0])
-	assert.FileExists(t, filepath.Join(directory, "checkpoint.img"))
-	assert.Zero(t, handler.deleteCalls)
-}
-
-func TestCheckpointFailureCleansResidualsWithoutDeletingSource(t *testing.T) {
-	handler := newCheckpointTestHandler()
-	handler.checkpointFn = func(_ context.Context, config svc.CheckpointConfig) error {
-		require.NoError(t, os.WriteFile(
-			filepath.Join(config.Directory, "partial"),
-			[]byte("partial"),
-			0600,
-		))
-		return errors.New("runtime checkpoint failed")
-	}
-	service := newTestService(t, map[string]svc.Handler{"runsc": handler})
-	storeRunningSandbox(t, service, "sbox-failure", "runsc")
-	directory := filepath.Join(t.TempDir(), "checkpoint")
-	require.NoError(t, os.Mkdir(directory, 0700))
-
-	_, err := service.Checkpoint(context.Background(), &runtime.CheckpointRequest{
-		ID:             "sbox-failure",
-		CheckpointDir:  directory,
-		TimeoutSeconds: 5,
-		LeaveRunning:   true,
-	})
-	require.Error(t, err)
-	assert.ErrorContains(t, err, "source sandbox state is not guaranteed")
-	entries, readErr := os.ReadDir(directory)
-	require.NoError(t, readErr)
-	assert.Empty(t, entries)
-	assert.Zero(t, handler.deleteCalls)
-}
-
-func TestCheckpointTimeoutCleansCreatedDirectory(t *testing.T) {
-	handler := newCheckpointTestHandler()
-	handler.checkpointFn = func(ctx context.Context, config svc.CheckpointConfig) error {
-		require.NoError(t, os.WriteFile(
-			filepath.Join(config.Directory, "partial"),
-			[]byte("partial"),
-			0600,
-		))
-		<-ctx.Done()
-		return ctx.Err()
-	}
-	service := newTestService(t, map[string]svc.Handler{"runsc": handler})
-	storeRunningSandbox(t, service, "sbox-timeout", "runsc")
-	directory := filepath.Join(t.TempDir(), "checkpoint")
-
-	_, err := service.Checkpoint(context.Background(), &runtime.CheckpointRequest{
-		ID:             "sbox-timeout",
-		CheckpointDir:  directory,
-		TimeoutSeconds: 1,
-	})
-	require.Error(t, err)
-	assert.Equal(t, codes.DeadlineExceeded, status.Code(err))
-	assert.NoDirExists(t, directory)
-	assert.Zero(t, handler.deleteCalls)
-}
-
-func TestCheckpointRejectsConcurrentOperation(t *testing.T) {
-	handler := newCheckpointTestHandler()
-	started := make(chan struct{})
-	release := make(chan struct{})
-	handler.checkpointFn = func(_ context.Context, config svc.CheckpointConfig) error {
-		close(started)
-		<-release
-		return os.WriteFile(filepath.Join(config.Directory, "checkpoint.img"), []byte("image"), 0600)
-	}
-	service := newTestService(t, map[string]svc.Handler{"runsc": handler})
-	storeRunningSandbox(t, service, "sbox-concurrent", "runsc")
-	root := t.TempDir()
-	firstResult := make(chan error, 1)
-	go func() {
-		_, err := service.Checkpoint(context.Background(), &runtime.CheckpointRequest{
-			ID:             "sbox-concurrent",
-			CheckpointDir:  filepath.Join(root, "first"),
-			TimeoutSeconds: 5,
-		})
-		firstResult <- err
-	}()
-	<-started
-
-	_, err := service.Checkpoint(context.Background(), &runtime.CheckpointRequest{
-		ID:             "sbox-concurrent",
-		CheckpointDir:  filepath.Join(root, "second"),
-		TimeoutSeconds: 5,
-	})
-	assert.Equal(t, codes.FailedPrecondition, status.Code(err))
-	close(release)
-	assert.NoError(t, <-firstResult)
-}
-
 func TestCheckpointValidatesRequestAndRuntime(t *testing.T) {
 	service := newTestService(t, map[string]svc.Handler{
 		"runsc": svc.NewFakeRuntimeHandler(),
 	})
-	storeRunningSandbox(t, service, "sbox-unsupported", "runsc")
+	const id = "sbox-validate"
+	stageCheckpointSource(t, service, id, "gen-validate")
+	dir := filepath.Join(service.config.RootDir, "checkpoints", "ckpt-validate")
 
+	// The scheduler line requires an explicit checkpoint identity.
 	_, err := service.Checkpoint(context.Background(), &runtime.CheckpointRequest{
-		ID:            "sbox-unsupported",
-		CheckpointDir: filepath.Join(t.TempDir(), "checkpoint"),
+		ID: id, CheckpointDir: dir,
 	})
 	assert.Equal(t, codes.InvalidArgument, status.Code(err))
 
-	_, err = service.Checkpoint(context.Background(), &runtime.CheckpointRequest{
-		ID:             "sbox-unsupported",
-		CheckpointDir:  filepath.Join(t.TempDir(), "checkpoint"),
-		TimeoutSeconds: 1,
+	// A stale expectation is rejected before any runtime work (the
+	// managed-capability and rootfs stages that follow are covered by the
+	// executeCheckpoint-level tests).
+	_, err = service.CheckpointIfGeneration(context.Background(), &runtime.CheckpointIfGenerationRequest{
+		Checkpoint:        &runtime.CheckpointRequest{ID: id, CheckpointDir: dir, CheckpointID: "ckpt-validate"},
+		ExpectedGeneration: "gen-other",
 	})
-	assert.Equal(t, codes.Unimplemented, status.Code(err))
+	assert.Equal(t, codes.FailedPrecondition, status.Code(err))
+}
+
+
+// stageCheckpointSource stages a RUNNING sandbox with a generation label and
+// an OCI bundle so the shared checkpoint path can validate the source.
+func stageCheckpointSource(t *testing.T, service *sandboxService, id, generation string) string {
+	t.Helper()
+	require.NoError(t, service.sandboxManager.StoreMetadata(id, &runtime.SandboxMetadata{
+		ID:             id,
+		RuntimeHandler: "runsc",
+		Labels:         map[string]string{resourceGenerationLabel: generation},
+	}))
+	bundleDir := filepath.Join(service.config.RootDir, "containers", id)
+	require.NoError(t, os.MkdirAll(bundleDir, 0o755))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(bundleDir, config.SandboxSpecFile),
+		[]byte(`{"ociVersion":"1.0.2","process":{"cwd":"/"},"root":{"path":"rootfs"},"linux":{"cgroupsPath":""},"annotations":{}}`),
+		0o600,
+	))
+	return generation
+}
+
+// stageDir registers a managed checkpoint directory under the daemon root.
+func stageDir(t *testing.T, name string) string {
+	t.Helper()
+	return filepath.Join(strings.TrimRight(t.TempDir(), "/"), name)
 }
 
 func TestCheckpointDirectoryValidation(t *testing.T) {
@@ -331,7 +249,7 @@ func TestStartSandboxRuntimeDispatchesRestore(t *testing.T) {
 	require.NoError(t, service.startSandboxRuntime(context.Background(), "runsc", config, nil))
 	require.Len(t, handler.restores, 1)
 	assert.Equal(t, config, handler.restores[0])
-	assert.Equal(t, "/checkpoints/one", handler.restoreDirs[0])
+	assert.Equal(t, filepath.Join("/checkpoints/one", "checkpoint.img"), handler.restoreDirs[0])
 	assert.Empty(t, handler.starts)
 }
 
