@@ -130,18 +130,19 @@ func TestScanFileChunksInheritRequiresParentEntry(t *testing.T) {
 }
 
 func TestTierSelectsInheritedIncrementalWindow(t *testing.T) {
-	// With a chunk manifest recording the parent's digests, a lost byte
-	// lineage routes to the digest-inherited SoftDirty first window: the
-	// dump is chunk-aligned, so every written chunk is locally
-	// representable and holes inherit the parent's bytes.
+	// The digest-inherited first window is gated off pending the
+	// sandboxd-side chunk-alignment re-port: a lost byte lineage must take
+	// the Full fallback even when a chunk manifest is available, because an
+	// unaligned baseless window leaves partially written chunks the seal
+	// refuses.
 	snapshotType, base, incremental, layoutSize, err := selectFirecrackerSnapshotTierUsable(
 		64<<10, "", false, true, "", false, true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if snapshotType != firecrackerSnapshotTypeSoftDirty || base != "" ||
-		incremental || layoutSize != 64<<10 {
-		t.Fatalf("inherited window not selected: type=%q base=%q incr=%v layout=%d",
+	if snapshotType != firecrackerSnapshotTypeFull || base != "" ||
+		incremental || layoutSize != 0 {
+		t.Fatalf("gated inherited window must fall back to Full: type=%q base=%q incr=%v layout=%d",
 			snapshotType, base, incremental, layoutSize)
 	}
 	// Without a chunk manifest the Full fallback stands: holes without a

@@ -481,6 +481,27 @@ func NewHandler(
 	if err := validateFirecrackerWritablePolicy(firecrackerConfig); err != nil {
 		return nil, err
 	}
+	// Fork-only snapshot knobs absorbed by the remote external-dirty-ranges
+	// model: the request surface no longer carries them, so configuring one
+	// must fail loudly instead of silently doing nothing.
+	for knob, enabled := range map[string]bool{
+		"sparse_full":               firecrackerConfig.SparseFull,
+		"skip_unchanged":            firecrackerConfig.SkipUnchanged,
+		"verify_incremental_memory": firecrackerConfig.VerifyIncrementalMemory,
+		"defer_window_dump":         firecrackerConfig.DeferWindowDump,
+	} {
+		if enabled {
+			return nil, fmt.Errorf(
+				"plugin.runtime.firecracker.%s is not supported by the current Firecracker line (absorbed by the external-dirty-ranges rebase); remove the key",
+				knob,
+			)
+		}
+	}
+	// Fail fast on invalid persistence budgets before touching runtime
+	// files or KVM.
+	if firecrackerConfig.UffdPersistWorkers < 0 || firecrackerConfig.UffdPersistWorkers > 64 {
+		return nil, errors.New("uffd_persist_workers must be 0 (handler default) or 1-64")
+	}
 	binary = firecrackerConfigPath(binary)
 	for description, path := range map[string]string{
 		"Firecracker binary": binary,
@@ -869,6 +890,7 @@ func (handler *Handler) Start(
 			VsockPath:   vsockPath,
 			OverlayPath: overlayPath,
 			VirtioFS:    virtioFSState,
+			Generation:  startConfig.ResourceGeneration,
 			CreatedAt:   time.Now().Format(time.RFC3339Nano),
 		},
 		done: make(chan struct{}),
