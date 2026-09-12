@@ -159,9 +159,11 @@ func parseFlags(args []string, errorOutput io.Writer) (options, error) {
 			"before any RPC)")
 	flags.StringVar(&value.workloadCmd, "workload-cmd", "",
 		"override the built-in start workload command (template warmup hooks)")
-	flag.Var(&value.mounts, "mount",
+	flags.Var(&value.mounts, "mount",
 		"repeatable mount formatted as host_path:target[:type[:opt1,opt2]]")
-	flag.Parse()
+	if err := flags.Parse(args); err != nil {
+		return value, err
+	}
 	return value, nil
 }
 

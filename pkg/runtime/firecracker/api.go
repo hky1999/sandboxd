@@ -277,15 +277,12 @@ func (api *firecrackerAPI) createSnapshotWithChunkAlign(ctx context.Context, sta
 	if verifyIncrementalMemory && snapshotType != firecrackerSnapshotTypeSoftDirty && snapshotType != firecrackerSnapshotTypeIncremental {
 		return fmt.Errorf("verify_incremental_memory requires Incremental or SoftDirty")
 	}
-	if chunkAlignBytes != 0 && snapshotType != firecrackerSnapshotTypeSoftDirty && snapshotType != firecrackerSnapshotTypeIncremental {
-		return fmt.Errorf("chunk_align_bytes requires Incremental or SoftDirty")
-	}
-	if skipUnchanged && snapshotType != firecrackerSnapshotTypeSoftDirty && snapshotType != firecrackerSnapshotTypeIncremental {
-		return fmt.Errorf("skip_unchanged requires Incremental or SoftDirty")
-	}
-	if sparseFull && snapshotType != firecrackerSnapshotTypeFull {
-		return fmt.Errorf("sparse_full requires Full")
-	}
+	// The Firecracker snapshot-create request surface is exactly the six
+	// fields the remote line accepts (deny_unknown_fields rejects anything
+	// else). The fork-only knobs sparse_full/skip_unchanged/
+	// verify_incremental_memory/chunk_align_bytes/defer_dump were absorbed
+	// by the remote external-dirty-ranges model and are refused at config
+	// load; they must never reach the request body.
 	body := map[string]any{
 		"snapshot_type": snapshotType,
 		"snapshot_path": statePath,
@@ -294,18 +291,6 @@ func (api *firecrackerAPI) createSnapshotWithChunkAlign(ctx context.Context, sta
 	}
 	if fsStatePath != "" {
 		body["fs_state_path"] = fsStatePath
-	}
-	if skipUnchanged {
-		body["skip_unchanged"] = true
-	}
-	if verifyIncrementalMemory {
-		body["verify_incremental_memory"] = true
-	}
-	if chunkAlignBytes != 0 {
-		body["chunk_align_bytes"] = chunkAlignBytes
-	}
-	if deferDump {
-		body["defer_dump"] = true
 	}
 	// Checkpoint artifacts deliberately remain in the host page cache. The
 	// caller accepts that success does not imply immediate power-loss

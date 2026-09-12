@@ -797,17 +797,14 @@ func selectFirecrackerSnapshotTierUsable(memorySize int64, basePath string, base
 		layoutMemorySize = memorySize
 		if memorySize <= 0 || base == "" || lineageLost {
 			_ = inheritedChunks
-			// Digest-inherited first window: the dump writes into a fresh
-			// sparse target with chunk-aligned ranges (chunk_align_bytes),
-			// so every written chunk is locally representable and holes
-			// carry the parent's digests. The unaligned write this gate
-			// once shipped left partially written chunks whose hole tails
-			// sealed as zeros instead of the parent's bytes — restored
-			// guests died in a kernel panic (found via a standalone-VMM
-			// serial capture; the ground-truth Full diff showed ~146
-			// corrupted chunks). Older VMMs without the field reject the
-			// request and the checkpoint fails closed into a Full retry.
-			if lineageLost && inheritedChunks && memorySize > 0 {
+			// Digest-inherited first window is GATED OFF again: the VMM-side
+			// chunk_align_bytes knob did not survive the remote-priority
+			// rebase (the external-dirty-ranges model absorbed it), and an
+			// unaligned baseless window leaves partially written chunks the
+			// seal must refuse (the historical corruption restored guests
+			// panicked on). Re-opening requires the sandboxd-side range
+			// alignment re-port; until then restored lineages take Full.
+			if false && lineageLost && inheritedChunks && memorySize > 0 {
 				return firecrackerSnapshotTypeSoftDirty, "", false, memorySize, nil
 			}
 			snapshotType = firecrackerSnapshotTypeFull
