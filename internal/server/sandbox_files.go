@@ -109,6 +109,7 @@ func (h *sandboxService) prepareSandboxFiles(
 	sandboxID string,
 	defaults svc.SandboxDefaults,
 	networkIP net.IP,
+	aclEnabled bool,
 	mounts []*runtime.Mount,
 	imageProcess *imageProcessSpec,
 	imageProcessTarget string,
@@ -137,7 +138,7 @@ func (h *sandboxService) prepareSandboxFiles(
 	}
 	needsHosts := !mountDestinationsOwn(owners, "/etc/hosts")
 	needsHostname := !mountDestinationsOwn(owners, "/etc/hostname")
-	needsResolver := h.aclMgr != nil || !mountDestinationsOwn(owners, "/etc/resolv.conf")
+	needsResolver := aclEnabled || !mountDestinationsOwn(owners, "/etc/resolv.conf")
 	if !needsHosts && !needsHostname && !needsResolver && imageProcess == nil {
 		return prepared, nil
 	}
@@ -186,7 +187,7 @@ func (h *sandboxService) prepareSandboxFiles(
 		if !info.Mode().IsRegular() {
 			return nil, fmt.Errorf("resolver source %s is not a regular file", resolver)
 		}
-		if h.aclMgr == nil {
+		if !aclEnabled {
 			prepared.mounts = append(prepared.mounts, sandboxFileMount("/etc/resolv.conf", resolver))
 		} else {
 			if h.interfaceMgr == nil || h.interfaceMgr.BridgeIp.To4() == nil {

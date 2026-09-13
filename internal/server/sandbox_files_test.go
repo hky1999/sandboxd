@@ -106,6 +106,7 @@ func TestPrepareSandboxFilesInjectsImageProcessConfig(t *testing.T) {
 			MountDestinations: defaultSandboxFileDestinations,
 		},
 		nil,
+		false,
 		nil,
 		want,
 		target,
@@ -143,6 +144,7 @@ func TestPrepareSandboxFilesRejectsImageProcessMountConflict(t *testing.T) {
 			"sbox-test",
 			svc.SandboxDefaults{Hostname: svc.DefaultSandboxHostname},
 			nil,
+			false,
 			[]*runtime.Mount{{Target: target}},
 			&imageProcessSpec{Version: 1, Args: []string{}, Cwd: "/"},
 			configTarget,
@@ -193,6 +195,7 @@ func TestPrepareSandboxFiles(t *testing.T) {
 		"sbox-test",
 		svc.SandboxDefaults{Hostname: "configured-host"},
 		net.ParseIP("10.88.0.2"),
+		false,
 		nil,
 		nil,
 		"",
@@ -232,6 +235,7 @@ func TestPrepareSandboxFilesHonorsParentMount(t *testing.T) {
 		"sbox-test",
 		svc.SandboxDefaults{Hostname: svc.DefaultSandboxHostname},
 		nil,
+		false,
 		[]*runtime.Mount{explicit},
 		nil,
 		"",
@@ -253,6 +257,7 @@ func TestPrepareSandboxFilesHonorsBaseResolverMount(t *testing.T) {
 			MountDestinations: []string{"/etc/resolv.conf"},
 		},
 		net.ParseIP("10.88.0.2"),
+		false,
 		nil,
 		nil,
 		"",
@@ -289,6 +294,7 @@ func TestPrepareSandboxFilesUsesManagedResolverForNetworkACL(t *testing.T) {
 			MountDestinations: []string{"/etc/resolv.conf"},
 		},
 		net.ParseIP("10.88.0.2"),
+		true,
 		nil,
 		nil,
 		"",
@@ -322,12 +328,98 @@ func TestValidateManagedResolverMounts(t *testing.T) {
 	}
 }
 
+func TestPrepareSandboxFilesWithoutNetworkACLOnACLNode(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		baseMounts   []string
+		explicitPath string
+		noBridge     bool
+	}{
+		{name: "node resolver"},
+		{name: "node resolver without bridge", noBridge: true},
+		{name: "runtime resolver", baseMounts: []string{"/etc/resolv.conf"}},
+		{name: "explicit resolver", explicitPath: "/etc/resolv.conf"},
+		{name: "explicit parent", explicitPath: "/etc"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			resolver := filepath.Join(root, "node-resolv.conf")
+			content := "nameserver 192.0.2.53\nsearch svc.example\noptions ndots:2 timeout:1\n"
+			if err := os.WriteFile(resolver, []byte(content), 0644); err != nil {
+				t.Fatal(err)
+			}
+			service := &sandboxService{
+				config: config.Config{
+					RootDir: root,
+					PluginConfig: config.PluginConfig{RuntimeConfig: config.RuntimeConfig{
+						ResolvConfPath: resolver,
+					}},
+				},
+				aclMgr:       &networkacl.Manager{},
+				interfaceMgr: &networkmanager.InterfaceManager{BridgeIp: net.ParseIP("10.88.0.1")},
+			}
+			if test.noBridge {
+				service.interfaceMgr = nil
+			}
+			var mounts []*runtime.Mount
+			if test.explicitPath != "" {
+				mounts = []*runtime.Mount{{
+					Target: test.explicitPath,
+					Source: &runtime.Mount_HostPath{HostPath: "/custom/resolver"},
+				}}
+			}
+			// Runc skips ACL registration even when the node has an ACL manager.
+			// It must not need a managed-DNS bridge or override an owned resolver.
+			prepared, err := service.prepareSandboxFiles(
+				"sbox-runc",
+				svc.SandboxDefaults{Hostname: svc.DefaultSandboxHostname, MountDestinations: test.baseMounts},
+				net.ParseIP("10.88.0.2"),
+				false,
+				mounts,
+				nil,
+				"",
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer prepared.Rollback()
+			if _, err := os.Stat(filepath.Join(prepared.root, "resolv.conf")); !os.IsNotExist(err) {
+				t.Fatalf("unexpected managed resolver: %v", err)
+			}
+			if test.explicitPath != "" && prepared.Mounts()[0] != mounts[0] {
+				t.Fatalf("explicit mount changed: %+v", prepared.Mounts())
+			}
+			var injected []*runtime.Mount
+			for _, mount := range prepared.Mounts()[len(mounts):] {
+				if mount.GetTarget() == "/etc/resolv.conf" {
+					injected = append(injected, mount)
+				}
+			}
+			if test.explicitPath != "" || len(test.baseMounts) > 0 {
+				if len(injected) != 0 {
+					t.Fatalf("owned resolver was overridden: %+v", injected)
+				}
+				return
+			}
+			if len(injected) != 1 || injected[0].GetHostPath() != resolver ||
+				!reflect.DeepEqual(injected[0].GetOptions(), []string{"bind", "ro"}) {
+				t.Fatalf("node resolver mount = %+v", injected)
+			}
+			got, err := os.ReadFile(injected[0].GetHostPath())
+			if err != nil || string(got) != content {
+				t.Fatalf("node resolver = %q, %v", got, err)
+			}
+		})
+	}
+}
+
 func TestPrepareSandboxFilesRejectsInvalidHostname(t *testing.T) {
 	service := &sandboxService{config: config.Config{RootDir: t.TempDir()}}
 	_, err := service.prepareSandboxFiles(
 		"sbox-test",
 		svc.SandboxDefaults{Hostname: "bad\nhost"},
 		nil,
+		false,
 		[]*runtime.Mount{{Target: "/etc"}},
 		nil,
 		"",

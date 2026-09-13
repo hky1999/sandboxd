@@ -14,12 +14,9 @@ dns_proxy_concurrency_limit = 256
 dns_proxy_per_sandbox_concurrency_limit = 16
 ```
 
-Enabling it initializes the selected packet backend and a DNS proxy on
-`sandbox0:53`.
-Sandboxd manages every sandbox's `/etc/resolv.conf` so policies can be added
-later without restarting the sandbox. A sandbox with no policy has no ACL
-hooks and its traffic remains unrestricted. `SetNetworkPolicy` can install a
-policy at any time after that sandbox reaches the running state.
+Enabling it initializes the selected packet backend and a DNS proxy on `sandbox0:53`. For runtimes that support network ACLs, sandboxd manages each sandbox's `/etc/resolv.conf` so policies can be added later without restarting the sandbox. A sandbox with no policy has no ACL hooks and its traffic remains unrestricted. `SetNetworkPolicy` can install a policy at any time after that sandbox reaches the running state.
+
+Runc does not support network ACLs and is not registered with the DNS proxy. It uses the configured node resolver unless the runtime or an explicit mount already owns `/etc/resolv.conf`, including through a parent mount such as `/etc`. Enabling ACLs on the node does not redirect runc DNS through the proxy or override these mounts.
 
 Do not enable the feature while the node has existing sandboxes. Their stored
 ACL bindings do not exist yet, so sandboxd deliberately fails startup instead
@@ -64,9 +61,7 @@ is enabled, `net.ipv4.conf.all.rp_filter=0`. Sandboxd sets
 silently change the two host-wide settings. See
 [the bpfnat notes](../bpf/bpfnat/README.md) for the complete backend setup.
 
-When ACL is enabled, a request-provided mount that owns `/etc/resolv.conf` is
-rejected because it could bypass managed DNS. Search domains and resolver
-options from the host resolver file are retained.
+For an ACL-enabled sandbox, a request-provided mount that owns `/etc/resolv.conf` is rejected because it could bypass managed DNS. Search domains and resolver options from the host resolver file are retained.
 
 ## API
 

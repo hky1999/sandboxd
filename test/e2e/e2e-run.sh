@@ -1707,6 +1707,8 @@ run_runc_checks() {
     assert_eq "${got}" "host-mount-ok" "runc host bind mount"
     got="$(sbox_cmd exec "${SANDBOX_ID}" /bin/wget -qO- "http://${GATEWAY_IP}:${HTTP_PORT}/health.txt")"
     assert_eq "${got}" "sandboxd-network-ok" "runc sandbox network"
+    got="$(sbox_cmd exec "${SANDBOX_ID}" /bin/cat /etc/resolv.conf)"
+    assert_eq "${got}" "$(cat /etc/resolv.conf)" "runc node resolver on an ACL-enabled node"
     sbox_cmd exec "${SANDBOX_ID}" /bin/test -c /dev/kvm
     local tty_status=0
     printf 'exit 7\n' | sbox_cmd exec -t "${SANDBOX_ID}" /bin/sh || tty_status=$?
@@ -1726,6 +1728,8 @@ run_runc_checks() {
     wait_for_state "${SANDBOX_ID}" "SANDBOX_STATE_RUNNING"
     got="$(sbox_cmd exec "${SANDBOX_ID}" /bin/echo recovered-runc)"
     assert_eq "${got}" "recovered-runc" "runc exec after sandboxd restart"
+    got="$(sbox_cmd exec "${SANDBOX_ID}" /bin/cat /etc/resolv.conf)"
+    assert_eq "${got}" "$(cat /etc/resolv.conf)" "runc node resolver after sandboxd restart"
 
     local deleted_id="${SANDBOX_ID}"
     sbox_cmd delete "${deleted_id}"
