@@ -797,14 +797,13 @@ func selectFirecrackerSnapshotTierUsable(memorySize int64, basePath string, base
 		layoutMemorySize = memorySize
 		if memorySize <= 0 || base == "" || lineageLost {
 			_ = inheritedChunks
-			// Digest-inherited first window is GATED OFF again: the VMM-side
-			// chunk_align_bytes knob did not survive the remote-priority
-			// rebase (the external-dirty-ranges model absorbed it), and an
-			// unaligned baseless window leaves partially written chunks the
-			// seal must refuse (the historical corruption restored guests
-			// panicked on). Re-opening requires the sandboxd-side range
-			// alignment re-port; until then restored lineages take Full.
-			if false && lineageLost && inheritedChunks && memorySize > 0 {
+			// Digest-inherited first window: the dump writes into a fresh
+			// sparse target, and the VMM grid-aligns every write set on
+			// sparse targets (SEEK_HOLE heuristic, 256KiB grid), so each
+			// written chunk is complete and holes carry the parent's
+			// digests. The seal's partial-chunk guard stays as the
+			// fail-closed invariant enforcer.
+			if lineageLost && inheritedChunks && memorySize > 0 {
 				return firecrackerSnapshotTypeSoftDirty, "", false, memorySize, nil
 			}
 			snapshotType = firecrackerSnapshotTypeFull
