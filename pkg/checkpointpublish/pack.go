@@ -308,7 +308,7 @@ func runPacked(ctx context.Context, dir, id string, store chunkstore.Store, m *c
 				// collection; min-age cannot protect the reuse. Dropping the
 				// reuse routes those chunks through the local repack below,
 				// which refreshes their bytes into fresh pack objects.
-				fenced, ferr := gcReuseFenced(ctx, keyed, keys[i])
+				fenced, ferr := gcFenceClaim(ctx, keyed, keys[i])
 				if ferr != nil {
 					return ferr
 				}
@@ -354,7 +354,7 @@ func runPacked(ctx context.Context, dir, id string, store chunkstore.Store, m *c
 				// on — route the chunk through the local repack instead. An
 				// inherited hole has no local bytes, so a marked parent
 				// fails here rather than sealing zeros under its digest.
-				fenced, ferr := gcReuseFenced(ctx, keyed, chunkstore.PlainKey(c.Digest))
+				fenced, ferr := gcFenceClaim(ctx, keyed, chunkstore.PlainKey(c.Digest))
 				if ferr != nil {
 					return ferr
 				}
@@ -496,7 +496,7 @@ func runPacked(ctx context.Context, dir, id string, store chunkstore.Store, m *c
 			// Sweep fence: a marked pack is scheduled for collection; the
 			// bytes are already in hand, so re-PUT them and let the sweep's
 			// delete-time recheck see the refreshed timestamp and spare it.
-			fenced, ferr := gcReuseFenced(ctx, keyed, key)
+			fenced, ferr := gcFenceClaim(ctx, keyed, key)
 			if ferr != nil {
 				return ferr
 			}

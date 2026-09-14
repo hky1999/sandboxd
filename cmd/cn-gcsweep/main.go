@@ -69,6 +69,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -93,14 +94,16 @@ type sweepReport struct {
 	ArtifactsIndexless int    `json:"artifacts_indexless"`
 	ChunkObjectsLive   int    `json:"chunk_objects_live"`
 	ChunkObjectsDead   int    `json:"chunk_objects_dead"`
-	DeadYoung          int    `json:"dead_young"`    // unreferenced but younger than min-age
-	ForeignKept        int    `json:"foreign_kept"`  // unrecognized key shapes
-	MarksTracked       int    `json:"marks_tracked"` // sweep marks present before this run
-	MarksCreated       int    `json:"marks_created"` // victims marked this run (dry-run: would mark)
-	WaitGrace          int    `json:"wait_grace"`    // victims whose mark has not aged past mark-grace
-	RaceSpared         int    `json:"race_spared"`   // stale-mark candidates spared by the delete-time recheck
-	MarksCleared       int    `json:"marks_cleared"` // obsolete marks removed (object gone/refreshed/referenced)
-	NewArtifacts       int    `json:"new_artifacts"` // artifact sets that appeared mid-sweep (refs merged)
+	DeadYoung          int    `json:"dead_young"`     // unreferenced but younger than min-age
+	ForeignKept        int    `json:"foreign_kept"`   // unrecognized key shapes
+	MarksTracked       int    `json:"marks_tracked"`  // sweep marks present before this run
+	MarksCreated       int    `json:"marks_created"`  // victims marked this run (dry-run: would mark)
+	WaitGrace          int    `json:"wait_grace"`     // victims whose mark has not aged past mark-grace
+	RaceSpared         int    `json:"race_spared"`    // stale-mark candidates spared by the delete-time recheck
+	ClaimsSpared       int    `json:"claims_spared"`  // candidates skipped: a fenced publisher holds the claim
+	ClaimsCleared      int    `json:"claims_cleared"` // stale claims removed
+	MarksCleared       int    `json:"marks_cleared"`  // obsolete marks removed (object gone/refreshed/referenced)
+	NewArtifacts       int    `json:"new_artifacts"`  // artifact sets that appeared mid-sweep (refs merged)
 	Deletions          int    `json:"deletions"`
 	DeletionBytes      int64  `json:"deletion_bytes"`
 	DeleteErrors       int    `json:"delete_errors"`
@@ -158,11 +161,16 @@ func run(ctx context.Context, spec string, del bool, maxArtifactAge time.Duratio
 	}
 	artifacts := make(map[string]*artifactSet)
 	var chunkish []objectInfo
-	marks := make(map[string]time.Time) // swept object key -> marking instant
+	marks := make(map[string]time.Time)  // swept object key -> marking instant
+	claims := make(map[string]time.Time) // swept object key -> claim creation instant
 	report := sweepReport{Store: spec, DryRun: !del}
 	for _, o := range objects {
 		if victim, ok := strings.CutPrefix(o.Key, checkpointpublish.GCMarkNamespace+"/"); ok && victim != "" {
 			marks[victim] = o.Modified
+			continue
+		}
+		if owner, ok := strings.CutPrefix(o.Key, checkpointpublish.GCClaimNamespace+"/"); ok && owner != "" {
+			claims[owner] = o.Modified
 			continue
 		}
 		report.ObjectsTotal++
@@ -314,12 +322,25 @@ func run(ctx context.Context, spec string, del bool, maxArtifactAge time.Duratio
 	freshObjects := map[string]objectInfo{}
 	freshIndexAt := map[string]time.Time{}
 	if del && (len(candidates) > 0 || len(dropObjects) > 0) {
+		// Deletion requires conditional writes: every candidate is taken
+		// under an exclusive gc-claims/<key> create, which is the only way
+		// to close the window between this relisting and the DELETE — a
+		// publisher refreshing an object and committing its INDEX inside
+		// that window holds the claim first, and the claim attempt below
+		// fails closed. A store that does not honor If-None-Match refuses
+		// the whole run before anything is deleted.
+		if err := preflightConditionalWrites(ctx, client, base); err != nil {
+			return fmt.Errorf("store unusable for safe deletion: %w", err)
+		}
 		fresh, err := listAll(ctx, client, base)
 		if err != nil {
 			return fmt.Errorf("relist before delete: %w", err)
 		}
 		for _, o := range fresh {
 			if victim, ok := strings.CutPrefix(o.Key, checkpointpublish.GCMarkNamespace+"/"); ok && victim != "" {
+				continue
+			}
+			if owner, ok := strings.CutPrefix(o.Key, checkpointpublish.GCClaimNamespace+"/"); ok && owner != "" {
 				continue
 			}
 			freshObjects[o.Key] = o
@@ -354,10 +375,31 @@ func run(ctx context.Context, spec string, del bool, maxArtifactAge time.Duratio
 		}
 		report.MarksCleared++
 	}
+	// dropOwnClaim releases the claim this run won for key. Every resolution
+	// branch ends the claim: deletion finished, or the verdict said spare.
+	dropOwnClaim := func(key string) {
+		if err := deleteKey(ctx, client, base, checkpointpublish.GCClaimKey(key)); err != nil {
+			report.DeleteErrors++
+		}
+	}
 	for _, c := range candidates {
 		report.Deletions++
 		report.DeletionBytes += c.size
 		if !del {
+			continue
+		}
+		// Win the exclusive claim BEFORE acting on the cached relisting
+		// verdicts. A publisher fencing this reuse (mark probe → claim →
+		// re-upload → INDEX commit) holds the claim from its refresh until
+		// a later sweep clears it stale, so a 412 here means the object is
+		// spoken for regardless of what the relisting saw — this closes the
+		// relist→DELETE window the verdicts alone cannot.
+		created, cerr := putClaimIfAbsent(ctx, client, base, c.key)
+		if cerr != nil {
+			return fmt.Errorf("claim %s: %w", c.key, cerr)
+		}
+		if !created {
+			report.ClaimsSpared++
 			continue
 		}
 		fresh, exists := freshObjects[c.key]
@@ -383,6 +425,7 @@ func run(ctx context.Context, spec string, del bool, maxArtifactAge time.Duratio
 		default:
 			clearMark(c.key)
 		}
+		dropOwnClaim(c.key)
 	}
 	for _, o := range dropObjects {
 		report.Deletions++
@@ -413,6 +456,23 @@ func run(ctx context.Context, spec string, del bool, maxArtifactAge time.Duratio
 				continue
 			}
 			clearMark(key)
+		}
+	}
+	// Stale claims: a publisher's claim outlives the publish it protected
+	// only when the publisher died mid-fence. Past the mark grace — the
+	// same bound that covers the longest legitimate publish — it protects
+	// nothing a later run cannot re-derive; clear it. A sweep's own claims
+	// live for one candidate iteration and are already released above.
+	if del {
+		for key, at := range claims {
+			if now.Sub(at) < markGrace {
+				continue
+			}
+			if err := deleteKey(ctx, client, base, checkpointpublish.GCClaimKey(key)); err != nil {
+				report.DeleteErrors++
+				continue
+			}
+			report.ClaimsCleared++
 		}
 	}
 
@@ -555,6 +615,81 @@ func putMark(ctx context.Context, client *http.Client, base, key string, at time
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
 		return fmt.Errorf("PUT mark %s: status %d", key, resp.StatusCode)
+	}
+	return nil
+}
+
+// putClaimIfAbsent atomically creates the exclusive claim for key (S3
+// conditional write If-None-Match:*), verifying by read-back that the store
+// honored the condition — a store that ignores the header answers 200 for
+// an overwrite too, which would make the mutual exclusion fiction.
+func putClaimIfAbsent(ctx context.Context, client *http.Client, base, key string) (bool, error) {
+	claimKey := checkpointpublish.GCClaimKey(key)
+	url := base + "/" + claimKey
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, strings.NewReader("sweep"))
+	if err != nil {
+		return false, err
+	}
+	req.Header.Set("If-None-Match", "*")
+	req.ContentLength = int64(len("sweep"))
+	resp, err := client.Do(req)
+	if err != nil {
+		return false, err
+	}
+	resp.Body.Close()
+	switch resp.StatusCode {
+	case http.StatusPreconditionFailed:
+		return false, nil
+	case http.StatusOK, http.StatusNoContent:
+		// Read the claim back: only a genuinely conditional create can be
+		// trusted to have excluded every other writer.
+		got, err := getObject(ctx, client, base, claimKey)
+		if err != nil {
+			return false, fmt.Errorf("verify claim %s: %w", key, err)
+		}
+		if string(got) != "sweep" {
+			return false, fmt.Errorf("store does not honor If-None-Match on %s: claim was overwritten", claimKey)
+		}
+		return true, nil
+	default:
+		return false, fmt.Errorf("conditional PUT claim %s: status %d", key, resp.StatusCode)
+	}
+}
+
+// preflightConditionalWrites proves the store supports create-only PUTs
+// before any deletion happens: create a probe claim, then lose to it. A
+// store that lets the second writer win disables the whole deletion path.
+func preflightConditionalWrites(ctx context.Context, client *http.Client, base string) error {
+	probe := checkpointpublish.GCClaimKey(".preflight-" + strconv.FormatInt(time.Now().UnixNano(), 10))
+	url := base + "/" + probe
+	first, err := http.NewRequestWithContext(ctx, http.MethodPut, url, strings.NewReader("first"))
+	if err != nil {
+		return err
+	}
+	first.Header.Set("If-None-Match", "*")
+	first.ContentLength = 5
+	resp, err := client.Do(first)
+	if err != nil {
+		return err
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
+		return fmt.Errorf("preflight claim: status %d", resp.StatusCode)
+	}
+	second, err := http.NewRequestWithContext(ctx, http.MethodPut, url, strings.NewReader("second"))
+	if err != nil {
+		return err
+	}
+	second.Header.Set("If-None-Match", "*")
+	second.ContentLength = 6
+	resp2, err := client.Do(second)
+	if err != nil {
+		return err
+	}
+	resp2.Body.Close()
+	defer deleteKey(ctx, client, base, probe)
+	if resp2.StatusCode != http.StatusPreconditionFailed {
+		return fmt.Errorf("conditional writes not honored (second create answered %d, want 412)", resp2.StatusCode)
 	}
 	return nil
 }

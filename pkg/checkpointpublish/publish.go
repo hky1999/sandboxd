@@ -361,7 +361,7 @@ func RunWithOptions(ctx context.Context, checkpointDir, id string, store chunkst
 					// and exist only in the store: a marked parent means the
 					// parent generation is going away, and this artifact
 					// cannot be published against it.
-					fenced, err := gcReuseFenced(ctx, keyed, chunkstore.PlainKey(job.chunk.Digest))
+					fenced, err := gcFenceClaim(ctx, keyed, chunkstore.PlainKey(job.chunk.Digest))
 					if err != nil {
 						failUpload(err)
 						continue
@@ -389,7 +389,7 @@ func RunWithOptions(ctx context.Context, checkpointDir, id string, store chunkst
 					} else if ok {
 						// Same fence as the plain probe, on the object
 						// actually being reused (the .z body).
-						fenced, err := gcReuseFenced(ctx, keyed, chunkstore.CompressedKey(job.chunk.Digest))
+						fenced, err := gcFenceClaim(ctx, keyed, chunkstore.CompressedKey(job.chunk.Digest))
 						if err != nil {
 							failUpload(err)
 							continue

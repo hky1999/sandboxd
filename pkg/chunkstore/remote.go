@@ -248,6 +248,68 @@ func (r *Remote) HasKey(ctx context.Context, key string) (bool, error) {
 	return resp.StatusCode == http.StatusOK, nil
 }
 
+// ExclusivePutter is the atomic claim primitive over keyed objects: the PUT
+// succeeds only when the key does not already exist (S3 conditional write
+// If-None-Match:*; O_EXCL locally). The bucket sweep and the publishers use
+// it to make deletion authority and reuse authority mutually exclusive per
+// object — whoever wins the claim owns the key for the duration of one
+// delete or one fenced re-upload.
+type ExclusivePutter interface {
+	// PutKeyIfAbsent uploads an object only when the key is free, reporting
+	// whether this call created it. A store that cannot make the create
+	// atomic must not implement the interface at all.
+	PutKeyIfAbsent(ctx context.Context, key string, body io.Reader) (created bool, err error)
+}
+
+// PutKeyIfAbsent implements the S3 conditional write: If-None-Match:* is
+// honored as "create only" and answers 412 Precondition Failed when the
+// object exists. Servers without conditional-write support answer 200 for
+// the second writer too, which this method reports as an error rather than
+// a silent win — callers rely on the mutual exclusion for correctness.
+func (r *Remote) PutKeyIfAbsent(ctx context.Context, key string, body io.Reader) (bool, error) {
+	buf, err := io.ReadAll(body)
+	if err != nil {
+		return false, err
+	}
+	url := r.baseURL + "/" + strings.TrimLeft(key, "/")
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, bytes.NewReader(buf))
+	if err != nil {
+		return false, err
+	}
+	req.Header.Set("If-None-Match", "*")
+	req.ContentLength = int64(len(buf))
+	resp, err := r.client.Do(req)
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+	switch resp.StatusCode {
+	case http.StatusOK, http.StatusNoContent:
+		// Prove ownership by reading the claim back: a store that ignores
+		// If-None-Match answers 200 for an overwrite too, and mutual
+		// exclusion would be fiction. Only the writer whose token reads
+		// back owns the claim; anything else fails loud.
+		got, err := r.GetKey(ctx, key)
+		if err != nil {
+			return false, fmt.Errorf("verify conditional PUT %s: %w", key, err)
+		}
+		defer got.Close()
+		back, err := io.ReadAll(got)
+		if err != nil {
+			return false, fmt.Errorf("read back conditional PUT %s: %w", key, err)
+		}
+		if !bytes.Equal(back, buf) {
+			return false, fmt.Errorf(
+				"store does not honor If-None-Match on %s: claim was overwritten by a concurrent writer", key)
+		}
+		return true, nil
+	case http.StatusPreconditionFailed:
+		return false, nil
+	default:
+		return false, fmt.Errorf("conditional PUT %s: status %d", key, resp.StatusCode)
+	}
+}
+
 func (r *Remote) getKey(ctx context.Context, url string) (io.ReadCloser, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -327,4 +389,42 @@ func (l *Local) HasKey(ctx context.Context, key string) (bool, error) {
 		return false, nil
 	}
 	return err == nil, err
+}
+
+// PutKeyIfAbsent creates the object exclusively: O_EXCL makes the create
+// atomic, so exactly one concurrent writer can win a local claim.
+func (l *Local) PutKeyIfAbsent(ctx context.Context, key string, r io.Reader) (bool, error) {
+	target := path.Join(l.root, strings.TrimLeft(key, "/"))
+	if err := os.MkdirAll(path.Dir(target), 0o755); err != nil {
+		return false, err
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	f, err := os.OpenFile(target, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+	if err != nil {
+		if os.IsExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	defer f.Close()
+	if _, err := io.Copy(f, r); err != nil {
+		os.Remove(target)
+		return false, err
+	}
+	if err := ctx.Err(); err != nil {
+		os.Remove(target)
+		return false, err
+	}
+	if err := f.Sync(); err != nil {
+		os.Remove(target)
+		return false, err
+	}
+	dir, err := os.Open(path.Dir(target))
+	if err != nil {
+		return false, err
+	}
+	defer dir.Close()
+	return true, dir.Sync()
 }

@@ -185,7 +185,7 @@ func publishOverlayChunks(
 					// hole), so refresh the object by re-uploading instead
 					// of skipping — the digest re-check below keeps the
 					// global namespace poison-proof.
-					fenced, err := gcReuseFenced(ctx, store, key)
+					fenced, err := gcFenceClaim(ctx, store, key)
 					if err != nil {
 						failJob(err)
 						continue

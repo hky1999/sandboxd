@@ -30,7 +30,10 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -39,6 +42,7 @@ import (
 
 	"github.com/inclusionAI/sandboxd/pkg/checkpointchunks"
 	"github.com/inclusionAI/sandboxd/pkg/checkpointpublish"
+	"github.com/inclusionAI/sandboxd/pkg/chunkstore"
 )
 
 type fakeBucket struct {
@@ -71,6 +75,15 @@ func (b *fakeBucket) has(key string) bool {
 
 func (b *fakeBucket) serve(w http.ResponseWriter, r *http.Request) {
 	switch {
+	case r.Method == http.MethodHead:
+		b.mu.Lock()
+		_, ok := b.objects[strings.TrimPrefix(r.URL.Path, "/")]
+		b.mu.Unlock()
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
 	case r.Method == http.MethodGet && r.URL.RawQuery == "":
 		b.mu.Lock()
 		obj, ok := b.objects[strings.TrimPrefix(r.URL.Path, "/")]
@@ -123,6 +136,14 @@ func (b *fakeBucket) serve(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		b.mu.Lock()
 		defer b.mu.Unlock()
+		// S3 conditional write: If-None-Match:* succeeds only when the
+		// object does not exist (the atomic claim primitive).
+		if r.Header.Get("If-None-Match") == "*" {
+			if _, exists := b.objects[key]; exists {
+				w.WriteHeader(http.StatusPreconditionFailed)
+				return
+			}
+		}
 		b.objects[key] = fakeObject{body: body, modified: time.Now()}
 		w.WriteHeader(http.StatusOK)
 	case r.Method == http.MethodDelete:
@@ -486,4 +507,221 @@ func TestSweepMergesMidRunArtifactReferences(t *testing.T) {
 	if bucket.has(checkpointpublish.GCMarkKey(orphan[:2] + "/" + orphan)) {
 		t.Fatal("mark kept after the mid-run reference spared the object")
 	}
+}
+
+// barrierBucket wraps a fake bucket with a barrier that blocks chosen
+// requests (without holding the bucket lock) until released, so a real
+// publisher can run to completion while a sweep sits at the blocked step.
+type barrierBucket struct {
+	inner   *fakeBucket
+	block   func(method, key string) bool
+	hit     chan string
+	release chan struct{}
+}
+
+func (b *barrierBucket) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	key := strings.TrimPrefix(r.URL.Path, "/")
+	if b.block(r.Method, key) {
+		select {
+		case b.hit <- key:
+		default:
+		}
+		<-b.release
+	}
+	b.inner.serve(w, r)
+}
+
+// fixtureCheckpointDir builds a real-bytes checkpoint directory whose
+// WRITABLE LAYER ships as one digest-keyed overlay chunk — the object class
+// materialization fetches eagerly, so losing it breaks published artifacts
+// observably. A real publisher can publish the fixture twice (the second
+// run reuses the chunk objects).
+func fixtureCheckpointDir(t *testing.T) (string, string) {
+	t.Helper()
+	const chunkBytes = 256 << 10
+	data := make([]byte, chunkBytes)
+	for i := range data {
+		data[i] = byte(i*7 + 1)
+	}
+	digest := sha256.Sum256(data)
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "memory"), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "vmstate"), []byte("vmstate"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "overlay.ext4"), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	overlayDigest := hex.EncodeToString(digest[:])
+	om := &checkpointchunks.Manifest{
+		Version: 1, File: "overlay.ext4", FileSize: int64(len(data)),
+		ChunkBytes: chunkBytes, ChunkCount: 1,
+		FileDigestMode: checkpointchunks.FileDigestChunks,
+		Entries:        []checkpointchunks.Chunk{{Offset: 0, Digest: overlayDigest}},
+	}
+	om.FileDigest = checkpointchunks.RootDigest(om.Entries)
+	if err := checkpointchunks.WriteNamed(dir, checkpointpublish.OverlaySidecarName, om); err != nil {
+		t.Fatal(err)
+	}
+	m := &checkpointchunks.Manifest{
+		Version: 1, File: "memory", FileSize: int64(len(data)),
+		ChunkBytes: chunkBytes, ChunkCount: 1,
+		FileDigestMode: checkpointchunks.FileDigestChunks,
+		Entries:        []checkpointchunks.Chunk{{Offset: 0, Digest: hex.EncodeToString(digest[:])}},
+	}
+	m.FileDigest = checkpointchunks.RootDigest(m.Entries)
+	if err := checkpointchunks.Write(dir, m); err != nil {
+		t.Fatal(err)
+	}
+	// The checkpoint manifest is what makes the publisher ship a full
+	// artifact set (INDEX last) rather than bare chunk objects.
+	if err := os.WriteFile(filepath.Join(dir, "manifest.json"),
+		[]byte(`{"snapshot_type":"Full","memory_size":`+strconv.Itoa(len(data))+`}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return dir, overlayDigest
+}
+
+// sweepBarrierPublish runs the reviewer's deterministic interleave: the sweep
+// is parked INSIDE its delete phase (past the re-listing), a real publisher
+// then fences the marked chunk (re-upload) and commits its INDEX, and only
+// then is the sweep let go. The completed publication must survive.
+//
+// parkedOnClaim selects which sweep write parks the run: true blocks the
+// sweep's claim PUT (publisher wins the claim), false blocks the object
+// DELETE itself (the sweep already owns the claim and the publisher must
+// wait it out, then re-upload under its own claim).
+func sweepBarrierPublish(t *testing.T, parkedOnClaim bool) {
+	bucket := newFakeBucket()
+	dir, digest := fixtureCheckpointDir(t)
+	// The parked object is the overlay chunk: materialization reassembles
+	// the writable layer eagerly, so its loss is observable right here.
+	chunkKey := checkpointpublish.OverlayChunkKey(digest)
+
+	// The publisher's endpoint records lost claim races (412 on a
+	// gc-claims PUT), which is the deterministic signal that it is now
+	// contending with the parked sweep.
+	claimLost := make(chan string, 8)
+	plain := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		key := strings.TrimPrefix(r.URL.Path, "/")
+		if r.Method == http.MethodPut && strings.HasPrefix(key, "gc-claims/") &&
+			r.Header.Get("If-None-Match") == "*" && bucket.has(key) {
+			select {
+			case claimLost <- key:
+			default:
+			}
+		}
+		bucket.serve(w, r)
+	}))
+	defer plain.Close()
+	store, err := chunkstore.Open(plain.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Seed: publish p1, drop it, mark its (single) chunk, age the mark.
+	if _, err := checkpointpublish.Run(context.Background(), dir, "p1", store, plain.URL); err != nil {
+		t.Fatalf("seed publish: %v", err)
+	}
+	if err := run(context.Background(), plain.URL, true, 0, []string{"p1"}, 0, time.Hour, 2, false); err != nil {
+		t.Fatalf("mark-only sweep: %v", err)
+	}
+	if !bucket.has(checkpointpublish.GCMarkKey(chunkKey)) {
+		t.Fatalf("chunk %s not marked", chunkKey)
+	}
+	rewindMark(bucket, chunkKey, 2*time.Hour)
+
+	barrier := &barrierBucket{
+		inner: bucket,
+		block: func(method, key string) bool {
+			if parkedOnClaim {
+				return method == http.MethodPut && strings.HasPrefix(key, "gc-claims/")
+			}
+			return method == http.MethodDelete && key == chunkKey
+		},
+		hit:     make(chan string, 8),
+		release: make(chan struct{}),
+	}
+	sweepSrv := httptest.NewServer(barrier)
+	defer sweepSrv.Close()
+	sweepDone := make(chan error, 1)
+	go func() {
+		sweepDone <- run(context.Background(), sweepSrv.URL, true, 0, nil, 0, 0, 2, false)
+	}()
+	select {
+	case <-barrier.hit:
+	case <-time.After(30 * time.Second):
+		t.Fatal("sweep never reached its parked delete-phase write")
+	}
+
+	// The publisher runs against the unimpeded endpoint: fence (mark probe,
+	// claim, re-upload), artifact set, INDEX last, publish returns success.
+	// A fresh directory copy per artifact id: one .publish state per id.
+	p2dir := t.TempDir()
+	for _, name := range []string{"memory", "vmstate", "overlay.ext4", "manifest.json", checkpointchunks.ManifestName, checkpointpublish.OverlaySidecarName} {
+		body, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(p2dir, name), body, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pubDone := make(chan error, 1)
+	go func() {
+		_, err := checkpointpublish.Run(context.Background(), p2dir, "p2", store, plain.URL)
+		pubDone <- err
+	}()
+	if !parkedOnClaim {
+		// The sweep already owns the claim; the publisher must be contending
+		// (412) before the barrier opens — otherwise the race was not set up.
+		select {
+		case <-claimLost:
+		case <-time.After(30 * time.Second):
+			t.Fatal("publisher never contended the parked sweep's claim")
+		}
+	}
+	if parkedOnClaim {
+		if err := <-pubDone; err != nil {
+			t.Fatalf("publisher lost to a parked sweep: %v", err)
+		}
+	}
+	close(barrier.release)
+	if !parkedOnClaim {
+		if err := <-pubDone; err != nil {
+			t.Fatalf("publisher failed after the sweep released its claim: %v", err)
+		}
+	}
+	select {
+	case err := <-sweepDone:
+		if err != nil {
+			t.Fatalf("sweep: %v", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("sweep did not finish after the barrier")
+	}
+
+	// The completed publication must remain fully materializable.
+	mat := filepath.Join(t.TempDir(), "mat")
+	keyed, ok := store.(chunkstore.Keyed)
+	if !ok {
+		t.Fatal("remote store lacks the keyed surface")
+	}
+	if err := checkpointpublish.Materialize(context.Background(), mat, "p2", keyed); err != nil {
+		t.Fatalf("published artifact lost a dependency to the sweep: %v", err)
+	}
+}
+
+// F3b regression (recheck 2026-09-14 §3.2): publisher wins the claim while
+// the sweep is parked past its re-listing — the sweep must spare the object.
+func TestSweepBarrierPublisherWinsClaim(t *testing.T) {
+	sweepBarrierPublish(t, true)
+}
+
+// F3b regression, other direction: the sweep already owns the claim and sits
+// before the object DELETE; the publisher must wait the claim out, re-upload
+// the chunk under its own claim, and still commit a materializable artifact.
+func TestSweepBarrierSweepWinsClaim(t *testing.T) {
+	sweepBarrierPublish(t, false)
 }
