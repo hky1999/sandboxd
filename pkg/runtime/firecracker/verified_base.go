@@ -82,7 +82,12 @@ func selectCheckpointTierWithProof(state firecrackerPersistedState, requested st
 	if proof != nil {
 		usable = proof.matches(state.BaseMemoryPath, size)
 	}
-	chunksOK := state.BaseChunkManifestPath != ""
+	// A recorded digest lineage is only eligible while it still matches the
+	// VMM ledger's epoch. Stale means a dump consumed the window and its seal
+	// failed (or an operation aborted past the dump): the inherited window
+	// would dump only the post-failure delta while holes inherit the parent's
+	// digests, silently omitting the failed generation's writes.
+	chunksOK := state.BaseChunkManifestPath != "" && !state.BaseChunkManifestStale
 	return selectFirecrackerSnapshotTierUsable(size, state.BaseMemoryPath, state.BaseMemoryIncremental, state.BaseMemoryLineageLost, requested, usable, chunksOK)
 }
 

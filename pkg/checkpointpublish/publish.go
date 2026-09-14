@@ -334,6 +334,7 @@ func RunWithOptions(ctx context.Context, checkpointDir, id string, store chunkst
 		chunk checkpointchunks.Chunk
 	}
 	upload := make(chan uploadJob, workers*2)
+	keyed := store.(chunkstore.Keyed)
 	var skippedCount int64
 	var wg sync.WaitGroup
 	var progress int64
@@ -351,10 +352,31 @@ func RunWithOptions(ctx context.Context, checkpointDir, id string, store chunkst
 					failUpload(fmt.Errorf("has chunk %s: %w", job.chunk.Digest[:12], err))
 					continue
 				} else if ok {
-					atomic.AddInt64(&skippedCount, 1)
-					continue
+					// Sweep fence: a marked object is scheduled for
+					// collection once its mark ages past the sweep's grace,
+					// and min-age offers no protection because a reused
+					// object is old by construction. Refresh it by
+					// re-uploading — unless the local artifact is a hole
+					// (an inherited digest), whose bytes are the parent's
+					// and exist only in the store: a marked parent means the
+					// parent generation is going away, and this artifact
+					// cannot be published against it.
+					fenced, err := gcReuseFenced(ctx, keyed, chunkstore.PlainKey(job.chunk.Digest))
+					if err != nil {
+						failUpload(err)
+						continue
+					}
+					if !fenced {
+						atomic.AddInt64(&skippedCount, 1)
+						continue
+					}
+					if job.chunk.Inherited {
+						failUpload(fmt.Errorf(
+							"inherited chunk %s at %d is marked for collection by a bucket sweep; the parent generation's object must be republished before this artifact",
+							job.chunk.Digest[:12], job.chunk.Offset))
+						continue
+					}
 				}
-				keyed := store.(chunkstore.Keyed)
 				if opts.CompressChunks {
 					// Resume and cross-run idempotence: a compressed
 					// object from an interrupted earlier run already
@@ -365,8 +387,25 @@ func RunWithOptions(ctx context.Context, checkpointDir, id string, store chunkst
 						failUpload(fmt.Errorf("has compressed chunk %s: %w", job.chunk.Digest[:12], err))
 						continue
 					} else if ok {
-						atomic.AddInt64(&skippedCount, 1)
-						continue
+						// Same fence as the plain probe, on the object
+						// actually being reused (the .z body).
+						fenced, err := gcReuseFenced(ctx, keyed, chunkstore.CompressedKey(job.chunk.Digest))
+						if err != nil {
+							failUpload(err)
+							continue
+						}
+						if !fenced {
+							atomic.AddInt64(&skippedCount, 1)
+							continue
+						}
+						if job.chunk.Inherited {
+							failUpload(fmt.Errorf(
+								"inherited chunk %s at %d has only a sweep-marked compressed object; the parent generation's object must be republished before this artifact",
+								job.chunk.Digest[:12], job.chunk.Offset))
+							continue
+						}
+						// Fenced but locally representable: fall through
+						// and re-upload the compressed body.
 					}
 				}
 				if job.chunk.Inherited {

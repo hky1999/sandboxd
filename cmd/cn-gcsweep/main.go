@@ -25,19 +25,35 @@
 // additionally guarded by -min-age so chunks of an in-flight publication
 // (objects land before their INDEX) are never caught mid-publish.
 //
+// Deletion itself is MARK-THEN-SWEEP: a candidate is recorded as a
+// gc-marks/<key> object and collected only once that mark has aged past
+// -mark-grace. min-age alone cannot make a single-pass delete safe: a
+// publisher that reuses an OLD object (a Has hit — unchanged chunks are
+// skipped, never re-uploaded) publishes no young bytes for the sweep to
+// spare, and its INDEX lands last. The grace window plus two coordinated
+// checks close that race: publishers probe the mark at every Has-hit
+// reuse and refresh the object instead of skipping (checkpointpublish's
+// gc fence), and the sweep re-lists the bucket immediately before
+// deleting — an object that vanished, was refreshed, or is referenced by
+// an artifact set that appeared mid-sweep is spared and its mark cleared.
+//
 // Artifact SETS (artifacts/<id>/*) are ID-named and exclusive, so they
 // may age out wholesale: -max-artifact-age drops sets whose INDEX is
 // older than the bound, -drop names IDs explicitly. Dropping an artifact
 // removes its objects and stops its chunks from counting as references —
-// a chunk dies only when its LAST referencing artifact is gone.
+// a chunk dies only when its LAST referencing artifact is gone. A dropped
+// set whose INDEX appeared or changed since the listing is spared for a
+// later run (a publication committed under that ID mid-sweep).
 //
 // The tool is fail-closed: if any surviving artifact's INDEX or sidecar
 // cannot be fetched and decoded, NOTHING is deleted, because the live set
 // cannot be proven. Objects with unrecognized key shapes are never
-// touched. Deletion requires -delete; without it the run reports only.
+// touched. Deletion requires -delete; without it the run reports only
+// and writes nothing — no marks either.
 //
 //	cn-gcsweep -store http://172.18.0.1:19000/cn-chunks            # report
-//	cn-gcsweep -store ... -delete -max-artifact-age 168h -min-age 24h
+//	cn-gcsweep -store ... -delete -max-artifact-age 168h -min-age 24h  # marks
+//	cn-gcsweep -store ... -delete ... -mark-grace 0                 # also collect
 //
 // Exit codes: 0 report/deletion ran, 1 error, 2 usage.
 package main
@@ -77,8 +93,14 @@ type sweepReport struct {
 	ArtifactsIndexless int    `json:"artifacts_indexless"`
 	ChunkObjectsLive   int    `json:"chunk_objects_live"`
 	ChunkObjectsDead   int    `json:"chunk_objects_dead"`
-	DeadYoung          int    `json:"dead_young"`   // unreferenced but younger than min-age
-	ForeignKept        int    `json:"foreign_kept"` // unrecognized key shapes
+	DeadYoung          int    `json:"dead_young"`    // unreferenced but younger than min-age
+	ForeignKept        int    `json:"foreign_kept"`  // unrecognized key shapes
+	MarksTracked       int    `json:"marks_tracked"` // sweep marks present before this run
+	MarksCreated       int    `json:"marks_created"` // victims marked this run (dry-run: would mark)
+	WaitGrace          int    `json:"wait_grace"`    // victims whose mark has not aged past mark-grace
+	RaceSpared         int    `json:"race_spared"`   // stale-mark candidates spared by the delete-time recheck
+	MarksCleared       int    `json:"marks_cleared"` // obsolete marks removed (object gone/refreshed/referenced)
+	NewArtifacts       int    `json:"new_artifacts"` // artifact sets that appeared mid-sweep (refs merged)
 	Deletions          int    `json:"deletions"`
 	DeletionBytes      int64  `json:"deletion_bytes"`
 	DeleteErrors       int    `json:"delete_errors"`
@@ -91,24 +113,25 @@ func main() {
 	maxArtifactAge := flag.Duration("max-artifact-age", 0, "drop artifact sets whose INDEX is older (0 keeps all)")
 	drop := flag.String("drop", "", "comma-separated artifact IDs to drop regardless of age")
 	minAge := flag.Duration("min-age", 24*time.Hour, "never delete unreferenced chunk/pack/overlay objects younger than this (in-flight publish guard)")
+	markGrace := flag.Duration("mark-grace", 24*time.Hour, "a deletion candidate is collected only once its sweep mark is older than this (concurrent-reuse fence; keep >= the longest publish)")
 	workers := flag.Int("workers", 8, "concurrent INDEX/sidecar fetches")
 	jsonOut := flag.Bool("json", false, "machine-readable report")
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "usage: cn-gcsweep -store URL [-delete] [-max-artifact-age 168h] [-drop ID,ID] [-min-age 24h]\n")
+		fmt.Fprintf(os.Stderr, "usage: cn-gcsweep -store URL [-delete] [-max-artifact-age 168h] [-drop ID,ID] [-min-age 24h] [-mark-grace 24h]\n")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
-	if *storeSpec == "" || *minAge < 0 || *maxArtifactAge < 0 || *workers < 1 || *workers > 64 {
+	if *storeSpec == "" || *minAge < 0 || *maxArtifactAge < 0 || *markGrace < 0 || *workers < 1 || *workers > 64 {
 		flag.Usage()
 		os.Exit(2)
 	}
-	if err := run(context.Background(), *storeSpec, *del, *maxArtifactAge, strings.Split(*drop, ","), *minAge, *workers, *jsonOut); err != nil {
+	if err := run(context.Background(), *storeSpec, *del, *maxArtifactAge, strings.Split(*drop, ","), *minAge, *markGrace, *workers, *jsonOut); err != nil {
 		fmt.Fprintf(os.Stderr, "gcsweep: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func run(ctx context.Context, spec string, del bool, maxArtifactAge time.Duration, dropIDs []string, minAge time.Duration, workers int, jsonOut bool) error {
+func run(ctx context.Context, spec string, del bool, maxArtifactAge time.Duration, dropIDs []string, minAge, markGrace time.Duration, workers int, jsonOut bool) error {
 	if !strings.HasPrefix(spec, "http://") && !strings.HasPrefix(spec, "https://") {
 		return fmt.Errorf("cn-gcsweep sweeps HTTP stores; use cn-gc for local caches")
 	}
@@ -125,7 +148,9 @@ func run(ctx context.Context, spec string, del bool, maxArtifactAge time.Duratio
 		}
 	}
 
-	// Partition: artifacts/<id>/<file> vs everything else.
+	// Partition: artifacts/<id>/<file> vs sweep marks vs everything else.
+	// Marks are sweep bookkeeping, not payload: they are counted separately
+	// and never join the object totals.
 	type artifactSet struct {
 		objects  []objectInfo
 		indexAt  time.Time
@@ -133,8 +158,13 @@ func run(ctx context.Context, spec string, del bool, maxArtifactAge time.Duratio
 	}
 	artifacts := make(map[string]*artifactSet)
 	var chunkish []objectInfo
+	marks := make(map[string]time.Time) // swept object key -> marking instant
 	report := sweepReport{Store: spec, DryRun: !del}
 	for _, o := range objects {
+		if victim, ok := strings.CutPrefix(o.Key, checkpointpublish.GCMarkNamespace+"/"); ok && victim != "" {
+			marks[victim] = o.Modified
+			continue
+		}
 		report.ObjectsTotal++
 		report.BytesTotal += o.Size
 		if id, ok := artifactIDOfKey(o.Key); ok {
@@ -152,6 +182,7 @@ func run(ctx context.Context, spec string, del bool, maxArtifactAge time.Duratio
 		}
 		chunkish = append(chunkish, o)
 	}
+	report.MarksTracked = len(marks)
 
 	// Resolve references of every KEPT artifact. Fail-closed: one
 	// unresolvable manifest aborts the whole sweep.
@@ -234,30 +265,154 @@ func run(ctx context.Context, spec string, del bool, maxArtifactAge time.Duratio
 		}
 		victims = append(victims, o)
 	}
-	victims = append(victims, dropObjects...)
 
-	// Delete (or report). Artifact-set objects dropped by age or -drop
-	// carry no min-age guard: they are ID-exclusive and their age was the
-	// criterion.
+	// Mark-then-sweep: a victim is never deleted in the run that found it.
+	// It is recorded as gc-marks/<key> and becomes collectable only once the
+	// mark has aged past -mark-grace. The grace window is the
+	// concurrent-publish fence: a publisher that leans on an existing object
+	// (a Has hit — min-age cannot protect this, the object is old by
+	// construction) probes the mark at reuse time and refreshes the object
+	// instead of skipping the upload, and a publication that commits during
+	// the window appears as a new artifact set whose references the
+	// delete-time recheck merges. An existing mark keeps its original
+	// timestamp: rewriting it would reset the grace and let an unlucky
+	// object cycle marks forever.
+	victimSet := make(map[string]struct{}, len(victims))
 	for _, o := range victims {
+		victimSet[o.Key] = struct{}{}
+		if _, marked := marks[o.Key]; marked {
+			continue
+		}
+		if del {
+			if err := putMark(ctx, client, base, o.Key, now); err != nil {
+				return fmt.Errorf("mark %s: %w", o.Key, err)
+			}
+			marks[o.Key] = now
+		}
+		report.MarksCreated++
+	}
+	type candidate struct {
+		key  string
+		size int64
+	}
+	var candidates []candidate
+	for _, o := range victims {
+		if marked, ok := marks[o.Key]; ok && now.Sub(marked) >= markGrace {
+			candidates = append(candidates, candidate{key: o.Key, size: o.Size})
+		} else {
+			report.WaitGrace++
+		}
+	}
+
+	// Delete-time recheck. Everything is re-verified against a fresh
+	// listing: objects that vanished, were refreshed (a publisher's fence
+	// re-uploaded them), or became referenced — including through artifact
+	// sets that appeared while this sweep ran — are spared and their marks
+	// cleared. Artifact-set objects dropped by age or -drop stay immediate
+	// and ID-exclusive, but a set whose INDEX changed since the listing is
+	// spared wholesale: something re-published under that ID mid-sweep.
+	freshObjects := map[string]objectInfo{}
+	freshIndexAt := map[string]time.Time{}
+	if del && (len(candidates) > 0 || len(dropObjects) > 0) {
+		fresh, err := listAll(ctx, client, base)
+		if err != nil {
+			return fmt.Errorf("relist before delete: %w", err)
+		}
+		for _, o := range fresh {
+			if victim, ok := strings.CutPrefix(o.Key, checkpointpublish.GCMarkNamespace+"/"); ok && victim != "" {
+				continue
+			}
+			freshObjects[o.Key] = o
+			if id, ok := artifactIDOfKey(o.Key); ok && strings.HasSuffix(o.Key, "/"+checkpointpublish.IndexName) {
+				freshIndexAt[id] = o.Modified
+			}
+		}
+		for id := range freshIndexAt {
+			set, seen := artifacts[id]
+			if seen && (set.hasIndex && freshIndexAt[id].Equal(set.indexAt)) {
+				continue
+			}
+			// A set that appeared (or had its INDEX rewritten) after the
+			// scan: its references were invisible to the live set above.
+			live, err := artifactReferences(ctx, client, base, id)
+			if err != nil {
+				return fmt.Errorf("live set unprovable after concurrent publication, nothing deleted: artifact %s: %w", id, err)
+			}
+			for key := range live {
+				refs[key] = struct{}{}
+			}
+			report.NewArtifacts++
+		}
+	}
+	deleteObject := func(key string) bool {
+		return deleteKey(ctx, client, base, key) == nil
+	}
+	clearMark := func(key string) {
+		if err := deleteKey(ctx, client, base, checkpointpublish.GCMarkKey(key)); err != nil {
+			report.DeleteErrors++
+			return
+		}
+		report.MarksCleared++
+	}
+	for _, c := range candidates {
+		report.Deletions++
+		report.DeletionBytes += c.size
+		if !del {
+			continue
+		}
+		fresh, exists := freshObjects[c.key]
+		_, live := refs[c.key]
+		switch {
+		case !exists:
+			// The object vanished (another sweeper, an operator): the mark
+			// is obsolete either way.
+			clearMark(c.key)
+		case now.Sub(fresh.Modified) < minAge:
+			// Refreshed mid-flight: a publisher fenced its Has-hit reuse by
+			// re-uploading. No longer at risk; drop the mark and let a later
+			// sweep re-evaluate from scratch.
+			report.RaceSpared++
+			clearMark(c.key)
+		case live:
+			// Referenced now (a publication committed during the grace
+			// window): its INDEX covers the object from here on.
+			report.RaceSpared++
+			clearMark(c.key)
+		case !deleteObject(c.key):
+			report.DeleteErrors++
+		default:
+			clearMark(c.key)
+		}
+	}
+	for _, o := range dropObjects {
 		report.Deletions++
 		report.DeletionBytes += o.Size
 		if !del {
 			continue
 		}
-		req, err := http.NewRequestWithContext(ctx, http.MethodDelete, base+"/"+o.Key, nil)
-		if err != nil {
-			report.DeleteErrors++
-			continue
+		if id, ok := artifactIDOfKey(o.Key); ok {
+			if indexAt, has := freshIndexAt[id]; has {
+				if set, seen := artifacts[id]; !seen || !set.hasIndex || !indexAt.Equal(set.indexAt) {
+					// The INDEX appeared or changed since the listing: a
+					// publication committed under this ID mid-sweep.
+					report.RaceSpared++
+					continue
+				}
+			}
 		}
-		resp, err := client.Do(req)
-		if err != nil {
+		if !deleteObject(o.Key) {
 			report.DeleteErrors++
-			continue
 		}
-		resp.Body.Close()
-		if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
-			report.DeleteErrors++
+	}
+	// Obsolete marks: the underlying key is no longer a victim (became
+	// referenced, or the object is gone). Leaving them would fence reuse
+	// forever on the publisher side.
+	if del {
+		for key := range marks {
+			if _, still := victimSet[key]; still {
+				continue
+			}
+			clearMark(key)
 		}
 	}
 
@@ -267,10 +422,13 @@ func run(ctx context.Context, spec string, del bool, maxArtifactAge time.Duratio
 	} else {
 		fmt.Printf("gcsweep: store=%s objects=%d (%dMiB) artifacts kept/dropped/indexless=%d/%d/%d "+
 			"chunk-objects live/dead/young/foreign=%d/%d/%d/%d "+
+			"marks tracked/created/wait-grace=%d/%d/%d spared/cleared/new-artifacts=%d/%d/%d "+
 			"reclaim %d objects (%dMiB) errors=%d dry-run=%v\n",
 			spec, report.ObjectsTotal, report.BytesTotal>>20,
 			report.ArtifactsKept, report.ArtifactsDropped, report.ArtifactsIndexless,
 			report.ChunkObjectsLive, report.ChunkObjectsDead, report.DeadYoung, report.ForeignKept,
+			report.MarksTracked, report.MarksCreated, report.WaitGrace,
+			report.RaceSpared, report.MarksCleared, report.NewArtifacts,
 			report.Deletions, report.DeletionBytes>>20, report.DeleteErrors, report.DryRun)
 	}
 	return nil
@@ -318,7 +476,17 @@ func artifactReferences(ctx context.Context, client *http.Client, base, id strin
 		if err != nil {
 			return nil, fmt.Errorf("decode sidecar %s: %w", name, err)
 		}
+		// Overlay chunks live in their own global namespace
+		// (overlay-chunks/<aa>/<digest>) and are never uploaded compressed
+		// or packed: registering the memory-style key for them would leave
+		// every live overlay object unreferenced, turning surviving blocks
+		// into deletion candidates the moment they age past min-age.
+		overlay := name == checkpointpublish.OverlaySidecarName
 		for _, entry := range m.Entries {
+			if overlay {
+				refs[checkpointpublish.OverlayChunkKey(entry.Digest)] = struct{}{}
+				continue
+			}
 			refs[entry.Digest[:2]+"/"+entry.Digest] = struct{}{}
 			refs[chunkstore.CompressedKey(entry.Digest)] = struct{}{}
 		}
@@ -367,6 +535,43 @@ func getObject(ctx context.Context, client *http.Client, base, key string) ([]by
 		return nil, fmt.Errorf("GET %s: status %d", key, resp.StatusCode)
 	}
 	return io.ReadAll(io.LimitReader(resp.Body, checkpointchunks.MaxManifestBytes+1<<20))
+}
+
+// putMark records a deletion candidate: a small object whose store
+// modification time is the marking instant (the body repeats it for
+// operators reading the bucket by hand). Publishers probe marks at Has-hit
+// reuse and refresh the object instead of leaning on it; the sweep collects
+// only marks older than the grace and re-verifies everything at delete time.
+func putMark(ctx context.Context, client *http.Client, base, key string, at time.Time) error {
+	body := strings.NewReader(at.UTC().Format(time.RFC3339Nano))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, base+"/"+checkpointpublish.GCMarkKey(key), body)
+	if err != nil {
+		return err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
+		return fmt.Errorf("PUT mark %s: status %d", key, resp.StatusCode)
+	}
+	return nil
+}
+
+// deleteKey removes one object (a collected victim, an obsolete mark, or a
+// dropped artifact-set file). A missing object is success: sweeps are
+// idempotent and a concurrent sweeper may have won.
+func deleteKey(ctx context.Context, client *http.Client, base, key string) error {
+	resp, err := client.Do(mustRequest(ctx, http.MethodDelete, base+"/"+key))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNotFound {
+		return fmt.Errorf("DELETE %s: status %d", key, resp.StatusCode)
+	}
+	return nil
 }
 
 func mustRequest(ctx context.Context, method, url string) *http.Request {

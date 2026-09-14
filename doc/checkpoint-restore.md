@@ -191,6 +191,21 @@ restart always marks the lineage lost for surviving sandboxes: the restart
 cannot tell which generation the surviving VMM is armed against, so the
 cheapest provably-safe recovery is one `Full` checkpoint per sandbox.
 
+The same rule governs the digest lineage behind the inherited first window
+(the sparse-placeholder base a restore records): the recorded chunk manifest
+is eligible only while it still matches the ledger's epoch. A checkpoint that
+consumed the window (the dump was written and the ledger re-armed) but failed
+to seal marks the digest lineage stale — re-opening the inherited window
+against the old parent would dump only the post-failure delta while hole
+chunks inherit the parent's digests, silently omitting the failed
+generation's writes, and the artifact would be internally digest-consistent,
+so no later check could catch it. Staleness clears only where the
+manifest-to-ledger alignment is provable again: a fresh restore adoption of
+the sparse placeholder, or a successful seal adopting its own artifact. Every
+other lineage-loss site (snapshot errors past the attempt, deferred-dump
+failures, post-resume seal errors, aborted checkpoint operations, verification
+failures adopting a sealed base) keeps the stale mark and forces `Full`.
+
 The manifest digests the small VM state and optional virtiofsd state
 components. Hashing the memory file
 or `overlay.ext4` is skipped because it costs seconds of CPU and page-cache
@@ -583,7 +598,9 @@ The artifact set's small files — `manifest.json`, `chunks.json`, `vmstate`, an
 
 ### Bucket sweep (cn-gcsweep)
 
-Content-addressed chunk objects are shared across artifacts and generations, so they cannot expire by age. `cn-gcsweep -store URL` reference-counts instead: every surviving artifact's INDEX and the sidecars it names (bundle or per-file) contribute the exact live key set — plain and `.z` chunk objects, memory packs of both identities, overlay chunks — and only objects referenced by no surviving artifact become deletion candidates, additionally guarded by `-min-age` (default 24h) so chunks of an in-flight publication, whose objects land before their INDEX, are never caught mid-publish. Artifact sets (`artifacts/<id>/*`) are ID-named and exclusive, so they may age out wholesale: `-max-artifact-age` drops sets whose INDEX is older and `-drop ID,ID` names sets explicitly; a chunk dies only when its last referencing artifact is gone. The tool is fail-closed — one unfetchable or undecodable INDEX or sidecar aborts every deletion because the live set cannot be proven — and objects with unrecognized key shapes are never touched. Without `-delete` the run only reports. Sweep runs are operational tooling (cron or manual), not wired into publishers; concurrent sweeps are safe because deletions are idempotent and the reference scan is read-only, but a sweep racing a publisher relies on the min-age guard.
+Content-addressed chunk objects are shared across artifacts and generations, so they cannot expire by age. `cn-gcsweep -store URL` reference-counts instead: every surviving artifact's INDEX and the sidecars it names (bundle or per-file) contribute the exact live key set — plain and `.z` chunk objects under `<aa>/<digest>` keys, memory packs of both identities, overlay chunks under their own `overlay-chunks/<aa>/<digest>` namespace — and only objects referenced by no surviving artifact become deletion candidates, additionally guarded by `-min-age` (default 24h) so chunks of an in-flight publication, whose objects land before their INDEX, are never caught mid-publish. Artifact sets (`artifacts/<id>/*`) are ID-named and exclusive, so they may age out wholesale: `-max-artifact-age` drops sets whose INDEX is older and `-drop ID,ID` names sets explicitly; a chunk dies only when its last referencing artifact is gone. The tool is fail-closed — one unfetchable or undecodable INDEX or sidecar aborts every deletion because the live set cannot be proven — and objects with unrecognized key shapes are never touched. Without `-delete` the run only reports and writes nothing.
+
+Deletion is mark-then-sweep because min-age alone cannot make a single-pass delete safe: a publisher that reuses an OLD object (unchanged chunks are Has hits, never re-uploaded) publishes no young bytes for the sweep to spare, and its INDEX lands last. A candidate is therefore recorded as a `gc-marks/<key>` object and collected only once that mark has aged past `-mark-grace` (default 24h). The grace window is fenced from both sides: publishers probe the mark at every Has-hit reuse and refresh the object by re-uploading instead of skipping (an inherited hole has no local bytes, so a marked parent fails the publish with a republish-the-parent error instead of sealing zeros under its digest), and the sweep re-lists the bucket immediately before deleting — an object that vanished, was refreshed, or is referenced by an artifact set that appeared mid-sweep is spared and its mark cleared. Artifact-set drops re-verify the set's INDEX mtime the same way. The residual exposure is a publisher whose Has probes all precede the marking yet whose INDEX outlives the full grace window; keep the grace at or above the longest legitimate publish (cn-publishd crash-resume included) and the window stays shut. Concurrent sweeps are safe: marks are idempotent, deletions are idempotent, and the reference scan is read-only.
 
 `Materialize` (cn-fetch) rebuilds a restorable directory on a node that
 never saw the source. Every file is digest-verified against the INDEX, the

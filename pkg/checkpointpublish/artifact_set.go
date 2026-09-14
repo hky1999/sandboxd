@@ -178,7 +178,21 @@ func publishOverlayChunks(
 					failJob(fmt.Errorf("has overlay chunk %s: %w", j.digest[:12], err))
 					continue
 				} else if ok {
-					continue
+					// Sweep fence: a marked overlay block is scheduled for
+					// collection once its mark ages past the sweep's grace,
+					// and min-age cannot protect the reuse (the object is old
+					// by construction). The local bytes are real (not a
+					// hole), so refresh the object by re-uploading instead
+					// of skipping — the digest re-check below keeps the
+					// global namespace poison-proof.
+					fenced, err := gcReuseFenced(ctx, store, key)
+					if err != nil {
+						failJob(err)
+						continue
+					}
+					if !fenced {
+						continue
+					}
 				}
 				block := make([]byte, j.length)
 				n, err := overlay.ReadAt(block, j.offset)

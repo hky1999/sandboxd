@@ -157,6 +157,64 @@ func TestTierSelectsInheritedIncrementalWindow(t *testing.T) {
 	}
 }
 
+func TestTierForcesFullWhenDigestLineageStale(t *testing.T) {
+	// F1 regression: a checkpoint consumed the VMM window (the dump was
+	// written and the ledger re-armed) but its seal failed. The recorded
+	// chunk manifest then describes a generation the ledger has moved past:
+	// re-opening the inherited window would dump only the post-failure
+	// delta while hole chunks inherit the parent's digests, silently
+	// omitting every page the failed generation wrote. The digest lineage
+	// must be ineligible until a fresh restore or a successful seal
+	// re-aligns the manifest with the ledger epoch.
+	fresh := firecrackerPersistedState{
+		MemoryMiB:             64,
+		BaseChunkManifestPath: "/base/chunks.json",
+		BaseMemoryLineageLost: true, // the restore-produced digest base
+	}
+	snapshotType, base, _, layoutSize, err := selectCheckpointTierWithProof(fresh, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshotType != firecrackerSnapshotTypeSoftDirty || base != "" || layoutSize != 64<<20 {
+		t.Fatalf("fresh restore must keep the inherited window: type=%q base=%q layout=%d",
+			snapshotType, base, layoutSize)
+	}
+	stale := fresh
+	stale.BaseChunkManifestStale = true
+	snapshotType, base, _, layoutSize, err = selectCheckpointTierWithProof(stale, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshotType != firecrackerSnapshotTypeFull || base != "" || layoutSize != 0 {
+		t.Fatalf("stale digest lineage must force Full: type=%q base=%q layout=%d",
+			snapshotType, base, layoutSize)
+	}
+}
+
+func TestBaseDigestLineageStalenessTransitions(t *testing.T) {
+	// The three shapes of losing the byte lineage:
+	//  - a failed dump/seal stales the digest lineage too (the window was
+	//    consumed against a generation that never sealed);
+	//  - a restore adoption of a sparse placeholder keeps it eligible (the
+	//    VMM was loaded from exactly the manifest's bytes);
+	//  - adopting a byte base re-aligns the epoch and clears the flag.
+	instance := &firecrackerInstance{state: firecrackerPersistedState{
+		BaseChunkManifestPath: "/base/chunks.json",
+	}}
+	instance.markBaseMemoryDigestInherited()
+	if !instance.state.BaseMemoryLineageLost || instance.baseChunkManifestStale() {
+		t.Fatal("restore adoption must keep the digest lineage eligible")
+	}
+	instance.markBaseMemoryLineageLost()
+	if !instance.baseChunkManifestStale() {
+		t.Fatal("a failed dump/seal must stale the digest lineage")
+	}
+	instance.setBaseMemoryProof("/new/base", false, nil)
+	if instance.baseChunkManifestStale() || instance.state.BaseMemoryLineageLost {
+		t.Fatal("adopting a byte base must clear both lineage-loss marks")
+	}
+}
+
 func TestScanFileChunksRejectsPartialChunkUnderInheritance(t *testing.T) {
 	parent := &checkpointchunks.Manifest{
 		Version: 1, File: "memory", FileSize: 4 * checkpointchunks.DefaultChunkBytes,

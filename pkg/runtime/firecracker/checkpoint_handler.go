@@ -677,6 +677,7 @@ func (handler *Handler) persistCheckpointChanges(instance *firecrackerInstance, 
 		state.BaseMemoryPath = ""
 		state.BaseMemoryIncremental = false
 		state.BaseMemoryLineageLost = false
+		state.BaseChunkManifestStale = false
 	}
 	if before == after {
 		return nil
@@ -743,6 +744,18 @@ func (handler *Handler) loadInheritedChunkManifest(instance *firecrackerInstance
 	if path == "" {
 		return nil
 	}
+	// A stale manifest describes a generation the VMM ledger has moved past
+	// (a dump consumed the window and the seal failed). Inheriting hole
+	// digests from it would seal an artifact that is missing the failed
+	// generation's writes — refuse regardless of the caller: the Full path
+	// this forces is the only provable artifact.
+	if instance.baseChunkManifestStale() {
+		logrus.Warnf(
+			"firecracker: inherited chunk manifest %s is stale (the ledger epoch moved past it); taking Full",
+			path,
+		)
+		return nil
+	}
 	manifest, err := checkpointchunks.Load(filepath.Dir(path))
 	if err != nil {
 		logrus.Warnf(
@@ -796,13 +809,16 @@ func selectFirecrackerSnapshotTierUsable(memorySize int64, basePath string, base
 		snapshotType = firecrackerSnapshotTypeSoftDirty
 		layoutMemorySize = memorySize
 		if memorySize <= 0 || base == "" || lineageLost {
-			_ = inheritedChunks
 			// Digest-inherited first window: the dump writes into a fresh
 			// sparse target, and the VMM grid-aligns every write set on
 			// sparse targets (SEEK_HOLE heuristic, 256KiB grid), so each
 			// written chunk is complete and holes carry the parent's
 			// digests. The seal's partial-chunk guard stays as the
-			// fail-closed invariant enforcer.
+			// fail-closed invariant enforcer. Eligibility is settled by the
+			// callers (verified_base/loadInheritedChunkManifest): inherited
+			// chunks are only offered when the recorded manifest still
+			// matches the VMM ledger's epoch — never after a dump whose
+			// seal failed, which would omit that generation's writes.
 			if lineageLost && inheritedChunks && memorySize > 0 {
 				return firecrackerSnapshotTypeSoftDirty, "", false, memorySize, nil
 			}
@@ -1035,7 +1051,12 @@ func adoptCheckpointMemory(
 				memoryPath, err,
 			)
 		}
-		instance.markBaseMemoryLineageLost()
+		// The VMM was loaded from exactly this placeholder's bytes, so the
+		// ledger window is epoch-aligned with whatever digest lineage was
+		// recorded above — keep it eligible. This is the ONLY lineage-loss
+		// site with that property; every failure path past a dump must take
+		// markBaseMemoryLineageLost, which also stales the digest lineage.
+		instance.markBaseMemoryDigestInherited()
 		return
 	}
 	instance.setBaseMemory(memoryPath, incremental)

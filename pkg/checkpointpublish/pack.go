@@ -300,7 +300,21 @@ func runPacked(ctx context.Context, dir, id string, store chunkstore.Store, m *c
 		err = parallelPackWork(ctx, len(keys), result.Workers, func(ctx context.Context, i int) error {
 			var err error
 			present[i], err = keyed.HasKey(ctx, keys[i])
-			return err
+			if err != nil {
+				return err
+			}
+			if present[i] {
+				// Sweep fence: a marked baseline pack is scheduled for
+				// collection; min-age cannot protect the reuse. Dropping the
+				// reuse routes those chunks through the local repack below,
+				// which refreshes their bytes into fresh pack objects.
+				fenced, ferr := gcReuseFenced(ctx, keyed, keys[i])
+				if ferr != nil {
+					return ferr
+				}
+				present[i] = !fenced
+			}
+			return nil
 		})
 		if err != nil {
 			return fail(err)
@@ -331,10 +345,25 @@ func runPacked(ctx context.Context, dir, id string, store chunkstore.Store, m *c
 		}
 		present := c.Digest == checkpointchunks.ZeroChunkDigest(int(length))
 		if !present && !reuse && !opts.PackSkipChunkProbe {
-			var err error
-			present, err = store.Has(ctx, c.Digest)
+			ok, err := store.Has(ctx, c.Digest)
 			if err != nil {
 				return err
+			}
+			if ok {
+				// Sweep fence: a marked standalone object cannot be leaned
+				// on — route the chunk through the local repack instead. An
+				// inherited hole has no local bytes, so a marked parent
+				// fails here rather than sealing zeros under its digest.
+				fenced, ferr := gcReuseFenced(ctx, keyed, chunkstore.PlainKey(c.Digest))
+				if ferr != nil {
+					return ferr
+				}
+				if fenced && c.Inherited {
+					return fmt.Errorf(
+						"inherited chunk %s is marked for collection by a bucket sweep; the parent generation's object must be republished before this artifact",
+						c.Digest[:12])
+				}
+				present = !fenced
 			}
 		}
 		if present || reuse {
@@ -462,6 +491,16 @@ func runPacked(ctx context.Context, dir, id string, store chunkstore.Store, m *c
 		present, err := keyed.HasKey(ctx, key)
 		if err != nil {
 			return err
+		}
+		if present {
+			// Sweep fence: a marked pack is scheduled for collection; the
+			// bytes are already in hand, so re-PUT them and let the sweep's
+			// delete-time recheck see the refreshed timestamp and spare it.
+			fenced, ferr := gcReuseFenced(ctx, keyed, key)
+			if ferr != nil {
+				return ferr
+			}
+			present = !fenced
 		}
 		if !present {
 			if err := keyed.PutKey(ctx, key, bytes.NewReader(buf)); err != nil {

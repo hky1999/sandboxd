@@ -114,6 +114,18 @@ type firecrackerPersistedState struct {
 	// a daemon restart loses it and the next checkpoint safely degrades to
 	// Full.
 	BaseChunkManifestPath string `json:"base_chunk_manifest_path,omitempty"`
+	// BaseChunkManifestStale marks that the digest lineage recorded by
+	// BaseChunkManifestPath no longer matches the VMM dirty-page ledger's
+	// epoch: a checkpoint consumed the window (the dump was written and the
+	// ledger re-armed) but never sealed, or an operation aborted past its
+	// dump. While set, the digest-inherited first window is ineligible —
+	// re-opening it would dump only the post-failure delta while hole
+	// chunks inherit parent digests, silently omitting every page the
+	// failed generation wrote (digest self-consistency cannot catch this:
+	// the artifact is internally coherent but is not the guest's memory).
+	// Only a fresh restore or a successful seal re-establishes the
+	// manifest-to-ledger alignment, which is exactly when this clears.
+	BaseChunkManifestStale bool `json:"base_chunk_manifest_stale,omitempty"`
 	// BaseMemoryLineageLost marks that the VMM dirty-page ledger may be
 	// armed against a base sandboxd no longer holds: a checkpoint failed
 	// after the VMM wrote and re-armed its window, or the daemon restarted
@@ -249,6 +261,12 @@ func (instance *firecrackerInstance) setBaseMemoryProof(path string, incremental
 	instance.state.BaseMemoryPath = path
 	instance.state.BaseMemoryIncremental = incremental
 	instance.state.BaseMemoryLineageLost = false
+	// Adopting a byte base is epoch-aligned by construction (a restore just
+	// loaded it, or a seal just wrote it and re-armed the window against it),
+	// so whatever digest lineage was recorded before describes a ledger epoch
+	// that no longer exists: drop it rather than leave a stale manifest path
+	// eligible for inheritance.
+	instance.state.BaseChunkManifestStale = false
 	instance.mu.Unlock()
 }
 
@@ -268,17 +286,45 @@ func (instance *firecrackerInstance) baseChunkManifest() string {
 	return instance.state.BaseChunkManifestPath
 }
 
+func (instance *firecrackerInstance) baseChunkManifestStale() bool {
+	instance.mu.Lock()
+	defer instance.mu.Unlock()
+	return instance.state.BaseChunkManifestStale
+}
+
 // markBaseMemoryLineageLost drops the incremental lineage and records that
 // the VMM soft-dirty ledger may still be armed against the discarded base.
 // The next checkpoint must take a Full snapshot: with the ledger armed a
 // SoftDirty request writes only the window delta, which would silently lose
-// every page written before the discarded generation.
+// every page written before the discarded generation. The recorded digest
+// lineage goes stale with it — the ledger's epoch no longer matches the
+// generation that manifest describes, so the inherited window must not
+// re-open against it either.
 func (instance *firecrackerInstance) markBaseMemoryLineageLost() {
 	instance.mu.Lock()
 	instance.baseProof = nil
 	instance.state.BaseMemoryPath = ""
 	instance.state.BaseMemoryIncremental = false
 	instance.state.BaseMemoryLineageLost = true
+	instance.state.BaseChunkManifestStale = true
+	instance.mu.Unlock()
+}
+
+// markBaseMemoryDigestInherited is the one lineage-loss shape that KEEPS the
+// digest lineage eligible: the byte-level base is a sparse placeholder the
+// local artifact cannot patch, but the VMM was loaded from exactly the bytes
+// that manifest describes (a fresh restore or materialization), so the ledger
+// window and the manifest describe the same generation and the next
+// checkpoint may take the digest-inherited SoftDirty window. Callers must be
+// able to prove that alignment — a running VMM whose window was already
+// consumed by a failed dump must use markBaseMemoryLineageLost instead.
+func (instance *firecrackerInstance) markBaseMemoryDigestInherited() {
+	instance.mu.Lock()
+	instance.baseProof = nil
+	instance.state.BaseMemoryPath = ""
+	instance.state.BaseMemoryIncremental = false
+	instance.state.BaseMemoryLineageLost = true
+	instance.state.BaseChunkManifestStale = false
 	instance.mu.Unlock()
 }
 

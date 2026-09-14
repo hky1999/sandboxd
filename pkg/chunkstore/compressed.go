@@ -32,6 +32,13 @@ func CompressedKey(digest string) string {
 	return digest[:2] + "/" + digest + ".z"
 }
 
+// PlainKey is the store key of an uncompressed chunk object: the two-hex
+// shard prefix plus the digest. Writers (Remote.Put), readers, and any
+// sweeper agree on the layout through this one helper.
+func PlainKey(digest string) string {
+	return digest[:2] + "/" + digest
+}
+
 // CompressedKeyDigest strips the ".z" suffix back to the content digest,
 // reporting whether the key named a compressed chunk object at all.
 func CompressedKeyDigest(key string) (string, bool) {

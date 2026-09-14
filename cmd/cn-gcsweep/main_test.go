@@ -27,11 +27,13 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -116,6 +118,13 @@ func (b *fakeBucket) serve(w http.ResponseWriter, r *http.Request) {
 		buf.WriteString(`</ListBucketResult>`)
 		w.Header().Set("Content-Type", "application/xml")
 		_, _ = w.Write(buf.Bytes())
+	case r.Method == http.MethodPut:
+		key := strings.TrimPrefix(r.URL.Path, "/")
+		body, _ := io.ReadAll(r.Body)
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		b.objects[key] = fakeObject{body: body, modified: time.Now()}
+		w.WriteHeader(http.StatusOK)
 	case r.Method == http.MethodDelete:
 		key := strings.TrimPrefix(r.URL.Path, "/")
 		b.mu.Lock()
@@ -216,7 +225,7 @@ func TestSweepKeepsSharedChunksAndDropsOrphans(t *testing.T) {
 	defer server.Close()
 
 	// Dry run: nothing deleted, orphan (.z) counted, young spared.
-	if err := run(context.Background(), server.URL, false, 0, nil, 24*time.Hour, 4, false); err != nil {
+	if err := run(context.Background(), server.URL, false, 0, nil, 24*time.Hour, 0, 4, false); err != nil {
 		t.Fatal(err)
 	}
 	if !bucket.has(orphan[:2] + "/" + orphan + ".z") {
@@ -224,7 +233,7 @@ func TestSweepKeepsSharedChunksAndDropsOrphans(t *testing.T) {
 	}
 	// Real run: orphan dies; shared and onlyA survive; young and foreign
 	// stay; the .z key shape is recognized.
-	if err := run(context.Background(), server.URL, true, 0, nil, 24*time.Hour, 4, false); err != nil {
+	if err := run(context.Background(), server.URL, true, 0, nil, 24*time.Hour, 0, 4, false); err != nil {
 		t.Fatal(err)
 	}
 	for _, key := range []string{shared[:2] + "/" + shared, onlyA[:2] + "/" + onlyA,
@@ -252,7 +261,7 @@ func TestSweepDropsArtifactAndItsLastChunk(t *testing.T) {
 
 	// Drop art-a explicitly: onlyA loses its last reference and dies;
 	// shared stays (art-b still names it); the artifact set goes.
-	if err := run(context.Background(), server.URL, true, 0, []string{"art-a"}, 24*time.Hour, 4, false); err != nil {
+	if err := run(context.Background(), server.URL, true, 0, []string{"art-a"}, 24*time.Hour, 0, 4, false); err != nil {
 		t.Fatal(err)
 	}
 	if bucket.has("artifacts/art-a/INDEX.json") || bucket.has("artifacts/art-a/BUNDLE") {
@@ -275,7 +284,7 @@ func TestSweepFailClosedOnUnresolvableIndex(t *testing.T) {
 	bucket.put("artifacts/broken/INDEX.json", []byte("not-json"), 48*time.Hour)
 	server := httptest.NewServer(http.HandlerFunc(bucket.serve))
 	defer server.Close()
-	if err := run(context.Background(), server.URL, true, 0, nil, 24*time.Hour, 4, false); err == nil {
+	if err := run(context.Background(), server.URL, true, 0, nil, 24*time.Hour, 0, 4, false); err == nil {
 		t.Fatal("unresolvable INDEX accepted")
 	}
 	if !bucket.has(orphan[:2] + "/" + orphan) {
@@ -304,7 +313,7 @@ func TestSweepMaxArtifactAgeDropsOnlyOldSets(t *testing.T) {
 	bucket.put(newChunk[:2]+"/"+newChunk, []byte("x"), 100*time.Hour)
 	server := httptest.NewServer(http.HandlerFunc(bucket.serve))
 	defer server.Close()
-	if err := run(context.Background(), server.URL, true, 48*time.Hour, nil, 24*time.Hour, 4, false); err != nil {
+	if err := run(context.Background(), server.URL, true, 48*time.Hour, nil, 24*time.Hour, 0, 4, false); err != nil {
 		t.Fatal(err)
 	}
 	if bucket.has("artifacts/gen-old/INDEX.json") || bucket.has(oldChunk[:2]+"/"+oldChunk) {
@@ -312,5 +321,169 @@ func TestSweepMaxArtifactAgeDropsOnlyOldSets(t *testing.T) {
 	}
 	if !bucket.has("artifacts/gen-new/INDEX.json") || !bucket.has(newChunk[:2]+"/"+newChunk) {
 		t.Fatal("young artifact was dropped")
+	}
+}
+
+// rewindMark ages a sweep mark past the grace window, simulating the wait
+// between the marking run and the collecting run.
+func rewindMark(b *fakeBucket, key string, age time.Duration) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	mark := checkpointpublish.GCMarkKey(key)
+	obj, ok := b.objects[mark]
+	if !ok {
+		panic("no mark for " + key)
+	}
+	obj.modified = time.Now().Add(-age)
+	b.objects[mark] = obj
+}
+
+// refreshObject simulates a publisher's gc fence: the Has-hit reuse of a
+// marked object re-uploaded its bytes, refreshing the store timestamp.
+func refreshObject(b *fakeBucket, key string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	obj, ok := b.objects[key]
+	if !ok {
+		panic("no object " + key)
+	}
+	obj.modified = time.Now()
+	b.objects[key] = obj
+}
+
+// F2 regression: overlay chunks live under overlay-chunks/<aa>/<digest>;
+// the sweep must count a live artifact's overlay sidecar as references for
+// THOSE keys. Before the fix every overlay object was unreferenced and a
+// -delete run reclaimed live blocks.
+func TestSweepKeepsReferencedOverlayChunks(t *testing.T) {
+	bucket := newFakeBucket()
+	memChunk, overlayLive, overlayOrphan := digestOf(11), digestOf(12), digestOf(13)
+	publishArtifactAsBundle(bucket, "art-o", []string{memChunk}, nil, []string{overlayLive})
+	bucket.put(memChunk[:2]+"/"+memChunk, []byte("x"), 48*time.Hour)
+	bucket.put(checkpointpublish.OverlayChunkKey(overlayLive), []byte("x"), 48*time.Hour)
+	bucket.put(checkpointpublish.OverlayChunkKey(overlayOrphan), []byte("x"), 48*time.Hour)
+	server := httptest.NewServer(http.HandlerFunc(bucket.serve))
+	defer server.Close()
+	if err := run(context.Background(), server.URL, true, 0, nil, 24*time.Hour, 0, 4, false); err != nil {
+		t.Fatal(err)
+	}
+	if !bucket.has(checkpointpublish.OverlayChunkKey(overlayLive)) {
+		t.Fatal("live overlay chunk deleted (reference key mismatch)")
+	}
+	if bucket.has(checkpointpublish.OverlayChunkKey(overlayOrphan)) {
+		t.Fatal("orphan overlay chunk survived")
+	}
+}
+
+// F3 core: a fresh victim is only MARKED, never deleted in the run that
+// found it; collection waits out the grace and then re-verifies.
+func TestSweepMarksBeforeCollecting(t *testing.T) {
+	bucket := newFakeBucket()
+	orphan := digestOf(21)
+	bucket.put(orphan[:2]+"/"+orphan, []byte("x"), 48*time.Hour)
+	server := httptest.NewServer(http.HandlerFunc(bucket.serve))
+	defer server.Close()
+
+	// First -delete run with a grace: mark only.
+	if err := run(context.Background(), server.URL, true, 0, nil, 24*time.Hour, 24*time.Hour, 4, false); err != nil {
+		t.Fatal(err)
+	}
+	if !bucket.has(orphan[:2] + "/" + orphan) {
+		t.Fatal("victim deleted before its mark aged past the grace")
+	}
+	if !bucket.has(checkpointpublish.GCMarkKey(orphan[:2] + "/" + orphan)) {
+		t.Fatal("victim not marked")
+	}
+	// The grace has not elapsed: a second run still only waits.
+	if err := run(context.Background(), server.URL, true, 0, nil, 24*time.Hour, 24*time.Hour, 4, false); err != nil {
+		t.Fatal(err)
+	}
+	if !bucket.has(orphan[:2] + "/" + orphan) {
+		t.Fatal("victim deleted before the grace elapsed")
+	}
+	// Simulate the wait, then collect.
+	rewindMark(bucket, orphan[:2]+"/"+orphan, 25*time.Hour)
+	if err := run(context.Background(), server.URL, true, 0, nil, 24*time.Hour, 24*time.Hour, 4, false); err != nil {
+		t.Fatal(err)
+	}
+	if bucket.has(orphan[:2] + "/" + orphan) {
+		t.Fatal("stale-marked victim survived collection")
+	}
+	if bucket.has(checkpointpublish.GCMarkKey(orphan[:2] + "/" + orphan)) {
+		t.Fatal("mark survived its object's collection")
+	}
+}
+
+// F3 refresh race: the publisher fence re-uploads a marked object mid-sweep
+// (between the scan listing and the delete-time recheck). The fresh listing
+// sees a young timestamp, spares the object, and clears the now-obsolete
+// mark — the next sweep re-evaluates it from scratch.
+func TestSweepSparesRefreshedVictim(t *testing.T) {
+	bucket := newFakeBucket()
+	orphan := digestOf(31)
+	bucket.put(orphan[:2]+"/"+orphan, []byte("x"), 48*time.Hour)
+	server := httptest.NewServer(http.HandlerFunc(bucket.serve))
+	defer server.Close()
+	if err := run(context.Background(), server.URL, true, 0, nil, 24*time.Hour, 24*time.Hour, 4, false); err != nil {
+		t.Fatal(err)
+	}
+	rewindMark(bucket, orphan[:2]+"/"+orphan, 25*time.Hour)
+	// The publisher's fence refresh lands between the second run's scan
+	// listing and its delete-time relisting: the scan still sees the old
+	// timestamp (a victim), the relisting sees a young one.
+	var listings atomic.Int32
+	server2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The relisting (this counter's second listing: the scan came
+		// first) must observe the young timestamp, so mutate pre-serve.
+		if r.Method == http.MethodGet && r.URL.RawQuery != "" && listings.Add(1) == 2 {
+			refreshObject(bucket, orphan[:2]+"/"+orphan)
+		}
+		bucket.serve(w, r)
+	}))
+	defer server2.Close()
+	if err := run(context.Background(), server2.URL, true, 0, nil, 24*time.Hour, 24*time.Hour, 4, false); err != nil {
+		t.Fatal(err)
+	}
+	if !bucket.has(orphan[:2] + "/" + orphan) {
+		t.Fatal("refreshed victim deleted despite the delete-time recheck")
+	}
+	if bucket.has(checkpointpublish.GCMarkKey(orphan[:2] + "/" + orphan)) {
+		t.Fatal("obsolete mark kept after the victim was spared")
+	}
+}
+
+// F3 committed-publish race: an artifact set whose INDEX appears between the
+// scan and the recheck references the marked object; the sweep merges the
+// new references and spares the object.
+func TestSweepMergesMidRunArtifactReferences(t *testing.T) {
+	bucket := newFakeBucket()
+	orphan := digestOf(41)
+	bucket.put(orphan[:2]+"/"+orphan, []byte("x"), 48*time.Hour)
+	server := httptest.NewServer(http.HandlerFunc(bucket.serve))
+	defer server.Close()
+	if err := run(context.Background(), server.URL, true, 0, nil, 24*time.Hour, 24*time.Hour, 4, false); err != nil {
+		t.Fatal(err)
+	}
+	rewindMark(bucket, orphan[:2]+"/"+orphan, 25*time.Hour)
+	// A publication commits after the second run's scan listing: its set
+	// appears only in the delete-time relisting.
+	var listings atomic.Int32
+	server2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		bucket.serve(w, r)
+		// Inject after the scan listing (this counter's first) has been
+		// served: only the delete-time relisting sees the new set.
+		if r.Method == http.MethodGet && r.URL.RawQuery != "" && listings.Add(1) == 1 {
+			publishArtifactAsBundle(bucket, "art-late", []string{orphan}, nil, nil)
+		}
+	}))
+	defer server2.Close()
+	if err := run(context.Background(), server2.URL, true, 0, nil, 24*time.Hour, 24*time.Hour, 4, false); err != nil {
+		t.Fatal(err)
+	}
+	if !bucket.has(orphan[:2] + "/" + orphan) {
+		t.Fatal("object deleted although a mid-run publication referenced it")
+	}
+	if bucket.has(checkpointpublish.GCMarkKey(orphan[:2] + "/" + orphan)) {
+		t.Fatal("mark kept after the mid-run reference spared the object")
 	}
 }
