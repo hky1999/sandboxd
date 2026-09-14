@@ -174,6 +174,7 @@ func publishOverlayChunks(
 					continue // drain
 				}
 				key := OverlayChunkKey(j.digest)
+				claimed := false
 				if ok, err := store.HasKey(ctx, key); err != nil {
 					failJob(fmt.Errorf("has overlay chunk %s: %w", j.digest[:12], err))
 					continue
@@ -183,7 +184,7 @@ func publishOverlayChunks(
 					// and min-age cannot protect the reuse (the object is old
 					// by construction). The local bytes are real (not a
 					// hole), so refresh the object by re-uploading instead
-					// of skipping — the digest re-check below keeps the
+					// of skipping — the digest re-check inside keeps the
 					// global namespace poison-proof.
 					fenced, err := gcFenceClaim(ctx, store, key)
 					if err != nil {
@@ -193,31 +194,50 @@ func publishOverlayChunks(
 					if !fenced {
 						continue
 					}
+					claimed = true
 				}
-				block := make([]byte, j.length)
-				n, err := overlay.ReadAt(block, j.offset)
-				if err != nil &&
-					!errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
-					failJob(fmt.Errorf("read overlay chunk at %d: %w", j.offset, err))
-					continue
+				putBlock := func() error {
+					block := make([]byte, j.length)
+					n, err := overlay.ReadAt(block, j.offset)
+					if err != nil &&
+						!errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+						return fmt.Errorf("read overlay chunk at %d: %w", j.offset, err)
+					}
+					if n != j.length {
+						return fmt.Errorf("overlay chunk at %d short: %d bytes, want %d",
+							j.offset, n, j.length)
+					}
+					// The object key is the content address shared by every
+					// future generation: upload only bytes that actually hash
+					// to it, or a corrupted local original would poison the
+					// global namespace for all Has-hit readers (F9).
+					sum := sha256.Sum256(block)
+					if hex.EncodeToString(sum[:]) != j.digest {
+						return fmt.Errorf("overlay chunk at %d content hashes to %s, sidecar claims %s — refusing to publish",
+							j.offset, hex.EncodeToString(sum[:]), j.digest)
+					}
+					if err := store.PutKey(ctx, key, bytes.NewReader(block)); err != nil {
+						return fmt.Errorf("put overlay chunk at %d: %w", j.offset, err)
+					}
+					return nil
 				}
-				if n != j.length {
-					failJob(fmt.Errorf("overlay chunk at %d short: %d bytes, want %d",
-						j.offset, n, j.length))
-					continue
+				err := putBlock()
+				switch {
+				case err == nil && claimed:
+					// Fenced re-upload complete: end this claim's protection.
+					gcReleaseClaim(ctx, store, key)
+				case err == nil:
+					// Fresh-upload guard: the key may carry a mark left by a
+					// collector that just deleted the previous body; redo the
+					// upload under the claim so the object provably exists
+					// once the claim is released.
+					err = gcGuardFreshUpload(ctx, store, key, putBlock)
 				}
-				// The object key is the content address shared by every
-				// future generation: upload only bytes that actually hash
-				// to it, or a corrupted local original would poison the
-				// global namespace for all Has-hit readers (F9).
-				sum := sha256.Sum256(block)
-				if hex.EncodeToString(sum[:]) != j.digest {
-					failJob(fmt.Errorf("overlay chunk at %d content hashes to %s, sidecar claims %s — refusing to publish",
-						j.offset, hex.EncodeToString(sum[:]), j.digest))
-					continue
-				}
-				if err := store.PutKey(ctx, key, bytes.NewReader(block)); err != nil {
-					failJob(fmt.Errorf("put overlay chunk at %d: %w", j.offset, err))
+				if err != nil {
+					if claimed {
+						gcReleaseClaim(ctx, store, key)
+					}
+					failJob(err)
 					continue
 				}
 			}

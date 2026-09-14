@@ -23,6 +23,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -77,12 +78,13 @@ func (b *fakeBucket) serve(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case r.Method == http.MethodHead:
 		b.mu.Lock()
-		_, ok := b.objects[strings.TrimPrefix(r.URL.Path, "/")]
+		obj, ok := b.objects[strings.TrimPrefix(r.URL.Path, "/")]
 		b.mu.Unlock()
 		if !ok {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
+		w.Header().Set("Last-Modified", obj.modified.UTC().Format(http.TimeFormat))
 		w.WriteHeader(http.StatusOK)
 	case r.Method == http.MethodGet && r.URL.RawQuery == "":
 		b.mu.Lock()
@@ -92,6 +94,9 @@ func (b *fakeBucket) serve(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
+		sum := md5.Sum(obj.body)
+		w.Header().Set("ETag", `"`+hex.EncodeToString(sum[:])+`"`)
+		w.Header().Set("Last-Modified", obj.modified.UTC().Format(http.TimeFormat))
 		_, _ = w.Write(obj.body)
 	case r.Method == http.MethodGet:
 		// ListObjectsV2: prefix and continuation over sorted keys.
@@ -150,9 +155,19 @@ func (b *fakeBucket) serve(w http.ResponseWriter, r *http.Request) {
 		key := strings.TrimPrefix(r.URL.Path, "/")
 		b.mu.Lock()
 		defer b.mu.Unlock()
-		if _, ok := b.objects[key]; !ok {
+		obj, ok := b.objects[key]
+		if !ok {
 			w.WriteHeader(http.StatusNotFound)
 			return
+		}
+		// S3 conditional delete: If-Match only removes the observed
+		// generation (the ETag of the current body).
+		if want := r.Header.Get("If-Match"); want != "" {
+			sum := md5.Sum(obj.body)
+			if strings.Trim(want, `"`) != hex.EncodeToString(sum[:]) {
+				w.WriteHeader(http.StatusPreconditionFailed)
+				return
+			}
 		}
 		delete(b.objects, key)
 		w.WriteHeader(http.StatusNoContent)
@@ -636,7 +651,10 @@ func sweepBarrierPublish(t *testing.T, parkedOnClaim bool) {
 		inner: bucket,
 		block: func(method, key string) bool {
 			if parkedOnClaim {
-				return method == http.MethodPut && strings.HasPrefix(key, "gc-claims/")
+				// The full claim key of the target object ONLY: the preflight
+				// probe also PUTs gc-claims/* before the final relisting, and
+				// parking there would place the barrier before the relist.
+				return method == http.MethodPut && key == checkpointpublish.GCClaimKey(chunkKey)
 			}
 			return method == http.MethodDelete && key == chunkKey
 		},
@@ -647,7 +665,10 @@ func sweepBarrierPublish(t *testing.T, parkedOnClaim bool) {
 	defer sweepSrv.Close()
 	sweepDone := make(chan error, 1)
 	go func() {
-		sweepDone <- run(context.Background(), sweepSrv.URL, true, 0, nil, 0, 0, 2, false)
+		// mark-grace 1h: the freshly-marked memory chunk is NOT a candidate
+		// (its mark is young), so the sweep parks holding exactly one claim
+		// — the target overlay chunk's.
+		sweepDone <- run(context.Background(), sweepSrv.URL, true, 0, nil, 0, time.Hour, 2, false)
 	}()
 	select {
 	case <-barrier.hit:
@@ -724,4 +745,210 @@ func TestSweepBarrierPublisherWinsClaim(t *testing.T) {
 // the chunk under its own claim, and still commit a materializable artifact.
 func TestSweepBarrierSweepWinsClaim(t *testing.T) {
 	sweepBarrierPublish(t, false)
+}
+
+// Ported from the 2026-09-14 recheck (Docs/checks/20260914T-b2dd1d5-
+// progress-and-gc-claims-check.md): the original repro asserted the BYPASS
+// (publisher claim PUTs == 0 on the Has-miss path); with the fix the same
+// path must CLAIM — the count assertion flips to >= 1 while every invariant
+// assertion (artifact materializable, claim generations survive) is kept.
+func TestReviewTwoSweepsHasMissPublish(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	bucket := newFakeBucket()
+	seedDir, digest := fixtureCheckpointDir(t)
+	key := checkpointpublish.OverlayChunkKey(digest)
+	claimKey := checkpointpublish.GCClaimKey(key)
+	markKey := checkpointpublish.GCMarkKey(key)
+	var publisherClaimPuts atomic.Int32
+	plain := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut && strings.TrimPrefix(r.URL.Path, "/") == claimKey {
+			publisherClaimPuts.Add(1)
+		}
+		bucket.serve(w, r)
+	}))
+	defer plain.Close()
+	store, err := chunkstore.Open(plain.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := checkpointpublish.Run(ctx, seedDir, "review-seed", store, plain.URL); err != nil {
+		t.Fatal(err)
+	}
+	bucket.mu.Lock()
+	for k := range bucket.objects {
+		if strings.HasPrefix(k, "artifacts/review-seed/") {
+			delete(bucket.objects, k)
+		}
+	}
+	old := bucket.objects[key]
+	old.modified = time.Now().Add(-72 * time.Hour)
+	bucket.objects[key] = old
+	// The memory chunk shares the fixture digest: make its mark young so it
+	// stays out of the candidate set (mark-grace 24h below).
+	bucket.mu.Unlock()
+	bucket.put(markKey, []byte("marked"), 48*time.Hour)
+
+	bHit, releaseB := make(chan struct{}), make(chan struct{})
+	var bOnce, releaseBOnce sync.Once
+	sweepB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut && strings.TrimPrefix(r.URL.Path, "/") == claimKey {
+			bOnce.Do(func() { close(bHit) })
+			select {
+			case <-releaseB:
+			case <-ctx.Done():
+				return
+			}
+		}
+		bucket.serve(w, r)
+	}))
+	defer sweepB.Close()
+	defer releaseBOnce.Do(func() { close(releaseB) })
+	doneB := make(chan error, 1)
+	go func() { doneB <- run(ctx, sweepB.URL, true, 0, nil, 24*time.Hour, 24*time.Hour, 2, false) }()
+	select {
+	case <-bHit:
+	case <-time.After(8 * time.Second):
+		t.Fatal("timed out waiting for sweep B claim PUT after final relist")
+	}
+
+	aHit, releaseA := make(chan struct{}), make(chan struct{})
+	var aOnce, releaseAOnce sync.Once
+	sweepA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete && strings.TrimPrefix(r.URL.Path, "/") == markKey {
+			aOnce.Do(func() { close(aHit) })
+			select {
+			case <-releaseA:
+			case <-ctx.Done():
+				return
+			}
+		}
+		bucket.serve(w, r)
+	}))
+	defer sweepA.Close()
+	defer releaseAOnce.Do(func() { close(releaseA) })
+	doneA := make(chan error, 1)
+	go func() { doneA <- run(ctx, sweepA.URL, true, 0, nil, 24*time.Hour, 24*time.Hour, 2, false) }()
+	select {
+	case <-aHit:
+	case <-time.After(8 * time.Second):
+		t.Fatal("timed out waiting for sweep A after payload deletion")
+	}
+	if bucket.has(key) || !bucket.has(claimKey) || !bucket.has(markKey) {
+		t.Fatal("invalid barrier: expected absent payload with A's claim and mark still present")
+	}
+
+	pubDir, pubDigest := fixtureCheckpointDir(t)
+	if pubDigest != digest {
+		t.Fatal("fixture digest changed")
+	}
+	// The publisher now contends with sweep A's held claim on the memory
+	// chunk (same digest, fence engaged); run it async and release A once
+	// contention is observed, so the claim-wait-then-reupload path executes.
+	pubDone := make(chan error, 1)
+	go func() {
+		_, err := checkpointpublish.Run(ctx, pubDir, "review-new", store, plain.URL)
+		pubDone <- err
+	}()
+	select {
+	case err := <-pubDone:
+		if err != nil {
+			t.Fatalf("publisher failed while sweep A parked: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		// Still running: it must be waiting on A's claim; let A finish.
+		releaseAOnce.Do(func() { close(releaseA) })
+	}
+	releaseAOnce.Do(func() { close(releaseA) })
+	select {
+	case err := <-pubDone:
+		if err != nil {
+			t.Fatalf("publisher: %v", err)
+		}
+	case <-time.After(12 * time.Second):
+		t.Fatal("publisher did not finish after sweep A released")
+	}
+	if !bucket.has(key) {
+		t.Fatal("publisher did not rebuild the payload")
+	}
+	if got := publisherClaimPuts.Load(); got < 1 {
+		t.Fatalf("Has-miss recreate must participate in the claim protocol, got %d claim PUTs", got)
+	}
+	releaseBOnce.Do(func() { close(releaseB) })
+	for _, done := range []chan error{doneA, doneB} {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("sweep: %v", err)
+			}
+		case <-time.After(12 * time.Second):
+			t.Fatal("sweep did not finish")
+		}
+	}
+	keyed := store.(chunkstore.Keyed)
+	if err := checkpointpublish.Materialize(ctx, filepath.Join(t.TempDir(), "materialized"), "review-new", keyed); err != nil {
+		t.Fatalf("published artifact lost dependency after Has-miss publication between two collectors: %v", err)
+	}
+}
+
+// Ported from the same recheck: a stale-claim cleanup derived from an old
+// listing must not delete a replacement claim another participant created.
+func TestReviewStaleCleanupDeletesReplacementClaim(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	bucket := newFakeBucket()
+	key := "overlay-chunks/aa/" + strings.Repeat("a", 64)
+	claimKey := checkpointpublish.GCClaimKey(key)
+	bucket.put(key, []byte("young payload"), 0)
+	bucket.put(claimKey, []byte("old-owner-nonce"), 48*time.Hour)
+	plain := httptest.NewServer(http.HandlerFunc(bucket.serve))
+	defer plain.Close()
+
+	hit, release := make(chan struct{}), make(chan struct{})
+	var hitOnce, releaseOnce sync.Once
+	parked := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete && strings.TrimPrefix(r.URL.Path, "/") == claimKey {
+			hitOnce.Do(func() { close(hit) })
+			select {
+			case <-release:
+			case <-ctx.Done():
+				return
+			}
+		}
+		bucket.serve(w, r)
+	}))
+	defer parked.Close()
+	defer releaseOnce.Do(func() { close(release) })
+	done := make(chan error, 1)
+	go func() { done <- run(ctx, parked.URL, true, 0, nil, 24*time.Hour, 24*time.Hour, 2, false) }()
+	select {
+	case <-hit:
+	case <-time.After(8 * time.Second):
+		t.Fatal("timed out waiting for collector B stale-claim DELETE")
+	}
+
+	if err := run(ctx, plain.URL, true, 0, nil, 24*time.Hour, 24*time.Hour, 2, false); err != nil {
+		t.Fatalf("collector A: %v", err)
+	}
+	store, err := chunkstore.Open(plain.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := store.(chunkstore.ExclusivePutter).PutKeyIfAbsent(ctx, claimKey, strings.NewReader("new-owner-nonce"))
+	if err != nil || !created {
+		t.Fatalf("fresh publisher claim: created=%v err=%v", created, err)
+	}
+	acquired := time.Now()
+	releaseOnce.Do(func() { close(release) })
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("collector B: %v", err)
+		}
+	case <-time.After(8 * time.Second):
+		t.Fatal("collector B did not finish")
+	}
+	if !bucket.has(claimKey) {
+		t.Fatalf("stale collector deleted replacement publisher claim aged only %s; mark-grace=24h", time.Since(acquired))
+	}
 }

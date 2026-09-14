@@ -17,6 +17,7 @@ package chunkstore
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -250,15 +251,23 @@ func (r *Remote) HasKey(ctx context.Context, key string) (bool, error) {
 
 // ExclusivePutter is the atomic claim primitive over keyed objects: the PUT
 // succeeds only when the key does not already exist (S3 conditional write
-// If-None-Match:*; O_EXCL locally). The bucket sweep and the publishers use
-// it to make deletion authority and reuse authority mutually exclusive per
-// object — whoever wins the claim owns the key for the duration of one
-// delete or one fenced re-upload.
+// If-None-Match:*; O_EXCL locally), and the conditional DELETE removes the
+// object only while it still carries the caller's generation. The bucket
+// sweep and the publishers use it to make deletion authority and reuse
+// authority mutually exclusive per object — whoever wins the claim owns the
+// key for the duration of one delete or one fenced re-upload, and only the
+// owner (or a cleanup matching the observed generation) can end it.
 type ExclusivePutter interface {
 	// PutKeyIfAbsent uploads an object only when the key is free, reporting
 	// whether this call created it. A store that cannot make the create
 	// atomic must not implement the interface at all.
 	PutKeyIfAbsent(ctx context.Context, key string, body io.Reader) (created bool, err error)
+	// DeleteKeyIfMatch removes the object only while its ETag still equals
+	// the caller's observation (S3 conditional DELETE If-Match). A 412
+	// reports lost the race (someone replaced the object) as (false, nil).
+	// The ETag of a claim body is the hex MD5 of its bytes (single-part
+	// PUTs), so callers that know their own body never need a prior GET.
+	DeleteKeyIfMatch(ctx context.Context, key, etag string) (deleted bool, err error)
 }
 
 // PutKeyIfAbsent implements the S3 conditional write: If-None-Match:* is
@@ -307,6 +316,33 @@ func (r *Remote) PutKeyIfAbsent(ctx context.Context, key string, body io.Reader)
 		return false, nil
 	default:
 		return false, fmt.Errorf("conditional PUT %s: status %d", key, resp.StatusCode)
+	}
+}
+
+// DeleteKeyIfMatch implements the S3 conditional delete: the DELETE only
+// takes effect while the object's ETag still equals the observed one, so a
+// claim replaced between observation and removal answers 412 and survives.
+func (r *Remote) DeleteKeyIfMatch(ctx context.Context, key, etag string) (bool, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, r.baseURL+"/"+strings.TrimLeft(key, "/"), nil)
+	if err != nil {
+		return false, err
+	}
+	req.Header.Set("If-Match", strings.Trim(etag, `"`))
+	resp, err := r.client.Do(req)
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+	switch resp.StatusCode {
+	case http.StatusNoContent, http.StatusOK:
+		return true, nil
+	case http.StatusPreconditionFailed:
+		return false, nil
+	case http.StatusNotFound:
+		// Already gone: nothing of that generation remains to protect.
+		return false, nil
+	default:
+		return false, fmt.Errorf("conditional DELETE %s: status %d", key, resp.StatusCode)
 	}
 }
 
@@ -427,4 +463,24 @@ func (l *Local) PutKeyIfAbsent(ctx context.Context, key string, r io.Reader) (bo
 	}
 	defer dir.Close()
 	return true, dir.Sync()
+}
+
+// DeleteKeyIfMatch removes the object only while its content still hashes to
+// the observed ETag: read, compare, and unlink under the local rename race
+// window (single-writer stores make this exact; the guard is for parity with
+// the remote conditional delete).
+func (l *Local) DeleteKeyIfMatch(ctx context.Context, key, etag string) (bool, error) {
+	target := path.Join(l.root, strings.TrimLeft(key, "/"))
+	body, err := os.ReadFile(target)
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	sum := md5.Sum(body)
+	if strings.Trim(etag, `"`) != hex.EncodeToString(sum[:]) {
+		return false, nil
+	}
+	return true, os.Remove(target)
 }

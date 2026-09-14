@@ -60,6 +60,8 @@ package main
 
 import (
 	"context"
+	"crypto/md5"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/xml"
 	"flag"
@@ -375,57 +377,108 @@ func run(ctx context.Context, spec string, del bool, maxArtifactAge time.Duratio
 		}
 		report.MarksCleared++
 	}
-	// dropOwnClaim releases the claim this run won for key. Every resolution
-	// branch ends the claim: deletion finished, or the verdict said spare.
-	dropOwnClaim := func(key string) {
-		if err := deleteKey(ctx, client, base, checkpointpublish.GCClaimKey(key)); err != nil {
-			report.DeleteErrors++
-		}
+	// Deletion runs in three phases, per the claim-first discipline: protect
+	// first, re-derive the basis under the protection, then act.
+	claimNonce := sweepClaimBody()
+	type owned struct {
+		key  string
+		size int64
 	}
+	report.Deletions += len(candidates)
 	for _, c := range candidates {
-		report.Deletions++
 		report.DeletionBytes += c.size
+	}
+	var held []owned
+	for _, c := range candidates {
 		if !del {
-			continue
+			break
 		}
-		// Win the exclusive claim BEFORE acting on the cached relisting
-		// verdicts. A publisher fencing this reuse (mark probe → claim →
-		// re-upload → INDEX commit) holds the claim from its refresh until
-		// a later sweep clears it stale, so a 412 here means the object is
-		// spoken for regardless of what the relisting saw — this closes the
-		// relist→DELETE window the verdicts alone cannot.
-		created, cerr := putClaimIfAbsent(ctx, client, base, c.key)
+		// Phase 1 — win the exclusive claim BEFORE acting: every writer that
+		// can make this object matter again (fenced re-upload, Has-miss
+		// recreate) contends for the same atomic create, so a 412 here means
+		// the object is spoken for regardless of what any earlier
+		// observation said.
+		created, cerr := putClaimIfAbsent(ctx, client, base, c.key, claimNonce)
 		if cerr != nil {
+			// Fail closed mid-batch: release what this run holds.
+			for _, o := range held {
+				releaseClaimIfMine(ctx, client, base, o.key, claimNonce)
+			}
 			return fmt.Errorf("claim %s: %w", c.key, cerr)
 		}
-		if !created {
+		if created {
+			held = append(held, owned{key: c.key, size: c.size})
+		} else {
 			report.ClaimsSpared++
-			continue
 		}
-		fresh, exists := freshObjects[c.key]
-		_, live := refs[c.key]
-		switch {
-		case !exists:
-			// The object vanished (another sweeper, an operator): the mark
-			// is obsolete either way.
-			clearMark(c.key)
-		case now.Sub(fresh.Modified) < minAge:
-			// Refreshed mid-flight: a publisher fenced its Has-hit reuse by
-			// re-uploading. No longer at risk; drop the mark and let a later
-			// sweep re-evaluate from scratch.
-			report.RaceSpared++
-			clearMark(c.key)
-		case live:
-			// Referenced now (a publication committed during the grace
-			// window): its INDEX covers the object from here on.
-			report.RaceSpared++
-			clearMark(c.key)
-		case !deleteObject(c.key):
-			report.DeleteErrors++
-		default:
-			clearMark(c.key)
+	}
+	if del && len(held) > 0 {
+		// Phase 2 — re-derive the reference basis UNDER the claims: the
+		// relisting's reference set is stale by construction, and a
+		// publication that committed since then must spare its objects even
+		// when min-age is disabled. One fresh listing; only sets that
+		// appeared or changed get their references resolved.
+		fresh, err := listAll(ctx, client, base)
+		if err != nil {
+			for _, o := range held {
+				releaseClaimIfMine(ctx, client, base, o.key, claimNonce)
+			}
+			return fmt.Errorf("relist references under claims: %w", err)
 		}
-		dropOwnClaim(c.key)
+		freshIndexAt := map[string]time.Time{}
+		for _, o := range fresh {
+			if id, ok := artifactIDOfKey(o.Key); ok && strings.HasSuffix(o.Key, "/"+checkpointpublish.IndexName) {
+				freshIndexAt[id] = o.Modified
+			}
+		}
+		for id, indexAt := range freshIndexAt {
+			set, seen := artifacts[id]
+			if seen && (set.hasIndex && indexAt.Equal(set.indexAt)) {
+				continue
+			}
+			live, err := artifactReferences(ctx, client, base, id)
+			if err != nil {
+				for _, o := range held {
+					releaseClaimIfMine(ctx, client, base, o.key, claimNonce)
+				}
+				return fmt.Errorf("live set unprovable under claims, nothing deleted: artifact %s: %w", id, err)
+			}
+			for key := range live {
+				refs[key] = struct{}{}
+			}
+			report.NewArtifacts++
+		}
+		// Phase 3 — verdicts from FRESH observations only: the object's
+		// current mtime (any recreate/refresh is visible) and the re-derived
+		// reference set. The cached relisting decides nothing anymore.
+		for _, o := range held {
+			mod, exists, herr := headObjectModified(ctx, client, base, o.key)
+			_, live := refs[o.key]
+			switch {
+			case herr != nil:
+				report.DeleteErrors++
+			case !exists:
+				// The object vanished (another sweeper, an operator): the
+				// mark is obsolete either way.
+				clearMark(o.key)
+			case time.Since(mod) < minAge:
+				// Freshly (re-)written while this sweep ran: a fenced
+				// publisher or a Has-miss recreate. No longer at risk; drop
+				// the mark and let a later sweep re-evaluate.
+				report.RaceSpared++
+				clearMark(o.key)
+			case live:
+				// Referenced by an artifact INDEX — including one that
+				// committed while this sweep ran.
+				report.RaceSpared++
+				clearMark(o.key)
+			case !deleteObject(o.key):
+				report.DeleteErrors++
+			default:
+				clearMark(o.key)
+			}
+			releaseClaimIfMine(ctx, client, base, o.key, claimNonce)
+		}
 	}
 	for _, o := range dropObjects {
 		report.Deletions++
@@ -461,18 +514,26 @@ func run(ctx context.Context, spec string, del bool, maxArtifactAge time.Duratio
 	// Stale claims: a publisher's claim outlives the publish it protected
 	// only when the publisher died mid-fence. Past the mark grace — the
 	// same bound that covers the longest legitimate publish — it protects
-	// nothing a later run cannot re-derive; clear it. A sweep's own claims
-	// live for one candidate iteration and are already released above.
+	// nothing a later run cannot re-derive; clear it, but only the exact
+	// generation observed NOW: fetch the claim fresh, require it to still
+	// be grace-old, and bind the delete to its ETag so a claim another
+	// participant created in the meantime survives (a fixed body would be
+	// no credential; every owner mints a unique nonce).
 	if del {
-		for key, at := range claims {
-			if now.Sub(at) < markGrace {
-				continue
-			}
-			if err := deleteKey(ctx, client, base, checkpointpublish.GCClaimKey(key)); err != nil {
+		for key := range claims {
+			claimKey := checkpointpublish.GCClaimKey(key)
+			etag, modified, err := headClaim(ctx, client, base, claimKey)
+			if err != nil {
 				report.DeleteErrors++
 				continue
 			}
-			report.ClaimsCleared++
+			if now.Sub(modified) < markGrace {
+				continue
+			}
+			if deleteClaimIfMatch(ctx, client, base, claimKey, etag) {
+				report.ClaimsCleared++
+			}
+			// 412: the claim was replaced by a live participant — leave it.
 		}
 	}
 
@@ -619,19 +680,33 @@ func putMark(ctx context.Context, client *http.Client, base, key string, at time
 	return nil
 }
 
+// sweepClaimBody is this run's unique owner token: the generation every
+// release and cleanup of this run's claims must match. A fixed string is
+// not a credential — a replacement claim by another participant must never
+// be deletable through an older observation.
+func sweepClaimBody() string {
+	return "sweep-" + strconv.FormatInt(time.Now().UnixNano(), 36) + "-" +
+		strconv.FormatInt(int64(os.Getpid()), 36)
+}
+
+func bodyETag(body string) string {
+	sum := md5.Sum([]byte(body))
+	return hex.EncodeToString(sum[:])
+}
+
 // putClaimIfAbsent atomically creates the exclusive claim for key (S3
 // conditional write If-None-Match:*), verifying by read-back that the store
 // honored the condition — a store that ignores the header answers 200 for
 // an overwrite too, which would make the mutual exclusion fiction.
-func putClaimIfAbsent(ctx context.Context, client *http.Client, base, key string) (bool, error) {
+func putClaimIfAbsent(ctx context.Context, client *http.Client, base, key, body string) (bool, error) {
 	claimKey := checkpointpublish.GCClaimKey(key)
 	url := base + "/" + claimKey
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, strings.NewReader("sweep"))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, strings.NewReader(body))
 	if err != nil {
 		return false, err
 	}
 	req.Header.Set("If-None-Match", "*")
-	req.ContentLength = int64(len("sweep"))
+	req.ContentLength = int64(len(body))
 	resp, err := client.Do(req)
 	if err != nil {
 		return false, err
@@ -647,13 +722,64 @@ func putClaimIfAbsent(ctx context.Context, client *http.Client, base, key string
 		if err != nil {
 			return false, fmt.Errorf("verify claim %s: %w", key, err)
 		}
-		if string(got) != "sweep" {
+		if string(got) != body {
 			return false, fmt.Errorf("store does not honor If-None-Match on %s: claim was overwritten", claimKey)
 		}
 		return true, nil
 	default:
 		return false, fmt.Errorf("conditional PUT claim %s: status %d", key, resp.StatusCode)
 	}
+}
+
+// releaseClaimIfMine drops a claim this run created, and only this
+// generation: the conditional delete (If-Match on the claim body's ETag)
+// answers 412 when another participant already replaced the claim, which is
+// the desired outcome — their protection must survive our release.
+func releaseClaimIfMine(ctx context.Context, client *http.Client, base, key, body string) {
+	deleteClaimIfMatch(ctx, client, base, checkpointpublish.GCClaimKey(key), bodyETag(body))
+}
+
+// deleteClaimIfMatch removes a claim only while it still carries the
+// observed generation (S3 conditional DELETE If-Match).
+func deleteClaimIfMatch(ctx context.Context, client *http.Client, base, claimKey, etag string) bool {
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, base+"/"+claimKey, nil)
+	if err != nil {
+		return false
+	}
+	req.Header.Set("If-Match", etag)
+	resp, err := client.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	switch resp.StatusCode {
+	case http.StatusOK, http.StatusNoContent:
+		return true
+	default: // 412 replaced, 404 gone: nothing of that generation remains
+		return false
+	}
+}
+
+// headObjectModified returns the object's CURRENT modification time (and
+// existence) — the fresh observation verdicts are re-derived from after the
+// claim is won, never from the cached relisting.
+func headObjectModified(ctx context.Context, client *http.Client, base, key string) (time.Time, bool, error) {
+	resp, err := client.Do(mustRequest(ctx, http.MethodHead, base+"/"+key))
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return time.Time{}, false, nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		return time.Time{}, false, fmt.Errorf("HEAD %s: status %d", key, resp.StatusCode)
+	}
+	mod, err := http.ParseTime(resp.Header.Get("Last-Modified"))
+	if err != nil {
+		return time.Time{}, true, fmt.Errorf("HEAD %s: bad Last-Modified %q", key, resp.Header.Get("Last-Modified"))
+	}
+	return mod, true, nil
 }
 
 // preflightConditionalWrites proves the store supports create-only PUTs
@@ -691,7 +817,37 @@ func preflightConditionalWrites(ctx context.Context, client *http.Client, base s
 	if resp2.StatusCode != http.StatusPreconditionFailed {
 		return fmt.Errorf("conditional writes not honored (second create answered %d, want 412)", resp2.StatusCode)
 	}
+	// Conditional DELETE (If-Match) is opportunistic, not required: stores
+	// that honor it get an atomic confirm→delete for claim cleanup, and
+	// stores that ignore the header degrade to a plain delete whose safety
+	// is carried by the fresh observation — the cleanup re-GETs the claim
+	// and requires it to STILL be grace-old, and a grace-old claim has no
+	// live releaser inside the documented publish/grace bound (live owners
+	// release within milliseconds of claiming). The residual is exactly the
+	// long-publish boundary the contract already states.
+	_ = deleteKey(ctx, client, base, probe)
 	return nil
+}
+
+// headClaim fetches a claim's current ETag and modification time — the
+// fresh generation observation the stale cleanup binds its delete to.
+func headClaim(ctx context.Context, client *http.Client, base, claimKey string) (etag string, modified time.Time, err error) {
+	resp, err := client.Do(mustRequest(ctx, http.MethodGet, base+"/"+claimKey))
+	if err != nil {
+		return "", time.Time{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", time.Time{}, fmt.Errorf("GET claim: status %d", resp.StatusCode)
+	}
+	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+		return "", time.Time{}, err
+	}
+	mod, err := http.ParseTime(resp.Header.Get("Last-Modified"))
+	if err != nil {
+		return "", time.Time{}, fmt.Errorf("GET claim: bad Last-Modified")
+	}
+	return strings.Trim(resp.Header.Get("ETag"), `"`), mod, nil
 }
 
 // deleteKey removes one object (a collected victim, an obsolete mark, or a

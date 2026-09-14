@@ -16,8 +16,13 @@ package checkpointpublish
 
 import (
 	"context"
+	"crypto/md5"
+	"encoding/hex"
 	"fmt"
+	"os"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/inclusionAI/sandboxd/pkg/chunkstore"
@@ -39,13 +44,12 @@ func GCMarkKey(key string) string {
 // sweep and the publishers contend for with atomic creates
 // (chunkstore.ExclusivePutter): gc-claims/<object-key>. Whoever wins the
 // claim owns the object for one operation — the sweep for one verified
-// delete (claim → recheck verdicts → DELETE → drop claim), a publisher for
-// one fenced re-upload (claim → re-PUT → INDEX commit; the claim is dropped
-// by a later sweep once stale). This closes the window the delete-time
-// relisting cannot: a publisher that refreshes an object and commits its
-// INDEX entirely between another sweep's relisting and its DELETE is no
-// longer reachable, because the sweep must win the claim AFTER its
-// relisting, and the fenced publisher already holds it by then.
+// delete (claim → fresh basis → DELETE → release), a publisher for one
+// fenced (re-)upload (claim → PUT → release). The claim body carries the
+// owner's unique nonce, and every release or stale cleanup is a conditional
+// delete bound to the observed generation (If-Match), so a replacement
+// claim can never be destroyed by a participant acting on an older
+// observation.
 const GCClaimNamespace = "gc-claims"
 
 // GCClaimKey is the claim object's key for a store object.
@@ -54,14 +58,36 @@ func GCClaimKey(key string) string {
 }
 
 // claimAcquireWait bounds how long a fenced publisher waits for a sweep's
-// claim to clear. A sweep holds a claim for one recheck plus one DELETE —
-// milliseconds — so half a minute covers a slow shared bucket with margin;
-// past the bound the publish fails closed rather than racing the delete.
+// claim to clear. A sweep holds a claim for one fresh check plus one DELETE
+// — milliseconds — so half a minute covers a slow shared bucket with
+// margin; past the bound the publish fails closed rather than racing the
+// delete.
 const claimAcquireWait = 30 * time.Second
 
+// claimNonceValue mints a per-process unique owner token for claim bodies:
+// the generation token a later conditional delete must match. A fixed
+// string is NOT a credential — two different participants must never share
+// one.
+var claimNonceValue atomic.Pointer[string]
+
+func init() {
+	nonce := "pub-" + strconv.FormatInt(time.Now().UnixNano(), 36) + "-" +
+		strconv.FormatUint(uint64(os.Getpid()), 36)
+	claimNonceValue.Store(&nonce)
+}
+
+func claimBody() string { return *claimNonceValue.Load() }
+
+// claimETag is the S3 ETag of a claim body (hex MD5 of single-part PUTs);
+// callers that know their own nonce never need a prior GET to release.
+func claimETag(body string) string {
+	sum := md5.Sum([]byte(body))
+	return hex.EncodeToString(sum[:])
+}
+
 // gcAcquireClaim atomically creates the claim for key. A lost race (a sweep
-// is mid-delete) is retried until the bound; the error path is the
-// fail-closed outcome, never "proceed anyway".
+// is mid-delete, or another publisher fences first) is retried until the
+// bound; the error path is the fail-closed outcome, never "proceed anyway".
 func gcAcquireClaim(ctx context.Context, store chunkstore.Keyed, key string) error {
 	ep, ok := store.(chunkstore.ExclusivePutter)
 	if !ok {
@@ -69,7 +95,7 @@ func gcAcquireClaim(ctx context.Context, store chunkstore.Keyed, key string) err
 	}
 	deadline := time.Now().Add(claimAcquireWait)
 	for {
-		created, err := ep.PutKeyIfAbsent(ctx, GCClaimKey(key), strings.NewReader("claim"))
+		created, err := ep.PutKeyIfAbsent(ctx, GCClaimKey(key), strings.NewReader(claimBody()))
 		if err != nil {
 			return err
 		}
@@ -87,21 +113,16 @@ func gcAcquireClaim(ctx context.Context, store chunkstore.Keyed, key string) err
 	}
 }
 
-// gcFenceClaim probes the sweep mark and, when fenced, acquires the claim
-// before the caller re-uploads: from here on no sweep can win this object's
-// claim until it drops ours, so the re-upload and the INDEX commit that
-// follows are protected against a relisting-verdict racing in from the past.
-// The claim is NOT released afterwards: a later sweep clears it as stale
-// once it outlives the publish it was protecting.
-func gcFenceClaim(ctx context.Context, store chunkstore.Keyed, key string) (fenced bool, err error) {
-	fenced, err = gcReuseFenced(ctx, store, key)
-	if err != nil || !fenced {
-		return fenced, err
+// gcReleaseClaim drops a claim this process created, and ONLY that
+// generation: the conditional delete answers 412 when someone else already
+// replaced the claim, which is the desired outcome — their protection must
+// survive our cleanup.
+func gcReleaseClaim(ctx context.Context, store chunkstore.Keyed, key string) {
+	ep, ok := store.(chunkstore.ExclusivePutter)
+	if !ok {
+		return // stores without the primitive never created claims either
 	}
-	if err := gcAcquireClaim(ctx, store, key); err != nil {
-		return false, err
-	}
-	return true, nil
+	_, _ = ep.DeleteKeyIfMatch(ctx, GCClaimKey(key), claimETag(claimBody()))
 }
 
 // gcReuseFenced reports whether reusing the store object at key is fenced by
@@ -121,4 +142,43 @@ func gcReuseFenced(ctx context.Context, store chunkstore.Keyed, key string) (boo
 		return false, fmt.Errorf("probe sweep mark for %s: %w", key, err)
 	}
 	return ok, nil
+}
+
+// gcFenceClaim probes the sweep mark and, when fenced, acquires the claim
+// BEFORE the caller re-uploads: from here on no sweep can win this object's
+// claim until this process releases it (gcReleaseClaim, after the upload),
+// so the re-upload and the INDEX commit that follows are protected against a
+// collector acting on a pre-claim observation.
+func gcFenceClaim(ctx context.Context, store chunkstore.Keyed, key string) (fenced bool, err error) {
+	fenced, err = gcReuseFenced(ctx, store, key)
+	if err != nil || !fenced {
+		return fenced, err
+	}
+	if err := gcAcquireClaim(ctx, store, key); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// gcGuardFreshUpload closes the OTHER write path around the claim: a Has
+// MISS means some collector may have just deleted the object while still
+// holding its claim, and this fresh PUT recreates the key without any
+// protection. After the upload the object's mark is probed — a sweep only
+// ever deletes keys it has marked, so an unmarked key needs no guard — and
+// a marked key gets the full claim → re-upload → release cycle: the re-make
+// under mutual exclusion guarantees the object exists once the claim is
+// released, whatever a concurrent collector did to the first copy.
+func gcGuardFreshUpload(ctx context.Context, store chunkstore.Keyed, key string, reupload func() error) error {
+	marked, err := gcReuseFenced(ctx, store, key)
+	if err != nil {
+		return err
+	}
+	if !marked {
+		return nil
+	}
+	if err := gcAcquireClaim(ctx, store, key); err != nil {
+		return err
+	}
+	defer gcReleaseClaim(ctx, store, key)
+	return reupload()
 }

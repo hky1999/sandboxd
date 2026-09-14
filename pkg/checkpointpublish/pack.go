@@ -304,11 +304,13 @@ func runPacked(ctx context.Context, dir, id string, store chunkstore.Store, m *c
 				return err
 			}
 			if present[i] {
-				// Sweep fence: a marked baseline pack is scheduled for
-				// collection; min-age cannot protect the reuse. Dropping the
-				// reuse routes those chunks through the local repack below,
-				// which refreshes their bytes into fresh pack objects.
-				fenced, ferr := gcFenceClaim(ctx, keyed, keys[i])
+				// Sweep fence (probe only): a marked baseline pack is
+				// scheduled for collection; min-age cannot protect the reuse.
+				// Dropping the reuse routes those chunks through the local
+				// repack below — nothing is uploaded under THIS key here, so
+				// there is nothing to claim; the fresh pack gets the full
+				// claim lifecycle at its own upload site.
+				fenced, ferr := gcReuseFenced(ctx, keyed, keys[i])
 				if ferr != nil {
 					return ferr
 				}
@@ -350,11 +352,13 @@ func runPacked(ctx context.Context, dir, id string, store chunkstore.Store, m *c
 				return err
 			}
 			if ok {
-				// Sweep fence: a marked standalone object cannot be leaned
-				// on — route the chunk through the local repack instead. An
-				// inherited hole has no local bytes, so a marked parent
-				// fails here rather than sealing zeros under its digest.
-				fenced, ferr := gcFenceClaim(ctx, keyed, chunkstore.PlainKey(c.Digest))
+				// Sweep fence (probe only): a marked standalone object cannot
+				// be leaned on — route the chunk through the local repack
+				// instead. An inherited hole has no local bytes, so a marked
+				// parent fails here rather than sealing zeros under its
+				// digest. Nothing is uploaded under this key in this pass;
+				// the pack that carries the bytes gets the claim lifecycle.
+				fenced, ferr := gcReuseFenced(ctx, keyed, chunkstore.PlainKey(c.Digest))
 				if ferr != nil {
 					return ferr
 				}
@@ -492,20 +496,29 @@ func runPacked(ctx context.Context, dir, id string, store chunkstore.Store, m *c
 		if err != nil {
 			return err
 		}
+		claimed := false
+		putPack := func() error {
+			return keyed.PutKey(ctx, key, bytes.NewReader(buf))
+		}
 		if present {
 			// Sweep fence: a marked pack is scheduled for collection; the
-			// bytes are already in hand, so re-PUT them and let the sweep's
-			// delete-time recheck see the refreshed timestamp and spare it.
+			// bytes are already in hand, so re-PUT them under the claim.
 			fenced, ferr := gcFenceClaim(ctx, keyed, key)
 			if ferr != nil {
 				return ferr
 			}
+			claimed = fenced
 			present = !fenced
 		}
 		if !present {
-			if err := keyed.PutKey(ctx, key, bytes.NewReader(buf)); err != nil {
+			if err := putPack(); err != nil {
 				return err
 			}
+		}
+		if claimed {
+			gcReleaseClaim(ctx, keyed, key)
+		} else if err := gcGuardFreshUpload(ctx, keyed, key, putPack); err != nil {
+			return err
 		}
 		uploadTime := time.Since(uploadStart)
 		mu.Lock()
