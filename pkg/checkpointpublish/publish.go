@@ -259,6 +259,29 @@ func RunWithOptions(ctx context.Context, checkpointDir, id string, store chunkst
 		state.StartedAt = time.Now().UTC()
 	}
 
+	// Publication intent: from before the first store write of this run
+	// until its terminal state, gc-pubintents/<id>/<attempt-nonce> tells
+	// every sweep that this publication's objects are on their way to an
+	// INDEX commit and must not be collected. The per-object claims each
+	// end at their PUT and cannot cover the release→INDEX gap; the intent
+	// covers every object family of the run — Has-reused plain chunks, .z
+	// bodies, inherited digests with no local bytes, packs, overlay chunks,
+	// and the artifact set — because it opens before any of them are
+	// touched. Establishing it is a safety record, not telemetry: a failed
+	// intent PUT fails the whole publish closed BEFORE any data upload or
+	// INDEX write. The deferred end runs on success, failure, and panic
+	// unwinds alike; a cancelled context (or a crash) leaves the intent to
+	// expire by the sweep's grace bound, which is the safe direction —
+	// protection errs toward skipping collection, never toward collecting.
+	intentKeyed, intentOK := store.(chunkstore.Keyed)
+	if intentOK {
+		intentKey, intentBody, err := gcBeginPubIntent(ctx, intentKeyed, id)
+		if err != nil {
+			return failState(state, err)
+		}
+		defer gcEndPubIntent(context.WithoutCancel(ctx), intentKeyed, intentKey, intentBody)
+	}
+
 	manifest, err := checkpointchunks.Load(checkpointDir)
 	if err != nil {
 		if !os.IsNotExist(err) {
@@ -333,6 +356,13 @@ func RunWithOptions(ctx context.Context, checkpointDir, id string, store chunkst
 	type uploadJob struct {
 		chunk checkpointchunks.Chunk
 	}
+	// heldClaim pairs a fenced object key with the EXACT acquisition's
+	// handle: the release must match the generation that was acquired, not
+	// whatever claim may sit on the key by the time the upload completes.
+	type heldClaim struct {
+		key  string
+		body string
+	}
 	upload := make(chan uploadJob, workers*2)
 	keyed := store.(chunkstore.Keyed)
 	var skippedCount int64
@@ -348,152 +378,157 @@ func RunWithOptions(ctx context.Context, checkpointDir, id string, store chunkst
 				if failedFlag.Load() {
 					continue // drain
 				}
-				// claimedKey tracks the claim this iteration holds from a
-				// fenced Has hit until after the re-upload completes; the
-				// matching release is generation-bound, so a replaced claim
-				// can never be dropped by mistake.
-				claimedPlain, claimedComp := "", ""
-				releaseClaims := func() {
-					if claimedPlain != "" {
-						gcReleaseClaim(ctx, keyed, claimedPlain)
+				// The per-job closure gives every failure path ONE release
+				// point: whatever claims this job acquired are dropped by
+				// the deferred release when the job ends, no matter which
+				// intermediate step failed (a leaked claim would block every
+				// later sweep and publish on the key for up to the claim
+				// grace). releaseClaims is idempotent — the fenced success
+				// path may release early and let the defer no-op.
+				func() {
+					// heldClaims tracks each claim this job holds from a
+					// fenced Has hit until after the re-upload completes;
+					// each release carries the EXACT acquisition's handle,
+					// so a replaced claim can never be dropped by mistake.
+					var heldClaims []heldClaim
+					releaseClaims := func() {
+						for _, h := range heldClaims {
+							gcReleaseClaim(ctx, keyed, h.key, h.body)
+						}
+						heldClaims = nil
 					}
-					if claimedComp != "" {
-						gcReleaseClaim(ctx, keyed, claimedComp)
-					}
-				}
-				if ok, err := store.Has(ctx, job.chunk.Digest); err != nil {
-					failUpload(fmt.Errorf("has chunk %s: %w", job.chunk.Digest[:12], err))
-					continue
-				} else if ok {
-					// Sweep fence: a marked object is scheduled for
-					// collection once its mark ages past the sweep's grace,
-					// and min-age offers no protection because a reused
-					// object is old by construction. Refresh it by
-					// re-uploading — unless the local artifact is a hole
-					// (an inherited digest), whose bytes are the parent's
-					// and exist only in the store: a marked parent means the
-					// parent generation is going away, and this artifact
-					// cannot be published against it.
-					fenced, err := gcFenceClaim(ctx, keyed, chunkstore.PlainKey(job.chunk.Digest))
-					if err != nil {
-						failUpload(err)
-						continue
-					}
-					if !fenced {
-						atomic.AddInt64(&skippedCount, 1)
-						continue
-					}
-					if job.chunk.Inherited {
-						releaseClaims()
-						failUpload(fmt.Errorf(
-							"inherited chunk %s at %d is marked for collection by a bucket sweep; the parent generation's object must be republished before this artifact",
-							job.chunk.Digest[:12], job.chunk.Offset))
-						continue
-					}
-					claimedPlain = chunkstore.PlainKey(job.chunk.Digest)
-				}
-				if opts.CompressChunks {
-					// Resume and cross-run idempotence: a compressed
-					// object from an interrupted earlier run already
-					// satisfies this digest. Only the plain probe above
-					// stays global — a chunk that exists uncompressed
-					// is reused as-is and a reader's fallback finds it.
-					if ok, err := keyed.HasKey(ctx, chunkstore.CompressedKey(job.chunk.Digest)); err != nil {
-						failUpload(fmt.Errorf("has compressed chunk %s: %w", job.chunk.Digest[:12], err))
-						continue
+					defer releaseClaims()
+					if ok, err := store.Has(ctx, job.chunk.Digest); err != nil {
+						failUpload(fmt.Errorf("has chunk %s: %w", job.chunk.Digest[:12], err))
+						return
 					} else if ok {
-						// Same fence as the plain probe, on the object
-						// actually being reused (the .z body).
-						fenced, err := gcFenceClaim(ctx, keyed, chunkstore.CompressedKey(job.chunk.Digest))
+						// Sweep fence: a marked object is scheduled for
+						// collection once its mark ages past the sweep's
+						// grace, and min-age offers no protection because a
+						// reused object is old by construction. Refresh it
+						// by re-uploading — unless the local artifact is a
+						// hole (an inherited digest), whose bytes are the
+						// parent's and exist only in the store: a marked
+						// parent means the parent generation is going away,
+						// and this artifact cannot be published against it.
+						plainClaim, fenced, err := gcFenceClaim(ctx, keyed, chunkstore.PlainKey(job.chunk.Digest))
 						if err != nil {
 							failUpload(err)
-							continue
+							return
 						}
 						if !fenced {
 							atomic.AddInt64(&skippedCount, 1)
-							continue
+							return
 						}
+						heldClaims = append(heldClaims, heldClaim{key: chunkstore.PlainKey(job.chunk.Digest), body: plainClaim})
 						if job.chunk.Inherited {
-							releaseClaims()
 							failUpload(fmt.Errorf(
-								"inherited chunk %s at %d has only a sweep-marked compressed object; the parent generation's object must be republished before this artifact",
+								"inherited chunk %s at %d is marked for collection by a bucket sweep; the parent generation's object must be republished before this artifact",
 								job.chunk.Digest[:12], job.chunk.Offset))
-							continue
+							return // deferred releaseClaims drops the claim
 						}
-						// Fenced but locally representable: fall through
-						// and re-upload the compressed body.
-						claimedComp = chunkstore.CompressedKey(job.chunk.Digest)
 					}
-				}
-				if job.chunk.Inherited {
-					// The local artifact is a hole here (digest-inherited
-					// generation): its real bytes live in the store under
-					// this very digest. A store miss means the parent
-					// object is gone — NEVER upload local hole bytes under
-					// the parent's key, that would poison the namespace
-					// with zeros the digest vouches against.
-					releaseClaims()
-					failUpload(fmt.Errorf(
-						"inherited chunk %s at %d missing from the store; the parent generation's object must be republished before this artifact",
-						job.chunk.Digest[:12], job.chunk.Offset))
-					continue
-				}
-				if _, err := memory.ReadAt(buf, job.chunk.Offset); err != nil &&
-					!errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
-					failUpload(fmt.Errorf("read chunk at %d: %w", job.chunk.Offset, err))
-					continue
-				}
-				end := int(manifest.FileSize - job.chunk.Offset)
-				if end > manifest.ChunkBytes {
-					end = manifest.ChunkBytes
-				}
-				putChunk := func() error {
 					if opts.CompressChunks {
-						// The object body is a zstd stream; the digest still
-						// names the uncompressed bytes and the transport
-						// sidecar carries the compression marker.
-						body, err := chunkstore.CompressChunkBody(buf[:end])
-						if err != nil {
-							return fmt.Errorf("compress chunk at %d: %w", job.chunk.Offset, err)
+						// Resume and cross-run idempotence: a compressed
+						// object from an interrupted earlier run already
+						// satisfies this digest. Only the plain probe above
+						// stays global — a chunk that exists uncompressed
+						// is reused as-is and a reader's fallback finds it.
+						if ok, err := keyed.HasKey(ctx, chunkstore.CompressedKey(job.chunk.Digest)); err != nil {
+							failUpload(fmt.Errorf("has compressed chunk %s: %w", job.chunk.Digest[:12], err))
+							return
+						} else if ok {
+							// Same fence as the plain probe, on the object
+							// actually being reused (the .z body).
+							compClaim, fenced, err := gcFenceClaim(ctx, keyed, chunkstore.CompressedKey(job.chunk.Digest))
+							if err != nil {
+								failUpload(err)
+								return
+							}
+							if !fenced {
+								atomic.AddInt64(&skippedCount, 1)
+								return
+							}
+							heldClaims = append(heldClaims, heldClaim{key: chunkstore.CompressedKey(job.chunk.Digest), body: compClaim})
+							if job.chunk.Inherited {
+								failUpload(fmt.Errorf(
+									"inherited chunk %s at %d has only a sweep-marked compressed object; the parent generation's object must be republished before this artifact",
+									job.chunk.Digest[:12], job.chunk.Offset))
+								return
+							}
+							// Fenced but locally representable: fall through
+							// and re-upload the compressed body.
 						}
-						if err := keyed.PutKey(ctx, chunkstore.CompressedKey(job.chunk.Digest), bytes.NewReader(body)); err != nil {
-							return fmt.Errorf("put compressed chunk at %d: %w", job.chunk.Offset, err)
+					}
+					if job.chunk.Inherited {
+						// The local artifact is a hole here (digest-inherited
+						// generation): its real bytes live in the store under
+						// this very digest. A store miss means the parent
+						// object is gone — NEVER upload local hole bytes under
+						// the parent's key, that would poison the namespace
+						// with zeros the digest vouches against.
+						failUpload(fmt.Errorf(
+							"inherited chunk %s at %d missing from the store; the parent generation's object must be republished before this artifact",
+							job.chunk.Digest[:12], job.chunk.Offset))
+						return
+					}
+					if _, err := memory.ReadAt(buf, job.chunk.Offset); err != nil &&
+						!errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+						failUpload(fmt.Errorf("read chunk at %d: %w", job.chunk.Offset, err))
+						return
+					}
+					end := int(manifest.FileSize - job.chunk.Offset)
+					if end > manifest.ChunkBytes {
+						end = manifest.ChunkBytes
+					}
+					putChunk := func() error {
+						if opts.CompressChunks {
+							// The object body is a zstd stream; the digest still
+							// names the uncompressed bytes and the transport
+							// sidecar carries the compression marker.
+							body, err := chunkstore.CompressChunkBody(buf[:end])
+							if err != nil {
+								return fmt.Errorf("compress chunk at %d: %w", job.chunk.Offset, err)
+							}
+							if err := keyed.PutKey(ctx, chunkstore.CompressedKey(job.chunk.Digest), bytes.NewReader(body)); err != nil {
+								return fmt.Errorf("put compressed chunk at %d: %w", job.chunk.Offset, err)
+							}
+							return nil
+						}
+						if err := store.Put(ctx, job.chunk.Digest, bytes.NewReader(buf[:end])); err != nil {
+							return fmt.Errorf("put chunk at %d: %w", job.chunk.Offset, err)
 						}
 						return nil
 					}
-					if err := store.Put(ctx, job.chunk.Digest, bytes.NewReader(buf[:end])); err != nil {
-						return fmt.Errorf("put chunk at %d: %w", job.chunk.Offset, err)
-					}
-					return nil
-				}
-				if err := putChunk(); err != nil {
-					releaseClaims()
-					failUpload(err)
-					continue
-				}
-				if claimedPlain != "" || claimedComp != "" {
-					// Fenced re-upload complete: end this claim's protection.
-					releaseClaims()
-				} else {
-					// Fresh-upload guard: a collector may have deleted the
-					// object seconds ago while still holding its claim, and
-					// a SECOND collector can then act on its pre-deletion
-					// observation against this recreated key. When the key
-					// carries a mark, redo the upload under the claim so the
-					// object provably exists once the claim is released.
-					guardKey := chunkstore.PlainKey(job.chunk.Digest)
-					if opts.CompressChunks {
-						guardKey = chunkstore.CompressedKey(job.chunk.Digest)
-					}
-					if err := gcGuardFreshUpload(ctx, keyed, guardKey, putChunk); err != nil {
+					if err := putChunk(); err != nil {
 						failUpload(err)
-						continue
+						return // deferred releaseClaims drops any held claim
 					}
-				}
-				progressMu.Lock()
-				progress++
-				state.ChunksPut = int(progress)
-				progressMu.Unlock()
+					if len(heldClaims) > 0 {
+						// Fenced re-upload complete: end these claims'
+						// protection early; the deferred release no-ops.
+						releaseClaims()
+					} else {
+						// Fresh-upload guard: a collector may have deleted the
+						// object seconds ago while still holding its claim, and
+						// a SECOND collector can then act on its pre-deletion
+						// observation against this recreated key. When the key
+						// carries a mark, redo the upload under the claim so the
+						// object provably exists once the claim is released.
+						guardKey := chunkstore.PlainKey(job.chunk.Digest)
+						if opts.CompressChunks {
+							guardKey = chunkstore.CompressedKey(job.chunk.Digest)
+						}
+						if err := gcGuardFreshUpload(ctx, keyed, guardKey, putChunk); err != nil {
+							failUpload(err)
+							return
+						}
+					}
+					progressMu.Lock()
+					progress++
+					state.ChunksPut = int(progress)
+					progressMu.Unlock()
+				}()
 			}
 		}()
 	}

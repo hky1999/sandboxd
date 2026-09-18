@@ -496,18 +496,28 @@ func runPacked(ctx context.Context, dir, id string, store chunkstore.Store, m *c
 		if err != nil {
 			return err
 		}
-		claimed := false
+		claim := "" // this acquisition's handle; empty = no claim held
+		// One release point for every path: a pack upload that fails after
+		// the fence claim was acquired must not leak the claim (it would
+		// block later sweeps and publishes on the key for the claim
+		// grace). The success path releases early and empties the handle,
+		// making the deferred release a no-op.
+		defer func() {
+			if claim != "" {
+				gcReleaseClaim(ctx, keyed, key, claim)
+			}
+		}()
 		putPack := func() error {
 			return keyed.PutKey(ctx, key, bytes.NewReader(buf))
 		}
 		if present {
 			// Sweep fence: a marked pack is scheduled for collection; the
 			// bytes are already in hand, so re-PUT them under the claim.
-			fenced, ferr := gcFenceClaim(ctx, keyed, key)
+			body, fenced, ferr := gcFenceClaim(ctx, keyed, key)
 			if ferr != nil {
 				return ferr
 			}
-			claimed = fenced
+			claim = body
 			present = !fenced
 		}
 		if !present {
@@ -515,8 +525,9 @@ func runPacked(ctx context.Context, dir, id string, store chunkstore.Store, m *c
 				return err
 			}
 		}
-		if claimed {
-			gcReleaseClaim(ctx, keyed, key)
+		if claim != "" {
+			gcReleaseClaim(ctx, keyed, key, claim)
+			claim = ""
 		} else if err := gcGuardFreshUpload(ctx, keyed, key, putPack); err != nil {
 			return err
 		}

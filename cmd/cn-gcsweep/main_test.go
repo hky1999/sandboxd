@@ -47,9 +47,14 @@ import (
 )
 
 type fakeBucket struct {
-	mu      sync.Mutex
-	objects map[string]fakeObject
-	gets    map[string]int
+	mu sync.Mutex
+	// ignoreDeleteIfMatch emulates the degraded backend observed on the
+	// real MinIO (2026-09-14 acceptance): a DELETE carrying If-Match
+	// executes unconditionally, so GET+DELETE cannot act as an atomic
+	// compare-and-delete.
+	ignoreDeleteIfMatch bool
+	objects             map[string]fakeObject
+	gets                map[string]int
 }
 
 type fakeObject struct {
@@ -72,6 +77,18 @@ func (b *fakeBucket) has(key string) bool {
 	defer b.mu.Unlock()
 	_, ok := b.objects[key]
 	return ok
+}
+
+// hasUnderPrefix reports whether any object key starts with prefix.
+func (b *fakeBucket) hasUnderPrefix(prefix string) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for k := range b.objects {
+		if strings.HasPrefix(k, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func (b *fakeBucket) serve(w http.ResponseWriter, r *http.Request) {
@@ -161,8 +178,9 @@ func (b *fakeBucket) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		// S3 conditional delete: If-Match only removes the observed
-		// generation (the ETag of the current body).
-		if want := r.Header.Get("If-Match"); want != "" {
+		// generation (the ETag of the current body) — unless the degraded
+		// mode ignores the header entirely.
+		if want := r.Header.Get("If-Match"); want != "" && !b.ignoreDeleteIfMatch {
 			sum := md5.Sum(obj.body)
 			if strings.Trim(want, `"`) != hex.EncodeToString(sum[:]) {
 				w.WriteHeader(http.StatusPreconditionFailed)
@@ -527,11 +545,14 @@ func TestSweepMergesMidRunArtifactReferences(t *testing.T) {
 // barrierBucket wraps a fake bucket with a barrier that blocks chosen
 // requests (without holding the bucket lock) until released, so a real
 // publisher can run to completion while a sweep sits at the blocked step.
+// A non-nil done channel is the escape hatch that keeps a failing test's
+// deferred Server.Close from waiting forever on a parked handler.
 type barrierBucket struct {
 	inner   *fakeBucket
 	block   func(method, key string) bool
 	hit     chan string
 	release chan struct{}
+	done    <-chan struct{}
 }
 
 func (b *barrierBucket) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -541,7 +562,16 @@ func (b *barrierBucket) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		case b.hit <- key:
 		default:
 		}
-		<-b.release
+		if b.done == nil {
+			<-b.release
+			b.inner.serve(w, r)
+			return
+		}
+		select {
+		case <-b.release:
+		case <-b.done:
+			return
+		}
 	}
 	b.inner.serve(w, r)
 }
@@ -950,5 +980,678 @@ func TestReviewStaleCleanupDeletesReplacementClaim(t *testing.T) {
 	}
 	if !bucket.has(claimKey) {
 		t.Fatalf("stale collector deleted replacement publisher claim aged only %s; mark-grace=24h", time.Since(acquired))
+	}
+}
+
+// Reviewer 2026-09-15 §3.1 (degraded conditional DELETE): two collectors
+// observe the same grace-old claim; collector A deletes it, a publisher
+// atomically creates a replacement, and collector B's already-issued DELETE —
+// bound to the OLD claim's generation — must never be able to destroy the
+// replacement. On a backend that ignores If-Match on DELETE, GET+DELETE is
+// not an atomic compare-and-delete, so the only safe behavior is to REFUSE
+// automatic deletion on such a backend outright.
+//
+// On the unfixed baseline the run parks at B's stale-cleanup DELETE, the
+// interleaving plays out, and B's stale DELETE destroys the fresh publisher
+// claim (red). With the fix the run refuses at the preflight probe before
+// any deletion and the claim is never endangered (green).
+func TestReviewStaleCleanupDegradedBackendRefusesDeletion(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	bucket := newFakeBucket()
+	bucket.ignoreDeleteIfMatch = true
+	key := "overlay-chunks/aa/" + strings.Repeat("a", 64)
+	claimKey := checkpointpublish.GCClaimKey(key)
+	bucket.put(key, []byte("young payload"), 0)
+	bucket.put(claimKey, []byte("old-owner-nonce"), 48*time.Hour)
+
+	hit, release := make(chan struct{}), make(chan struct{})
+	var hitOnce, releaseOnce sync.Once
+	parked := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete && strings.TrimPrefix(r.URL.Path, "/") == claimKey {
+			hitOnce.Do(func() { close(hit) })
+			select {
+			case <-release:
+			case <-ctx.Done():
+				return
+			}
+		}
+		bucket.serve(w, r)
+	}))
+	defer parked.Close()
+	defer releaseOnce.Do(func() { close(release) })
+	done := make(chan error, 1)
+	go func() { done <- run(ctx, parked.URL, true, 0, nil, 24*time.Hour, 24*time.Hour, 2, false) }()
+
+	select {
+	case <-hit:
+		// Baseline interleaving: B is parked with its DELETE issued against
+		// the OLD claim's generation. Collector A (unimpeded endpoint)
+		// completes its own cleanup and removes the old claim; a publisher
+		// then atomically acquires a fresh claim.
+		plain := httptest.NewServer(http.HandlerFunc(bucket.serve))
+		defer plain.Close()
+		if err := run(ctx, plain.URL, true, 0, nil, 24*time.Hour, 24*time.Hour, 2, false); err != nil {
+			t.Fatalf("collector A: %v", err)
+		}
+		store, err := chunkstore.Open(plain.URL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		created, err := store.(chunkstore.ExclusivePutter).PutKeyIfAbsent(ctx, claimKey, strings.NewReader("new-owner-nonce"))
+		if err != nil || !created {
+			t.Fatalf("fresh publisher claim: created=%v err=%v", created, err)
+		}
+		releaseOnce.Do(func() { close(release) })
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("collector B: %v", err)
+			}
+		case <-time.After(8 * time.Second):
+			t.Fatal("collector B did not finish after the barrier")
+		}
+		if !bucket.has(claimKey) {
+			t.Fatal("degraded backend: collector B's stale DELETE destroyed the publisher's replacement claim — GET+DELETE is not atomic when If-Match is ignored")
+		}
+	case err := <-done:
+		// Fixed path: the store failed the conditional-delete probe, so the
+		// sweep refused before any deletion (and before any mutation).
+		if err == nil || !strings.Contains(err.Error(), "conditional DELETE") {
+			t.Fatalf("degraded backend must refuse automatic deletion, got %v", err)
+		}
+		if !bucket.has(key) || !bucket.has(claimKey) {
+			t.Fatal("a refusing sweep still mutated or deleted objects")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("collector B neither parked at its stale DELETE nor refused")
+	}
+}
+
+// Reviewer 2026-09-15 §3.2 (release before INDEX): the publisher's per-object
+// claims end at each PUT while the artifact INDEX commits last, so a sweep
+// that runs inside that gap — mature mark, min-age=0 — deletes the chunk the
+// publication just landed; the publish still returns success and the
+// published artifact is missing a block. The publication intent
+// (gc-pubintents/<id>) must make the sweep skip every deletion while the
+// publication is between its first store write and its INDEX commit.
+//
+// The publisher is parked deterministically by blocking its INDEX PUT (the
+// barrier fires only after every chunk, claim, and bundle write completed),
+// the collector runs to completion in that gap, and the final assertion is
+// the reviewer's: a publish that returned success must be fully
+// materializable.
+func TestReviewPublishProtectedThroughIndexCommit(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	bucket := newFakeBucket()
+	dir, digest := fixtureCheckpointDir(t)
+	overlayKey := checkpointpublish.OverlayChunkKey(digest)
+	memoryKey := digest[:2] + "/" + digest
+	plain := httptest.NewServer(http.HandlerFunc(bucket.serve))
+	defer plain.Close()
+	store, err := chunkstore.Open(plain.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Seed publication p1, drop it, and age its chunks' marks mature.
+	if _, err := checkpointpublish.Run(ctx, dir, "p1", store, plain.URL); err != nil {
+		t.Fatalf("seed publish: %v", err)
+	}
+	if err := run(ctx, plain.URL, true, 0, []string{"p1"}, 0, time.Hour, 2, false); err != nil {
+		t.Fatalf("mark-only sweep: %v", err)
+	}
+	if !bucket.has(checkpointpublish.GCMarkKey(overlayKey)) {
+		t.Fatal("overlay chunk not marked")
+	}
+	rewindMark(bucket, overlayKey, 2*time.Hour)
+
+	// Park the publisher's INDEX commit: every other store write of the
+	// publication runs to completion first, so the barrier hit is exactly
+	// the reviewer's pause point — uploads done, claims released, INDEX not
+	// yet committed.
+	indexKey := checkpointpublish.ArtifactKey("p2", checkpointpublish.IndexName)
+	barrier := &barrierBucket{
+		inner: bucket,
+		block: func(method, key string) bool {
+			return method == http.MethodPut && key == indexKey
+		},
+		hit:     make(chan string, 8),
+		release: make(chan struct{}),
+		done:    ctx.Done(),
+	}
+	pubSrv := httptest.NewServer(barrier)
+	defer func() { cancel(); pubSrv.Close() }()
+	pubStore, err := chunkstore.Open(pubSrv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p2dir := t.TempDir()
+	for _, name := range []string{"memory", "vmstate", "overlay.ext4", "manifest.json", checkpointchunks.ManifestName, checkpointpublish.OverlaySidecarName} {
+		body, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(p2dir, name), body, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pubDone := make(chan error, 1)
+	go func() {
+		_, err := checkpointpublish.Run(ctx, p2dir, "p2", pubStore, pubSrv.URL)
+		pubDone <- err
+	}()
+	select {
+	case <-barrier.hit:
+	case <-time.After(20 * time.Second):
+		t.Fatal("publisher never reached its INDEX commit")
+	}
+
+	// The collector runs while the publication is parked pre-INDEX: mature
+	// mark on the overlay chunk, min-age=0 and mark-grace=0 — maximally
+	// aggressive. It must not delete anything the publication needs.
+	if err := run(ctx, plain.URL, true, 0, nil, 0, 0, 2, false); err != nil {
+		t.Fatalf("collecting sweep: %v", err)
+	}
+	close(barrier.release)
+	select {
+	case err := <-pubDone:
+		if err != nil {
+			t.Fatalf("publisher: %v", err)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("publisher did not finish after the barrier")
+	}
+	if !bucket.has(overlayKey) || !bucket.has(memoryKey) {
+		t.Fatal("chunk deleted while the publication was between its uploads and the INDEX commit")
+	}
+	mat := filepath.Join(t.TempDir(), "mat")
+	if err := checkpointpublish.Materialize(ctx, mat, "p2", store.(chunkstore.Keyed)); err != nil {
+		t.Fatalf("publish returned success but the artifact lost a dependency to a mid-publish sweep: %v", err)
+	}
+}
+
+// Ordering regression (reviewer 2026-09-17 follow-up): the deletion basis
+// must observe publication intents BEFORE the INDEX listing of the same
+// basis. The adversarial junction is a publisher that commits its INDEX
+// and then deletes its intent while the sweep sits BETWEEN the two
+// observations — an implementation that lists INDEX first and checks
+// intents second would see NEITHER (INDEX not yet committed at listing
+// time, intent already deleted at check time) and would delete the
+// committed publication's chunks. The sweep is parked deterministically on
+// the first full listing that follows any intent listing (the delete-time
+// recheck), the publisher runs to FULL completion during the park, and
+// the released sweep must then spare the chunk through the merged INDEX.
+func TestReviewIntentIndexJunctionOrderedObservation(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	bucket := newFakeBucket()
+	dir, digest := fixtureCheckpointDir(t)
+	overlayKey := checkpointpublish.OverlayChunkKey(digest)
+	plain := httptest.NewServer(http.HandlerFunc(bucket.serve))
+	defer plain.Close()
+	store, err := chunkstore.Open(plain.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := checkpointpublish.Run(ctx, dir, "p1", store, plain.URL); err != nil {
+		t.Fatalf("seed publish: %v", err)
+	}
+	if err := run(ctx, plain.URL, true, 0, []string{"p1"}, 0, time.Hour, 2, false); err != nil {
+		t.Fatalf("mark-only sweep: %v", err)
+	}
+	rewindMark(bucket, overlayKey, 2*time.Hour)
+
+	parkHit, parkRelease := make(chan struct{}), make(chan struct{})
+	var parkOnce, releaseOnce sync.Once
+	var sawIntentList, parked bool
+	sweepSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.RawQuery != "" {
+			if r.URL.Query().Get("prefix") != "" {
+				sawIntentList = true
+			} else if sawIntentList && !parked {
+				// First full listing after an intent listing: the
+				// delete-time recheck. Park the sweep exactly between its
+				// intent observation and its INDEX basis.
+				parked = true
+				parkOnce.Do(func() { close(parkHit) })
+				select {
+				case <-parkRelease:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}
+		bucket.serve(w, r)
+	}))
+	defer sweepSrv.Close()
+	defer releaseOnce.Do(func() { close(parkRelease) })
+	sweepDone := make(chan error, 1)
+	go func() { sweepDone <- run(ctx, sweepSrv.URL, true, 0, nil, 0, 0, 2, false) }()
+	select {
+	case <-parkHit:
+	case <-time.After(20 * time.Second):
+		t.Fatal("sweep never reached its delete-time recheck listing")
+	}
+
+	// The publisher runs to FULL completion during the park: chunk
+	// uploads, INDEX commit, and intent deletion all land before the
+	// sweep's INDEX basis is taken.
+	p2dir := t.TempDir()
+	for _, name := range []string{"memory", "vmstate", "overlay.ext4", "manifest.json", checkpointchunks.ManifestName, checkpointpublish.OverlaySidecarName} {
+		body, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(p2dir, name), body, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := checkpointpublish.Run(ctx, p2dir, "p2", store, plain.URL); err != nil {
+		t.Fatalf("publisher: %v", err)
+	}
+	if bucket.hasUnderPrefix(checkpointpublish.GCPubIntentNamespace + "/") {
+		t.Fatal("publisher did not clean up its intent")
+	}
+	releaseOnce.Do(func() { close(parkRelease) })
+	select {
+	case err := <-sweepDone:
+		if err != nil {
+			t.Fatalf("sweep: %v", err)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("sweep did not finish after the barrier")
+	}
+	if !bucket.has(overlayKey) {
+		t.Fatal("junction: sweep deleted a chunk of a publication whose INDEX committed and intent was deleted between the sweep's observations")
+	}
+	mat := filepath.Join(t.TempDir(), "mat")
+	if err := checkpointpublish.Materialize(ctx, mat, "p2", store.(chunkstore.Keyed)); err != nil {
+		t.Fatalf("artifact at the junction lost a dependency: %v", err)
+	}
+}
+
+// Expired intents are garbage a dead publish left behind: past the grace
+// they starve every later sweep, so a run with no young intent clears them
+// — generation-bound (conditional delete on the freshly observed ETag) and
+// only after a fresh age check, so a retrying publisher that refreshed the
+// intent keeps it. A young intent makes the whole run a read-only skip
+// (intents_wait): nothing is cleared, nothing deleted.
+func TestSweepClearsExpiredIntents(t *testing.T) {
+	bucket := newFakeBucket()
+	deadKey := checkpointpublish.GCPubIntentNamespace + "/dead-publish/attempt-1"
+	bucket.put(deadKey, []byte("crashed-owner"), 48*time.Hour)
+	server := httptest.NewServer(http.HandlerFunc(bucket.serve))
+	defer server.Close()
+	report, err := sweepRun(context.Background(), server.URL, true, 0, nil, 24*time.Hour, 24*time.Hour, 24*time.Hour, 24*time.Hour, 2, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bucket.has(deadKey) {
+		t.Fatal("expired intent survived collection")
+	}
+	if report.IntentsCleared != 1 || report.IntentsTracked != 1 || report.IntentsWait != 0 {
+		t.Fatalf("intent accounting: tracked=%d cleared=%d wait=%d, want 1/1/0",
+			report.IntentsTracked, report.IntentsCleared, report.IntentsWait)
+	}
+	// A young intent turns the next run into a read-only skip: an expired
+	// leftover from ANOTHER dead publish stays until a quiet run clears it.
+	staleKey := checkpointpublish.GCPubIntentNamespace + "/older-dead/attempt-1"
+	bucket.put(staleKey, []byte("older-owner"), 48*time.Hour)
+	liveKey := checkpointpublish.GCPubIntentNamespace + "/live-publish/attempt-1"
+	bucket.put(liveKey, []byte("live-owner"), 0)
+	report, err = sweepRun(context.Background(), server.URL, true, 0, nil, 24*time.Hour, 24*time.Hour, 24*time.Hour, 24*time.Hour, 2, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bucket.has(liveKey) || !bucket.has(staleKey) {
+		t.Fatal("an intents-wait run cleared or deleted an intent")
+	}
+	if report.IntentsWait != 1 {
+		t.Fatalf("intents-wait accounting: wait=%d, want 1", report.IntentsWait)
+	}
+}
+
+// Reviewer 2026-09-17 follow-up (overlapping attempts, same checkpoint ID):
+// attempt A is parked between its uploads and its INDEX commit; attempt B
+// under the SAME ID starts, completes, and legitimately removes its own
+// intent. A is still alive, so its protection must NOT have been B's to
+// remove: the sweep must still see a young intent and spare A's
+// dependencies. A single shared intent key fails exactly here — B's
+// legal conditional delete of its own generation would leave the running
+// A with zero intent and collectable dependencies.
+func TestReviewIntentPerAttemptOverlappingPublishers(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
+	defer cancel()
+	bucket := newFakeBucket()
+	dir, digest := fixtureCheckpointDir(t)
+	overlayKey := checkpointpublish.OverlayChunkKey(digest)
+	plain := httptest.NewServer(http.HandlerFunc(bucket.serve))
+	defer plain.Close()
+	store, err := chunkstore.Open(plain.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := checkpointpublish.Run(ctx, dir, "p1", store, plain.URL); err != nil {
+		t.Fatalf("seed publish: %v", err)
+	}
+	if err := run(ctx, plain.URL, true, 0, []string{"p1"}, 0, time.Hour, 2, false); err != nil {
+		t.Fatalf("mark-only sweep: %v", err)
+	}
+	rewindMark(bucket, overlayKey, 2*time.Hour)
+
+	// Park ONLY the FIRST INDEX PUT under the shared ID (attempt A's);
+	// attempt B's INDEX PUT must pass through and complete.
+	indexKey := checkpointpublish.ArtifactKey("px", checkpointpublish.IndexName)
+	var indexParks atomic.Int32
+	parkHit, parkRelease := make(chan struct{}), make(chan struct{})
+	var parkOnce sync.Once
+	pubSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut && strings.TrimPrefix(r.URL.Path, "/") == indexKey &&
+			indexParks.Add(1) == 1 {
+			parkOnce.Do(func() { close(parkHit) })
+			select {
+			case <-parkRelease:
+			case <-ctx.Done():
+				return
+			}
+		}
+		bucket.serve(w, r)
+	}))
+	defer func() { cancel(); pubSrv.Close() }()
+	pubStore, err := chunkstore.Open(pubSrv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	copyFixture := func() string {
+		d := t.TempDir()
+		for _, name := range []string{"memory", "vmstate", "overlay.ext4", "manifest.json", checkpointchunks.ManifestName, checkpointpublish.OverlaySidecarName} {
+			body, err := os.ReadFile(filepath.Join(dir, name))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(d, name), body, 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return d
+	}
+	// Attempt A: parked between its uploads and its INDEX commit. A's
+	// content is the seeded fixture, so its overlay chunk carries the
+	// mature mark and is uploaded (fenced) before the park.
+	aDone := make(chan error, 1)
+	go func() {
+		_, err := checkpointpublish.Run(ctx, copyFixture(), "px", pubStore, pubSrv.URL)
+		aDone <- err
+	}()
+	select {
+	case <-parkHit:
+	case <-time.After(20 * time.Second):
+		t.Fatal("attempt A never reached its INDEX commit")
+	}
+	// Attempt B under the SAME ID publishes DIFFERENT writable-layer
+	// bytes: B's committed INDEX does not reference A's overlay chunk, so
+	// the only thing standing between the collector and A's chunk is A's
+	// mid-publish protection. B runs to FULL completion — including its
+	// own intent cleanup — while A stays parked.
+	bdir := copyFixture()
+	bData := make([]byte, 256<<10)
+	for i := range bData {
+		bData[i] = byte(i*13 + 5)
+	}
+	if err := os.WriteFile(filepath.Join(bdir, "overlay.ext4"), bData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	bSum := sha256.Sum256(bData)
+	bDigest := hex.EncodeToString(bSum[:])
+	bom := &checkpointchunks.Manifest{
+		Version: 1, File: "overlay.ext4", FileSize: int64(len(bData)),
+		ChunkBytes: 256 << 10, ChunkCount: 1,
+		FileDigestMode: checkpointchunks.FileDigestChunks,
+		Entries:        []checkpointchunks.Chunk{{Offset: 0, Digest: bDigest}},
+	}
+	bom.FileDigest = checkpointchunks.RootDigest(bom.Entries)
+	if err := checkpointchunks.WriteNamed(bdir, checkpointpublish.OverlaySidecarName, bom); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := checkpointpublish.Run(ctx, bdir, "px", store, plain.URL); err != nil {
+		t.Fatalf("attempt B: %v", err)
+	}
+
+	// The collector runs now: A is still mid-publish, so a young intent
+	// must remain and every deletion must be skipped.
+	if err := run(ctx, plain.URL, true, 0, nil, 0, 0, 2, false); err != nil {
+		t.Fatalf("collecting sweep: %v", err)
+	}
+	close(parkRelease)
+	select {
+	case err := <-aDone:
+		if err != nil {
+			t.Fatalf("attempt A: %v", err)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("attempt A did not finish after the barrier")
+	}
+	if !bucket.has(overlayKey) {
+		t.Fatal("attempt B's completion stripped the still-running attempt A's mid-publish protection")
+	}
+	// Both attempts' dependency chunks survive: A's (the marked, seeded
+	// overlay block) through A's own still-young intent, and B's newly
+	// uploaded block through the same skip. (Materializing "px" here is
+	// deliberately NOT asserted: two overlapping same-ID attempts with
+	// DIFFERENT content overwrite each other's ID-named BUNDLE/INDEX — an
+	// unsupported topology by contract — and the collection safety of the
+	// shared content-addressed chunks is what this regression pins.)
+	bOverlayKey := checkpointpublish.OverlayChunkKey(bDigest)
+	if !bucket.has(bOverlayKey) {
+		t.Fatal("attempt B's uploaded chunk was collected while attempt A was still mid-publish")
+	}
+}
+
+// Reviewer 2026-09-17 follow-up (claim liveness vs mark-grace=0): a
+// publication intent protects publishers, never a RUNNING COLLECTOR's own
+// claim. Collector A wins K's claim and parks mid-verdict; collector B —
+// with no publisher intent in sight, since none is needed — must not be
+// able to clear A's still-held claim just because -mark-grace is 0. If it
+// could, a publisher would then win the freed claim, rebuild, and commit,
+// and A's resumed DELETE would land on the committed generation with the
+// mutual exclusion a fiction. Claim cleanup therefore has its OWN grace
+// (-claim-grace), decoupled from mark-grace and positive under -delete.
+func TestReviewClaimGraceDecoupledFromMarkGrace(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	bucket := newFakeBucket()
+	dir, digest := fixtureCheckpointDir(t)
+	overlayKey := checkpointpublish.OverlayChunkKey(digest)
+	claimKey := checkpointpublish.GCClaimKey(overlayKey)
+	plain := httptest.NewServer(http.HandlerFunc(bucket.serve))
+	defer plain.Close()
+	store, err := chunkstore.Open(plain.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := checkpointpublish.Run(ctx, dir, "p1", store, plain.URL); err != nil {
+		t.Fatalf("seed publish: %v", err)
+	}
+	if err := run(ctx, plain.URL, true, 0, []string{"p1"}, 0, time.Hour, 2, false); err != nil {
+		t.Fatalf("mark-only sweep: %v", err)
+	}
+	rewindMark(bucket, overlayKey, 2*time.Hour)
+
+	// Collector A: maximally aggressive (min-age 0, mark-grace 0), parked
+	// at the data DELETE — holding the claim.
+	barrier := &barrierBucket{
+		inner: bucket,
+		block: func(method, key string) bool {
+			return method == http.MethodDelete && key == overlayKey
+		},
+		hit:     make(chan string, 8),
+		release: make(chan struct{}),
+		done:    ctx.Done(),
+	}
+	sweepSrv := httptest.NewServer(barrier)
+	defer func() { cancel(); sweepSrv.Close() }()
+	aDone := make(chan error, 1)
+	go func() { aDone <- run(ctx, sweepSrv.URL, true, 0, nil, 0, 0, 2, false) }()
+	select {
+	case <-barrier.hit:
+	case <-time.After(20 * time.Second):
+		t.Fatal("collector A never reached its parked delete")
+	}
+	if !bucket.has(claimKey) {
+		t.Fatal("invalid setup: collector A is not holding the claim")
+	}
+
+	// Collector B, same aggressive mark-grace of zero, runs to completion:
+	// its stale-claim cleanup must spare A's held claim (claim-grace is a
+	// separate, positive bound).
+	if err := run(ctx, plain.URL, true, 0, nil, 0, 0, 2, false); err != nil {
+		t.Fatalf("collector B: %v", err)
+	}
+	if !bucket.has(claimKey) {
+		t.Fatal("mark-grace=0 let collector B clear a claim collector A was still holding")
+	}
+
+	// Let A finish its collection; a publisher then rebuilds the chunk and
+	// commits — the whole sequence stays consistent.
+	close(barrier.release)
+	select {
+	case err := <-aDone:
+		if err != nil {
+			t.Fatalf("collector A: %v", err)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("collector A did not finish after the barrier")
+	}
+	p2dir := t.TempDir()
+	for _, name := range []string{"memory", "vmstate", "overlay.ext4", "manifest.json", checkpointchunks.ManifestName, checkpointpublish.OverlaySidecarName} {
+		body, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(p2dir, name), body, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := checkpointpublish.Run(ctx, p2dir, "p2", store, plain.URL); err != nil {
+		t.Fatalf("rebuild publish: %v", err)
+	}
+	if !bucket.has(overlayKey) {
+		t.Fatal("publisher did not rebuild the collected chunk")
+	}
+	mat := filepath.Join(t.TempDir(), "mat")
+	if err := checkpointpublish.Materialize(ctx, mat, "p2", store.(chunkstore.Keyed)); err != nil {
+		t.Fatalf("artifact after the full sequence lost a dependency: %v", err)
+	}
+}
+
+// Reviewer diff recheck 2026-09-17 (unlocked mark clearing): collector A
+// drops the artifacts that reference K, wins K's claim, and parks before
+// its DELETE. Collector B, whose basis still sees the old INDEXes (A has
+// not removed them yet), judges K live — not a victim — and its
+// OBSOLETE-mark pass must not delete K's mark: a publisher arriving then
+// would find no mark, reuse the object fence-less and claim-less, commit
+// its INDEX, and A's resumed DELETE would land on the committed
+// generation. Mark clearing therefore runs under the key's claim, exactly
+// like the verdicts: B loses the claim race and leaves the mark alone.
+func TestReviewMarkClearingClaimGuarded(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
+	defer cancel()
+	bucket := newFakeBucket()
+	dir, digest := fixtureCheckpointDir(t)
+	memoryKey := digest[:2] + "/" + digest
+	overlayKey := checkpointpublish.OverlayChunkKey(digest)
+	claimKey := checkpointpublish.GCClaimKey(overlayKey)
+	markKey := checkpointpublish.GCMarkKey(overlayKey)
+	plain := httptest.NewServer(http.HandlerFunc(bucket.serve))
+	defer plain.Close()
+	store, err := chunkstore.Open(plain.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Two artifacts referencing the shared chunks; A will drop both.
+	for _, id := range []string{"pa", "pb"} {
+		pdir := t.TempDir()
+		for _, name := range []string{"memory", "vmstate", "overlay.ext4", "manifest.json", checkpointchunks.ManifestName, checkpointpublish.OverlaySidecarName} {
+			body, err := os.ReadFile(filepath.Join(dir, name))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(pdir, name), body, 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err := checkpointpublish.Run(ctx, pdir, id, store, plain.URL); err != nil {
+			t.Fatalf("seed publish %s: %v", id, err)
+		}
+	}
+	// A mature mark on the overlay chunk (the candidate A will collect).
+	bucket.put(markKey, []byte("mature"), 2*time.Hour)
+
+	// Collector A: drop both artifacts, claim the overlay chunk, park at
+	// its DELETE (min-age 0 / mark-grace 0; claim-grace default 24h).
+	barrier := &barrierBucket{
+		inner: bucket,
+		block: func(method, key string) bool {
+			return method == http.MethodDelete && key == overlayKey
+		},
+		hit:     make(chan string, 8),
+		release: make(chan struct{}),
+		done:    ctx.Done(),
+	}
+	sweepSrv := httptest.NewServer(barrier)
+	defer func() { cancel(); sweepSrv.Close() }()
+	aDone := make(chan error, 1)
+	go func() { aDone <- run(ctx, sweepSrv.URL, true, 0, []string{"pa", "pb"}, 0, 0, 2, false) }()
+	select {
+	case <-barrier.hit:
+	case <-time.After(20 * time.Second):
+		t.Fatal("collector A never reached its parked delete")
+	}
+	if !bucket.has(claimKey) {
+		t.Fatal("invalid setup: collector A is not holding the claim")
+	}
+
+	// Collector B sees both INDEXes (A has not deleted the sets yet), so K
+	// is LIVE for B and its mark is an obsolete mark. B must lose the
+	// claim race and leave the mark in place.
+	if err := run(ctx, plain.URL, true, 0, nil, 0, 0, 2, false); err != nil {
+		t.Fatalf("collector B: %v", err)
+	}
+	if !bucket.has(markKey) {
+		t.Fatal("collector B cleared a mark whose object's claim a parked collector was still holding")
+	}
+
+	// Let A finish (collect the chunk, clear the mark, release), then a
+	// publisher rebuilds and commits — the sequence stays consistent.
+	close(barrier.release)
+	select {
+	case err := <-aDone:
+		if err != nil {
+			t.Fatalf("collector A: %v", err)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("collector A did not finish after the barrier")
+	}
+	p2dir := t.TempDir()
+	for _, name := range []string{"memory", "vmstate", "overlay.ext4", "manifest.json", checkpointchunks.ManifestName, checkpointpublish.OverlaySidecarName} {
+		body, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(p2dir, name), body, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := checkpointpublish.Run(ctx, p2dir, "pc", store, plain.URL); err != nil {
+		t.Fatalf("rebuild publish: %v", err)
+	}
+	if !bucket.has(overlayKey) || !bucket.has(memoryKey) {
+		t.Fatal("publisher did not rebuild the collected chunks")
+	}
+	mat := filepath.Join(t.TempDir(), "mat")
+	if err := checkpointpublish.Materialize(ctx, mat, "pc", store.(chunkstore.Keyed)); err != nil {
+		t.Fatalf("artifact after the unlocked-mark sequence lost a dependency: %v", err)
 	}
 }

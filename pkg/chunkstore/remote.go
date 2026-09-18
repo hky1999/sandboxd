@@ -27,6 +27,7 @@ import (
 	"path"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -465,16 +466,41 @@ func (l *Local) PutKeyIfAbsent(ctx context.Context, key string, r io.Reader) (bo
 	return true, dir.Sync()
 }
 
-// DeleteKeyIfMatch removes the object only while its content still hashes to
-// the observed ETag: read, compare, and unlink under the local rename race
-// window (single-writer stores make this exact; the guard is for parity with
-// the remote conditional delete).
+// DeleteKeyIfMatch removes the object only while it still carries the
+// observed generation, as a REAL cross-process compare-and-delete: the
+// read-compare-unlink runs under an exclusive flock on the object itself,
+// and the path is re-resolved to the SAME inode after the lock is held, so
+// a claim another process unlinked and re-created between the open and the
+// lock is detected (inode mismatch) and left alone. Claim creators do not
+// need the lock: their O_EXCL create is already atomic. This is the local
+// counterpart of the remote conditional DELETE — without it, two local
+// publishers sharing a store root could destroy each other's claims
+// through the read/unlink race the remote side closes with If-Match.
 func (l *Local) DeleteKeyIfMatch(ctx context.Context, key, etag string) (bool, error) {
 	target := path.Join(l.root, strings.TrimLeft(key, "/"))
-	body, err := os.ReadFile(target)
+	f, err := os.OpenFile(target, os.O_RDONLY, 0)
 	if os.IsNotExist(err) {
 		return false, nil
 	}
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		return false, err
+	}
+	defer syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+	// The path must still name THIS inode: a mismatch means another process
+	// already unlinked (and possibly re-created) the claim — that
+	// generation is not ours to delete.
+	info, err := f.Stat()
+	if err != nil {
+		return false, err
+	}
+	if pathInfo, err := os.Stat(target); err != nil || !os.SameFile(info, pathInfo) {
+		return false, nil
+	}
+	body, err := io.ReadAll(f)
 	if err != nil {
 		return false, err
 	}

@@ -174,7 +174,7 @@ func publishOverlayChunks(
 					continue // drain
 				}
 				key := OverlayChunkKey(j.digest)
-				claimed := false
+				claim := "" // this acquisition's handle; empty = no claim held
 				if ok, err := store.HasKey(ctx, key); err != nil {
 					failJob(fmt.Errorf("has overlay chunk %s: %w", j.digest[:12], err))
 					continue
@@ -186,7 +186,7 @@ func publishOverlayChunks(
 					// hole), so refresh the object by re-uploading instead
 					// of skipping — the digest re-check inside keeps the
 					// global namespace poison-proof.
-					fenced, err := gcFenceClaim(ctx, store, key)
+					body, fenced, err := gcFenceClaim(ctx, store, key)
 					if err != nil {
 						failJob(err)
 						continue
@@ -194,7 +194,7 @@ func publishOverlayChunks(
 					if !fenced {
 						continue
 					}
-					claimed = true
+					claim = body
 				}
 				putBlock := func() error {
 					block := make([]byte, j.length)
@@ -223,9 +223,9 @@ func publishOverlayChunks(
 				}
 				err := putBlock()
 				switch {
-				case err == nil && claimed:
+				case err == nil && claim != "":
 					// Fenced re-upload complete: end this claim's protection.
-					gcReleaseClaim(ctx, store, key)
+					gcReleaseClaim(ctx, store, key, claim)
 				case err == nil:
 					// Fresh-upload guard: the key may carry a mark left by a
 					// collector that just deleted the previous body; redo the
@@ -234,8 +234,8 @@ func publishOverlayChunks(
 					err = gcGuardFreshUpload(ctx, store, key, putBlock)
 				}
 				if err != nil {
-					if claimed {
-						gcReleaseClaim(ctx, store, key)
+					if claim != "" {
+						gcReleaseClaim(ctx, store, key, claim)
 					}
 					failJob(err)
 					continue

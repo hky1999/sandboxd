@@ -37,6 +37,34 @@
 // deleting — an object that vanished, was refreshed, or is referenced by
 // an artifact set that appeared mid-sweep is spared and its mark cleared.
 //
+// Mid-publish protection has two halves. The per-object claims
+// (gc-claims/<key>, conditional creates) cover one fenced upload each and
+// end at that upload's PUT; they cannot cover the release→INDEX gap, so
+// every publisher additionally writes a publication INTENT
+// (gc-pubintents/<checkpoint-id>/<attempt-nonce>, unique per attempt so
+// overlapping attempts under one ID cannot end each other's protection)
+// before its first store object and removes it only after its INDEX
+// commits. The sweep derives every deletion basis by observing intents
+// BEFORE the INDEX listing of the same basis: a publisher commits its
+// INDEX first and deletes its intent second, so an observation that saw
+// NO intent can only mean the intent was already deleted — which implies
+// the INDEX was already committed — which implies the LATER INDEX listing
+// must see it. The reverse order (INDEX listing first, intent check
+// second) can miss both and delete a committed publication's chunks; a
+// single multi-page listing is itself the wrong order, because
+// lexicographic pagination serves artifacts/ before gc-pubintents/. The
+// repeated LISTs are observations, not atomic mutual exclusion —
+// exclusion is carried by the claims and the conditional writes proven by
+// the preflight.
+//
+// The preflight proves BOTH conditional-write primitives before anything
+// is mutated: create-only PUTs (If-None-Match:*) AND real conditional
+// DELETEs (If-Match). A backend that ignores If-Match on DELETE (the team
+// MinIO does) turns stale-claim cleanup into a non-atomic
+// compare-and-delete that can destroy a freshly created replacement claim;
+// there is no safe degradation for that store shape, so such a backend is
+// refused automatic deletion outright.
+//
 // Artifact SETS (artifacts/<id>/*) are ID-named and exclusive, so they
 // may age out wholesale: -max-artifact-age drops sets whose INDEX is
 // older than the bound, -drop names IDs explicitly. Dropping an artifact
@@ -96,16 +124,19 @@ type sweepReport struct {
 	ArtifactsIndexless int    `json:"artifacts_indexless"`
 	ChunkObjectsLive   int    `json:"chunk_objects_live"`
 	ChunkObjectsDead   int    `json:"chunk_objects_dead"`
-	DeadYoung          int    `json:"dead_young"`     // unreferenced but younger than min-age
-	ForeignKept        int    `json:"foreign_kept"`   // unrecognized key shapes
-	MarksTracked       int    `json:"marks_tracked"`  // sweep marks present before this run
-	MarksCreated       int    `json:"marks_created"`  // victims marked this run (dry-run: would mark)
-	WaitGrace          int    `json:"wait_grace"`     // victims whose mark has not aged past mark-grace
-	RaceSpared         int    `json:"race_spared"`    // stale-mark candidates spared by the delete-time recheck
-	ClaimsSpared       int    `json:"claims_spared"`  // candidates skipped: a fenced publisher holds the claim
-	ClaimsCleared      int    `json:"claims_cleared"` // stale claims removed
-	MarksCleared       int    `json:"marks_cleared"`  // obsolete marks removed (object gone/refreshed/referenced)
-	NewArtifacts       int    `json:"new_artifacts"`  // artifact sets that appeared mid-sweep (refs merged)
+	DeadYoung          int    `json:"dead_young"`      // unreferenced but younger than min-age
+	ForeignKept        int    `json:"foreign_kept"`    // unrecognized key shapes
+	MarksTracked       int    `json:"marks_tracked"`   // sweep marks present before this run
+	MarksCreated       int    `json:"marks_created"`   // victims marked this run (dry-run: would mark)
+	WaitGrace          int    `json:"wait_grace"`      // victims whose mark has not aged past mark-grace
+	RaceSpared         int    `json:"race_spared"`     // stale-mark candidates spared by the delete-time recheck
+	ClaimsSpared       int    `json:"claims_spared"`   // candidates skipped: a fenced publisher holds the claim
+	ClaimsCleared      int    `json:"claims_cleared"`  // stale claims removed
+	MarksCleared       int    `json:"marks_cleared"`   // obsolete marks removed (object gone/refreshed/referenced)
+	NewArtifacts       int    `json:"new_artifacts"`   // artifact sets that appeared mid-sweep (refs merged)
+	IntentsTracked     int    `json:"intents_tracked"` // publication intents present before this run
+	IntentsWait        int    `json:"intents_wait"`    // runs skipped: young publication intents bar deletion
+	IntentsCleared     int    `json:"intents_cleared"` // expired intents removed (fresh-age verified)
 	Deletions          int    `json:"deletions"`
 	DeletionBytes      int64  `json:"deletion_bytes"`
 	DeleteErrors       int    `json:"delete_errors"`
@@ -119,10 +150,12 @@ func main() {
 	drop := flag.String("drop", "", "comma-separated artifact IDs to drop regardless of age")
 	minAge := flag.Duration("min-age", 24*time.Hour, "never delete unreferenced chunk/pack/overlay objects younger than this (in-flight publish guard)")
 	markGrace := flag.Duration("mark-grace", 24*time.Hour, "a deletion candidate is collected only once its sweep mark is older than this (concurrent-reuse fence; keep >= the longest publish)")
+	claimGrace := flag.Duration("claim-grace", 24*time.Hour, "a gc-claims/<key> is stale-cleanable only once older than this — independent of mark-grace, so a zero mark-grace cannot clear a claim another collector still holds (keep >= the longest claim-held interval: a sweep's claim-to-verdict batch)")
+	intentGrace := flag.Duration("intent-grace", 24*time.Hour, "while any publication intent (gc-pubintents/<id>) is younger than this, the sweep deletes nothing (mid-publish guard through the INDEX commit; keep >= the longest legitimate publish incl. crash-resume)")
 	workers := flag.Int("workers", 8, "concurrent INDEX/sidecar fetches")
 	jsonOut := flag.Bool("json", false, "machine-readable report")
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "usage: cn-gcsweep -store URL [-delete] [-max-artifact-age 168h] [-drop ID,ID] [-min-age 24h] [-mark-grace 24h]\n")
+		fmt.Fprintf(os.Stderr, "usage: cn-gcsweep -store URL [-delete] [-max-artifact-age 168h] [-drop ID,ID] [-min-age 24h] [-mark-grace 24h] [-intent-grace 24h]\n")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
@@ -130,21 +163,49 @@ func main() {
 		flag.Usage()
 		os.Exit(2)
 	}
-	if err := run(context.Background(), *storeSpec, *del, *maxArtifactAge, strings.Split(*drop, ","), *minAge, *markGrace, *workers, *jsonOut); err != nil {
+	if *claimGrace < 0 || (*del && *claimGrace == 0) {
+		// Claim liveness is deliberately decoupled from mark-grace: a zero
+		// claim grace would let one collector immediately clear another
+		// collector's HELD claim, and the first collector's resumed DELETE
+		// would then run with the mutual exclusion a fiction.
+		fmt.Fprintf(os.Stderr, "gcsweep: -claim-grace must be positive with -delete (a live collector holds claims across its whole claim-to-verdict batch)\n")
+		os.Exit(2)
+	}
+	if *intentGrace < 0 || (*del && *intentGrace == 0) {
+		// A zero intent grace under -delete would disable the mid-publish
+		// guard entirely — every intent instantly "expired" — which is the
+		// exact hole the intent exists to close. Tests and one-off cleanup
+		// passes can pick an explicit tiny grace instead.
+		fmt.Fprintf(os.Stderr, "gcsweep: -intent-grace must be positive with -delete (the publication intent is the only guard for a publish between its uploads and its INDEX commit)\n")
+		os.Exit(2)
+	}
+	if _, err := sweepRun(context.Background(), *storeSpec, *del, *maxArtifactAge, strings.Split(*drop, ","), *minAge, *markGrace, *claimGrace, *intentGrace, *workers, *jsonOut); err != nil {
 		fmt.Fprintf(os.Stderr, "gcsweep: %v\n", err)
 		os.Exit(1)
 	}
 }
 
+// defaultClaimGrace and defaultIntentGrace keep run()'s signature (and its
+// callers) stable while sweepRun exposes the knobs.
+const (
+	defaultClaimGrace  = 24 * time.Hour
+	defaultIntentGrace = 24 * time.Hour
+)
+
 func run(ctx context.Context, spec string, del bool, maxArtifactAge time.Duration, dropIDs []string, minAge, markGrace time.Duration, workers int, jsonOut bool) error {
+	_, err := sweepRun(ctx, spec, del, maxArtifactAge, dropIDs, minAge, markGrace, defaultClaimGrace, defaultIntentGrace, workers, jsonOut)
+	return err
+}
+
+func sweepRun(ctx context.Context, spec string, del bool, maxArtifactAge time.Duration, dropIDs []string, minAge, markGrace, claimGrace, intentGrace time.Duration, workers int, jsonOut bool) (*sweepReport, error) {
 	if !strings.HasPrefix(spec, "http://") && !strings.HasPrefix(spec, "https://") {
-		return fmt.Errorf("cn-gcsweep sweeps HTTP stores; use cn-gc for local caches")
+		return nil, fmt.Errorf("cn-gcsweep sweeps HTTP stores; use cn-gc for local caches")
 	}
 	base := strings.TrimRight(spec, "/")
 	client := &http.Client{Timeout: 120 * time.Second}
 	objects, err := listAll(ctx, client, base)
 	if err != nil {
-		return fmt.Errorf("list: %w", err)
+		return nil, fmt.Errorf("list: %w", err)
 	}
 	dropped := make(map[string]bool)
 	for _, id := range dropIDs {
@@ -163,8 +224,9 @@ func run(ctx context.Context, spec string, del bool, maxArtifactAge time.Duratio
 	}
 	artifacts := make(map[string]*artifactSet)
 	var chunkish []objectInfo
-	marks := make(map[string]time.Time)  // swept object key -> marking instant
-	claims := make(map[string]time.Time) // swept object key -> claim creation instant
+	marks := make(map[string]time.Time)   // swept object key -> marking instant
+	claims := make(map[string]time.Time)  // swept object key -> claim creation instant
+	intents := make(map[string]time.Time) // intent key suffix (<id>/<attempt>) -> instant
 	report := sweepReport{Store: spec, DryRun: !del}
 	for _, o := range objects {
 		if victim, ok := strings.CutPrefix(o.Key, checkpointpublish.GCMarkNamespace+"/"); ok && victim != "" {
@@ -173,6 +235,10 @@ func run(ctx context.Context, spec string, del bool, maxArtifactAge time.Duratio
 		}
 		if owner, ok := strings.CutPrefix(o.Key, checkpointpublish.GCClaimNamespace+"/"); ok && owner != "" {
 			claims[owner] = o.Modified
+			continue
+		}
+		if id, ok := strings.CutPrefix(o.Key, checkpointpublish.GCPubIntentNamespace+"/"); ok && id != "" {
+			intents[id] = o.Modified
 			continue
 		}
 		report.ObjectsTotal++
@@ -193,6 +259,7 @@ func run(ctx context.Context, spec string, del bool, maxArtifactAge time.Duratio
 		chunkish = append(chunkish, o)
 	}
 	report.MarksTracked = len(marks)
+	report.IntentsTracked = len(intents)
 
 	// Resolve references of every KEPT artifact. Fail-closed: one
 	// unresolvable manifest aborts the whole sweep.
@@ -250,7 +317,7 @@ func run(ctx context.Context, spec string, del bool, maxArtifactAge time.Duratio
 	close(jobs)
 	wg.Wait()
 	if resolveErr != nil {
-		return fmt.Errorf("live set unprovable, nothing deleted: %w", resolveErr)
+		return nil, fmt.Errorf("live set unprovable, nothing deleted: %w", resolveErr)
 	}
 
 	// Classify non-artifact objects against the live set.
@@ -276,6 +343,34 @@ func run(ctx context.Context, spec string, del bool, maxArtifactAge time.Duratio
 		victims = append(victims, o)
 	}
 
+	// Mid-publish gate (advisory, from the scan listing): a young
+	// publication intent means an artifact is between its first store
+	// write and its INDEX commit — skip this run entirely rather than mark
+	// or claim anything it may need. The authoritative gates below
+	// re-observe intents with the correct ordering before every deletion
+	// basis; this one only avoids pointless work (and its observation is
+	// itself unordered — the scan listing is not a deletion basis).
+	if del {
+		if n := youngIntentCount(intents, intentGrace, now); n > 0 {
+			report.IntentsWait = n
+			printReport(spec, &report, jsonOut)
+			return &report, nil
+		}
+		// Preflight BEFORE any mutation — marks included: a store that
+		// cannot host the protocol's conditional writes must not be left
+		// with marks or claims that no later run can honor or clear. The
+		// union condition covers every phase that mutates bookkeeping or
+		// data: victim marking and collection, artifact drops, stale-claim
+		// cleanup, the claim-guarded obsolete-mark clearing (which now
+		// creates and releases claims), and expired-intent clearing — a
+		// refusing run touches no real object, mark, claim, or intent.
+		if len(victims) > 0 || len(dropObjects) > 0 || len(claims) > 0 || len(marks) > 0 || len(intents) > 0 {
+			if err := preflightConditionalWrites(ctx, client, base); err != nil {
+				return nil, fmt.Errorf("store unusable for safe deletion: %w", err)
+			}
+		}
+	}
+
 	// Mark-then-sweep: a victim is never deleted in the run that found it.
 	// It is recorded as gc-marks/<key> and becomes collectable only once the
 	// mark has aged past -mark-grace. The grace window is the
@@ -295,7 +390,7 @@ func run(ctx context.Context, spec string, del bool, maxArtifactAge time.Duratio
 		}
 		if del {
 			if err := putMark(ctx, client, base, o.Key, now); err != nil {
-				return fmt.Errorf("mark %s: %w", o.Key, err)
+				return nil, fmt.Errorf("mark %s: %w", o.Key, err)
 			}
 			marks[o.Key] = now
 		}
@@ -324,19 +419,29 @@ func run(ctx context.Context, spec string, del bool, maxArtifactAge time.Duratio
 	freshObjects := map[string]objectInfo{}
 	freshIndexAt := map[string]time.Time{}
 	if del && (len(candidates) > 0 || len(dropObjects) > 0) {
-		// Deletion requires conditional writes: every candidate is taken
-		// under an exclusive gc-claims/<key> create, which is the only way
-		// to close the window between this relisting and the DELETE — a
-		// publisher refreshing an object and committing its INDEX inside
-		// that window holds the claim first, and the claim attempt below
-		// fails closed. A store that does not honor If-None-Match refuses
-		// the whole run before anything is deleted.
-		if err := preflightConditionalWrites(ctx, client, base); err != nil {
-			return fmt.Errorf("store unusable for safe deletion: %w", err)
+		// Deletion-basis derivation, ordered: observe publication intents
+		// FIRST, then the INDEX listing. A publisher commits its INDEX
+		// before deleting its intent, so an observation that saw NO young
+		// intent can only mean the intent was already deleted — which
+		// implies the INDEX was already committed — which implies the
+		// LATER listing must see it. The reverse order (INDEX listing
+		// first, intent check second) can miss both and delete a committed
+		// publication's chunks; a single multi-page listing is itself the
+		// wrong order, because lexicographic pagination serves artifacts/
+		// before gc-pubintents/. These LISTs are observations, not atomic
+		// mutual exclusion — exclusion is carried by the claims held
+		// through the verdicts below and by the preflight-proven
+		// conditional writes.
+		if n, err := youngIntentsNow(ctx, client, base, intentGrace); err != nil {
+			return nil, fmt.Errorf("list publication intents: %w", err)
+		} else if n > 0 {
+			report.IntentsWait = n
+			printReport(spec, &report, jsonOut)
+			return &report, nil
 		}
 		fresh, err := listAll(ctx, client, base)
 		if err != nil {
-			return fmt.Errorf("relist before delete: %w", err)
+			return nil, fmt.Errorf("relist before delete: %w", err)
 		}
 		for _, o := range fresh {
 			if victim, ok := strings.CutPrefix(o.Key, checkpointpublish.GCMarkNamespace+"/"); ok && victim != "" {
@@ -345,10 +450,25 @@ func run(ctx context.Context, spec string, del bool, maxArtifactAge time.Duratio
 			if owner, ok := strings.CutPrefix(o.Key, checkpointpublish.GCClaimNamespace+"/"); ok && owner != "" {
 				continue
 			}
+			if id, ok := strings.CutPrefix(o.Key, checkpointpublish.GCPubIntentNamespace+"/"); ok && id != "" {
+				// Belt and braces: a publication that started after the
+				// intent listing above is still worth skipping for. Its
+				// uploads that touch THIS run's candidates are separately
+				// serialized by the claims, but skipping is cheaper and
+				// strictly safer.
+				if time.Since(o.Modified) < intentGrace {
+					report.IntentsWait++
+				}
+				continue
+			}
 			freshObjects[o.Key] = o
 			if id, ok := artifactIDOfKey(o.Key); ok && strings.HasSuffix(o.Key, "/"+checkpointpublish.IndexName) {
 				freshIndexAt[id] = o.Modified
 			}
+		}
+		if report.IntentsWait > 0 {
+			printReport(spec, &report, jsonOut)
+			return &report, nil
 		}
 		for id := range freshIndexAt {
 			set, seen := artifacts[id]
@@ -359,7 +479,7 @@ func run(ctx context.Context, spec string, del bool, maxArtifactAge time.Duratio
 			// scan: its references were invisible to the live set above.
 			live, err := artifactReferences(ctx, client, base, id)
 			if err != nil {
-				return fmt.Errorf("live set unprovable after concurrent publication, nothing deleted: artifact %s: %w", id, err)
+				return nil, fmt.Errorf("live set unprovable after concurrent publication, nothing deleted: artifact %s: %w", id, err)
 			}
 			for key := range live {
 				refs[key] = struct{}{}
@@ -404,7 +524,7 @@ func run(ctx context.Context, spec string, del bool, maxArtifactAge time.Duratio
 			for _, o := range held {
 				releaseClaimIfMine(ctx, client, base, o.key, claimNonce)
 			}
-			return fmt.Errorf("claim %s: %w", c.key, cerr)
+			return nil, fmt.Errorf("claim %s: %w", c.key, cerr)
 		}
 		if created {
 			held = append(held, owned{key: c.key, size: c.size})
@@ -413,23 +533,50 @@ func run(ctx context.Context, spec string, del bool, maxArtifactAge time.Duratio
 		}
 	}
 	if del && len(held) > 0 {
-		// Phase 2 — re-derive the reference basis UNDER the claims: the
-		// relisting's reference set is stale by construction, and a
-		// publication that committed since then must spare its objects even
-		// when min-age is disabled. One fresh listing; only sets that
-		// appeared or changed get their references resolved.
+		// Phase 2 — re-derive the reference basis UNDER the claims, with
+		// the same observation order as the pre-claim gate: intents FIRST,
+		// then the INDEX listing. A young intent here releases every claim
+		// and skips the run — the publication is mid-flight, and its
+		// objects are not collectable regardless of what the cached scan
+		// said.
+		if n, err := youngIntentsNow(ctx, client, base, intentGrace); err != nil {
+			for _, o := range held {
+				releaseClaimIfMine(ctx, client, base, o.key, claimNonce)
+			}
+			return nil, fmt.Errorf("list publication intents under claims: %w", err)
+		} else if n > 0 {
+			for _, o := range held {
+				releaseClaimIfMine(ctx, client, base, o.key, claimNonce)
+			}
+			report.IntentsWait = n
+			printReport(spec, &report, jsonOut)
+			return &report, nil
+		}
 		fresh, err := listAll(ctx, client, base)
 		if err != nil {
 			for _, o := range held {
 				releaseClaimIfMine(ctx, client, base, o.key, claimNonce)
 			}
-			return fmt.Errorf("relist references under claims: %w", err)
+			return nil, fmt.Errorf("relist references under claims: %w", err)
 		}
 		freshIndexAt := map[string]time.Time{}
 		for _, o := range fresh {
+			if id, ok := strings.CutPrefix(o.Key, checkpointpublish.GCPubIntentNamespace+"/"); ok && id != "" {
+				if time.Since(o.Modified) < intentGrace {
+					report.IntentsWait++
+				}
+				continue
+			}
 			if id, ok := artifactIDOfKey(o.Key); ok && strings.HasSuffix(o.Key, "/"+checkpointpublish.IndexName) {
 				freshIndexAt[id] = o.Modified
 			}
+		}
+		if report.IntentsWait > 0 {
+			for _, o := range held {
+				releaseClaimIfMine(ctx, client, base, o.key, claimNonce)
+			}
+			printReport(spec, &report, jsonOut)
+			return &report, nil
 		}
 		for id, indexAt := range freshIndexAt {
 			set, seen := artifacts[id]
@@ -441,7 +588,7 @@ func run(ctx context.Context, spec string, del bool, maxArtifactAge time.Duratio
 				for _, o := range held {
 					releaseClaimIfMine(ctx, client, base, o.key, claimNonce)
 				}
-				return fmt.Errorf("live set unprovable under claims, nothing deleted: artifact %s: %w", id, err)
+				return nil, fmt.Errorf("live set unprovable under claims, nothing deleted: artifact %s: %w", id, err)
 			}
 			for key := range live {
 				refs[key] = struct{}{}
@@ -502,57 +649,163 @@ func run(ctx context.Context, spec string, del bool, maxArtifactAge time.Duratio
 	}
 	// Obsolete marks: the underlying key is no longer a victim (became
 	// referenced, or the object is gone). Leaving them would fence reuse
-	// forever on the publisher side.
+	// forever on the publisher side — but clearing them must not cross
+	// another collector's held-claim interval: a parked collector that is
+	// about to DELETE the object still relies on the mark to keep
+	// fence-less publishers off the object, and a mark removed under it
+	// lets a later publisher reuse without any claim, right into the
+	// resumed DELETE. The clearing therefore runs UNDER the key's claim,
+	// exactly like the verdicts: a lost claim race (someone owns this
+	// object's fate right now) skips the clearing to a later run.
 	if del {
 		for key := range marks {
 			if _, still := victimSet[key]; still {
 				continue
 			}
+			created, cerr := putClaimIfAbsent(ctx, client, base, key, claimNonce)
+			if cerr != nil {
+				report.DeleteErrors++
+				continue
+			}
+			if !created {
+				continue // another participant holds the object's fate
+			}
 			clearMark(key)
+			releaseClaimIfMine(ctx, client, base, key, claimNonce)
 		}
 	}
 	// Stale claims: a publisher's claim outlives the publish it protected
-	// only when the publisher died mid-fence. Past the mark grace — the
-	// same bound that covers the longest legitimate publish — it protects
+	// only when the publisher died mid-fence, and a collector's claim
+	// outlives its sweep only when the sweep died mid-batch. Claim
+	// liveness is judged by -claim-grace, deliberately DECOUPLED from
+	// mark-grace: a collector holds its claims across the whole
+	// claim-to-verdict batch, and a -mark-grace of 0 must not let a second
+	// collector clear the first one's held claim mid-flight — the resumed
+	// DELETE would then run without the mutual exclusion the claim is.
+	// A LIVE publisher's claim additionally always sits inside its own
+	// young publication intent — claims are only ever taken during a
+	// publish — so the cleanup re-observes intents first and skips
+	// entirely while any is young. Past the bounds, the claim protects
 	// nothing a later run cannot re-derive; clear it, but only the exact
 	// generation observed NOW: fetch the claim fresh, require it to still
 	// be grace-old, and bind the delete to its ETag so a claim another
 	// participant created in the meantime survives (a fixed body would be
-	// no credential; every owner mints a unique nonce).
+	// no credential; every owner mints a unique nonce per acquisition).
 	if del {
-		for key := range claims {
-			claimKey := checkpointpublish.GCClaimKey(key)
-			etag, modified, err := headClaim(ctx, client, base, claimKey)
+		if n, err := youngIntentsNow(ctx, client, base, intentGrace); err != nil {
+			report.DeleteErrors++
+		} else if n > 0 {
+			report.IntentsWait = n
+		} else {
+			for key := range claims {
+				claimKey := checkpointpublish.GCClaimKey(key)
+				etag, modified, err := headClaim(ctx, client, base, claimKey)
+				if err != nil {
+					report.DeleteErrors++
+					continue
+				}
+				if now.Sub(modified) < claimGrace {
+					continue
+				}
+				if deleteClaimIfMatch(ctx, client, base, claimKey, etag) {
+					report.ClaimsCleared++
+				}
+				// 412: the claim was replaced by a live participant — leave it.
+			}
+		}
+	}
+	// Expired intents: a publish that never ended (crash, hard cancel)
+	// leaves its intent behind; past the grace bound it protects nothing
+	// and starves every later sweep. Clear it exactly like a stale claim:
+	// fresh GET for the CURRENT ETag and age, require it to still be
+	// grace-old — a retrying publisher refreshes the intent's timestamp,
+	// and must not have its live intent yanked — then delete bound to that
+	// observed generation. The grace bound IS the valid-publish-duration
+	// boundary: keep -intent-grace at or above the longest legitimate
+	// publish (cn-publishd crash-resume included).
+	if del && len(intents) > 0 {
+		// The map keys are the literal intent object keys' suffixes
+		// (<checkpoint-id>/<attempt-nonce>): intents are per-attempt, so
+		// there is nothing to reconstruct from an id — clear exactly the
+		// objects the listing saw.
+		for suffix := range intents {
+			intentKey := checkpointpublish.GCPubIntentNamespace + "/" + suffix
+			etag, modified, err := headClaim(ctx, client, base, intentKey)
 			if err != nil {
 				report.DeleteErrors++
 				continue
 			}
-			if now.Sub(modified) < markGrace {
+			if time.Since(modified) < intentGrace {
 				continue
 			}
-			if deleteClaimIfMatch(ctx, client, base, claimKey, etag) {
-				report.ClaimsCleared++
+			if deleteClaimIfMatch(ctx, client, base, intentKey, etag) {
+				report.IntentsCleared++
 			}
-			// 412: the claim was replaced by a live participant — leave it.
+			// 412: replaced by a retrying publisher — leave it.
 		}
 	}
 
+	printReport(spec, &report, jsonOut)
+	return &report, nil
+}
+
+// printReport emits the run's report in the requested format.
+func printReport(spec string, report *sweepReport, jsonOut bool) {
 	if jsonOut {
 		encoded, _ := json.MarshalIndent(report, "", "  ")
 		fmt.Println(string(encoded))
-	} else {
-		fmt.Printf("gcsweep: store=%s objects=%d (%dMiB) artifacts kept/dropped/indexless=%d/%d/%d "+
-			"chunk-objects live/dead/young/foreign=%d/%d/%d/%d "+
-			"marks tracked/created/wait-grace=%d/%d/%d spared/cleared/new-artifacts=%d/%d/%d "+
-			"reclaim %d objects (%dMiB) errors=%d dry-run=%v\n",
-			spec, report.ObjectsTotal, report.BytesTotal>>20,
-			report.ArtifactsKept, report.ArtifactsDropped, report.ArtifactsIndexless,
-			report.ChunkObjectsLive, report.ChunkObjectsDead, report.DeadYoung, report.ForeignKept,
-			report.MarksTracked, report.MarksCreated, report.WaitGrace,
-			report.RaceSpared, report.MarksCleared, report.NewArtifacts,
-			report.Deletions, report.DeletionBytes>>20, report.DeleteErrors, report.DryRun)
+		return
 	}
-	return nil
+	fmt.Printf("gcsweep: store=%s objects=%d (%dMiB) artifacts kept/dropped/indexless=%d/%d/%d "+
+		"chunk-objects live/dead/young/foreign=%d/%d/%d/%d "+
+		"marks tracked/created/wait-grace=%d/%d/%d spared/cleared/new-artifacts=%d/%d/%d "+
+		"intents tracked/wait/cleared=%d/%d/%d "+
+		"reclaim %d objects (%dMiB) errors=%d dry-run=%v\n",
+		spec, report.ObjectsTotal, report.BytesTotal>>20,
+		report.ArtifactsKept, report.ArtifactsDropped, report.ArtifactsIndexless,
+		report.ChunkObjectsLive, report.ChunkObjectsDead, report.DeadYoung, report.ForeignKept,
+		report.MarksTracked, report.MarksCreated, report.WaitGrace,
+		report.RaceSpared, report.MarksCleared, report.NewArtifacts,
+		report.IntentsTracked, report.IntentsWait, report.IntentsCleared,
+		report.Deletions, report.DeletionBytes>>20, report.DeleteErrors, report.DryRun)
+}
+
+// youngIntentCount counts publication intents whose store age has not yet
+// reached the grace bound.
+func youngIntentCount(intents map[string]time.Time, grace time.Duration, now time.Time) int {
+	n := 0
+	for _, at := range intents {
+		if now.Sub(at) < grace {
+			n++
+		}
+	}
+	return n
+}
+
+// youngIntentsNow takes a FRESH prefix listing of the publication intents
+// and reports how many are still inside the grace bound. Callers take this
+// BEFORE the INDEX listing of the same deletion basis — see the ordering
+// argument in sweepRun.
+func youngIntentsNow(ctx context.Context, client *http.Client, base string, grace time.Duration) (int, error) {
+	intents, err := listIntents(ctx, client, base)
+	if err != nil {
+		return 0, err
+	}
+	return youngIntentCount(intents, grace, time.Now()), nil
+}
+
+// listIntents lists the gc-pubintents/ namespace: publication id -> store
+// modification time.
+func listIntents(ctx context.Context, client *http.Client, base string) (map[string]time.Time, error) {
+	objects, err := listAllPrefix(ctx, client, base, checkpointpublish.GCPubIntentNamespace+"/")
+	if err != nil {
+		return nil, err
+	}
+	intents := make(map[string]time.Time, len(objects))
+	for _, o := range objects {
+		intents[strings.TrimPrefix(o.Key, checkpointpublish.GCPubIntentNamespace+"/")] = o.Modified
+	}
+	return intents, nil
 }
 
 // artifactIDOfKey reports the checkpoint ID for artifacts/<id>/<file>
@@ -782,9 +1035,25 @@ func headObjectModified(ctx context.Context, client *http.Client, base, key stri
 	return mod, true, nil
 }
 
-// preflightConditionalWrites proves the store supports create-only PUTs
-// before any deletion happens: create a probe claim, then lose to it. A
-// store that lets the second writer win disables the whole deletion path.
+// preflightConditionalWrites proves BOTH conditional-write primitives the
+// deletion protocol depends on, before the run mutates anything:
+//
+//   - create-only PUTs (If-None-Match:*): the second writer must get 412;
+//   - real conditional DELETEs (If-Match): a wrong-ETag delete must be
+//     refused (412) and leave the object, and the correct-ETag delete must
+//     remove it.
+//
+// A backend that ignores If-Match on DELETE (the team MinIO does — measured
+// 2026-09-14: a wrong-ETag DELETE answers 204 and deletes) turns the stale
+// claim cleanup into a non-atomic compare-and-delete: a delete issued
+// against one observed generation can destroy a freshly created replacement
+// claim (collector A clears the old claim, a publisher conditionally creates
+// the new one, collector B's in-flight delete lands). No number of fresh
+// observations closes that window — GET+DELETE is not CAS — so such a
+// backend is refused automatic deletion outright. A backend whose ETags are
+// not the content MD5 of single-part PUTs (SSE-KMS and friends) fails the
+// correct-ETag probe and is refused for the symmetric reason: claims could
+// never be released or cleaned there, only accumulated.
 func preflightConditionalWrites(ctx context.Context, client *http.Client, base string) error {
 	probe := checkpointpublish.GCClaimKey(".preflight-" + strconv.FormatInt(time.Now().UnixNano(), 10))
 	url := base + "/" + probe
@@ -817,15 +1086,21 @@ func preflightConditionalWrites(ctx context.Context, client *http.Client, base s
 	if resp2.StatusCode != http.StatusPreconditionFailed {
 		return fmt.Errorf("conditional writes not honored (second create answered %d, want 412)", resp2.StatusCode)
 	}
-	// Conditional DELETE (If-Match) is opportunistic, not required: stores
-	// that honor it get an atomic confirm→delete for claim cleanup, and
-	// stores that ignore the header degrade to a plain delete whose safety
-	// is carried by the fresh observation — the cleanup re-GETs the claim
-	// and requires it to STILL be grace-old, and a grace-old claim has no
-	// live releaser inside the documented publish/grace bound (live owners
-	// release within milliseconds of claiming). The residual is exactly the
-	// long-publish boundary the contract already states.
-	_ = deleteKey(ctx, client, base, probe)
+	// Conditional DELETE must be real, not decorative. Probe with a WRONG
+	// ETag first: the delete must be refused AND the object must survive.
+	if deleted := deleteClaimIfMatch(ctx, client, base, probe, bodyETag("first-but-wrong")); deleted {
+		return fmt.Errorf("store does not honor conditional DELETE (a wrong-ETag delete executed); refusing automatic deletion: GET+DELETE cannot act as an atomic compare-and-delete on this backend")
+	}
+	if _, exists, err := headObjectModified(ctx, client, base, probe); err != nil {
+		return fmt.Errorf("verify conditional DELETE probe: %w", err)
+	} else if !exists {
+		return fmt.Errorf("store does not honor conditional DELETE (probe object vanished under a refused delete); refusing automatic deletion")
+	}
+	// The correct-ETag delete must succeed: a store that cannot execute it
+	// can neither release nor clean claims, so deletion stays refused.
+	if deleted := deleteClaimIfMatch(ctx, client, base, probe, bodyETag("first")); !deleted {
+		return fmt.Errorf("store refuses the correct-ETag conditional DELETE (claims could never be released or cleaned); refusing automatic deletion")
+	}
 	return nil
 }
 
@@ -875,10 +1150,20 @@ func mustRequest(ctx context.Context, method, url string) *http.Request {
 
 // listAll paginates ListObjectsV2 over the anonymous S3 subset.
 func listAll(ctx context.Context, client *http.Client, base string) ([]objectInfo, error) {
+	return listAllPrefix(ctx, client, base, "")
+}
+
+// listAllPrefix paginates ListObjectsV2 restricted to a key prefix. The
+// prefix rides the query (real S3) AND is re-applied client-side, because
+// simple S3-subset fakes ignore the parameter; both behave identically.
+func listAllPrefix(ctx context.Context, client *http.Client, base, prefix string) ([]objectInfo, error) {
 	var out []objectInfo
 	token := ""
 	for {
 		q := url.Values{"list-type": {"2"}}
+		if prefix != "" {
+			q.Set("prefix", prefix)
+		}
 		if token != "" {
 			q.Set("continuation-token", token)
 		}
@@ -908,6 +1193,9 @@ func listAll(ctx context.Context, client *http.Client, base string) ([]objectInf
 			return nil, err
 		}
 		for _, c := range page.Contents {
+			if prefix != "" && !strings.HasPrefix(c.Key, prefix) {
+				continue
+			}
 			mod, _ := time.Parse(time.RFC3339, c.Modified)
 			out = append(out, objectInfo{Key: c.Key, Size: c.Size, Modified: mod})
 		}
