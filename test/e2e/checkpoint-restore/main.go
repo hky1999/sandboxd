@@ -164,6 +164,21 @@ func parseFlags(args []string, errorOutput io.Writer) (options, error) {
 	if err := flags.Parse(args); err != nil {
 		return value, err
 	}
+	// Presence, not non-emptiness, is intent: record which identity flags
+	// actually appeared on the command line — `--operation-id=` is a
+	// deliberate empty value, not an omission — so validateOptions can
+	// tell the two apart (the Set bits are the "explicitly passed" half
+	// of that contract; Visit reports exactly the flags that were set).
+	flags.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "operation-id":
+			value.operationIDSet = true
+		case "expected-root-digest":
+			value.expectedRootDigestSet = true
+		case "expected-request-digest":
+			value.expectedRequestDigestSet = true
+		}
+	})
 	return value, nil
 }
 
