@@ -237,6 +237,22 @@ func (m *cgroupResourceManager) GetAvailableResource() (int64, int64, error) {
 	return cpuMilli, memoryBytes, nil
 }
 
+func (m *cgroupResourceManager) GetNodeResourceDetail() (int64, int64, int64, int64, error) {
+	cpuMilli, err := m.cpuCapacity()
+	if err != nil {
+		return 0, 0, 0, 0, err
+	}
+	memoryBytes, err := m.memoryCapacity()
+	if err != nil {
+		return 0, 0, 0, 0, err
+	}
+	usedMem := int64(0)
+	if current, err := readCgroupInt64(m.memory, "memory.current"); err == nil && current > 0 {
+		usedMem = current
+	}
+	return cpuMilli, memoryBytes, 0, usedMem, nil
+}
+
 func (*cgroupResourceManager) Stop() {}
 
 func (m *cgroupResourceManager) cpuCapacity() (int64, error) {
@@ -452,6 +468,21 @@ func parseCPUSet(value string) (int, error) {
 		last = item.last
 	}
 	return count, nil
+}
+
+func readCgroupInt64(hierarchy cgroupHierarchy, file string) (int64, error) {
+	if hierarchy.current == "" {
+		return 0, fmt.Errorf("cgroup current path is empty")
+	}
+	data, err := os.ReadFile(filepath.Join(hierarchy.current, file))
+	if err != nil {
+		return 0, err
+	}
+	value, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	return value, nil
 }
 
 func readMemoryLimit(hierarchy cgroupHierarchy, mode cgroups.CGMode) (int64, bool, error) {

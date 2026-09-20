@@ -528,3 +528,8 @@ func (mgr *k8sWatchResourceManager) GetAvailableResource() (int64, int64, error)
 		totalCPU, totalMem, allocatedCPU, allocatedMem, cpuMilli, memBytes)
 	return cpuMilli, memBytes, nil
 }
+
+func (mgr *k8sWatchResourceManager) GetNodeResourceDetail() (int64, int64, int64, int64, error) {
+	totalCPU, totalMem, allocatedCPU, allocatedMem := mgr.snapshot()
+	return totalCPU, totalMem, allocatedCPU, allocatedMem, nil
+}

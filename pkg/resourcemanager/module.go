@@ -47,6 +47,10 @@ type Module struct {
 	mu                        sync.RWMutex
 	availCpu                  int64
 	availMem                  int64
+	totalCpu                  float64
+	totalMem                  int64
+	usedCpu                   float64
+	usedMem                   int64
 	xpu                       xpuProvider
 	ephemeralStorage          ephemeralStorageProvider
 	ephemeralStorageCapacity  uint64
@@ -72,6 +76,14 @@ type resourceInfo struct {
 	Xpu      []xpumanager.Resource `json:"xpu"`
 	Storage  *uint64               `json:"storage,omitempty"`
 	Features []string              `json:"features"`
+	// Total/used node resources for consumers that need real usage math
+	// (scheduler-side usage-aware admission). CPU is cores, memory bytes;
+	// "used" follows the provider's accounting. Legacy consumers keep
+	// reading cpu/mem (available).
+	TotalCpu float64 `json:"totalCpu,omitempty"`
+	TotalMem int64   `json:"totalMem,omitempty"`
+	UsedCpu  float64 `json:"usedCpu,omitempty"`
+	UsedMem  int64   `json:"usedMem,omitempty"`
 }
 
 type xpuProvider interface {
@@ -178,6 +190,10 @@ func (m *Module) Start() error {
 			Mem:      availableAfterTransientReservations(m.availMem, m.transientMemory),
 			Xpu:      []xpumanager.Resource{},
 			Features: []string{},
+			TotalCpu: m.totalCpu,
+			TotalMem: m.totalMem,
+			UsedCpu:  m.usedCpu,
+			UsedMem:  m.usedMem,
 		}
 		if m.xpu != nil {
 			info.Xpu = m.xpu.Resources()
@@ -335,9 +351,18 @@ func (m *Module) refreshOnce() {
 	// Wire format expects CPU in cores; underlying manager returns
 	// millicores (see standalone main.go for the same division).
 	cpu /= 1000
+	totalCPUMilli, totalMemBytes, usedCPUMilli, usedMemBytes, derr := m.nodeResource.GetNodeResourceDetail()
 	m.mu.Lock()
 	m.availCpu = cpu
 	m.availMem = mem
+	if derr == nil {
+		m.totalCpu = float64(totalCPUMilli) / 1000.0
+		m.totalMem = totalMemBytes
+		m.usedCpu = float64(usedCPUMilli) / 1000.0
+		m.usedMem = usedMemBytes
+	} else {
+		m.totalCpu, m.totalMem, m.usedCpu, m.usedMem = 0, 0, 0, 0
+	}
 	m.mu.Unlock()
 	m.lastRefresh.Store(time.Now().UnixNano())
 	logrus.Debugf("resourcemanager: avail cpu=%d cores mem=%d bytes", cpu, mem)

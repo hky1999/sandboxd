@@ -33,6 +33,10 @@ const (
 
 type NodeResourceManager interface {
 	GetAvailableResource() (int64, int64, error)
+	// GetNodeResourceDetail reports total and used node resources.
+	// CPU is millicores, memory bytes. "used" follows the provider's
+	// accounting (kubernetes: pod requests; cgroup: current usage).
+	GetNodeResourceDetail() (totalCPU, totalMem, usedCPU, usedMem int64, err error)
 	Stop()
 }
 
