@@ -111,14 +111,6 @@ func readCPUStatUsec(root string) (int64, error) {
 	return 0, errNoCPUStat
 }
 
-func readInt64File(path string) (int64, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return 0, err
-	}
-	return strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64)
-}
-
 type usageError string
 
 func (e usageError) Error() string { return string(e) }
