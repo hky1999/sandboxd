@@ -51,6 +51,9 @@ type Module struct {
 	totalMem                  int64
 	usedCpu                   float64
 	usedMem                   int64
+	usedKnown                 bool
+	reservedCpu               float64
+	reservedMem               int64
 	xpu                       xpuProvider
 	ephemeralStorage          ephemeralStorageProvider
 	ephemeralStorageCapacity  uint64
@@ -77,13 +80,20 @@ type resourceInfo struct {
 	Storage  *uint64               `json:"storage,omitempty"`
 	Features []string              `json:"features"`
 	// Total/used node resources for consumers that need real usage math
-	// (scheduler-side usage-aware admission). CPU is cores, memory bytes;
-	// "used" follows the provider's accounting. Legacy consumers keep
-	// reading cpu/mem (available).
-	TotalCpu float64 `json:"totalCpu,omitempty"`
-	TotalMem int64   `json:"totalMem,omitempty"`
-	UsedCpu  float64 `json:"usedCpu,omitempty"`
-	UsedMem  int64   `json:"usedMem,omitempty"`
+	// (scheduler-side usage-aware admission). CPU is cores, memory bytes.
+	// used* are PHYSICAL usage (cgroup of sandboxd), NOT pod requests;
+	// zero is a valid value, so these fields carry no omitempty.
+	// UsedKnown=false means the physical read failed: consumers must treat
+	// the sample as unknown, never as zero. Reserved* expose pod requests
+	// separately (informational). Legacy consumers keep reading cpu/mem
+	// (available).
+	TotalCpu   float64 `json:"totalCpu"`
+	TotalMem   int64   `json:"totalMem"`
+	UsedCpu    float64 `json:"usedCpu"`
+	UsedMem    int64   `json:"usedMem"`
+	UsedKnown  bool    `json:"usedKnown"`
+	ReservedCpu  float64 `json:"reservedCpu,omitempty"`
+	ReservedMem  int64   `json:"reservedMem,omitempty"`
 }
 
 type xpuProvider interface {
@@ -190,10 +200,13 @@ func (m *Module) Start() error {
 			Mem:      availableAfterTransientReservations(m.availMem, m.transientMemory),
 			Xpu:      []xpumanager.Resource{},
 			Features: []string{},
-			TotalCpu: m.totalCpu,
-			TotalMem: m.totalMem,
-			UsedCpu:  m.usedCpu,
-			UsedMem:  m.usedMem,
+			TotalCpu:   m.totalCpu,
+			TotalMem:   m.totalMem,
+			UsedCpu:    m.usedCpu,
+			UsedMem:    m.usedMem,
+			UsedKnown:  m.usedKnown,
+			ReservedCpu:  m.reservedCpu,
+			ReservedMem:  m.reservedMem,
 		}
 		if m.xpu != nil {
 			info.Xpu = m.xpu.Resources()
@@ -351,18 +364,17 @@ func (m *Module) refreshOnce() {
 	// Wire format expects CPU in cores; underlying manager returns
 	// millicores (see standalone main.go for the same division).
 	cpu /= 1000
-	totalCPUMilli, totalMemBytes, usedCPUMilli, usedMemBytes, derr := m.nodeResource.GetNodeResourceDetail()
+	detail := m.nodeResource.GetNodeResourceDetail()
 	m.mu.Lock()
 	m.availCpu = cpu
 	m.availMem = mem
-	if derr == nil {
-		m.totalCpu = float64(totalCPUMilli) / 1000.0
-		m.totalMem = totalMemBytes
-		m.usedCpu = float64(usedCPUMilli) / 1000.0
-		m.usedMem = usedMemBytes
-	} else {
-		m.totalCpu, m.totalMem, m.usedCpu, m.usedMem = 0, 0, 0, 0
-	}
+	m.totalCpu = float64(detail.TotalCPUMilli) / 1000.0
+	m.totalMem = detail.TotalMemBytes
+	m.usedCpu = detail.UsedCPUCores
+	m.usedMem = detail.UsedMemBytes
+	m.usedKnown = detail.Known
+	m.reservedCpu = float64(detail.ReservedCPUMilli) / 1000.0
+	m.reservedMem = detail.ReservedMemBytes
 	m.mu.Unlock()
 	m.lastRefresh.Store(time.Now().UnixNano())
 	logrus.Debugf("resourcemanager: avail cpu=%d cores mem=%d bytes", cpu, mem)

@@ -53,6 +53,10 @@ func (s stubXPUProvider) Resources() []xpumanager.Resource {
 	return s.resources
 }
 
+func (s *stubNodeResourceManager) GetNodeResourceDetail() NodeResourceDetail {
+	return NodeResourceDetail{}
+}
+
 func (s *stubNodeResourceManager) GetAvailableResource() (int64, int64, error) {
 	return s.cpu, s.mem, nil
 }

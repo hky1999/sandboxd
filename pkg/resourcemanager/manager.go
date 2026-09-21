@@ -31,12 +31,26 @@ const (
 	ProviderCgroup     = "cgroup"
 )
 
+// NodeResourceDetail separates capacity, reservations and physical usage.
+// Total/Reserved come from the provider's accounting (kubernetes: node
+// allocatable and pod requests; cgroup: local capacity). Used is the
+// PHYSICAL usage of the cgroup containing sandboxd; Known=false means the
+// physical read failed and the sample must be treated as unknown, never as
+// zero. CPU units: TotalCPUMilli/ReservedCPUMilli are millicores,
+// UsedCPUCores is normalized cores.
+type NodeResourceDetail struct {
+	TotalCPUMilli   int64
+	TotalMemBytes   int64
+	ReservedCPUMilli int64
+	ReservedMemBytes int64
+	UsedCPUCores    float64
+	UsedMemBytes    int64
+	Known           bool
+}
+
 type NodeResourceManager interface {
 	GetAvailableResource() (int64, int64, error)
-	// GetNodeResourceDetail reports total and used node resources.
-	// CPU is millicores, memory bytes. "used" follows the provider's
-	// accounting (kubernetes: pod requests; cgroup: current usage).
-	GetNodeResourceDetail() (totalCPU, totalMem, usedCPU, usedMem int64, err error)
+	GetNodeResourceDetail() NodeResourceDetail
 	Stop()
 }
 

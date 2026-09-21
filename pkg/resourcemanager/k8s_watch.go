@@ -48,6 +48,7 @@ type k8sWatchResourceManager struct {
 	allocatedCPU int64
 	allocatedMem int64
 	podRequests  map[string]podResourceRequest
+	self         *selfUsage
 }
 
 type podResourceRequest struct {
@@ -67,6 +68,7 @@ func newK8sWatchResourceManager() (*k8sWatchResourceManager, error) {
 		ctx:           ctx,
 		cancel:        cancel,
 		podRequests:   make(map[string]podResourceRequest),
+		self:          newSelfUsage(),
 	}
 	if err := mgr.start(); err != nil {
 		cancel()
@@ -529,7 +531,27 @@ func (mgr *k8sWatchResourceManager) GetAvailableResource() (int64, int64, error)
 	return cpuMilli, memBytes, nil
 }
 
-func (mgr *k8sWatchResourceManager) GetNodeResourceDetail() (int64, int64, int64, int64, error) {
-	totalCPU, totalMem, allocatedCPU, allocatedMem := mgr.snapshot()
-	return totalCPU, totalMem, allocatedCPU, allocatedMem, nil
+func (mgr *k8sWatchResourceManager) GetNodeResourceDetail() NodeResourceDetail {
+	totalCPU, totalMem, reservedCPU, reservedMem := mgr.snapshot()
+	detail := NodeResourceDetail{
+		TotalCPUMilli:    totalCPU,
+		TotalMemBytes:    totalMem,
+		ReservedCPUMilli: reservedCPU,
+		ReservedMemBytes: reservedMem,
+	}
+	// Physical usage of the node pod itself: pod requests are reservations
+	// and must not be reported as usage. Any read failure keeps Known=false
+	// (unknown, never zero).
+	usedMem, memErr := mgr.self.MemoryUsage()
+	if memErr != nil {
+		return detail
+	}
+	usedCores, cpuErr := mgr.self.CPUUsageCores()
+	if cpuErr != nil {
+		return detail
+	}
+	detail.UsedMemBytes = usedMem
+	detail.UsedCPUCores = usedCores
+	detail.Known = true
+	return detail
 }
