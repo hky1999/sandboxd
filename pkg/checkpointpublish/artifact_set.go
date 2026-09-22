@@ -28,6 +28,7 @@ import (
 	"path/filepath"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/inclusionAI/sandboxd/pkg/checkpointchunks"
 	"github.com/inclusionAI/sandboxd/pkg/chunkstore"
@@ -266,7 +267,18 @@ func publishOverlayChunks(
 
 // publishArtifactSet uploads vmstate, overlay, manifest, chunk sidecar and
 // the INDEX that binds them, skipping objects the store already holds.
-func publishArtifactSetWithTransport(ctx context.Context, checkpointDir, id string, store chunkstore.Keyed, state *State, transport *checkpointchunks.Manifest) error {
+// phases (optional) receives the attribution split: MetaWall spans entry
+// through the BUNDLE PUT (overlay chunk PUTs + bundle assembly + bundle
+// upload) and IndexWall the INDEX commit PUT.
+func publishArtifactSetWithTransport(ctx context.Context, checkpointDir, id string, store chunkstore.Keyed, state *State, transport *checkpointchunks.Manifest, phases *PublishPhases) error {
+	metaStart := time.Now()
+	defer func() {
+		if phases != nil && phases.MetaWall == 0 {
+			// Failed before the INDEX section: still record the stage wall
+			// consumed so far.
+			phases.MetaWall = time.Since(metaStart)
+		}
+	}()
 	// A directory carrying only a memory file (chunk-scan fixtures, or
 	// callers publishing bare memory layers) publishes its chunks without
 	// an artifact set; blind materialization is simply not advertised for
@@ -351,12 +363,21 @@ func publishArtifactSetWithTransport(ctx context.Context, checkpointDir, id stri
 	if err := store.PutKey(ctx, ArtifactKey(id, BundleName), bytes.NewReader(bundle)); err != nil {
 		return fmt.Errorf("upload bundle: %w", err)
 	}
+	if phases != nil {
+		phases.MetaWall = time.Since(metaStart)
+	}
 	encoded, err := json.MarshalIndent(index, "", "  ")
 	if err != nil {
 		return err
 	}
-	if err := store.PutKey(ctx, ArtifactKey(id, IndexName),
-		jsonReader(encoded)); err != nil {
+	indexStart := time.Now()
+	err = store.PutKey(ctx, ArtifactKey(id, IndexName), jsonReader(encoded))
+	if phases != nil {
+		// Recorded BEFORE the error check: a failed commit keeps its stage
+		// wall too, not only its request counters.
+		phases.IndexWall = time.Since(indexStart)
+	}
+	if err != nil {
 		return fmt.Errorf("upload index: %w", err)
 	}
 	state.ArtifactSet = true

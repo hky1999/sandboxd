@@ -56,6 +56,26 @@ type PluginConfig struct {
 	ImageManagerConfig `toml:"image" json:"image"`
 
 	CheckpointCatalogConfig `toml:"checkpoint_catalog" json:"checkpointCatalog"`
+
+	CheckpointAdmissionConfig `toml:"checkpoint_admission" json:"checkpointAdmission"`
+}
+
+// CheckpointAdmissionConfig gates the publication-spool backpressure check
+// at the Checkpoint RPC entry (M1). Empty Roots (the default) disables the
+// gate entirely — zero behavior change for existing deployments. When
+// configured, a checkpoint whose artifact root's filesystem free space has
+// dropped below MinFreeBytes is refused with a stable, distinguishable
+// FailedPrecondition error naming the spool; the check reads the SAME
+// .publish state files cn-publishd maintains (no second authority), counts
+// every non-published record as unpublished (a crashed publisher's
+// "publishing" record over-refuses, never under-refuses), and never
+// deletes anything to relieve pressure. Restores are not gated.
+type CheckpointAdmissionConfig struct {
+	// Roots are the catalogued artifact roots the spool check scans.
+	Roots []string `toml:"roots" json:"roots"`
+	// MinFreeBytes reserves space for live writable layers and running
+	// instances; at or below it new checkpoints are refused explicitly.
+	MinFreeBytes int64 `toml:"min_free_bytes" json:"minFreeBytes"`
 }
 
 // ImageManagerConfig configures image and mount lifecycle management.

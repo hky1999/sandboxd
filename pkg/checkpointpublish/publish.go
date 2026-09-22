@@ -33,6 +33,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -44,9 +45,14 @@ import (
 	"github.com/inclusionAI/sandboxd/pkg/chunkstore"
 )
 
-// States of the publish state machine.
+// States of the publish state machine. StateQueued is the persisted
+// enqueue record the scanner writes on discovery (M1): it makes the
+// "queued" lifecycle state observable and crash-durable without a second
+// authority — the record lives in the same .publish namespace and only the
+// scanner itself creates it.
 const (
 	StateLocalReady    = "local_ready"
+	StateQueued        = "queued"
 	StatePublishing    = "publishing"
 	StatePublished     = "published"
 	StatePublishFailed = "publish_failed"
@@ -74,6 +80,48 @@ type State struct {
 	StartedAt   time.Time `json:"started_at,omitempty"`
 	PublishedAt time.Time `json:"published_at,omitempty"`
 	LastError   string    `json:"last_error,omitempty"`
+	// Retries counts failed publish attempts (publish_failed backoff input).
+	// Absent on records written before M1: such records retry immediately,
+	// preserving the historical behavior for old artifacts.
+	Retries int `json:"retries,omitempty"`
+	// FailedAt timestamps the last failed attempt; the scanner defers a
+	// retry until FailedAt + StateNextAttempt(Retries, base, cap).
+	FailedAt *time.Time `json:"failed_at,omitempty"`
+}
+
+// StateNextAttempt is the bounded exponential backoff delay before retry
+// number retries+1: base << retries, capped. Zero base disables deferral.
+func StateNextAttempt(retries int, base, cap time.Duration) time.Duration {
+	if base <= 0 || retries <= 0 {
+		return 0
+	}
+	d := base
+	for i := 1; i < retries; i++ {
+		// Saturation guard: multiplying past cap/2 means the next doubling
+		// either overflows int64 or exceeds cap — both resolve to cap. A
+		// very large retries must never wrap d to a negative value and
+		// bypass the ceiling.
+		if cap > 0 && d >= cap/2 {
+			return cap
+		}
+		// >= (not >): d == 1<<62 exactly would overflow on the next
+		// doubling (2^63 wraps to MinInt64), so the boundary value itself
+		// must saturate. An uncapped (cap == 0) backoff saturates to
+		// MaxInt64 — returning cap here would return zero and disable the
+		// deferral precisely when retries are huge, the one case that
+		// needs it most.
+		if d >= (1 << 62) {
+			if cap > 0 {
+				return cap
+			}
+			return time.Duration(math.MaxInt64)
+		}
+		d *= 2
+	}
+	if cap > 0 && d > cap {
+		return cap
+	}
+	return d
 }
 
 // StatePath returns the state file location for a checkpoint directory.
@@ -109,6 +157,7 @@ type StateWriteTiming struct {
 type StateTimings struct {
 	Publishing StateWriteTiming `json:"publishing"`
 	Published  StateWriteTiming `json:"published"`
+	Failed     StateWriteTiming `json:"failed,omitempty"`
 }
 
 func writeState(state State) error {
@@ -165,16 +214,17 @@ func writeStateMeasured(state State, timing *StateWriteTiming) error {
 
 // Result summarizes one Run.
 type Result struct {
-	StateTimings      *StateTimings `json:"state_timings,omitempty"`
-	PackPayloadBudget int           `json:"pack_payload_budget,omitempty"`
-	PackPayloadPeak   int64         `json:"pack_payload_peak,omitempty"`
-	PackTimings       *PackTimings  `json:"pack_timings,omitempty"`
-	PacksPut          int           `json:"packs_put,omitempty"`
-	PacksSkip         int           `json:"packs_skip,omitempty"`
-	Workers           int           `json:"workers"` // actual memory upload concurrency
-	State             State         `json:"state"`
-	ChunksPut         int           `json:"chunks_put"`  // unique chunks written this run
-	ChunksSkip        int           `json:"chunks_skip"` // unique chunks reused or synthesized
+	StateTimings      *StateTimings  `json:"state_timings,omitempty"`
+	Phases            *PublishPhases `json:"phases,omitempty"` // attempt attribution (walls + request counters)
+	PackPayloadBudget int            `json:"pack_payload_budget,omitempty"`
+	PackPayloadPeak   int64          `json:"pack_payload_peak,omitempty"`
+	PackTimings       *PackTimings   `json:"pack_timings,omitempty"`
+	PacksPut          int            `json:"packs_put,omitempty"`
+	PacksSkip         int            `json:"packs_skip,omitempty"`
+	Workers           int            `json:"workers"` // actual memory upload concurrency
+	State             State          `json:"state"`
+	ChunksPut         int            `json:"chunks_put"`  // unique chunks written this run
+	ChunksSkip        int            `json:"chunks_skip"` // unique chunks reused or synthesized
 }
 
 // Run publishes the checkpoint's memory chunks: it computes (or reuses) the
@@ -259,6 +309,26 @@ func RunWithOptions(ctx context.Context, checkpointDir, id string, store chunkst
 		state.StartedAt = time.Now().UTC()
 	}
 
+	// Attribution (T_remote decomposition): every store request of the
+	// attempt is counted, split into data (Has/GET/PUT with bytes) and
+	// control (GC intents/claims, no data columns). The tiered wrapper
+	// preserves the store's exact capability set — optional-interface
+	// assertions (Keyed, ExclusivePutter) answer identically before and
+	// after wrapping, so fallback and fail-closed paths are unchanged.
+	counters := &phaseCounters{}
+	store = instrumentStore(store, counters)
+	phases := &PublishPhases{}
+	result.Phases = phases
+	// Unified freeze: EVERY return path from here on finalizes the shared
+	// attribution. The defer mutates the POINTED-TO Phases/StateTimings, so
+	// the caller observes it even though Result travels by value — this is
+	// what keeps early returns (a failed publishing state write, a failed
+	// failed-state write in failAttempt, mid-upload errors) from leaking an
+	// unfrozen attempt. finalizeAttemptPhases is idempotent (it re-reads
+	// the monotonic counters), so success paths that already finalized are
+	// unaffected.
+	defer finalizeAttemptPhases(result.Phases, counters, result.StateTimings)
+
 	// Publication intent: from before the first store write of this run
 	// until its terminal state, gc-pubintents/<id>/<attempt-nonce> tells
 	// every sweep that this publication's objects are on their way to an
@@ -277,19 +347,25 @@ func RunWithOptions(ctx context.Context, checkpointDir, id string, store chunkst
 	if intentOK {
 		intentKey, intentBody, err := gcBeginPubIntent(ctx, intentKeyed, id)
 		if err != nil {
-			return failState(state, err)
+			return failAttempt(&result, counters, state, err)
 		}
 		defer gcEndPubIntent(context.WithoutCancel(ctx), intentKeyed, intentKey, intentBody)
 	}
 
+	loadStart := time.Now()
 	manifest, err := checkpointchunks.Load(checkpointDir)
+	phases.ManifestLoadWall = time.Since(loadStart)
 	if err != nil {
 		if !os.IsNotExist(err) {
-			return failState(state, err)
+			return failAttempt(&result, counters, state, err)
 		}
+		// No sealed sidecar: this is the only path that actually scans and
+		// hashes the memory file.
+		scanStart := time.Now()
 		manifest, err = checkpointchunks.Compute(ctx, checkpointDir, checkpointchunks.DefaultChunkBytes)
+		phases.ScanHashWall = time.Since(scanStart)
 		if err != nil {
-			return failState(state, err)
+			return failAttempt(&result, counters, state, err)
 		}
 	}
 	state.ChunksTotal = manifest.ChunkCount
@@ -301,7 +377,7 @@ func RunWithOptions(ctx context.Context, checkpointDir, id string, store chunkst
 		// without keyed access cannot host them. Fail before any state
 		// or object changes.
 		if _, ok := store.(chunkstore.Keyed); !ok {
-			return failState(state, errors.New("compressed chunk publication requires a keyed store"))
+			return failAttempt(&result, counters, state, errors.New("compressed chunk publication requires a keyed store"))
 		}
 	}
 
@@ -311,9 +387,10 @@ func RunWithOptions(ctx context.Context, checkpointDir, id string, store chunkst
 
 	memory, err := os.Open(filepath.Join(checkpointDir, manifest.File))
 	if err != nil {
-		return failState(state, err)
+		return failAttempt(&result, counters, state, err)
 	}
 	defer memory.Close()
+	uploadStart := time.Now()
 
 	// O-1: parallel chunk upload. Sequential PUTs bound the publish wall
 	// clock by per-request latency (~25ms/object, 54s for 2,200 chunks at
@@ -486,7 +563,9 @@ func RunWithOptions(ctx context.Context, checkpointDir, id string, store chunkst
 							// The object body is a zstd stream; the digest still
 							// names the uncompressed bytes and the transport
 							// sidecar carries the compression marker.
+							compStart := time.Now()
 							body, err := chunkstore.CompressChunkBody(buf[:end])
+							counters.addCompress(time.Since(compStart))
 							if err != nil {
 								return fmt.Errorf("compress chunk at %d: %w", job.chunk.Offset, err)
 							}
@@ -548,8 +627,11 @@ func RunWithOptions(ctx context.Context, checkpointDir, id string, store chunkst
 	}
 	close(upload)
 	wg.Wait()
+	// Recorded BEFORE the error check: an upload stage that died on a
+	// failed Has/PUT still keeps its wall, not only its request counters.
+	phases.UploadWall = time.Since(uploadStart)
 	if err := readUploadErr(); err != nil {
-		return failState(state, err)
+		return failAttempt(&result, counters, state, err)
 	}
 	put = int(progress)
 	skipped = int(atomic.LoadInt64(&skippedCount))
@@ -566,11 +648,11 @@ func RunWithOptions(ctx context.Context, checkpointDir, id string, store chunkst
 			view.Compression = checkpointchunks.CompressionZstd
 			transport = &view
 		}
-		if err := publishArtifactSetWithTransport(ctx, checkpointDir, id, keyed, &state, transport); err != nil {
-			return failState(state, err)
+		if err := publishArtifactSetWithTransport(ctx, checkpointDir, id, keyed, &state, transport, phases); err != nil {
+			return failAttempt(&result, counters, state, err)
 		}
 	} else {
-		return failState(state, errors.New("store backend cannot host artifact sets"))
+		return failAttempt(&result, counters, state, errors.New("store backend cannot host artifact sets"))
 	}
 
 	state.State = StatePublished
@@ -585,11 +667,58 @@ func RunWithOptions(ctx context.Context, checkpointDir, id string, store chunkst
 	return result, nil
 }
 
-func failState(state State, cause error) (Result, error) {
+// finalizeAttemptPhases freezes the request counters into the phases and
+// derives the state-persistence wall from the attempt's measured state
+// writes (sequential local writes; additive).
+func finalizeAttemptPhases(phases *PublishPhases, counters *phaseCounters, timings *StateTimings) {
+	if phases == nil || counters == nil {
+		return
+	}
+	snap := counters.snapshot()
+	phases.HasReqs = snap.HasReqs
+	phases.HasTimeTotal = snap.HasTimeTotal
+	phases.GetReqs = snap.GetReqs
+	phases.GetOpenTimeTotal = snap.GetOpenTimeTotal
+	phases.GetTimeTotal = snap.GetTimeTotal
+	phases.GetBytes = snap.GetBytes
+	phases.PutReqs = snap.PutReqs
+	phases.PutBytes = snap.PutBytes
+	phases.PutTimeTotal = snap.PutTimeTotal
+	phases.CompressTimeTotal = snap.CompressTimeTotal
+	phases.ControlReqs = snap.ControlReqs
+	phases.ControlTimeTotal = snap.ControlTimeTotal
+	if timings != nil {
+		phases.StateWall = timings.Publishing.Total + timings.Published.Total + timings.Failed.Total
+	}
+}
+
+// failAttempt is the publish attempt's failure terminal: it persists the
+// publish_failed record (with retry bookkeeping), records the failed
+// state-write timing, and FINALIZES the attribution so failed attempts
+// keep every stage wall and request counter observed so far — a fresh
+// empty Result would erase exactly the evidence of where the attempt died.
+func failAttempt(result *Result, counters *phaseCounters, state State, cause error) (Result, error) {
 	state.State = StatePublishFailed
 	state.LastError = cause.Error()
-	if err := writeState(state); err != nil {
-		return Result{}, err
+	// Backoff bookkeeping (M1): count the attempt and stamp it so the
+	// scanner defers the retry by StateNextAttempt instead of hammering a
+	// down store every round. Pre-M1 records had no Retries and retried
+	// immediately; only failed attempts from now on carry the fields.
+	state.Retries++
+	now := time.Now().UTC()
+	state.FailedAt = &now
+	// The ATTEMPTED transition is reflected on the result BEFORE the state
+	// write: if the failed-state write itself errors, the returned Result
+	// still reports publish_failed (what was attempted), the write's
+	// duration is kept in StateTimings.Failed (writeStateMeasured times
+	// errors too), and the attempt's counters are frozen by RunWithOptions's
+	// unified defer regardless of which return fires.
+	result.State = state
+	if result.StateTimings == nil {
+		result.StateTimings = &StateTimings{}
 	}
-	return Result{State: state}, cause
+	if err := writeStateMeasured(state, &result.StateTimings.Failed); err != nil {
+		return *result, err
+	}
+	return *result, cause
 }

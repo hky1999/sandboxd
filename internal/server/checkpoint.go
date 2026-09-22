@@ -28,6 +28,8 @@ import (
 	"github.com/inclusionAI/sandboxd/pkg/errord"
 	svc "github.com/inclusionAI/sandboxd/pkg/runtime"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+
+	"github.com/inclusionAI/sandboxd/pkg/checkpointpublish"
 )
 
 type checkpointDirectory struct {
@@ -104,6 +106,18 @@ func (h *sandboxService) checkpoint(
 	}
 	if strings.TrimSpace(request.ID) == "" {
 		return nil, errord.ToGRPCf(errord.ErrInvalidArgument, "sandbox ID is required")
+	}
+	// Publication-spool backpressure admission (M1, config-gated, default
+	// OFF): refuse new checkpoints explicitly while the catalogued artifact
+	// filesystem is under its reserve, instead of letting the unpublished
+	// spool squeeze live writable layers toward ENOSDC. The check reads the
+	// same .publish state files cn-publishd maintains (no second authority);
+	// a crashed publisher's "publishing" record still counts as unpublished
+	// (over-refuses, never under-refuses); nothing is ever deleted to
+	// relieve pressure; restores are not gated; the error is stable and
+	// distinguishable so callers can delay-and-retry.
+	if err := h.checkpointAdmission(); err != nil {
+		return nil, errord.ToGRPCf(errord.ErrFailedPrecondition, "%s", err.Error())
 	}
 	if request.TimeoutSeconds == 0 {
 		return nil, errord.ToGRPCf(
@@ -477,4 +491,20 @@ func (directory *checkpointDirectory) cleanup() error {
 		cleanupErr = errors.Join(cleanupErr, os.RemoveAll(filepath.Join(directory.path, entry.Name())))
 	}
 	return cleanupErr
+}
+
+// checkpointAdmission applies the publication-spool backpressure gate when
+// configured (empty roots = disabled, the default). It is a read-only
+// shared-filesystem probe: the .publish records cn-publishd maintains are
+// the single authority, a young "publishing" record counts as unpublished
+// (a crashed publisher over-refuses, never under-refuses), and an
+// unreadable root refuses fail-closed rather than guessing.
+func (h *sandboxService) checkpointAdmission() error {
+	admission := h.config.PluginConfig.CheckpointAdmissionConfig
+	if len(admission.Roots) == 0 || admission.MinFreeBytes <= 0 {
+		return nil // gate disabled: historical behavior, zero change
+	}
+	return checkpointpublish.CheckAdmission(admission.Roots, checkpointpublish.BackpressureLimits{
+		MinFreeBytes: admission.MinFreeBytes,
+	})
 }

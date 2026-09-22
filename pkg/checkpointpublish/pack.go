@@ -216,7 +216,24 @@ func runPacked(ctx context.Context, dir, id string, store chunkstore.Store, m *c
 	phaseStart := time.Now()
 	timings := &PackTimings{}
 	result.PackTimings = timings
-	fail := func(err error) (Result, error) { return failState(state, err) }
+	// The packed stage's wall survives failures: any exit before the
+	// success point below (classify, build, or a pack PUT dying) still
+	// records PackWall. The success path caps it at the LAST PACK PUT —
+	// the artifact-set stage after it keeps its own meta/index walls, so
+	// PackWall never swallows them.
+	packStageStart := phaseStart
+	defer func() {
+		if timings.PackWall == 0 && result.Phases != nil {
+			result.Phases.PackWall = time.Since(packStageStart)
+		}
+	}()
+	// Failure keeps the attempt's attribution: counters travel with the
+	// instrumented store wrapper the caller installed.
+	var counters *phaseCounters
+	if inst, ok := store.(interface{ counters() *phaseCounters }); ok {
+		counters = inst.counters()
+	}
+	fail := func(err error) (Result, error) { return failAttempt(&result, counters, state, err) }
 	keyed, ok := store.(chunkstore.Keyed)
 	if !ok {
 		return fail(fmt.Errorf("packed publication requires keyed store"))
@@ -557,10 +574,13 @@ func runPacked(ctx context.Context, dir, id string, store chunkstore.Store, m *c
 	result.PackPayloadPeak = peakPayload.Load()
 	timings.PackWall = time.Since(phaseStart)
 	phaseStart = time.Now()
+	if result.Phases != nil {
+		result.Phases.PackWall = timings.PackWall
+	}
 	if err := checkpointchunks.ValidateTransport(&transport); err != nil {
 		return fail(err)
 	}
-	if err := publishArtifactSetWithTransport(ctx, dir, id, keyed, &state, &transport); err != nil {
+	if err := publishArtifactSetWithTransport(ctx, dir, id, keyed, &state, &transport, result.Phases); err != nil {
 		return fail(err)
 	}
 	timings.Artifacts = time.Since(phaseStart)
@@ -572,5 +592,11 @@ func runPacked(ctx context.Context, dir, id string, store chunkstore.Store, m *c
 		return result, err
 	}
 	result.State = state
+	if result.Phases != nil {
+		// Concurrent accumulated totals from the pack workers (they
+		// overlap each other and the walls; never addable).
+		result.Phases.PackBuildTimeTotal = timings.BuildTotal
+		result.Phases.PackUploadTimeTotal = timings.UploadTotal
+	}
 	return result, nil
 }
