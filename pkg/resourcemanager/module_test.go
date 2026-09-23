@@ -229,6 +229,7 @@ func TestModuleSocketServesUnknownDuringProviderOutage(t *testing.T) {
 	// Bind the listener without the refresh goroutine so test refreshes
 	// are the only writers.
 	require.NoError(t, m.startListener())
+	defer m.Stop()
 
 	client := &http.Client{Transport: &http.Transport{
 		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
@@ -252,7 +253,7 @@ func TestModuleSocketServesUnknownDuringProviderOutage(t *testing.T) {
 	if code != http.StatusOK || !info.UsedKnown || info.UsedMem != 2<<30 {
 		t.Fatalf("healthy phase: code=%d usedKnown=%v usedMem=%d", code, info.UsedKnown, info.UsedMem)
 	}
-	if info.Cpu != 2500 || info.Mem != 5<<30 {
+	if info.Cpu != 2 || info.Mem != 5<<30 { // wire Cpu is cores (2500m -> 2)
 		t.Fatalf("healthy phase availability: cpu=%d mem=%d", info.Cpu, info.Mem)
 	}
 
@@ -272,6 +273,7 @@ func TestModuleSocketServesUnknownDuringProviderOutage(t *testing.T) {
 	}
 
 	// Recovery with DIFFERENT values proves a fresh refresh, not a replay.
+	resourceManager.setErr(nil)
 	resourceManager.setState(1800, 3<<30,
 		NodeResourceDetail{TotalCPUMilli: 4000, TotalMemBytes: 16 << 30,
 			UsedCPUCores: 0.5, UsedMemBytes: 1 << 30, Known: true})
@@ -280,7 +282,7 @@ func TestModuleSocketServesUnknownDuringProviderOutage(t *testing.T) {
 	if code != http.StatusOK || !info.UsedKnown || info.UsedMem != 1<<30 {
 		t.Fatalf("recovery phase: code=%d usedKnown=%v usedMem=%d", code, info.UsedKnown, info.UsedMem)
 	}
-	if info.Cpu != 1800 || info.Mem != 3<<30 {
+	if info.Cpu != 1 || info.Mem != 3<<30 { // 1800m -> 1 core on the wire
 		t.Fatalf("recovery phase availability: cpu=%d mem=%d", info.Cpu, info.Mem)
 	}
 }
@@ -291,10 +293,9 @@ func TestModuleSocketRefusesStaleSnapshot(t *testing.T) {
 	resourceManager := &stubNodeResourceManager{cpu: 2500, mem: 5 << 30}
 	sockPath := filepath.Join(t.TempDir(), "resource.sock")
 	m := &Module{
-		nodeResource:    resourceManager,
-		sockPath:        sockPath,
-		stopCh:          make(chan struct{}),
-		stalenessWindow: 50 * time.Millisecond,
+		nodeResource: resourceManager,
+		sockPath:     sockPath,
+		stopCh:       make(chan struct{}),
 	}
 	require.NoError(t, m.startListener())
 	defer m.Stop()
@@ -312,7 +313,9 @@ func TestModuleSocketRefusesStaleSnapshot(t *testing.T) {
 		t.Fatalf("fresh snapshot served %d, want 200", resp.StatusCode)
 	}
 
-	time.Sleep(80 * time.Millisecond) // exceed the 50ms test window
+	// Age the snapshot deterministically: backdate the last refresh
+	// beyond the (default) staleness window instead of sleeping.
+	m.lastRefresh.Store(time.Now().Add(-2 * time.Minute).UnixNano())
 	resp, err = client.Get("http://sandboxd/resource")
 	require.NoError(t, err)
 	resp.Body.Close()

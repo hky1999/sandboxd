@@ -62,9 +62,6 @@ type Module struct {
 	transientMemory           map[string]int64
 
 	lastRefresh atomic.Int64 // unix-nano of most recent successful refresh
-	// stalenessWindow overrides Healthy()'s 30s window when positive
-	// (tests only; zero means the default).
-	stalenessWindow time.Duration
 	listener    net.Listener
 	stopCh      chan struct{}
 	closeOnce   sync.Once
@@ -285,18 +282,14 @@ func (m *Module) Stop() {
 }
 
 // Healthy reports whether the latest provider refresh was within the
-// staleness window. The window is a variable only so tests can age a
-// snapshot deterministically without sleeping.
+// 30s staleness window; tests age snapshots deterministically by
+// backdating lastRefresh.
 func (m *Module) Healthy() bool {
 	ts := m.lastRefresh.Load()
 	if ts == 0 {
 		return false
 	}
-	window := m.stalenessWindow
-	if window <= 0 {
-		window = 30 * time.Second
-	}
-	return time.Since(time.Unix(0, ts)) < window
+	return time.Since(time.Unix(0, ts)) < 30*time.Second
 }
 
 // Capacity returns the node's currently-available CPU (millicores) and memory
