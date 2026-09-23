@@ -521,23 +521,32 @@ func maxInt64(v int64, floor int64) int64 {
 	return v
 }
 
+// boundedDomainCapacity clamps node-reported totals to the pod's actual
+// cgroup-domain limits. Both capacity consumers (available + detail) share
+// it: min(nodeTotal, domainLimit) when both are known-positive; zero when
+// the domain limit is unlimited or unreadable (never host-wide fallback).
+func (mgr *k8sWatchResourceManager) boundedDomainCapacity(nodeMem, nodeCPU int64) (int64, int64) {
+	mem, cpu := nodeMem, nodeCPU
+	if capBytes, err := mgr.self.DomainCapacityBytes(); err == nil && capBytes > 0 {
+		if capBytes < nodeMem {
+			mem = capBytes
+		}
+	} else {
+		mem = 0
+	}
+	if milli, err := mgr.self.DomainCPUMilli(); err == nil && milli > 0 {
+		if milli < nodeCPU {
+			cpu = milli
+		}
+	} else {
+		cpu = 0
+	}
+	return mem, cpu
+}
+
 func (mgr *k8sWatchResourceManager) GetAvailableResource() (int64, int64, error) {
-	totalCPU, totalMem, allocatedCPU, allocatedMem := mgr.snapshot()
-	// Same domain-bounded capacity as GetNodeResourceDetail: available is
-	// computed against the pod's cgroup-domain limits, not the host-wide
-	// node allocatable (three sibling kind pods must not each promise the
-	// whole host). Unlimited/unreadable domain -> zero available.
-	detail := NodeResourceDetail{}
-	if capBytes, err := mgr.self.DomainCapacityBytes(); err == nil && capBytes > 0 && capBytes < totalMem {
-		totalMem = capBytes
-	} else {
-		totalMem = 0
-	}
-	if milli, err := mgr.self.DomainCPUMilli(); err == nil && milli > 0 && milli < totalCPU {
-		totalCPU = milli
-	} else {
-		totalCPU = 0
-	}
+	nodeCPU, nodeMem, allocatedCPU, allocatedMem := mgr.snapshot()
+	totalMem, totalCPU := mgr.boundedDomainCapacity(nodeMem, nodeCPU)
 	cpuMilli := maxInt64(totalCPU-allocatedCPU, 0)
 	memBytes := maxInt64(totalMem-allocatedMem, 0)
 	memBytes = (memBytes >> 30) << 30
@@ -554,32 +563,9 @@ func (mgr *k8sWatchResourceManager) GetNodeResourceDetail() NodeResourceDetail {
 		ReservedCPUMilli: reservedCPU,
 		ReservedMemBytes: reservedMem,
 	}
-	// The k8s node allocatable spans the WHOLE host; on this single-host
-	// kind deployment sibling node pods would each claim it three times.
-	// Clamp the reported capacity to the pod's actual cgroup-domain limits
-	// (deployment partitions the host through these), so capacity, usage
-	// and reservations stay in one physical domain. Memory: a readable
-	// finite domain max always wins; unlimited or unreadable yields zero
-	// capacity (never host-wide fallback). CPU: quota is normalized to
-	// millicores through its own period; unlimited/unreadable yields zero.
-	if capBytes, err := mgr.self.DomainCapacityBytes(); err == nil {
-		if capBytes > 0 && capBytes < totalMem {
-			detail.TotalMemBytes = capBytes
-		} else if capBytes <= 0 {
-			detail.TotalMemBytes = 0
-		}
-	} else {
-		detail.TotalMemBytes = 0
-	}
-	if milli, err := mgr.self.DomainCPUMilli(); err == nil {
-		if milli > 0 && milli < totalCPU {
-			detail.TotalCPUMilli = milli
-		} else if milli <= 0 {
-			detail.TotalCPUMilli = 0
-		}
-	} else {
-		detail.TotalCPUMilli = 0
-	}
+	// Same single domain-bounded capacity entry as GetAvailableResource:
+	// min(nodeTotal, domainLimit), zero on unlimited/unreadable domain.
+	detail.TotalMemBytes, detail.TotalCPUMilli = mgr.boundedDomainCapacity(totalMem, totalCPU)
 	// Physical usage of the node pod itself: pod requests are reservations
 	// and must not be reported as usage. Any read failure keeps Known=false
 	// (unknown, never zero).

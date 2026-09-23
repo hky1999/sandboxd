@@ -373,6 +373,8 @@ func (m *Module) refreshOnce() {
 		m.mu.Lock()
 		m.usedKnown = false
 		m.usedCpu, m.usedMem = 0, 0
+		// Stale availability must not keep authorizing admissions either.
+		m.availCpu, m.availMem = 0, 0
 		m.mu.Unlock()
 		return
 	}

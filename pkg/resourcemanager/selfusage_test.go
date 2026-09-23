@@ -163,3 +163,58 @@ func TestDomainCPUMilliFixtures(t *testing.T) {
 		t.Fatal("missing file must error")
 	}
 }
+
+// boundedDomainCapacity semantics: min(node, domain) when both known;
+// zero when unlimited/unreadable; equal/higher domain keeps node value.
+func TestBoundedDomainCapacityMatrix(t *testing.T) {
+	dir := t.TempDir()
+	mgr := &k8sWatchResourceManager{self: &selfUsage{unifiedRoot: dir}}
+	writeCPU := func(content string) {
+		if err := os.WriteFile(filepath.Join(dir, "cpu.max"), []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeMem := func(content string) {
+		if err := os.WriteFile(filepath.Join(dir, "memory.max"), []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	const nodeMem = int64(201220395008)
+	const nodeCPU = int64(104000)
+	// lower domain limits win
+	writeMem("34359738368\n") // 32GiB
+	writeCPU("2000000 100000\n")
+	mem, cpu := mgr.boundedDomainCapacity(nodeMem, nodeCPU)
+	if mem != 34359738368 || cpu != 20000 {
+		t.Fatalf("lower: got mem=%d cpu=%d", mem, cpu)
+	}
+	// equal keeps node
+	writeMem("201220395008\n")
+	writeCPU("10400000 100000\n")
+	mem, cpu = mgr.boundedDomainCapacity(nodeMem, nodeCPU)
+	if mem != nodeMem || cpu != nodeCPU {
+		t.Fatalf("equal: got mem=%d cpu=%d", mem, cpu)
+	}
+	// higher keeps node
+	writeMem("402440790016\n")
+	writeCPU("20800000 100000\n")
+	mem, cpu = mgr.boundedDomainCapacity(nodeMem, nodeCPU)
+	if mem != nodeMem || cpu != nodeCPU {
+		t.Fatalf("higher: got mem=%d cpu=%d", mem, cpu)
+	}
+	// unlimited domain -> zero
+	writeMem("max\n")
+	writeCPU("max 100000\n")
+	mem, cpu = mgr.boundedDomainCapacity(nodeMem, nodeCPU)
+	if mem != 0 || cpu != 0 {
+		t.Fatalf("unlimited: got mem=%d cpu=%d", mem, cpu)
+	}
+	// unreadable -> zero
+	if err := os.Remove(filepath.Join(dir, "memory.max")); err != nil {
+		t.Fatal(err)
+	}
+	mem, _ = mgr.boundedDomainCapacity(nodeMem, nodeCPU)
+	if mem != 0 {
+		t.Fatalf("unreadable mem: got %d", mem)
+	}
+}
