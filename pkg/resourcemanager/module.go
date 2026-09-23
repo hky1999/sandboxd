@@ -87,13 +87,13 @@ type resourceInfo struct {
 	// the sample as unknown, never as zero. Reserved* expose pod requests
 	// separately (informational). Legacy consumers keep reading cpu/mem
 	// (available).
-	TotalCpu   float64 `json:"totalCpu"`
-	TotalMem   int64   `json:"totalMem"`
-	UsedCpu    float64 `json:"usedCpu"`
-	UsedMem    int64   `json:"usedMem"`
-	UsedKnown  bool    `json:"usedKnown"`
-	ReservedCpu  float64 `json:"reservedCpu,omitempty"`
-	ReservedMem  int64   `json:"reservedMem,omitempty"`
+	TotalCpu    float64 `json:"totalCpu"`
+	TotalMem    int64   `json:"totalMem"`
+	UsedCpu     float64 `json:"usedCpu"`
+	UsedMem     int64   `json:"usedMem"`
+	UsedKnown   bool    `json:"usedKnown"`
+	ReservedCpu float64 `json:"reservedCpu,omitempty"`
+	ReservedMem int64   `json:"reservedMem,omitempty"`
 }
 
 type xpuProvider interface {
@@ -219,17 +219,17 @@ func (m *Module) startListener() error {
 		}
 		m.mu.RLock()
 		info := resourceInfo{
-			Cpu:      m.availCpu,
-			Mem:      availableAfterTransientReservations(m.availMem, m.transientMemory),
-			Xpu:      []xpumanager.Resource{},
-			Features: []string{},
-			TotalCpu:   m.totalCpu,
-			TotalMem:   m.totalMem,
-			UsedCpu:    m.usedCpu,
-			UsedMem:    m.usedMem,
-			UsedKnown:  m.usedKnown,
-			ReservedCpu:  m.reservedCpu,
-			ReservedMem:  m.reservedMem,
+			Cpu:         m.availCpu,
+			Mem:         availableAfterTransientReservations(m.availMem, m.transientMemory),
+			Xpu:         []xpumanager.Resource{},
+			Features:    []string{},
+			TotalCpu:    m.totalCpu,
+			TotalMem:    m.totalMem,
+			UsedCpu:     m.usedCpu,
+			UsedMem:     m.usedMem,
+			UsedKnown:   m.usedKnown,
+			ReservedCpu: m.reservedCpu,
+			ReservedMem: m.reservedMem,
 		}
 		if m.xpu != nil {
 			info.Xpu = m.xpu.Resources()

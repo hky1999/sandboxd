@@ -39,13 +39,13 @@ const (
 // zero. CPU units: TotalCPUMilli/ReservedCPUMilli are millicores,
 // UsedCPUCores is normalized cores.
 type NodeResourceDetail struct {
-	TotalCPUMilli   int64
-	TotalMemBytes   int64
+	TotalCPUMilli    int64
+	TotalMemBytes    int64
 	ReservedCPUMilli int64
 	ReservedMemBytes int64
-	UsedCPUCores    float64
-	UsedMemBytes    int64
-	Known           bool
+	UsedCPUCores     float64
+	UsedMemBytes     int64
+	Known            bool
 }
 
 type NodeResourceManager interface {

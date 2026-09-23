@@ -47,7 +47,7 @@ type cgroupHierarchy struct {
 // cgroup containing sandboxd. It never creates cgroups or writes controller
 // files, so it is safe to use with cgroup-disabled sandbox execution.
 type cgroupResourceManager struct {
-	self *selfUsage
+	self      *selfUsage
 	mode      cgroups.CGMode
 	cpu       cgroupHierarchy
 	memory    cgroupHierarchy

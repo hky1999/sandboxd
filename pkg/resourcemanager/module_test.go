@@ -15,14 +15,14 @@
 package resourcemanager
 
 import (
-	"errors"
-	"sync"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"net/http"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -205,7 +205,6 @@ func TestModuleServesAvailableResourceOverUnixSocket(t *testing.T) {
 // Module must satisfy the metrics CapacityProvider so the collector can read
 // the socket-aligned availability figure.
 var _ CapacityProvider = (*Module)(nil)
-
 
 // Success -> provider error -> recovery: the socket never serves a stale
 // payload as known. On error BOTH the physical fields and the advertised

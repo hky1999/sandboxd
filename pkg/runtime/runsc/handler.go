@@ -173,11 +173,11 @@ func (r *Handler) Start(ctx context.Context, config runtimecore.StartConfig) err
 	}
 
 	startArgs := StartArgs{
-		ID:                 config.ID,
-		BundleDir:          bundlePath,
+		ID:          config.ID,
+		BundleDir:   bundlePath,
 		UserStdout:  config.Stdout,
 		UserStderr:  config.Stderr,
-		RootOverlay:         rootOverlay,
+		RootOverlay: rootOverlay,
 		Network: NetworkConfig{
 			Interface:   config.Network.Interface,
 			LinkAddress: config.Network.GuestHardwareAddr(),
@@ -306,12 +306,12 @@ func (r *Handler) Restore(
 	}
 
 	startArgs := StartArgs{
-		ID:          config.ID,
-		BundleDir:   bundlePath,
-		UserStdout:  config.Stdout,
-		UserStderr:  config.Stderr,
-		RootOverlay: rootOverlay,
-		FsRestoreImagePath:  fsImagePath,
+		ID:                 config.ID,
+		BundleDir:          bundlePath,
+		UserStdout:         config.Stdout,
+		UserStderr:         config.Stderr,
+		RootOverlay:        rootOverlay,
+		FsRestoreImagePath: fsImagePath,
 		Network: NetworkConfig{
 			Interface:   config.Network.Interface,
 			LinkAddress: config.Network.GuestHardwareAddr(),
