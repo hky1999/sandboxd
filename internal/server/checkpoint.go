@@ -15,12 +15,12 @@
 package server
 
 import (
-	runtimeSpec "github.com/opencontainers/runtime-spec/specs-go"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	runtimeSpec "github.com/opencontainers/runtime-spec/specs-go"
 	"io"
 	"os"
 	"path/filepath"

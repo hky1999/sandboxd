@@ -36,15 +36,15 @@ import (
 type checkpointTestHandler struct {
 	*svc.FakeRuntimeHandler
 
-	mu           sync.Mutex
-	checkpointFn func(context.Context, string, string, svc.CheckpointOptions) error
-	restoreFn    func(context.Context, svc.StartConfig, string) error
-	checkpoints  []string
+	mu                sync.Mutex
+	checkpointFn      func(context.Context, string, string, svc.CheckpointOptions) error
+	restoreFn         func(context.Context, svc.StartConfig, string) error
+	checkpoints       []string
 	checkpointOptions []svc.CheckpointOptions
-	restores     []svc.StartConfig
-	restoreDirs  []string
-	starts       []svc.StartConfig
-	deleteCalls  int
+	restores          []svc.StartConfig
+	restoreDirs       []string
+	starts            []svc.StartConfig
+	deleteCalls       int
 }
 
 func newCheckpointTestHandler() *checkpointTestHandler {
@@ -121,12 +121,11 @@ func TestCheckpointValidatesRequestAndRuntime(t *testing.T) {
 	// managed-capability and rootfs stages that follow are covered by the
 	// executeCheckpoint-level tests).
 	_, err = service.CheckpointIfGeneration(context.Background(), &runtime.CheckpointIfGenerationRequest{
-		Checkpoint:        &runtime.CheckpointRequest{ID: id, CheckpointDir: dir, CheckpointID: "ckpt-validate"},
+		Checkpoint:         &runtime.CheckpointRequest{ID: id, CheckpointDir: dir, CheckpointID: "ckpt-validate"},
 		ExpectedGeneration: "gen-other",
 	})
 	assert.Equal(t, codes.FailedPrecondition, status.Code(err))
 }
-
 
 // stageCheckpointSource stages a RUNNING sandbox with a generation label and
 // an OCI bundle so the shared checkpoint path can validate the source.

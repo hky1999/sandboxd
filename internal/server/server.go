@@ -1699,14 +1699,14 @@ func (h *sandboxService) createSandbox(
 		if dnatConfigured {
 			h.networkMgr.cleanupDnatRules(sandboxID)
 		}
-	if preparedResources != nil {
-		if err := h.deactivateStartNetwork(preparedResources.OccupiedResource); err != nil {
-			logrus.Warnf("deactivate network endpoint while rolling back sandbox %s: %v", sandboxID, err)
+		if preparedResources != nil {
+			if err := h.deactivateStartNetwork(preparedResources.OccupiedResource); err != nil {
+				logrus.Warnf("deactivate network endpoint while rolling back sandbox %s: %v", sandboxID, err)
+			}
 		}
-	}
-	if portsReserved {
-		h.networkMgr.releaseDnatPorts(sandboxID)
-	}
+		if portsReserved {
+			h.networkMgr.releaseDnatPorts(sandboxID)
+		}
 		aclCleanupFailed := aclAttempted && !aclRegistered
 		if aclAttempted && h.aclMgr != nil {
 			h.aclMu.Lock()
