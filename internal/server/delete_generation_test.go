@@ -10,7 +10,6 @@ import (
 	"path/filepath"
 	"testing"
 
-
 	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
 	"github.com/inclusionAI/sandboxd/config"
 	"github.com/inclusionAI/sandboxd/pkg/cgroupmanager"
@@ -137,7 +136,7 @@ func TestDeleteIfGenerationWithholdsReceiptWhenReleaseFails(t *testing.T) {
 	storeSandboxForDelete(t, s, id)
 	require.NoError(t, s.sandboxManager.StoreMetadata(id, &runtime.SandboxMetadata{
 		ID: id, RuntimeHandler: "runsc",
-		Labels:       map[string]string{resourceGenerationLabel: "generation"},
+		Labels:        map[string]string{resourceGenerationLabel: "generation"},
 		ResourceFacts: map[string]string{config.ResourceNameCgroup: cgroup},
 	}))
 	request := &runtime.DeleteIfGenerationRequest{ID: id, ExpectedGeneration: "generation"}
@@ -206,7 +205,7 @@ func (f *failingCgroupMgr) ReadMemoryLimit(string) (int64, error) { return 0, ni
 func (f *failingCgroupMgr) ReadFreeze(string) (cgroupmanager.FreezeState, error) {
 	return cgroupmanager.FreezeState{}, nil
 }
-func (f *failingCgroupMgr) WriteFreeze(string, bool) error       { return nil }
+func (f *failingCgroupMgr) WriteFreeze(string, bool) error                 { return nil }
 func (f *failingCgroupMgr) WriteMemoryLimits(string, uint64, uint64) error { return nil }
-func (f *failingCgroupMgr) SupportsMemoryShrink() bool           { return true }
-func (f *failingCgroupMgr) ShutDown() error                       { return nil }
+func (f *failingCgroupMgr) SupportsMemoryShrink() bool                     { return true }
+func (f *failingCgroupMgr) ShutDown() error                                { return nil }
