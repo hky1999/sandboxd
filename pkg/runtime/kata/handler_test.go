@@ -817,6 +817,7 @@ func TestPrepareKataDirectoryRootfsSeedsMountTargets(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	originalMount := mountKataOverlay
 	// The unmount helpers are stubbed like mountKataOverlay below: in an
 	// unprivileged test container the real syscall can return EPERM for a
 	// path that is not a mount at all, which the production EINVAL/ENOENT
