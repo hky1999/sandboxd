@@ -150,16 +150,13 @@ func TestDeleteIfGenerationWithholdsReceiptWhenReleaseFails(t *testing.T) {
 		require.Contains(t, err.Error(), "release resource cgroup")
 	}
 
-	// The journal proves the absence: no completed receipt exists for this
-	// generation (only the intent marker at most).
-	receiptDir, receiptPath := s.retirementPath(id, "generation")
-	if _, statErr := os.Stat(receiptPath); statErr == nil {
-		raw, readErr := os.ReadFile(receiptPath)
-		require.NoError(t, readErr)
-		require.NotContains(t, string(raw), "\"complete\":true",
-			"no completed receipt may exist while the release is unconfirmed")
-	}
-	_ = receiptDir
+	// The journal proves the absence: the receipt for this generation (the
+	// intent marker written before the runtime delete) must read Complete
+	// exactly false while the release is unconfirmed.
+	record, readErr := s.readRetirement(id, "generation")
+	require.NoError(t, readErr, "the intent receipt must be readable")
+	require.False(t, record.Complete,
+		"no completed receipt may exist while the release is unconfirmed")
 
 	// Identity survives the unconfirmed release.
 	current, err := s.sandboxManager.Get(id)
@@ -168,11 +165,15 @@ func TestDeleteIfGenerationWithholdsReceiptWhenReleaseFails(t *testing.T) {
 	require.Equal(t, cgroup, current.Metadata.ResourceFacts[config.ResourceNameCgroup],
 		"resource facts must stay intact across failed attempts")
 
-	// Fault cleared: the SAME generation and facts now complete for real.
+	// Fault cleared: the SAME generation and facts now complete for real,
+	// and the journal's receipt flips to Complete=true.
 	fake.recycleErr = nil
 	response, err := s.DeleteIfGeneration(context.Background(), request)
 	require.NoError(t, err)
 	require.Equal(t, "generation", response.RetiredGeneration)
+	record, readErr = s.readRetirement(id, "generation")
+	require.NoError(t, readErr)
+	require.True(t, record.Complete, "the confirmed release must complete the receipt")
 
 	// And the completed receipt is durable: the replay confirms idempotently.
 	_, err = s.DeleteIfGeneration(context.Background(), request)
