@@ -15,6 +15,8 @@
 package resourcemanager
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -309,18 +311,30 @@ func TestK8sWatchResourceManagerWatchEventHandlers(t *testing.T) {
 }
 
 func TestK8sWatchResourceManagerGetAvailableResource(t *testing.T) {
+	// The pod cgroup domain bounds what available may promise: the test
+	// pins a 16GiB/4000m domain so the node totals cannot exceed it.
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "memory.max"), []byte("17179869184\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "cpu.max"), []byte("400000 100000\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	mgr := &k8sWatchResourceManager{
-		totalCPU:     4000,
-		totalMem:     int64(10 << 30),
+		totalCPU:     104000,
+		totalMem:     int64(201 << 30),
 		allocatedCPU: 1500,
 		allocatedMem: int64((3 << 30) + (512 << 20)),
 		podRequests:  map[string]podResourceRequest{},
+		self:         &selfUsage{unifiedRoot: dir},
 	}
 
+	// Domain (16GiB/4000m) is lower than node totals: available derives
+	// from the domain, not the host-wide numbers.
 	cpu, mem, err := mgr.GetAvailableResource()
 	assert.NoError(t, err)
 	assert.Equal(t, int64(2500), cpu)
-	assert.Equal(t, int64(6<<30), mem)
+	assert.Equal(t, int64(12<<30), mem) // (16GiB - 3.5GiB) rounded down to GiB
 
 	mgr.allocatedCPU = 5000
 	mgr.allocatedMem = int64(12 << 30)
