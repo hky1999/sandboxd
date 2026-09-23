@@ -16,6 +16,8 @@ package resourcemanager
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -124,5 +126,40 @@ func TestSelfUsageDomainCPUNormalizesByPeriod(t *testing.T) {
 	}
 	if milli < 0 || milli > 100*1000*1000 {
 		t.Fatalf("domain cpu millicores out of plausible range: %d", milli)
+	}
+}
+
+func TestDomainCPUMilliFixtures(t *testing.T) {
+	dir := t.TempDir()
+	write := func(content string) string {
+		p := filepath.Join(dir, "cpu.max")
+		if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	cases := []struct {
+		content string
+		want    int64
+	}{
+		{"2000000 100000\n", 20000},
+		{"100000 100000\n", 1000},
+		{"50000 50000\n", 1000},
+		{"max 100000\n", 0},
+		{"garbage\n", 0},
+		{"0 100000\n", 0},
+		{"100000 0\n", 0},
+	}
+	for _, tc := range cases {
+		got, err := domainCPUMilliFrom(write(tc.content))
+		if err != nil {
+			t.Fatalf("content %q: %v", tc.content, err)
+		}
+		if got != tc.want {
+			t.Fatalf("content %q: got %d millicores, want %d", tc.content, got, tc.want)
+		}
+	}
+	if _, err := domainCPUMilliFrom(filepath.Join(dir, "missing")); err == nil {
+		t.Fatal("missing file must error")
 	}
 }

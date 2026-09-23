@@ -70,7 +70,12 @@ func (s *selfUsage) DomainCPUMilli() (int64, error) {
 	if s.unifiedRoot == "" {
 		return 0, errNoSelfCgroup
 	}
-	data, err := os.ReadFile(filepath.Join(s.unifiedRoot, "cpu.max"))
+	return domainCPUMilliFrom(filepath.Join(s.unifiedRoot, "cpu.max"))
+}
+
+// domainCPUMilliFrom is split for deterministic tests with fixture files.
+func domainCPUMilliFrom(path string) (int64, error) {
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return 0, err
 	}

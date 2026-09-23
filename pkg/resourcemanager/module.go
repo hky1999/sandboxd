@@ -366,7 +366,14 @@ func (m *Module) refreshLoop() {
 func (m *Module) refreshOnce() {
 	cpu, mem, err := m.nodeResource.GetAvailableResource()
 	if err != nil {
+		// A failed refresh invalidates the cached physical facts entirely:
+		// keeping the previous usedKnown=true would let the /resource
+		// handler serve stale data as fresh samples.
 		logrus.Errorf("resourcemanager: refresh failed: %v", err)
+		m.mu.Lock()
+		m.usedKnown = false
+		m.usedCpu, m.usedMem = 0, 0
+		m.mu.Unlock()
 		return
 	}
 	// Wire format expects CPU in cores; underlying manager returns

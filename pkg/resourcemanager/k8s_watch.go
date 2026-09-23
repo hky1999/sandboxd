@@ -523,10 +523,25 @@ func maxInt64(v int64, floor int64) int64 {
 
 func (mgr *k8sWatchResourceManager) GetAvailableResource() (int64, int64, error) {
 	totalCPU, totalMem, allocatedCPU, allocatedMem := mgr.snapshot()
+	// Same domain-bounded capacity as GetNodeResourceDetail: available is
+	// computed against the pod's cgroup-domain limits, not the host-wide
+	// node allocatable (three sibling kind pods must not each promise the
+	// whole host). Unlimited/unreadable domain -> zero available.
+	detail := NodeResourceDetail{}
+	if capBytes, err := mgr.self.DomainCapacityBytes(); err == nil && capBytes > 0 && capBytes < totalMem {
+		totalMem = capBytes
+	} else {
+		totalMem = 0
+	}
+	if milli, err := mgr.self.DomainCPUMilli(); err == nil && milli > 0 && milli < totalCPU {
+		totalCPU = milli
+	} else {
+		totalCPU = 0
+	}
 	cpuMilli := maxInt64(totalCPU-allocatedCPU, 0)
 	memBytes := maxInt64(totalMem-allocatedMem, 0)
 	memBytes = (memBytes >> 30) << 30
-	logrus.Infof("report k8s watch resource info: total(cpu: %d, mem: %d), allocated(cpu: %d, mem: %d), available(cpu: %d, mem: %d)",
+	logrus.Infof("report k8s watch resource info (domain-bounded): total(cpu: %d, mem: %d), allocated(cpu: %d, mem: %d), available(cpu: %d, mem: %d)",
 		totalCPU, totalMem, allocatedCPU, allocatedMem, cpuMilli, memBytes)
 	return cpuMilli, memBytes, nil
 }
@@ -548,7 +563,7 @@ func (mgr *k8sWatchResourceManager) GetNodeResourceDetail() NodeResourceDetail {
 	// capacity (never host-wide fallback). CPU: quota is normalized to
 	// millicores through its own period; unlimited/unreadable yields zero.
 	if capBytes, err := mgr.self.DomainCapacityBytes(); err == nil {
-		if capBytes > 0 && uint64(capBytes) < totalMem {
+		if capBytes > 0 && capBytes < totalMem {
 			detail.TotalMemBytes = capBytes
 		} else if capBytes <= 0 {
 			detail.TotalMemBytes = 0
