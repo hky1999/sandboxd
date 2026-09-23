@@ -336,8 +336,10 @@ func TestK8sWatchResourceManagerGetAvailableResource(t *testing.T) {
 	assert.Equal(t, int64(2500), cpu)
 	assert.Equal(t, int64(12<<30), mem) // (16GiB - 3.5GiB) rounded down to GiB
 
+	// Overcommit guard: reservations beyond the domain yield zero, never
+	// negative availability (raised above the 16GiB domain).
 	mgr.allocatedCPU = 5000
-	mgr.allocatedMem = int64(12 << 30)
+	mgr.allocatedMem = int64(17 << 30)
 	cpu, mem, err = mgr.GetAvailableResource()
 	assert.NoError(t, err)
 	assert.Equal(t, int64(0), cpu)

@@ -15,6 +15,7 @@
 package resourcemanager
 
 import (
+	"errors"
 	"context"
 	"encoding/json"
 	"io"
@@ -34,6 +35,8 @@ type stubNodeResourceManager struct {
 	cpu     int64
 	mem     int64
 	stopped atomic.Bool
+	err     error
+	detail  NodeResourceDetail
 }
 
 type stubXPUProvider struct {
@@ -54,10 +57,13 @@ func (s stubXPUProvider) Resources() []xpumanager.Resource {
 }
 
 func (s *stubNodeResourceManager) GetNodeResourceDetail() NodeResourceDetail {
-	return NodeResourceDetail{}
+	return s.detail
 }
 
 func (s *stubNodeResourceManager) GetAvailableResource() (int64, int64, error) {
+	if s.err != nil {
+		return 0, 0, s.err
+	}
 	return s.cpu, s.mem, nil
 }
 
@@ -179,3 +185,68 @@ func TestModuleServesAvailableResourceOverUnixSocket(t *testing.T) {
 // Module must satisfy the metrics CapacityProvider so the collector can read
 // the socket-aligned availability figure.
 var _ CapacityProvider = (*Module)(nil)
+
+
+// Success -> provider error -> recovery: the socket never serves a stale
+// payload as known. On error the physical fields go unknown/zero; on
+// recovery the fresh values are served again.
+func TestModuleSocketServesUnknownDuringProviderOutage(t *testing.T) {
+	resourceManager := &stubNodeResourceManager{
+		cpu: 2500, mem: 5 << 30,
+		detail: NodeResourceDetail{
+			TotalCPUMilli: 4000, TotalMemBytes: 16 << 30,
+			UsedCPUCores: 1.25, UsedMemBytes: 2 << 30, Known: true,
+		},
+	}
+	sockPath := filepath.Join(t.TempDir(), "resource.sock")
+	m := &Module{
+		nodeResource: resourceManager,
+		sockPath:     sockPath,
+		stopCh:       make(chan struct{}),
+	}
+	require.NoError(t, m.Start())
+	defer m.Stop()
+
+	client := &http.Client{Transport: &http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "unix", sockPath)
+		},
+	}}
+	get := func() (int, resourceInfo) {
+		resp, err := client.Get("http://sandboxd/resource")
+		require.NoError(t, err)
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		require.NoError(t, err)
+		var info resourceInfo
+		require.NoError(t, json.Unmarshal(body, &info))
+		return resp.StatusCode, info
+	}
+
+	// Healthy phase: known physical values are served.
+	m.refreshOnce()
+	code, info := get()
+	if code != http.StatusOK || !info.UsedKnown || info.UsedMem != 2<<30 {
+		t.Fatalf("healthy phase: code=%d usedKnown=%v usedMem=%d", code, info.UsedKnown, info.UsedMem)
+	}
+
+	// Provider outage: values must not stay stale-as-known.
+	resourceManager.err = errors.New("provider down")
+	m.refreshOnce()
+	code, info = get()
+	if code != http.StatusOK {
+		t.Fatalf("outage phase returned %d, want 200 with unknown fields", code)
+	}
+	if info.UsedKnown || info.UsedMem != 0 || info.UsedCpu != 0 {
+		t.Fatalf("outage phase served stale data: usedKnown=%v usedMem=%d usedCpu=%v",
+			info.UsedKnown, info.UsedMem, info.UsedCpu)
+	}
+
+	// Recovery: fresh values served again.
+	resourceManager.err = nil
+	m.refreshOnce()
+	code, info = get()
+	if code != http.StatusOK || !info.UsedKnown || info.UsedMem != 2<<30 {
+		t.Fatalf("recovery phase: code=%d usedKnown=%v usedMem=%d", code, info.UsedKnown, info.UsedMem)
+	}
+}
