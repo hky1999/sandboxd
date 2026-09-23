@@ -817,8 +817,23 @@ func TestPrepareKataDirectoryRootfsSeedsMountTargets(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	originalMount := mountKataOverlay
-	t.Cleanup(func() { mountKataOverlay = originalMount })
+	// The unmount helpers are stubbed like mountKataOverlay below: in an
+	// unprivileged test container the real syscall can return EPERM for a
+	// path that is not a mount at all, which the production EINVAL/ENOENT
+	// tolerance does not cover and the test does not exercise.
+	originalUnmount := unmountKataPath
+	originalDetach := detachKataPath
+	t.Cleanup(func() {
+		mountKataOverlay = originalMount
+		unmountKataPath = originalUnmount
+		detachKataPath = originalDetach
+	})
+	unmountKataPath = func(target string) error {
+		return syscall.EINVAL // "not a mount": the tolerated outcome
+	}
+	detachKataPath = func(target string) error {
+		return syscall.EINVAL
+	}
 	mountKataOverlay = func(_, upper, _, _ string) error {
 		info, err := os.Lstat(filepath.Join(upper, "etc", "resolv.conf"))
 		if err != nil || !info.Mode().IsRegular() {
