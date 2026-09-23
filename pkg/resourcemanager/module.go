@@ -62,6 +62,9 @@ type Module struct {
 	transientMemory           map[string]int64
 
 	lastRefresh atomic.Int64 // unix-nano of most recent successful refresh
+	// stalenessWindow overrides Healthy()'s 30s window when positive
+	// (tests only; zero means the default).
+	stalenessWindow time.Duration
 	listener    net.Listener
 	stopCh      chan struct{}
 	closeOnce   sync.Once
@@ -183,6 +186,21 @@ func (m *Module) MarkSandboxStopped(target sandbox.MetricsTarget) {
 // Start launches the refresh loop and HTTP server. It returns once the
 // listener is bound so external collectors can use the socket immediately.
 func (m *Module) Start() error {
+	if err := m.startListener(); err != nil {
+		return err
+	}
+	// startListener already launched the serve goroutine; add the refresh
+	// loop so production gets both. wg accounting: serve (+1) in
+	// startListener, refresh (+1) here.
+	m.startRefreshLoop()
+	return nil
+}
+
+// startListener binds the socket and registers the /resource handler
+// WITHOUT launching the refresh loop; tests use it so their explicit
+// refreshOnce calls are the only cache writers. Start wires the loop on
+// top.
+func (m *Module) startListener() error {
 	if _, err := os.Stat(m.sockPath); err == nil {
 		os.Remove(m.sockPath)
 	}
@@ -230,11 +248,15 @@ func (m *Module) Start() error {
 		_, _ = w.Write(body)
 	})
 
-	m.wg.Add(2)
+	m.wg.Add(1)
 	go m.serve(mux)
-	go m.refreshLoop()
-
 	return nil
+}
+
+// startRefreshLoop launches only the background refresh goroutine.
+func (m *Module) startRefreshLoop() {
+	m.wg.Add(1)
+	go m.refreshLoop()
 }
 
 // Stop closes the unix listener and waits for the refresh loop to drain.
@@ -263,13 +285,18 @@ func (m *Module) Stop() {
 }
 
 // Healthy reports whether the latest provider refresh was within the
-// staleness window.
+// staleness window. The window is a variable only so tests can age a
+// snapshot deterministically without sleeping.
 func (m *Module) Healthy() bool {
 	ts := m.lastRefresh.Load()
 	if ts == 0 {
 		return false
 	}
-	return time.Since(time.Unix(0, ts)) < 30*time.Second
+	window := m.stalenessWindow
+	if window <= 0 {
+		window = 30 * time.Second
+	}
+	return time.Since(time.Unix(0, ts)) < window
 }
 
 // Capacity returns the node's currently-available CPU (millicores) and memory

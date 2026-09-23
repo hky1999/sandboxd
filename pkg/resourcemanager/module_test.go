@@ -16,6 +16,7 @@ package resourcemanager
 
 import (
 	"errors"
+	"sync"
 	"context"
 	"encoding/json"
 	"io"
@@ -32,11 +33,26 @@ import (
 )
 
 type stubNodeResourceManager struct {
+	mu      sync.Mutex
 	cpu     int64
 	mem     int64
 	stopped atomic.Bool
 	err     error
 	detail  NodeResourceDetail
+}
+
+// setErr / setState take the stub lock so test-driven state changes are
+// ordered against in-flight reads (race-detector clean).
+func (s *stubNodeResourceManager) setErr(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.err = err
+}
+
+func (s *stubNodeResourceManager) setState(cpu, mem int64, detail NodeResourceDetail) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cpu, s.mem, s.detail = cpu, mem, detail
 }
 
 type stubXPUProvider struct {
@@ -57,10 +73,14 @@ func (s stubXPUProvider) Resources() []xpumanager.Resource {
 }
 
 func (s *stubNodeResourceManager) GetNodeResourceDetail() NodeResourceDetail {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return s.detail
 }
 
 func (s *stubNodeResourceManager) GetAvailableResource() (int64, int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.err != nil {
 		return 0, 0, s.err
 	}
@@ -188,8 +208,10 @@ var _ CapacityProvider = (*Module)(nil)
 
 
 // Success -> provider error -> recovery: the socket never serves a stale
-// payload as known. On error the physical fields go unknown/zero; on
-// recovery the fresh values are served again.
+// payload as known. On error BOTH the physical fields and the advertised
+// availability go unknown/zero; on recovery fresh (different) values are
+// served, proving a real refresh happened. No background loop runs: the
+// stub's mutex makes state changes and refreshes sequentially observable.
 func TestModuleSocketServesUnknownDuringProviderOutage(t *testing.T) {
 	resourceManager := &stubNodeResourceManager{
 		cpu: 2500, mem: 5 << 30,
@@ -204,8 +226,9 @@ func TestModuleSocketServesUnknownDuringProviderOutage(t *testing.T) {
 		sockPath:     sockPath,
 		stopCh:       make(chan struct{}),
 	}
-	require.NoError(t, m.Start())
-	defer m.Stop()
+	// Bind the listener without the refresh goroutine so test refreshes
+	// are the only writers.
+	require.NoError(t, m.startListener())
 
 	client := &http.Client{Transport: &http.Transport{
 		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
@@ -223,30 +246,85 @@ func TestModuleSocketServesUnknownDuringProviderOutage(t *testing.T) {
 		return resp.StatusCode, info
 	}
 
-	// Healthy phase: known physical values are served.
+	// Healthy phase: known physical values and real availability served.
 	m.refreshOnce()
 	code, info := get()
 	if code != http.StatusOK || !info.UsedKnown || info.UsedMem != 2<<30 {
 		t.Fatalf("healthy phase: code=%d usedKnown=%v usedMem=%d", code, info.UsedKnown, info.UsedMem)
 	}
+	if info.Cpu != 2500 || info.Mem != 5<<30 {
+		t.Fatalf("healthy phase availability: cpu=%d mem=%d", info.Cpu, info.Mem)
+	}
 
-	// Provider outage: values must not stay stale-as-known.
-	resourceManager.err = errors.New("provider down")
+	// Provider outage: physical fields unknown AND availability zeroed.
+	resourceManager.setErr(errors.New("provider down"))
 	m.refreshOnce()
 	code, info = get()
 	if code != http.StatusOK {
 		t.Fatalf("outage phase returned %d, want 200 with unknown fields", code)
 	}
 	if info.UsedKnown || info.UsedMem != 0 || info.UsedCpu != 0 {
-		t.Fatalf("outage phase served stale data: usedKnown=%v usedMem=%d usedCpu=%v",
+		t.Fatalf("outage phase served stale physical data: usedKnown=%v usedMem=%d usedCpu=%v",
 			info.UsedKnown, info.UsedMem, info.UsedCpu)
 	}
+	if info.Cpu != 0 || info.Mem != 0 {
+		t.Fatalf("outage phase kept stale availability: cpu=%d mem=%d", info.Cpu, info.Mem)
+	}
 
-	// Recovery: fresh values served again.
-	resourceManager.err = nil
+	// Recovery with DIFFERENT values proves a fresh refresh, not a replay.
+	resourceManager.setState(1800, 3<<30,
+		NodeResourceDetail{TotalCPUMilli: 4000, TotalMemBytes: 16 << 30,
+			UsedCPUCores: 0.5, UsedMemBytes: 1 << 30, Known: true})
 	m.refreshOnce()
 	code, info = get()
-	if code != http.StatusOK || !info.UsedKnown || info.UsedMem != 2<<30 {
+	if code != http.StatusOK || !info.UsedKnown || info.UsedMem != 1<<30 {
 		t.Fatalf("recovery phase: code=%d usedKnown=%v usedMem=%d", code, info.UsedKnown, info.UsedMem)
+	}
+	if info.Cpu != 1800 || info.Mem != 3<<30 {
+		t.Fatalf("recovery phase availability: cpu=%d mem=%d", info.Cpu, info.Mem)
+	}
+}
+
+// Over-age snapshots must be refused (503) instead of served stale, and
+// become servable again after a fresh refresh.
+func TestModuleSocketRefusesStaleSnapshot(t *testing.T) {
+	resourceManager := &stubNodeResourceManager{cpu: 2500, mem: 5 << 30}
+	sockPath := filepath.Join(t.TempDir(), "resource.sock")
+	m := &Module{
+		nodeResource:    resourceManager,
+		sockPath:        sockPath,
+		stopCh:          make(chan struct{}),
+		stalenessWindow: 50 * time.Millisecond,
+	}
+	require.NoError(t, m.startListener())
+	defer m.Stop()
+
+	client := &http.Client{Transport: &http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "unix", sockPath)
+		},
+	}}
+	m.refreshOnce()
+	resp, err := client.Get("http://sandboxd/resource")
+	require.NoError(t, err)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("fresh snapshot served %d, want 200", resp.StatusCode)
+	}
+
+	time.Sleep(80 * time.Millisecond) // exceed the 50ms test window
+	resp, err = client.Get("http://sandboxd/resource")
+	require.NoError(t, err)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("stale snapshot served %d, want 503", resp.StatusCode)
+	}
+
+	m.refreshOnce() // recovery re-arms the window
+	resp, err = client.Get("http://sandboxd/resource")
+	require.NoError(t, err)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("post-refresh snapshot served %d, want 200", resp.StatusCode)
 	}
 }
