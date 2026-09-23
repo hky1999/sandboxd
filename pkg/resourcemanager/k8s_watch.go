@@ -539,6 +539,22 @@ func (mgr *k8sWatchResourceManager) GetNodeResourceDetail() NodeResourceDetail {
 		ReservedCPUMilli: reservedCPU,
 		ReservedMemBytes: reservedMem,
 	}
+	// The k8s node allocatable spans the WHOLE host; on this single-host
+	// kind deployment sibling node pods would each claim it three times.
+	// Clamp the reported capacity to the pod's actual cgroup-domain limits
+	// (deployment partitions the host through these), so capacity, usage
+	// and reservations stay in one physical domain.
+	if capBytes, err := mgr.self.DomainCapacityBytes(); err == nil && capBytes > 0
+		&& uint64(capBytes) < totalMem {
+		detail.TotalMemBytes = capBytes
+	} else if err != nil && totalMem > 0 {
+		// Unlimited or unreadable domain cannot authorize host-wide capacity.
+		detail.TotalMemBytes = 0
+	}
+	if cpuQuota, limited, err := mgr.self.DomainCPUQuotaUsec(); err == nil && limited && cpuQuota > 0
+		&& uint64(cpuQuota)*1000 < totalCPU {
+		detail.TotalCPUMilli = cpuQuota * 1000
+	}
 	// Physical usage of the node pod itself: pod requests are reservations
 	// and must not be reported as usage. Any read failure keeps Known=false
 	// (unknown, never zero).

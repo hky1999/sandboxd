@@ -23,14 +23,19 @@ import (
 	"time"
 )
 
-// selfUsage reads the physical resource usage of the cgroup that contains
-// sandboxd itself (on the scheduler node pod that is the whole node pod:
-// proxies plus every sandbox). This is the "physical usage" input the
-// usage-aware admission needs; pod requests are reservations, not usage.
+// selfUsage reads the physical resource usage of the cgroup DOMAIN that the
+// scheduler's budget covers: the pod's cgroup-namespace root (the mount
+// point /sys/fs/cgroup inside the node pod), which contains the system
+// services AND every /akernel/<id> sandbox. Reading the daemon's own
+// service cgroup instead missed all sandbox memory (verified: sandboxes at
+// /akernel/* are siblings of system.slice, not children of
+// system.slice/sandboxd.service). Capacity comes from the same root's
+// memory.max so usage and capacity share one physical domain.
 type selfUsage struct {
 	mu sync.Mutex
 
-	// cgroup v2 unified root of the current process; empty when unavailable.
+	// cgroup v2 unified root of the pod's cgroup namespace; empty when
+	// unavailable (unknown samples, never zero-by-accident).
 	unifiedRoot string
 	// last cpu.stat usage read (microseconds) and its wall clock, used to
 	// normalize a usage delta into cores.
@@ -42,23 +47,64 @@ func newSelfUsage() *selfUsage {
 	return &selfUsage{unifiedRoot: detectUnifiedRoot()}
 }
 
+// detectUnifiedRoot returns the pod's cgroup-namespace root. On the node pod
+// every schedulable cgroup (system.slice, init.scope and /akernel/*) lives
+// below /sys/fs/cgroup, so the mount point itself is the budget domain; the
+// daemon's own /proc/self/cgroup path would only cover its service slice.
 func detectUnifiedRoot() string {
-	// /proc/self/cgroup lists "0::/path" on cgroup v2.
-	data, err := os.ReadFile("/proc/self/cgroup")
-	if err != nil {
-		return ""
+	if st, err := os.Stat(filepath.Join(rootMount, "cgroup.controllers")); err == nil && !st.IsDir() {
+		return rootMount
 	}
-	for _, line := range strings.Split(string(data), "\n") {
-		fields := strings.SplitN(strings.TrimSpace(line), ":", 3)
-		if len(fields) == 3 && fields[0] == "0" && fields[1] == "" {
-			return filepath.Join("/sys/fs/cgroup", fields[2])
-		}
-	}
-	// Fall back to the v2 mount root itself.
-	if st, err := os.Stat("/sys/fs/cgroup/cgroup.controllers"); err == nil && !st.IsDir() {
-		return "/sys/fs/cgroup"
+	if _, err := os.Stat(filepath.Join(rootMount, "memory.max")); err == nil {
+		return rootMount
 	}
 	return ""
+}
+
+const rootMount = "/sys/fs/cgroup"
+
+// DomainCPUQuotaUsec returns the domain's cpu.max quota (usec per period)
+// and whether a finite quota exists.
+func (s *selfUsage) DomainCPUQuotaUsec() (int64, bool, error) {
+	if s.unifiedRoot == "" {
+		return 0, false, errNoSelfCgroup
+	}
+	data, err := os.ReadFile(filepath.Join(s.unifiedRoot, "cpu.max"))
+	if err != nil {
+		return 0, false, err
+	}
+	fields := strings.Fields(strings.TrimSpace(string(data)))
+	if len(fields) != 2 || fields[0] == "max" {
+		return 0, false, nil
+	}
+	quota, err := strconv.ParseInt(fields[0], 10, 64)
+	if err != nil || quota <= 0 {
+		return 0, false, nil
+	}
+	return quota, true, nil
+}
+
+// DomainCapacityBytes returns the memory.max of the budget domain root, or
+// an error when the domain is unlimited or unreadable. An unlimited domain
+// ("max") has no finite capacity: callers must NOT fall back to the host
+// allocatable, because sibling node pods would each claim the whole host.
+func (s *selfUsage) DomainCapacityBytes() (int64, error) {
+	if s.unifiedRoot == "" {
+		return 0, errNoSelfCgroup
+	}
+	data, err := os.ReadFile(filepath.Join(s.unifiedRoot, "memory.max"))
+	if err != nil {
+		return 0, err
+	}
+	value := strings.TrimSpace(string(data))
+	if value == "max" {
+		return 0, errUnlimitedDomain
+	}
+	raw, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || raw <= 0 {
+		return 0, errUnlimitedDomain
+	}
+	return raw, nil
 }
 
 // MemoryUsage returns the current memory.usage-in-bytes of the containing
@@ -116,7 +162,8 @@ type usageError string
 func (e usageError) Error() string { return string(e) }
 
 const (
-	errNoSelfCgroup = usageError("self cgroup v2 root not detected")
-	errNoCPUStat    = usageError("cpu.stat usage_usec not found")
-	errNoCPUWindow  = usageError("no measurement window yet")
+	errNoSelfCgroup    = usageError("self cgroup v2 root not detected")
+	errNoCPUStat       = usageError("cpu.stat usage_usec not found")
+	errNoCPUWindow     = usageError("no measurement window yet")
+	errUnlimitedDomain = usageError("budget domain memory.max is unlimited")
 )

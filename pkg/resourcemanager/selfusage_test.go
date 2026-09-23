@@ -87,3 +87,25 @@ func TestSelfUsageCPUNeedsWindow(t *testing.T) {
 		t.Fatal("first cpu read has no window and must report unknown")
 	}
 }
+
+func TestSelfUsageDomainRootIsNamespaceMount(t *testing.T) {
+	s := newSelfUsage()
+	if detectUnifiedRoot() == "" && s.unifiedRoot == "" {
+		t.Skip("no cgroup v2 mount in this environment")
+	}
+	// The domain root must be the namespace mount itself, not the daemon's
+	// service slice: /akernel sandboxes are siblings of system.slice.
+	if got := detectUnifiedRoot(); got != "/sys/fs/cgroup" {
+		t.Fatalf("domain root = %q, want the namespace mount /sys/fs/cgroup", got)
+	}
+}
+
+func TestSelfUsageDomainCapacitySentinels(t *testing.T) {
+	s := &selfUsage{unifiedRoot: "/nonexistent"}
+	if _, _, err := s.DomainCPUQuotaUsec(); err == nil {
+		t.Fatal("unreadable domain must error, not zero")
+	}
+	if _, err := s.DomainCapacityBytes(); err == nil {
+		t.Fatal("unreadable domain must error, not zero")
+	}
+}
