@@ -543,17 +543,27 @@ func (mgr *k8sWatchResourceManager) GetNodeResourceDetail() NodeResourceDetail {
 	// kind deployment sibling node pods would each claim it three times.
 	// Clamp the reported capacity to the pod's actual cgroup-domain limits
 	// (deployment partitions the host through these), so capacity, usage
-	// and reservations stay in one physical domain.
-	if capBytes, err := mgr.self.DomainCapacityBytes(); err == nil && capBytes > 0
-		&& uint64(capBytes) < totalMem {
-		detail.TotalMemBytes = capBytes
-	} else if err != nil && totalMem > 0 {
-		// Unlimited or unreadable domain cannot authorize host-wide capacity.
+	// and reservations stay in one physical domain. Memory: a readable
+	// finite domain max always wins; unlimited or unreadable yields zero
+	// capacity (never host-wide fallback). CPU: quota is normalized to
+	// millicores through its own period; unlimited/unreadable yields zero.
+	if capBytes, err := mgr.self.DomainCapacityBytes(); err == nil {
+		if capBytes > 0 && uint64(capBytes) < totalMem {
+			detail.TotalMemBytes = capBytes
+		} else if capBytes <= 0 {
+			detail.TotalMemBytes = 0
+		}
+	} else {
 		detail.TotalMemBytes = 0
 	}
-	if cpuQuota, limited, err := mgr.self.DomainCPUQuotaUsec(); err == nil && limited && cpuQuota > 0
-		&& uint64(cpuQuota)*1000 < totalCPU {
-		detail.TotalCPUMilli = cpuQuota * 1000
+	if milli, err := mgr.self.DomainCPUMilli(); err == nil {
+		if milli > 0 && milli < totalCPU {
+			detail.TotalCPUMilli = milli
+		} else if milli <= 0 {
+			detail.TotalCPUMilli = 0
+		}
+	} else {
+		detail.TotalCPUMilli = 0
 	}
 	// Physical usage of the node pod itself: pod requests are reservations
 	// and must not be reported as usage. Any read failure keeps Known=false

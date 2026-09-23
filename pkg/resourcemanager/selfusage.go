@@ -63,25 +63,30 @@ func detectUnifiedRoot() string {
 
 const rootMount = "/sys/fs/cgroup"
 
-// DomainCPUQuotaUsec returns the domain's cpu.max quota (usec per period)
-// and whether a finite quota exists.
-func (s *selfUsage) DomainCPUQuotaUsec() (int64, bool, error) {
+// DomainCPUMilli returns the domain's cpu.max normalized to millicores
+// through its own period ("quota period" -> quota*1000/period). Zero with
+// nil error means unlimited; an error means unreadable (both conservative).
+func (s *selfUsage) DomainCPUMilli() (int64, error) {
 	if s.unifiedRoot == "" {
-		return 0, false, errNoSelfCgroup
+		return 0, errNoSelfCgroup
 	}
 	data, err := os.ReadFile(filepath.Join(s.unifiedRoot, "cpu.max"))
 	if err != nil {
-		return 0, false, err
+		return 0, err
 	}
 	fields := strings.Fields(strings.TrimSpace(string(data)))
 	if len(fields) != 2 || fields[0] == "max" {
-		return 0, false, nil
+		return 0, nil
 	}
 	quota, err := strconv.ParseInt(fields[0], 10, 64)
 	if err != nil || quota <= 0 {
-		return 0, false, nil
+		return 0, nil
 	}
-	return quota, true, nil
+	period, err := strconv.ParseInt(fields[1], 10, 64)
+	if err != nil || period <= 0 {
+		return 0, nil
+	}
+	return quota * 1000 / period, nil
 }
 
 // DomainCapacityBytes returns the memory.max of the budget domain root, or

@@ -102,10 +102,27 @@ func TestSelfUsageDomainRootIsNamespaceMount(t *testing.T) {
 
 func TestSelfUsageDomainCapacitySentinels(t *testing.T) {
 	s := &selfUsage{unifiedRoot: "/nonexistent"}
-	if _, _, err := s.DomainCPUQuotaUsec(); err == nil {
+	if _, err := s.DomainCPUMilli(); err == nil {
 		t.Fatal("unreadable domain must error, not zero")
 	}
 	if _, err := s.DomainCapacityBytes(); err == nil {
 		t.Fatal("unreadable domain must error, not zero")
+	}
+}
+
+// On a live cgroup v2 domain the CPU normalization must divide by the
+// period: cpu.max "2000000 100000" is 20 cores = 20000 millicores, not
+// 2000000*1000.
+func TestSelfUsageDomainCPUNormalizesByPeriod(t *testing.T) {
+	if detectUnifiedRoot() == "" {
+		t.Skip("no cgroup v2 mount in this environment")
+	}
+	s := newSelfUsage()
+	milli, err := s.DomainCPUMilli()
+	if err != nil {
+		t.Fatalf("domain cpu read: %v", err)
+	}
+	if milli < 0 || milli > 100*1000*1000 {
+		t.Fatalf("domain cpu millicores out of plausible range: %d", milli)
 	}
 }

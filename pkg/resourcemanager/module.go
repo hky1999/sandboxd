@@ -194,6 +194,14 @@ func (m *Module) Start() error {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/resource", func(w http.ResponseWriter, r *http.Request) {
+		// Never serve a payload whose physical fields are stale: an
+		// over-age snapshot is explicit unknown data, so consumers cannot
+		// refresh old observations into fresh samples.
+		if !m.Healthy() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte("resource snapshot stale\n"))
+			return
+		}
 		m.mu.RLock()
 		info := resourceInfo{
 			Cpu:      m.availCpu,
@@ -372,7 +380,13 @@ func (m *Module) refreshOnce() {
 	m.totalMem = detail.TotalMemBytes
 	m.usedCpu = detail.UsedCPUCores
 	m.usedMem = detail.UsedMemBytes
+	// A failed physical read keeps NOTHING known: serving the previous
+	// values with usedKnown=true would refresh stale data into new
+	// samples on the consumer side.
 	m.usedKnown = detail.Known
+	if !detail.Known {
+		m.usedCpu, m.usedMem = 0, 0
+	}
 	m.reservedCpu = float64(detail.ReservedCPUMilli) / 1000.0
 	m.reservedMem = detail.ReservedMemBytes
 	m.mu.Unlock()
