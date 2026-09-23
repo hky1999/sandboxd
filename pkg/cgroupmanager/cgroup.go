@@ -23,6 +23,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/containerd/cgroups/v3"
 	"github.com/inclusionAI/sandboxd/config"
 	"github.com/inclusionAI/sandboxd/internal/metrics"
 	"github.com/inclusionAI/sandboxd/internal/util"
@@ -96,6 +97,79 @@ type storedCgroupIDs struct {
 // CacheSizeLimit exposes the configured cache target for metrics reporting.
 func (c *CgroupManager) CacheSizeLimit() int { return c.cacheSize }
 
+// RecycleOps is the EXPORTED minimal seam for higher-layer integration
+// tests: a toggleable failing Kill/Reset drives the REAL Recycle
+// transaction through the server's release path.
+type RecycleOps interface {
+	Kill(name string) error
+	Reset(name string) error
+}
+
+// OOMSeam is the exported OOM surface NewForTest needs (Reset on reuse).
+type OOMSeam interface {
+	Reset(name string) error
+}
+
+type recycleOpsAdapter struct {
+	inner RecycleOps
+}
+
+func (a recycleOpsAdapter) mode() cgroups.CGMode          { return cgroups.Unified }
+func (a recycleOpsAdapter) prepareRoot(string, int64) error { return nil }
+func (a recycleOpsAdapter) list(string) ([]string, error)   { return nil, nil }
+func (a recycleOpsAdapter) create(string, *specs.LinuxResources) error { return nil }
+func (a recycleOpsAdapter) reset(name string) error        { return a.inner.Reset(name) }
+func (a recycleOpsAdapter) setPidsLimit(string, int64) error { return nil }
+func (a recycleOpsAdapter) update(string, *specs.LinuxResources) error { return nil }
+func (a recycleOpsAdapter) stat(string) (Stats, error)     { return Stats{}, nil }
+func (a recycleOpsAdapter) readFreeze(string) (FreezeState, error) {
+	return FreezeState{}, nil
+}
+func (a recycleOpsAdapter) writeFreeze(string, bool) error { return nil }
+func (a recycleOpsAdapter) writeMemoryLimits(string, uint64, uint64) error { return nil }
+func (a recycleOpsAdapter) identity(string) (CgroupIdentity, error) {
+	return CgroupIdentity{}, nil
+}
+func (a recycleOpsAdapter) newOOMWatcher() (oomWatcher, error) {
+	return nil, fmt.Errorf("not available in the test adapter")
+}
+func (a recycleOpsAdapter) kill(name string) error { return a.inner.Kill(name) }
+func (a recycleOpsAdapter) delete(string) error    { return nil }
+
+type oomSeamAdapter struct{ inner OOMSeam }
+
+func (a oomSeamAdapter) Add(string) error               { return nil }
+func (a oomSeamAdapter) Remove(string)                  {}
+func (a oomSeamAdapter) Reset(name string) error        { return a.inner.Reset(name) }
+func (a oomSeamAdapter) OOMKilled(string) (bool, error) { return false, nil }
+func (a oomSeamAdapter) Close() error                   { return nil }
+
+// NewForTest builds a manager around the injected Recycle/OOM seams: no
+// persistence, no GC worker, no create serialization — exactly the Recycle
+// transaction under test.
+func NewForTest(ops RecycleOps, oom OOMSeam, rootName string, cacheSize int) *CgroupManager {
+	return &CgroupManager{
+		rootName:  rootName,
+		cacheSize: cacheSize,
+		usingID:   cmap.New[struct{}](),
+		idleID:    util.New[string](""),
+		cgroups:   cmap.New[struct{}](),
+		gcQueue:   util.New[string](""),
+		gcWake:    make(chan struct{}, 1),
+		ops:       recycleOpsAdapter{inner: ops},
+		oom:       oomSeamAdapter{inner: oom},
+	}
+}
+
+// LeaseForTest marks a cgroup leased and registered, as Start would.
+func (c *CgroupManager) LeaseForTest(name string) {
+	c.usingID.Set(name, struct{}{})
+	c.cgroups.Set(name, struct{}{})
+	c.mu.Lock()
+	c.total++
+	c.mu.Unlock()
+}
+
 func (c *CgroupManager) gc() {
 	defer c.wg.Done()
 	attempts := make(map[string]int)
@@ -118,6 +192,10 @@ func (c *CgroupManager) gc() {
 			if err := c.removeCgroupFromSystem(name); err == nil {
 				delete(attempts, name)
 				c.generator.Release(name)
+				// Entries queued while a release was unconfirmed keep their
+				// registry mark until the directory is provably gone; clearing
+				// it here is what lets a Recycle retry confirm the release.
+				c.cgroups.Remove(name)
 				logrus.Debugf("delete cgroup %s from gc queue success", name)
 				continue
 			} else {
@@ -191,12 +269,18 @@ func (c *CgroupManager) Status() ([]string, []string) {
 // Runtime teardown has already run, so draining and restoring the small set of
 // controls managed by sandboxd belongs on this release path, not Start.
 func (c *CgroupManager) Recycle(id string) error {
-	if _, active := c.usingID.Pop(id); !active {
+	if !c.usingID.Has(id) {
+		// Unleased: never leased, cleanly recycled into the idle cache, or a
+		// confirmed release already completed. Duplicate releases are
+		// idempotent successes.
 		return nil
 	}
-	c.storeDirty.Store(true)
 
 	if !c.cgroups.Has(id) {
+		// Leased but no physical cgroup (a create that never landed): the
+		// release confirms — drop the lease and return the capacity.
+		c.usingID.Pop(id)
+		c.storeDirty.Store(true)
 		c.mu.Lock()
 		c.total--
 		c.mu.Unlock()
@@ -204,14 +288,21 @@ func (c *CgroupManager) Recycle(id string) error {
 	}
 
 	if err := c.cleanForReuse(id); err != nil {
-		logrus.Warnf("clean cgroup %s for reuse failed; destroy it: %v", id, err)
-		c.mu.Lock()
-		c.total--
-		c.mu.Unlock()
-		c.deleteCgroup(id)
-		return nil
+		// MINIMAL TRANSACTION: an unverified drain/reset is NOT a release.
+		// Keep the lease (persisted), the registry entry and the capacity —
+		// no idle admission, no asynchronous GC. The same identity's retry
+		// re-runs this exact transaction and converges only on a verified
+		// clean, so a cgroup can never be handed out or destroyed behind an
+		// unconfirmed release.
+		logrus.Warnf("clean cgroup %s for reuse failed; release unconfirmed, lease retained: %v", id, err)
+		return fmt.Errorf("cgroup %s cleanup unverified; retry the release: %w", id, err)
 	}
 
+	// Verified clean: the release confirms. Admission to the idle cache
+	// keeps the directory by design; beyond the cache size the existing
+	// destroy path (GC) applies, unchanged.
+	c.usingID.Pop(id)
+	c.storeDirty.Store(true)
 	c.mu.Lock()
 	if c.idleID.Length() < c.cacheSize {
 		c.idleID.Push(id)

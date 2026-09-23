@@ -434,7 +434,7 @@ func TestRecycleOnlyReturnsActiveOwnedCgroups(t *testing.T) {
 	assert.Equal(t, []string{name}, manager.idleID.List(), "duplicate recycle must not duplicate a cache entry")
 }
 
-func TestRecycleDestroysCgroupWhenCleanupFails(t *testing.T) {
+func TestRecycleKeepsLeaseWhenCleanupFailsAndConfirmsOnRecovery(t *testing.T) {
 	name := "/sandbox/lease"
 	oom := newFakeOOMWatcher()
 	ops := &fakeCgroupOps{oom: oom, killErr: assert.AnError}
@@ -454,13 +454,89 @@ func TestRecycleDestroysCgroupWhenCleanupFails(t *testing.T) {
 	manager.usingID.Set(name, struct{}{})
 	require.NoError(t, oom.Add(name))
 
-	require.NoError(t, manager.Recycle(name))
+	// Unverified drain: error, lease + registry + capacity + OOM watch all
+	// retained; nothing queued, nothing cached.
+	err := manager.Recycle(name)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "cleanup unverified")
+	assert.True(t, manager.usingID.Has(name), "lease must survive an unconfirmed release")
+	assert.True(t, manager.cgroups.Has(name))
+	assert.Equal(t, 1, manager.total, "capacity must not return before confirmation")
 	assert.Empty(t, manager.idleID.List())
-	assert.False(t, manager.cgroups.Has(name))
-	assert.Equal(t, []string{name}, manager.gcQueue.List())
-	assert.Zero(t, manager.total)
+	assert.Empty(t, manager.gcQueue.List(), "no asynchronous GC behind an unconfirmed release")
 	assert.Equal(t, []string{"kill"}, ops.calls)
-	assert.Equal(t, []string{"add:" + name, "remove:" + name}, oom.calls)
+	oom.mu.Lock()
+	_, stillWatched := oom.flags[name]
+	oom.mu.Unlock()
+	assert.True(t, stillWatched, "OOM registration must survive an unconfirmed release")
+
+	// Retry while the drain still fails: identical outcome.
+	ops.calls = nil
+	err = manager.Recycle(name)
+	require.Error(t, err)
+	assert.True(t, manager.usingID.Has(name))
+	assert.Equal(t, 1, manager.total)
+
+	// Recovery: verified clean confirms, releases lease and capacity, and
+	// admits the cgroup to the idle cache exactly once.
+	ops.killErr = nil
+	ops.calls = nil
+	require.NoError(t, manager.Recycle(name))
+	assert.False(t, manager.usingID.Has(name))
+	assert.Equal(t, []string{name}, manager.idleID.List())
+	// the idle cache KEEPS the capacity slot by design (total = using+idle)
+	assert.Equal(t, 1, manager.total)
+	assert.Equal(t, []string{"kill", "reset"}, ops.calls)
+
+	// Duplicate release of the cleanly cached id stays an idempotent success.
+	require.NoError(t, manager.Recycle(name))
+}
+
+// Rebuilt-manager semantics: the lease set reloads from the persisted store
+// and the registry from the directories. A lease whose release was
+// unconfirmed (directory present) still refuses to confirm after a restart;
+// the normal confirmed paths behave as before.
+func TestRecycleAfterManagerRebuildKeepsUnconfirmedLeases(t *testing.T) {
+	name := "/sandbox/pending"
+	oom := newFakeOOMWatcher()
+	ops := &fakeCgroupOps{oom: oom, killErr: assert.AnError}
+
+	rebuilt := &CgroupManager{
+		rootName:  "/sandbox",
+		cacheSize: 1,
+		usingID:   cmap.New[struct{}](),
+		idleID:    util.New[string](""),
+		cgroups:   cmap.New[struct{}](),
+		gcQueue:   util.New[string](""),
+		gcWake:    make(chan struct{}, 1),
+		ops:       ops,
+		oom:       oom,
+		total:     1,
+	}
+	rebuilt.cgroups.Set(name, struct{}{})
+	rebuilt.usingID.Set(name, struct{}{})
+	require.Error(t, rebuilt.Recycle(name))
+	assert.True(t, rebuilt.usingID.Has(name))
+	assert.Equal(t, 1, rebuilt.total)
+
+	gone := &CgroupManager{
+		rootName:  "/sandbox",
+		cacheSize: 1,
+		usingID:   cmap.New[struct{}](),
+		idleID:    util.New[string](""),
+		cgroups:   cmap.New[struct{}](),
+		gcQueue:   util.New[string](""),
+		gcWake:    make(chan struct{}, 1),
+		ops:       ops,
+		oom:       oom,
+		total:     1,
+	}
+	// leased but never physically created: release confirms and capacity
+	// returns exactly once
+	gone.usingID.Set(name, struct{}{})
+	require.NoError(t, gone.Recycle(name))
+	assert.False(t, gone.usingID.Has(name))
+	assert.Zero(t, gone.total)
 }
 
 func TestRecycleDestroysCleanCgroupWhenCacheIsFull(t *testing.T) {

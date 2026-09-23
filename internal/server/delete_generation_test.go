@@ -5,11 +5,15 @@ package server
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 
+
 	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
+	"github.com/inclusionAI/sandboxd/config"
+	"github.com/inclusionAI/sandboxd/pkg/cgroupmanager"
 	svc "github.com/inclusionAI/sandboxd/pkg/runtime"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/codes"
@@ -114,3 +118,94 @@ func TestPendingRetirementRetriesOnlyMatchingLiveGeneration(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, saved.Complete)
 }
+
+// An unconfirmed physical release must NOT produce the durable completion
+// receipt: with the cgroup release failing inside the REAL Recycle
+// transaction (toggleable fake through the exported seams), every delete
+// attempt fails, the journal carries no completed receipt, and the identity
+// survives; once the fault clears, the same generation/resource facts
+// complete for real and idempotently.
+func TestDeleteIfGenerationWithholdsReceiptWhenReleaseFails(t *testing.T) {
+	handler := &recordingDeleteHandler{FakeRuntimeHandler: svc.NewFakeRuntimeHandler()}
+	s := newTestService(t, map[string]svc.Handler{"runsc": handler})
+
+	fake := &failingCgroupMgr{}
+	s.cgroupMgr = fake
+
+	const id = "release-fails"
+	const cgroup = "/akernel/release-fails"
+	storeSandboxForDelete(t, s, id)
+	require.NoError(t, s.sandboxManager.StoreMetadata(id, &runtime.SandboxMetadata{
+		ID: id, RuntimeHandler: "runsc",
+		Labels:       map[string]string{resourceGenerationLabel: "generation"},
+		ResourceFacts: map[string]string{config.ResourceNameCgroup: cgroup},
+	}))
+	request := &runtime.DeleteIfGenerationRequest{ID: id, ExpectedGeneration: "generation"}
+
+	// Fault on: two delete attempts both fail inside the real release path.
+	fake.recycleErr = fmt.Errorf("cgroup /akernel/release-fails cleanup unverified: drain fault")
+	for attempt := 0; attempt < 2; attempt++ {
+		_, err := s.DeleteIfGeneration(context.Background(), request)
+		require.Error(t, err, "attempt %d: unconfirmed release must not complete", attempt)
+		require.Contains(t, err.Error(), "release resource cgroup")
+	}
+
+	// The journal proves the absence: no completed receipt exists for this
+	// generation (only the intent marker at most).
+	receiptDir, receiptPath := s.retirementPath(id, "generation")
+	if _, statErr := os.Stat(receiptPath); statErr == nil {
+		raw, readErr := os.ReadFile(receiptPath)
+		require.NoError(t, readErr)
+		require.NotContains(t, string(raw), "\"complete\":true",
+			"no completed receipt may exist while the release is unconfirmed")
+	}
+	_ = receiptDir
+
+	// Identity survives the unconfirmed release.
+	current, err := s.sandboxManager.Get(id)
+	require.NoError(t, err)
+	require.Equal(t, "generation", current.Metadata.Labels[resourceGenerationLabel])
+	require.Equal(t, cgroup, current.Metadata.ResourceFacts[config.ResourceNameCgroup],
+		"resource facts must stay intact across failed attempts")
+
+	// Fault cleared: the SAME generation and facts now complete for real.
+	fake.recycleErr = nil
+	response, err := s.DeleteIfGeneration(context.Background(), request)
+	require.NoError(t, err)
+	require.Equal(t, "generation", response.RetiredGeneration)
+
+	// And the completed receipt is durable: the replay confirms idempotently.
+	_, err = s.DeleteIfGeneration(context.Background(), request)
+	require.NoError(t, err)
+}
+
+// failingCgroupMgr fakes the service's own sandboxCgroups seam with a
+// toggleable Recycle failure, driving the REAL release/receipt chain.
+type failingCgroupMgr struct {
+	recycleErr error
+	recycles   []string
+}
+
+func (f *failingCgroupMgr) Allocate() (string, error) { return "", nil }
+func (f *failingCgroupMgr) Recycle(name string) error {
+	f.recycles = append(f.recycles, name)
+	if f.recycleErr != nil {
+		return f.recycleErr
+	}
+	return nil
+}
+func (f *failingCgroupMgr) Prepare(string, *runtime.LinuxSandboxResources) error { return nil }
+func (f *failingCgroupMgr) Stats(string) (cgroupmanager.Stats, error) {
+	return cgroupmanager.Stats{}, nil
+}
+func (f *failingCgroupMgr) CgroupIdentity(string) (cgroupmanager.CgroupIdentity, error) {
+	return cgroupmanager.CgroupIdentity{}, nil
+}
+func (f *failingCgroupMgr) ReadMemoryLimit(string) (int64, error) { return 0, nil }
+func (f *failingCgroupMgr) ReadFreeze(string) (cgroupmanager.FreezeState, error) {
+	return cgroupmanager.FreezeState{}, nil
+}
+func (f *failingCgroupMgr) WriteFreeze(string, bool) error       { return nil }
+func (f *failingCgroupMgr) WriteMemoryLimits(string, uint64, uint64) error { return nil }
+func (f *failingCgroupMgr) SupportsMemoryShrink() bool           { return true }
+func (f *failingCgroupMgr) ShutDown() error                       { return nil }
