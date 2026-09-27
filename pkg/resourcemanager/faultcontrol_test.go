@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
+	"runtime/debug"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -216,4 +218,35 @@ func TestObservationFaultFutureArmedAndReconstruction(t *testing.T) {
 	if _, _, ok := fresh.Active(); ok {
 		t.Fatal("reconstructed reader must see the expired lease as inert")
 	}
+}
+
+// Descriptor-ownership regression (independent negative
+// observation-fault-e24972f-descriptor-negative): after Active() reads the
+// control file, a GC cycle must never close an UNRELATED reopened
+// descriptor — the failure mode of closing the fd under os.File ownership.
+func TestObservationFaultDescriptorOwnership(t *testing.T) {
+	oldGC := debug.SetGCPercent(-1)
+	defer debug.SetGCPercent(oldGC)
+	writeLease(t, filepath.Join(t.TempDir(), "control.json"),
+		"descriptor-ownership", 30*time.Second, 0)
+	path := filepath.Join(t.TempDir(), "control2.json")
+	writeLease(t, path, "descriptor-ownership", 30*time.Second, 0)
+	f := &ObservationFault{Enabled: true, Path: path}
+	if _, _, ok := f.Active(); !ok {
+		t.Fatal("lease precondition")
+	}
+	victim, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer victim.Close()
+	for i := 0; i < 8; i++ {
+		runtime.GC()
+		time.Sleep(10 * time.Millisecond)
+		var b [1]byte
+		if _, err := victim.ReadAt(b[:], 0); err != nil {
+			t.Fatalf("unrelated reused descriptor was closed after GC: %v", err)
+		}
+	}
+	runtime.KeepAlive(victim)
 }

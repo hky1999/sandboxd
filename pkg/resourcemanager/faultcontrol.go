@@ -115,19 +115,27 @@ func (f *ObservationFault) Active() (tag string, remaining time.Duration, ok boo
 // the read is capped at 4097 bytes so an in-flight grower is refused
 // rather than read unboundedly.
 func (f *ObservationFault) readControlFile() *FaultControlFile {
-	fd, err := syscall.Open(f.Path, syscall.O_RDONLY|syscall.O_NONBLOCK, 0)
+	fd, err := syscall.Open(f.Path, syscall.O_RDONLY|syscall.O_NONBLOCK|syscall.O_CLOEXEC, 0)
 	if err != nil {
 		return nil
 	}
-	defer syscall.Close(fd)
+	// SINGLE OWNERSHIP from here: only the os.File closes this fd. The
+	// earlier defer syscall.Close alongside os.NewFile let the finalizer
+	// close a REUSED descriptor after GC (independent negative
+	// observation-fault-e24972f-descriptor-negative).
+	file := os.NewFile(uintptr(fd), f.Path)
+	if file == nil {
+		syscall.Close(fd)
+		return nil
+	}
+	defer file.Close()
 	var st syscall.Stat_t
-	if err := syscall.Fstat(fd, &st); err != nil {
+	if err := syscall.Fstat(int(file.Fd()), &st); err != nil {
 		return nil
 	}
 	if !isRegular(st) || st.Size > faultMaxFileSize {
 		return nil
 	}
-	file := os.NewFile(uintptr(fd), f.Path)
 	raw, err := io.ReadAll(io.LimitReader(file, faultMaxFileSize+1))
 	if err != nil || len(raw) > faultMaxFileSize {
 		return nil
