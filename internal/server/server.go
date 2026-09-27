@@ -1012,6 +1012,8 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 			mod.Stop()
 			return nil, fmt.Errorf("node-resource module start: %w", serr)
 		}
+		mod.SetObservationFault(cfg.NodeResourceConfig.EnableObservationFault,
+			cfg.NodeResourceConfig.ObservationFaultPath)
 		nodeResMod = mod
 		provider := cfg.NodeResourceConfig.Provider
 		if provider == "" {

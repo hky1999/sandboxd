@@ -75,6 +75,11 @@ type ImageManagerConfig struct {
 type NodeResourceConfig struct {
 	Provider string `toml:"provider" json:"provider"`
 	SockPath string `toml:"sock_path" json:"sockPath"`
+	// EnableObservationFault gates the DEFAULT-OFF /resource observation
+	// fault control (test facility). Production configs never set it.
+	EnableObservationFault bool `toml:"enable_observation_fault" json:"enableObservationFault"`
+	// ObservationFaultPath overrides the control-file location (tests).
+	ObservationFaultPath string `toml:"observation_fault_path" json:"observationFaultPath"`
 }
 
 // RuntimeConfig binary path of the runtime

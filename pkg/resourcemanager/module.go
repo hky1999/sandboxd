@@ -63,6 +63,11 @@ type Module struct {
 
 	lastRefresh atomic.Int64 // unix-nano of most recent successful refresh
 	listener    net.Listener
+
+	// obsFault is the DEFAULT-OFF observation fault control (see
+	// faultcontrol.go). Zero value = disabled; only a config-gated Module
+	// ever consults it.
+	obsFault ObservationFault
 	stopCh      chan struct{}
 	closeOnce   sync.Once
 	wg          sync.WaitGroup
@@ -197,6 +202,17 @@ func (m *Module) Start() error {
 // WITHOUT launching the refresh loop; tests use it so their explicit
 // refreshOnce calls are the only cache writers. Start wires the loop on
 // top.
+// SetObservationFault configures the DEFAULT-OFF observation fault control
+// from the sandboxd config. Empty path keeps the production default; the
+// facility stays inert unless Enabled is true AND a valid control file
+// appears (see faultcontrol.go).
+func (m *Module) SetObservationFault(enabled bool, path string) {
+	m.obsFault.Enabled = enabled
+	if path != "" {
+		m.obsFault.Path = path
+	}
+}
+
 func (m *Module) startListener() error {
 	if _, err := os.Stat(m.sockPath); err == nil {
 		os.Remove(m.sockPath)
@@ -209,6 +225,16 @@ func (m *Module) startListener() error {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/resource", func(w http.ResponseWriter, r *http.Request) {
+		// DEFAULT-OFF observation fault control (test facility): when a
+		// gated control file is active, the observation response is a
+		// bounded 503 naming the case. Scoped to THIS handler only — the
+		// stats/resize gRPC planes never pass through here.
+		if tag, remaining, active := m.obsFault.Active(); active {
+			m.obsFault.RecordHit(tag, remaining)
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte("observation fault active (case=" + tag + ")\n"))
+			return
+		}
 		// Never serve a payload whose physical fields are stale: an
 		// over-age snapshot is explicit unknown data, so consumers cannot
 		// refresh old observations into fresh samples.
