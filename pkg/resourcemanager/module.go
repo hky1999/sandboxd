@@ -67,10 +67,10 @@ type Module struct {
 	// obsFault is the DEFAULT-OFF observation fault control (see
 	// faultcontrol.go). Zero value = disabled; only a config-gated Module
 	// ever consults it.
-	obsFault ObservationFault
-	stopCh      chan struct{}
-	closeOnce   sync.Once
-	wg          sync.WaitGroup
+	obsFault  ObservationFault
+	stopCh    chan struct{}
+	closeOnce sync.Once
+	wg        sync.WaitGroup
 
 	collectorShutdown func(context.Context) error
 	collector         *Collector
