@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -90,7 +91,7 @@ func TestObservationFaultDefaultOffAndBoundedRead(t *testing.T) {
 		t.Fatal("nil receiver must be inactive")
 	}
 	fifo := filepath.Join(dir, "fifo")
-	if err := os.MkFifo(fifo, 0o600); err == nil {
+	if err := syscall.Mkfifo(fifo, 0o600); err == nil {
 		if _, _, ok := (&ObservationFault{Enabled: true, Path: fifo}).Active(); ok {
 			t.Fatal("FIFO control file must be refused")
 		}
