@@ -133,9 +133,11 @@ func TestObservationFaultHTTPThroughRealModule(t *testing.T) {
 	dir := t.TempDir()
 	sock := filepath.Join(dir, "resource.sock")
 	ctrl := filepath.Join(dir, "fault.json")
-	mod, err := NewModule(sock, "")
+	_ = os.Setenv("NODE_NAME", "fault-test-node")
+	t.Cleanup(func() { _ = os.Unsetenv("NODE_NAME") })
+	mod, err := NewModule(sock, ProviderCgroup)
 	if err != nil {
-		t.Fatal(err)
+		t.Skipf("cgroup provider unavailable in this container: %v", err)
 	}
 	mod.SetObservationFault(true, ctrl) // BEFORE Start, per internal/server
 	if err := mod.Start(); err != nil {
