@@ -61,7 +61,7 @@ func TestObservationFaultPersistentAbsoluteExpiry(t *testing.T) {
 	}
 	// stale leftover: armed 20m ago, deadline still future
 	cf := FaultControlFile{Case: "ur-4", TTLMs: (25 * time.Minute).Milliseconds(),
-		ArmedAtUnixMs: time.Now().Add(-20 * time.Minute).UnixMilli(),
+		ArmedAtUnixMs:  time.Now().Add(-20 * time.Minute).UnixMilli(),
 		DeadlineUnixMs: time.Now().Add(5 * time.Minute).UnixMilli()}
 	raw, _ := json.Marshal(cf)
 	_ = os.WriteFile(path, raw, 0o600)

@@ -43,10 +43,10 @@ const (
 // and an expired file is permanently inert because the deadline is
 // absolute and arming requires it to be strictly in the future.
 type FaultControlFile struct {
-	Case          string `json:"case"`
-	TTLMs         int64  `json:"ttl_ms"`
-	ArmedAtUnixMs int64  `json:"armed_at_unix_ms"`
-	DeadlineUnixMs int64 `json:"deadline_unix_ms"`
+	Case           string `json:"case"`
+	TTLMs          int64  `json:"ttl_ms"`
+	ArmedAtUnixMs  int64  `json:"armed_at_unix_ms"`
+	DeadlineUnixMs int64  `json:"deadline_unix_ms"`
 }
 
 // ObservationFault is the in-memory state. Re-reading the (bounded) control
@@ -62,10 +62,12 @@ type ObservationFault struct {
 
 // Active reports whether an observation fault is in force. The FILE is the
 // lease: valid only when every clause holds —
-//   case non-empty; TTL within [1s,10m];
-//   deadline == armed_at + ttl (1s tolerance);
-//   armed_at is recent (now-armed_at <= 10m: a stale leftover cannot arm);
-//   deadline strictly in the future (an expired file is permanently inert).
+//
+//	case non-empty; TTL within [1s,10m];
+//	deadline == armed_at + ttl (1s tolerance);
+//	armed_at is recent (now-armed_at <= 10m: a stale leftover cannot arm);
+//	deadline strictly in the future (an expired file is permanently inert).
+//
 // Daemon restart changes nothing: the same absolute deadline governs.
 func (f *ObservationFault) Active() (tag string, remaining time.Duration, ok bool) {
 	if f == nil || !f.Enabled {
