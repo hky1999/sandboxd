@@ -7,13 +7,23 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
 )
 
-func writeCtrl(t *testing.T, path string, cf any) {
+// writeLease writes a COMPLETE enabler lease: {case, ttl, armed_at,
+// deadline=armed_at+ttl}.
+func writeLease(t *testing.T, path, caseTag string, ttl time.Duration, backdate time.Duration) {
 	t.Helper()
+	armed := time.Now().Add(-backdate)
+	cf := FaultControlFile{
+		Case:           caseTag,
+		TTLMs:          ttl.Milliseconds(),
+		ArmedAtUnixMs:  armed.UnixMilli(),
+		DeadlineUnixMs: armed.Add(ttl).UnixMilli(),
+	}
 	raw, err := json.Marshal(cf)
 	if err != nil {
 		t.Fatal(err)
@@ -23,66 +33,77 @@ func writeCtrl(t *testing.T, path string, cf any) {
 	}
 }
 
-// Directed check 1 — TRIGGER: a gated, well-formed control file arms a
-// lease for exactly the file's case with remaining in (0, TTL].
+// Directed check 1 — TRIGGER.
 func TestObservationFaultTrigger(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "fault.json")
 	f := &ObservationFault{Enabled: true, Path: path}
-	writeCtrl(t, path, FaultControlFile{Case: "ur-3", TTLMs: 45000})
+	writeLease(t, path, "ur-3", 45*time.Second, 0)
 	tag, remaining, ok := f.Active()
 	if !ok || tag != "ur-3" || remaining <= 0 || remaining > 45*time.Second {
 		t.Fatalf("trigger failed: ok=%v tag=%q remaining=%v", ok, tag, remaining)
 	}
 }
 
-// Directed check 2 — NO SELF-ARMING WINDOW: out-of-bound TTL never arms
-// (and never becomes valid later — the deadline is arm-time + clamped TTL,
-// not a file-supplied absolute deadline); one-shot per case: after expiry
-// the same file cannot re-arm.
-func TestObservationFaultNoSelfArmAndOneShot(t *testing.T) {
+// Directed check 2 — PERSISTENT ABSOLUTE EXPIRY: expired lease inert; stale
+// armed_at inert; inconsistent lease inert.
+func TestObservationFaultPersistentAbsoluteExpiry(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "fault.json")
 	f := &ObservationFault{Enabled: true, Path: path}
-	writeCtrl(t, path, FaultControlFile{Case: "ur-3", TTLMs: int64((faultMaxTTL + time.Hour).Milliseconds())})
-	if _, _, ok := f.Active(); ok {
-		t.Fatal("TTL beyond the bound must never arm")
-	}
-	writeCtrl(t, path, FaultControlFile{Case: "ur-4", TTLMs: 1100})
+	writeLease(t, path, "ur-3", 1100*time.Millisecond, 0)
 	if _, _, ok := f.Active(); !ok {
-		t.Fatal("valid TTL must arm")
+		t.Fatal("precondition: active")
 	}
-	// force expiry by backdating the lease deadline
-	f.mu.Lock()
-	f.lease.deadline = time.Now().Add(-time.Second)
-	f.mu.Unlock()
+	time.Sleep(1300 * time.Millisecond)
 	if _, _, ok := f.Active(); ok {
-		t.Fatal("expired lease must auto-recover")
+		t.Fatal("expired lease must be permanently inert (absolute deadline)")
 	}
+	// stale leftover: armed 20m ago, deadline still future
+	cf := FaultControlFile{Case: "ur-4", TTLMs: (25 * time.Minute).Milliseconds(),
+		ArmedAtUnixMs: time.Now().Add(-20 * time.Minute).UnixMilli(),
+		DeadlineUnixMs: time.Now().Add(5 * time.Minute).UnixMilli()}
+	raw, _ := json.Marshal(cf)
+	_ = os.WriteFile(path, raw, 0o600)
 	if _, _, ok := f.Active(); ok {
-		t.Fatal("one-shot: the same still-present case must not re-arm")
+		t.Fatal("stale armed_at must be inert")
+	}
+	// inconsistent: deadline far beyond armed_at+ttl
+	cf2 := FaultControlFile{Case: "ur-5", TTLMs: (30 * time.Second).Milliseconds(),
+		ArmedAtUnixMs:  time.Now().UnixMilli(),
+		DeadlineUnixMs: time.Now().Add(30 * time.Minute).UnixMilli()}
+	raw2, _ := json.Marshal(cf2)
+	_ = os.WriteFile(path, raw2, 0o600)
+	if _, _, ok := f.Active(); ok {
+		t.Fatal("inconsistent lease must be inert")
 	}
 }
 
-// Directed check 3 — EXPLICIT RELEASE: deleting the file (or changing the
-// case) releases an armed lease immediately.
+// Directed check 3 — EXPLICIT RELEASE: removal releases; a different valid
+// case is a NEW lease with its own tag.
 func TestObservationFaultExplicitRelease(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "fault.json")
 	f := &ObservationFault{Enabled: true, Path: path}
-	writeCtrl(t, path, FaultControlFile{Case: "ur-5", TTLMs: 60000})
-	if _, _, ok := f.Active(); !ok {
-		t.Fatal("precondition: armed")
+	writeLease(t, path, "ur-5", 60*time.Second, 0)
+	if tag, _, ok := f.Active(); !ok || tag != "ur-5" {
+		t.Fatal("precondition: armed ur-5")
 	}
-	writeCtrl(t, path, FaultControlFile{Case: "someone-else", TTLMs: 60000})
+	writeLease(t, path, "ur-6", 60*time.Second, 0)
+	tag, _, ok := f.Active()
+	if !ok || tag != "ur-6" {
+		t.Fatalf("case change = new lease: ok=%v tag=%q", ok, tag)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
 	if _, _, ok := f.Active(); ok {
-		t.Fatal("case change must release")
+		t.Fatal("file removal must release")
 	}
 }
 
-// Directed check 4 — DEFAULT OFF / BOUNDED READ: config gate closed stays
-// inert; FIFO and oversized files are refused, not read unboundedly.
+// Directed check 4 — DEFAULT OFF / BOUNDED READ.
 func TestObservationFaultDefaultOffAndBoundedRead(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "fault.json")
-	writeCtrl(t, path, FaultControlFile{Case: "ur-6", TTLMs: 30000})
+	writeLease(t, path, "ur-7", 30*time.Second, 0)
 	if _, _, ok := (&ObservationFault{Enabled: false, Path: path}).Active(); ok {
 		t.Fatal("config gate closed must stay inactive")
 	}
@@ -104,10 +125,10 @@ func TestObservationFaultDefaultOffAndBoundedRead(t *testing.T) {
 	}
 }
 
-// Directed check 5 — REAL config wiring + REAL HTTP over the unix socket,
-// expiry and release observed on ONE keepalive connection. The Module is
-// built through the production constructor path with the fault configured
-// exactly as internal/server would (SetObservationFault from config).
+// Directed check 5 — REAL wiring + REAL HTTP: production constructor,
+// config applied BEFORE Start (as internal/server does), one keepalive
+// connection (dial count == 1 asserted) observing 200 -> 503 -> 200
+// (absolute expiry) -> 503 -> 200 (release); full bounded drain; timeouts.
 func TestObservationFaultHTTPThroughRealModule(t *testing.T) {
 	dir := t.TempDir()
 	sock := filepath.Join(dir, "resource.sock")
@@ -116,84 +137,57 @@ func TestObservationFaultHTTPThroughRealModule(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// the same call internal/server makes from config.NodeResourceConfig
-	mod.SetObservationFault(true, ctrl)
+	mod.SetObservationFault(true, ctrl) // BEFORE Start, per internal/server
 	if err := mod.Start(); err != nil {
 		t.Fatal(err)
 	}
 	defer mod.Stop()
 
-	client := &http.Client{Transport: unixTransport(sock)}
-
-	get := func() (int, string) {
+	var dials atomic.Int64
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: &http.Transport{
+			Dial: func(network, addr string) (net.Conn, error) {
+				dials.Add(1)
+				return net.Dial("unix", sock)
+			},
+		},
+	}
+	get := func() int {
 		resp, err := client.Get("http://unix/resource")
 		if err != nil {
 			t.Fatal(err)
 		}
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
 		resp.Body.Close()
-		return resp.StatusCode, string(body)
+		return resp.StatusCode
 	}
 
-	// pre-fault: healthy module serves 200 (refresh once so Healthy() is true)
 	mod.refreshOnce()
-	if code, _ := get(); code != http.StatusOK {
+	if code := get(); code != http.StatusOK {
 		t.Fatalf("pre-fault status = %d, want 200", code)
 	}
-	// arm via the control file; the SAME keepalive connection now sees 503
-	writeCtrl(t, ctrl, FaultControlFile{Case: "ur-http", TTLMs: 1200})
-	deadline := time.Now().Add(10 * time.Second)
-	code := 0
-	for time.Now().Before(deadline) {
-		code, _ = get()
-		if code == http.StatusServiceUnavailable {
-			break
+	writeLease(t, ctrl, "ur-http", 1500*time.Millisecond, 0)
+	waitFor := func(want int, budget time.Duration, what string) {
+		deadline := time.Now().Add(budget)
+		code := -1
+		for time.Now().Before(deadline) {
+			if code = get(); code == want {
+				return
+			}
+			time.Sleep(50 * time.Millisecond)
 		}
-		time.Sleep(50 * time.Millisecond)
+		t.Fatalf("%s: last status = %d, want %d", what, code, want)
 	}
-	if code != http.StatusServiceUnavailable {
-		t.Fatalf("fault-active status = %d, want 503")
-	}
-	// expiry auto-recovery on the same connection (TTL 1.2s)
-	deadline = time.Now().Add(6 * time.Second)
-	for time.Now().Before(deadline) {
-		code, _ = get()
-		if code == http.StatusOK {
-			break
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	if code != http.StatusOK {
-		t.Fatalf("post-expiry status = %d, want 200 (auto-recovery)", code)
-	}
-	// explicit release: new case arms, file removal releases, same connection
-	writeCtrl(t, ctrl, FaultControlFile{Case: "ur-http-2", TTLMs: 30000})
-	deadline = time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		if code, _ = get(); code == http.StatusServiceUnavailable {
-			break
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	if code != http.StatusServiceUnavailable {
-		t.Fatalf("second arm status = %d, want 503", code)
-	}
+	waitFor(http.StatusServiceUnavailable, 10*time.Second, "fault-active")
+	waitFor(http.StatusOK, 8*time.Second, "absolute expiry recovery")
+	writeLease(t, ctrl, "ur-http-2", 30*time.Second, 0)
+	waitFor(http.StatusServiceUnavailable, 8*time.Second, "second arm")
 	if err := os.Remove(ctrl); err != nil {
 		t.Fatal(err)
 	}
-	deadline = time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		if code, _ = get(); code == http.StatusOK {
-			break
-		}
-		time.Sleep(50 * time.Millisecond)
+	waitFor(http.StatusOK, 8*time.Second, "explicit release")
+	if n := dials.Load(); n != 1 {
+		t.Fatalf("keepalive violated: %d dial(s), want exactly 1", n)
 	}
-	if code != http.StatusOK {
-		t.Fatalf("post-release status = %d, want 200", code)
-	}
-}
-
-func unixTransport(sock string) *http.Transport {
-	dialer := func(network, addr string) (net.Conn, error) { return net.Dial("unix", sock) }
-	return &http.Transport{Dial: dialer}
 }

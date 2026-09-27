@@ -8,13 +8,11 @@
 //  1. the sandboxd config enables the facility (enable_observation_fault,
 //     default false — production configs never set it);
 //  2. a small regular control file (default
-//     /home/akernel/sandboxd/observation-fault.json) names a non-empty case
-//     tag and a bounded TTL. Arming happens ONLY at a validated read: the
-//     effective deadline is arm-time + TTL (clamped to [1s, 10m]) — a file
-//     can never "become valid later" the way a far-future absolute deadline
-//     would. Expiry auto-recovers with no second step; deleting the file
-//     is the explicit release. A case tag is armed AT MOST ONCE per
-//     process: an expired or released case cannot silently re-arm.
+//     /home/akernel/sandboxd/observation-fault.json) carries a complete
+//     lease {case, ttl_ms, armed_at, deadline} written by the enabler.
+//     The ABSOLUTE deadline is persistent across daemon restarts (a
+//     restart never resets the term); an expired or stale file is
+//     permanently inert; deleting the file is the explicit release.
 //
 // Every real HTTP hit under an ACTIVE fault is logged with case tag,
 // remaining budget and hit count ONLY — never headers, query strings or
@@ -38,16 +36,16 @@ const (
 	faultDefaultPath = "/home/akernel/sandboxd/observation-fault.json"
 )
 
-// FaultControlFile is the on-disk shape: {"case": "...", "ttl_ms": 45000}.
-// The deadline is NOT taken from the file — arming computes it locally.
+// FaultControlFile is the on-disk shape. The ENABLER writes all four
+// fields; the daemon only validates. ArmedAt/Deadline make the lease
+// PERSISTENT across daemon restarts: a restart can never reset the term,
+// and an expired file is permanently inert because the deadline is
+// absolute and arming requires it to be strictly in the future.
 type FaultControlFile struct {
-	Case  string `json:"case"`
-	TTLMs int64  `json:"ttl_ms"`
-}
-
-type faultLease struct {
-	caseTag  string
-	deadline time.Time
+	Case          string `json:"case"`
+	TTLMs         int64  `json:"ttl_ms"`
+	ArmedAtUnixMs int64  `json:"armed_at_unix_ms"`
+	DeadlineUnixMs int64 `json:"deadline_unix_ms"`
 }
 
 // ObservationFault is the in-memory state. Re-reading the (bounded) control
@@ -58,59 +56,45 @@ type ObservationFault struct {
 	// Path is the control file path (config-overridable for tests).
 	Path string
 
-	mu       sync.Mutex
-	lease    *faultLease
-	armed    map[string]bool // cases already armed (or expired) this process
-	hits     atomic.Int64
+	mu   sync.Mutex
+	hits atomic.Int64
 }
 
-// Active reports whether an observation fault is in force. Arming rules:
-// a well-formed file (non-empty case, TTL within [1s, 10m]) whose case has
-// not been armed before arms a lease for case-local deadline = now + TTL.
-// An armed lease stays active until its deadline (auto-recovery) or until
-// the control file no longer matches the armed case (explicit release —
-// delete the file or change the tag). Expired cases never re-arm.
+// Active reports whether an observation fault is in force. The FILE is the
+// lease: valid only when every clause holds —
+//   case non-empty; TTL within [1s,10m];
+//   deadline == armed_at + ttl (1s tolerance);
+//   armed_at is recent (now-armed_at <= 10m: a stale leftover cannot arm);
+//   deadline strictly in the future (an expired file is permanently inert).
+// Daemon restart changes nothing: the same absolute deadline governs.
 func (f *ObservationFault) Active() (tag string, remaining time.Duration, ok bool) {
 	if f == nil || !f.Enabled {
 		return "", 0, false
 	}
-	f.mu.Lock()
-	defer f.mu.Unlock()
+	cf := f.readControlFile()
+	if cf == nil {
+		return "", 0, false
+	}
 	now := time.Now()
-	// lease bookkeeping first: expiry auto-recovers
-	if f.lease != nil {
-		if !now.Before(f.lease.deadline) {
-			logrus.Warnf("resourcemanager: observation fault EXPIRED case=%s (auto-recovered)",
-				f.lease.caseTag)
-			f.armed[f.lease.caseTag] = true
-			f.lease = nil
-		} else if !f.fileMatchesCase(f.lease.caseTag) {
-			logrus.Warnf("resourcemanager: observation fault RELEASED case=%s (control file gone/changed)",
-				f.lease.caseTag)
-			f.lease = nil
-		}
+	ttl := time.Duration(cf.TTLMs) * time.Millisecond
+	if ttl < faultMinTTL || ttl > faultMaxTTL {
+		return "", 0, false
 	}
-	if f.lease == nil {
-		cf := f.readControlFile()
-		if cf == nil {
-			return "", 0, false
-		}
-		if f.armed == nil {
-			f.armed = map[string]bool{}
-		}
-		if f.armed[cf.Case] {
-			return "", 0, false // one-shot per case: no silent re-arm
-		}
-		ttl := time.Duration(cf.TTLMs) * time.Millisecond
-		if ttl < faultMinTTL || ttl > faultMaxTTL {
-			return "", 0, false // out-of-bound TTL is malformed, never arms
-		}
-		f.lease = &faultLease{caseTag: cf.Case, deadline: now.Add(ttl)}
-		f.armed[cf.Case] = true
-		logrus.Warnf("resourcemanager: observation fault ARMED case=%s ttl=%s (observation only)",
-			cf.Case, ttl)
+	if cf.ArmedAtUnixMs <= 0 || cf.DeadlineUnixMs <= 0 {
+		return "", 0, false
 	}
-	return f.lease.caseTag, time.Until(f.lease.deadline), true
+	armedAt := time.UnixMilli(cf.ArmedAtUnixMs)
+	deadline := time.UnixMilli(cf.DeadlineUnixMs)
+	if deadline.Sub(armedAt) > ttl+time.Second {
+		return "", 0, false // inconsistent lease
+	}
+	if now.Sub(armedAt) > faultMaxTTL {
+		return "", 0, false // stale leftover: permanently inert
+	}
+	if !now.Before(deadline) {
+		return "", 0, false // expired: permanently inert (absolute)
+	}
+	return cf.Case, time.Until(deadline), true
 }
 
 // readControlFile performs the BOUNDED read: the path must be a regular
@@ -130,13 +114,6 @@ func (f *ObservationFault) readControlFile() *FaultControlFile {
 		return nil
 	}
 	return &cf
-}
-
-// fileMatchesCase reports whether the control file currently on disk names
-// exactly the armed case (release detection).
-func (f *ObservationFault) fileMatchesCase(caseTag string) bool {
-	cf := f.readControlFile()
-	return cf != nil && cf.Case == caseTag
 }
 
 // RecordHit logs one real HTTP hit under an active fault: tag, remaining

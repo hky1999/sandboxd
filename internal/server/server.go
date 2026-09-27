@@ -1005,6 +1005,11 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 			return nil, fmt.Errorf("node-resource module init: %w", merr)
 		}
 		mod.SetXPUProvider(xpuMgr)
+		// Configure the (default-off) observation fault control BEFORE
+		// Start: the listener serves concurrently, so Enabled/Path must be
+		// immutable by the time any HTTP read consults them.
+		mod.SetObservationFault(cfg.NodeResourceConfig.EnableObservationFault,
+			cfg.NodeResourceConfig.ObservationFaultPath)
 		if serr := mod.Start(); serr != nil {
 			// NewModule already started the OTel collector's periodic-reader
 			// goroutine; if Start then fails to bind /var/run/resource.sock we
@@ -1012,8 +1017,6 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 			mod.Stop()
 			return nil, fmt.Errorf("node-resource module start: %w", serr)
 		}
-		mod.SetObservationFault(cfg.NodeResourceConfig.EnableObservationFault,
-			cfg.NodeResourceConfig.ObservationFaultPath)
 		nodeResMod = mod
 		provider := cfg.NodeResourceConfig.Provider
 		if provider == "" {
