@@ -21,9 +21,10 @@ package resourcemanager
 
 import (
 	"encoding/json"
+	"io"
 	"os"
-	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/sirupsen/logrus"
@@ -56,7 +57,6 @@ type ObservationFault struct {
 	// Path is the control file path (config-overridable for tests).
 	Path string
 
-	mu   sync.Mutex
 	hits atomic.Int64
 }
 
@@ -75,37 +75,60 @@ func (f *ObservationFault) Active() (tag string, remaining time.Duration, ok boo
 	if cf == nil {
 		return "", 0, false
 	}
-	now := time.Now()
-	ttl := time.Duration(cf.TTLMs) * time.Millisecond
-	if ttl < faultMinTTL || ttl > faultMaxTTL {
+	// Raw-range check BEFORE any duration conversion (overflow safety).
+	if cf.TTLMs < int64(faultMinTTL/time.Millisecond) || cf.TTLMs > int64(faultMaxTTL/time.Millisecond) {
 		return "", 0, false
 	}
 	if cf.ArmedAtUnixMs <= 0 || cf.DeadlineUnixMs <= 0 {
 		return "", 0, false
 	}
+	now := time.Now()
 	armedAt := time.UnixMilli(cf.ArmedAtUnixMs)
-	deadline := time.UnixMilli(cf.DeadlineUnixMs)
-	if deadline.Sub(armedAt) > ttl+time.Second {
-		return "", 0, false // inconsistent lease
+	// A FUTURE armed_at is malformed: without this check a lease written
+	// "tomorrow + 30s" would activate immediately and outlive the bound.
+	if now.Before(armedAt) {
+		return "", 0, false
 	}
+	// Stale leftover beyond the maximum term is permanently inert.
 	if now.Sub(armedAt) > faultMaxTTL {
-		return "", 0, false // stale leftover: permanently inert
+		return "", 0, false
 	}
+	// Deadline must EXACTLY equal armed_at + ttl. Millisecond int64
+	// addition cannot overflow (armed_at <= now < 2^48; ttl <= 6e5).
+	if cf.DeadlineUnixMs != cf.ArmedAtUnixMs+cf.TTLMs {
+		return "", 0, false
+	}
+	deadline := time.UnixMilli(cf.DeadlineUnixMs)
 	if !now.Before(deadline) {
 		return "", 0, false // expired: permanently inert (absolute)
 	}
-	return cf.Case, time.Until(deadline), true
+	remaining = time.Until(deadline)
+	if remaining > faultMaxTTL {
+		return "", 0, false // invariant guard: never exceed the max term
+	}
+	return cf.Case, remaining, true
 }
 
-// readControlFile performs the BOUNDED read: the path must be a regular
-// file of at most 4KiB; anything else (missing, FIFO, huge, malformed,
-// empty case) yields nil.
+// readControlFile performs a TOCTOU-safe BOUNDED read: the path is opened
+// NON-BLOCKING first (a FIFO substituted after any stat can never block),
+// the SAME fd is fstat'ed and must be a regular file of at most 4KiB, and
+// the read is capped at 4097 bytes so an in-flight grower is refused
+// rather than read unboundedly.
 func (f *ObservationFault) readControlFile() *FaultControlFile {
-	st, err := os.Stat(f.Path)
-	if err != nil || !st.Mode().IsRegular() || st.Size() > faultMaxFileSize {
+	fd, err := syscall.Open(f.Path, syscall.O_RDONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
 		return nil
 	}
-	raw, err := os.ReadFile(f.Path)
+	defer syscall.Close(fd)
+	var st syscall.Stat_t
+	if err := syscall.Fstat(fd, &st); err != nil {
+		return nil
+	}
+	if !isRegular(st) || st.Size > faultMaxFileSize {
+		return nil
+	}
+	file := os.NewFile(uintptr(fd), f.Path)
+	raw, err := io.ReadAll(io.LimitReader(file, faultMaxFileSize+1))
 	if err != nil || len(raw) > faultMaxFileSize {
 		return nil
 	}
@@ -115,6 +138,8 @@ func (f *ObservationFault) readControlFile() *FaultControlFile {
 	}
 	return &cf
 }
+
+func isRegular(st syscall.Stat_t) bool { return st.Mode&syscall.S_IFMT == syscall.S_IFREG }
 
 // RecordHit logs one real HTTP hit under an active fault: tag, remaining
 // budget, cumulative hit count — nothing else.

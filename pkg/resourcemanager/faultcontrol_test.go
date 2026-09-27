@@ -193,3 +193,27 @@ func TestObservationFaultHTTPThroughRealModule(t *testing.T) {
 		t.Fatalf("keepalive violated: %d dial(s), want exactly 1", n)
 	}
 }
+
+// Counterexample — FUTURE armed_at must be rejected (a lease written
+// "tomorrow, +30s" must not activate today and outlive the bound), and a
+// FRESHLY CONSTRUCTED ObservationFault reading an EXPIRED file stays inert
+// (no process-local state resets the absolute term).
+func TestObservationFaultFutureArmedAndReconstruction(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "fault.json")
+	f := &ObservationFault{Enabled: true, Path: path}
+	tomorrow := time.Now().Add(24 * time.Hour)
+	cf := FaultControlFile{Case: "ur-future", TTLMs: 30000,
+		ArmedAtUnixMs: tomorrow.UnixMilli(), DeadlineUnixMs: tomorrow.Add(30 * time.Second).UnixMilli()}
+	raw, _ := json.Marshal(cf)
+	_ = os.WriteFile(path, raw, 0o600)
+	if _, _, ok := f.Active(); ok {
+		t.Fatal("future armed_at must be rejected")
+	}
+	// expired file + a brand-new reader: still inert
+	writeLease(t, path, "ur-expired", 1100*time.Millisecond, 0)
+	time.Sleep(1300 * time.Millisecond)
+	fresh := &ObservationFault{Enabled: true, Path: path}
+	if _, _, ok := fresh.Active(); ok {
+		t.Fatal("reconstructed reader must see the expired lease as inert")
+	}
+}
