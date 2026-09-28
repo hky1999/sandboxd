@@ -219,6 +219,9 @@ type recordingCheckpointClient struct {
 	pauseErr                                                    error
 	cancelDuringCheckpoint                                      func()
 	resumeCtx                                                   context.Context
+	resumeEntryErr                                              error
+	resumeEntryRemaining                                        time.Duration
+	postReturnErr                                               error
 	order                                                       []string
 }
 
@@ -235,9 +238,21 @@ func (c *recordingCheckpointClient) Pause(_ context.Context, _ string) error {
 
 func (c *recordingCheckpointClient) Resume(ctx context.Context, _ string) error {
 	c.resumeCount++
+	// Capture the context state AT ENTRY: resumeSource's deferred cancel runs
+	// before Handler returns, so post-return reads would always see Canceled.
 	c.resumeCtx = ctx
+	c.resumeEntryErr = ctx.Err()
+	if deadline, ok := ctx.Deadline(); ok {
+		c.resumeEntryRemaining = time.Until(deadline)
+	}
 	c.order = append(c.order, "resume")
 	return nil
+}
+
+func (c *recordingCheckpointClient) recordPostReturnState() {
+	if c.resumeCtx != nil {
+		c.postReturnErr = c.resumeCtx.Err()
+	}
 }
 
 func (c *recordingCheckpointClient) Checkpoint(
@@ -327,15 +342,18 @@ func TestCheckpointIncludeFilesystemCancelledRequestStillResumes(t *testing.T) {
 	assert.Error(t, err)
 	assert.True(t, errors.Is(err, context.Canceled), "original cancellation error must survive: %v", err)
 	assert.Equal(t, 1, client.resumeCount, "cancelled request must still unfreeze the source")
-	// The unfreeze must run on its OWN context: not the cancelled request...
+	// At Resume ENTRY the cleanup context is live (not the cancelled request)
+	// and bounded: remaining deadline within (0, 10s] plus a tiny slack.
 	assert.NotNil(t, client.resumeCtx)
-	assert.NoError(t, client.resumeCtx.Err(), "resume context must be live, not the cancelled request")
-	// ...and it must be bounded by a deadline.
-	deadline, hasDeadline := client.resumeCtx.Deadline()
-	assert.True(t, hasDeadline, "resume context must carry a bounded deadline")
-	assert.True(t, deadline.After(time.Now()), "deadline must still be in the future")
+	assert.NoError(t, client.resumeEntryErr, "resume context must be live at entry")
+	assert.Greater(t, client.resumeEntryRemaining, time.Duration(0))
+	assert.LessOrEqual(t, client.resumeEntryRemaining, 10*time.Second+50*time.Millisecond)
 	// Execution order proves the unfreeze happened after the failed checkpoint.
 	assert.Equal(t, []string{"pause", "checkpoint", "resume"}, client.order)
+	// After Handler returns, the deferred cancel HAS fired — the cleanup
+	// timer is released.
+	client.recordPostReturnState()
+	assert.ErrorIs(t, client.postReturnErr, context.Canceled)
 }
 
 func TestCheckpointPlainCompatSkipsPauseAndPaths(t *testing.T) {
