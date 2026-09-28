@@ -382,6 +382,16 @@ func planBodyCount(r io.Reader) (count func() int64, body io.Reader) {
 		n := int64(v.Len())
 		return func() int64 { return n }, r
 	}
+	// A SEEKABLE inner body must stay seekable through the counting layer:
+	// Remote.PutKey's Seeker path (SeekEnd for ContentLength, SeekStart,
+	// then a streamed body) is exactly what verified streaming pack PUTs
+	// rely on — hiding the Seek behind a read-only wrapper would silently
+	// reroute them into the buffered ReadAll path. Non-seekable bodies
+	// keep the read-only wrapper and their historical behavior.
+	if s, ok := r.(io.Seeker); ok {
+		sc := &seekableCountingReader{countingReader: countingReader{inner: r}, seeker: s}
+		return sc.count, sc
+	}
 	cr := &countingReader{inner: r}
 	return cr.count, cr
 }
@@ -399,6 +409,17 @@ func (r *countingReader) Read(p []byte) (int, error) {
 }
 
 func (r *countingReader) count() int64 { return atomic.LoadInt64(&r.n) }
+
+// seekableCountingReader is a countingReader whose inner body is seekable;
+// seeks are forwarded so the store's Seeker detection still succeeds.
+type seekableCountingReader struct {
+	countingReader
+	seeker io.Seeker
+}
+
+func (r *seekableCountingReader) Seek(offset int64, whence int) (int64, error) {
+	return r.seeker.Seek(offset, whence)
+}
 
 // settlingReadCloser streams a GET body through the tracker: every read
 // tallies bytes; EOF, a body error, or Close settles the full elapsed and

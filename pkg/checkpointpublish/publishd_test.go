@@ -34,6 +34,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -2100,5 +2101,436 @@ func TestBackpressureAllRootsStatfs(t *testing.T) {
 	bad := SnapshotBackpressure([]string{root1, "/nonexistent-root-xyz"}, BackpressureLimits{}, nil)
 	if !bad.Backpressured {
 		t.Fatal("nonexistent root did not set Backpressured")
+	}
+}
+
+// TestScanRoundAdaptiveLayoutDecisionObservable: the adaptive decision must
+// reach the daemon's round output — success attempts, failure attempts, and
+// (absence on) the reconcile path.
+func TestScanRoundAdaptiveLayoutDecisionObservable(t *testing.T) {
+	// Pack-layout success + JSON exposure.
+	root1 := t.TempDir()
+	store1, err := chunkstore.NewLocal(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	adaptivePackedFixtureIn(t, root1, "adp-pack", adaptivePatternData())
+	packOpts := ScanRoundOptions{Roots: []string{root1}, Store: store1, StoreName: "test",
+		Timeout: time.Minute, PackBytes: 4 << 20, AdaptivePackThresholdBytes: 1}
+	res := ScanRound(context.Background(), packOpts)
+	if len(res.Failed) != 0 || len(res.Published) != 1 || res.Published[0] != "adp-pack" {
+		t.Fatalf("pack round = %+v (failed=%v)", res, res.Failed)
+	}
+	if len(res.Phases) != 1 || res.Phases[0].LayoutDecision == nil ||
+		res.Phases[0].LayoutDecision.Chosen != layoutPack || res.Phases[0].LayoutDecision.Reason != layoutReasonAtOrAbove {
+		t.Fatalf("pack attempt must carry its decision: %+v", res.Phases)
+	}
+	enc, err := json.Marshal(res)
+	if err != nil || !strings.Contains(string(enc), "\"layout_decision\"") || !strings.Contains(string(enc), "at_or_above_threshold") {
+		t.Fatalf("round JSON must expose the decision: %s (%v)", enc, err)
+	}
+
+	// Plain-layout success on a memory-only artifact (no artifact set).
+	root2 := t.TempDir()
+	store2, err := chunkstore.NewLocal(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	newM1Fixture(t, root2, "adp-plain")
+	plainOpts := ScanRoundOptions{Roots: []string{root2}, Store: store2, StoreName: "test",
+		Timeout: time.Minute, PackBytes: 4 << 20, AdaptivePackThresholdBytes: 1 << 40}
+	res2 := ScanRound(context.Background(), plainOpts)
+	if len(res2.Failed) != 0 || len(res2.Published) != 1 {
+		t.Fatalf("plain round = %+v (failed=%v)", res2, res2.Failed)
+	}
+	if len(res2.Phases) != 1 || res2.Phases[0].LayoutDecision == nil ||
+		res2.Phases[0].LayoutDecision.Chosen != layoutPlain || res2.Phases[0].LayoutDecision.Reason != layoutReasonBelow {
+		t.Fatalf("plain attempt decision: %+v", res2.Phases)
+	}
+
+	// Failure attempts keep the decision: a store dying at the first pack
+	// PUT still shows which layout the attempt chose.
+	root3 := t.TempDir()
+	underlying, err := chunkstore.NewLocal(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	adaptivePackedFixtureIn(t, root3, "adp-fail", adaptivePatternData())
+	failOpts := ScanRoundOptions{Roots: []string{root3}, Store: newFailingPutStore(underlying, 1),
+		StoreName: "test", Timeout: time.Minute, PackBytes: 4 << 20, AdaptivePackThresholdBytes: 1}
+	res3 := ScanRound(context.Background(), failOpts)
+	if len(res3.Failed) != 1 || res3.Failed["adp-fail"] == "" {
+		t.Fatalf("failure round = %+v", res3.Failed)
+	}
+	if len(res3.Phases) != 1 || res3.Phases[0].LayoutDecision == nil || res3.Phases[0].LayoutDecision.Chosen != layoutPack {
+		t.Fatalf("failed attempt must keep its decision: %+v", res3.Phases)
+	}
+
+	// Reconcile path (crash after INDEX commit, local state lost): the
+	// converged entry carries Reconciled=true and NO layout decision — no
+	// publish attempt ran in that round.
+	if err := os.Remove(filepath.Join(root1, ".publish", "adp-pack.json")); err != nil {
+		t.Fatal(err)
+	}
+	res4 := ScanRound(context.Background(), packOpts)
+	if len(res4.Reconciled) != 1 || res4.Reconciled[0] != "adp-pack" {
+		t.Fatalf("reconcile round = %+v", res4)
+	}
+	if len(res4.Phases) != 1 || !res4.Phases[0].Reconciled || res4.Phases[0].LayoutDecision != nil {
+		t.Fatalf("reconciled entry must have no decision: %+v", res4.Phases)
+	}
+}
+
+// TestScanRoundAdaptiveStickyAcrossDaemonRounds: the sticky-layout contract
+// must hold through the REAL daemon queue/retry flow, not only direct
+// RunWithOptions calls. Round one decides plain and dies mid-upload; round
+// two (a) with adaptive still on but a would-pack threshold stays plain and
+// succeeds; round two (b, separate artifact) with adaptive OFF and pack
+// configured is refused, writes nothing, and leaves layout=plain recorded.
+func TestScanRoundAdaptiveStickyAcrossDaemonRounds(t *testing.T) {
+	// (a) sticky plain through the queue: fail round → retry round packs a
+	// fresh decision but must not flip this artifact.
+	rootA := t.TempDir()
+	underDir := t.TempDir()
+	underlying, err := chunkstore.NewLocal(underDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adaptivePackedFixtureIn(t, rootA, "sticky-a", adaptivePatternData())
+	failOpts := ScanRoundOptions{Roots: []string{rootA}, Store: newFailingPutStore(underlying, 1),
+		StoreName: "s", Timeout: time.Minute, PackBytes: 4 << 20, AdaptivePackThresholdBytes: 1 << 40}
+	res1 := ScanRound(context.Background(), failOpts)
+	if len(res1.Failed) != 1 || res1.Failed["sticky-a"] == "" {
+		t.Fatalf("fail round = %+v", res1.Failed)
+	}
+	st, _ := Status(filepath.Join(rootA, "sticky-a"))
+	if st == nil || st.State != StatePublishFailed || st.Layout != layoutPlain {
+		t.Fatalf("fail round state = %+v", st)
+	}
+	goodDir := t.TempDir()
+	good, err := chunkstore.NewLocal(goodDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	retryOpts := ScanRoundOptions{Roots: []string{rootA}, Store: good, StoreName: "s",
+		Timeout: time.Minute, PackBytes: 4 << 20, AdaptivePackThresholdBytes: 1} // fresh decision would PACK
+	res2 := ScanRound(context.Background(), retryOpts)
+	if len(res2.Failed) != 0 || len(res2.Published) != 1 || res2.Published[0] != "sticky-a" {
+		t.Fatalf("retry round = %+v (failed=%v)", res2, res2.Failed)
+	}
+	if len(res2.Phases) != 1 || res2.Phases[0].LayoutDecision == nil ||
+		res2.Phases[0].LayoutDecision.Chosen != layoutPlain || res2.Phases[0].LayoutDecision.Reason != layoutReasonSticky {
+		t.Fatalf("retry must be sticky plain: %+v", res2.Phases)
+	}
+	if hasPackObjects(t, goodDir) {
+		t.Fatalf("sticky-plain retry must not produce pack objects")
+	}
+
+	// (b) adaptive OFF + pack configured on a decided-plain artifact: the
+	// daemon's own attempt is refused, nothing is written, layout survives.
+	rootB := t.TempDir()
+	under2Dir := t.TempDir()
+	under2, err := chunkstore.NewLocal(under2Dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adaptivePackedFixtureIn(t, rootB, "drift-b", adaptivePatternData())
+	failOptsB := failOpts
+	failOptsB.Roots = []string{rootB}
+	failOptsB.Store = newFailingPutStore(under2, 1)
+	if res := ScanRound(context.Background(), failOptsB); len(res.Failed) != 1 {
+		t.Fatalf("setup fail round = %+v", res.Failed)
+	}
+	driftDir := t.TempDir()
+	driftStore, err := chunkstore.NewLocal(driftDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	driftOpts := ScanRoundOptions{Roots: []string{rootB}, Store: driftStore, StoreName: "s",
+		Timeout: time.Minute, PackBytes: 4 << 20} // adaptive OFF
+	res3 := ScanRound(context.Background(), driftOpts)
+	if len(res3.Failed) != 1 || !strings.Contains(res3.Failed["drift-b"], "adaptive off") {
+		t.Fatalf("drift round must refuse with the remedy: %+v", res3.Failed)
+	}
+	if n := storeObjects(t, driftDir); n != 0 {
+		t.Fatalf("refused drift round wrote %d objects", n)
+	}
+	stB, _ := Status(filepath.Join(rootB, "drift-b"))
+	if stB == nil || stB.State != StatePublishFailed || stB.Layout != layoutPlain {
+		t.Fatalf("refused round must leave layout=plain failed state: %+v", stB)
+	}
+}
+
+func hasPackObjects(t *testing.T, root string) bool {
+	t.Helper()
+	found := false
+	filepath.WalkDir(root, func(_ string, d os.DirEntry, err error) error {
+		if err == nil && d.IsDir() && d.Name() == "memory-packs" {
+			found = true
+		}
+		return nil
+	})
+	return found
+}
+
+// TestScanRoundMalformedStateNotOverwritten: an unreadable state file fails
+// the artifact for the round — the scanner must not enqueue it (which would
+// overwrite the record with a fresh queued state) and the publisher (direct
+// or daemon) must refuse before any store IO.
+func TestScanRoundMalformedStateNotOverwritten(t *testing.T) {
+	root := t.TempDir()
+	dir := adaptivePackedFixtureIn(t, root, "mangled", adaptivePatternData())
+	statePath := filepath.Join(root, ".publish", "mangled.json")
+	if err := os.MkdirAll(filepath.Dir(statePath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	const garbage = `{"checkpoint_id": "mangled", "state": ` // truncated JSON
+	if err := os.WriteFile(statePath, []byte(garbage), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	storeDir := t.TempDir()
+	store, err := chunkstore.NewLocal(storeDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts := ScanRoundOptions{Roots: []string{root}, Store: store, StoreName: "s",
+		Timeout: time.Minute, PackBytes: 4 << 20, AdaptivePackThresholdBytes: 1}
+	res := ScanRound(context.Background(), opts)
+	if len(res.Failed) != 1 || !strings.Contains(res.Failed["mangled"], "read publish state") {
+		t.Fatalf("malformed state must fail the round: %+v", res.Failed)
+	}
+	kept, rerr := os.ReadFile(statePath)
+	if rerr != nil || string(kept) != garbage {
+		t.Fatalf("scanner must not overwrite the malformed record: %q (%v)", kept, rerr)
+	}
+	if n := storeObjects(t, storeDir); n != 0 {
+		t.Fatalf("malformed-state round wrote %d objects", n)
+	}
+	// The direct publisher refuses on the same file, also before any IO.
+	directDir := t.TempDir()
+	direct, derr := chunkstore.NewLocal(directDir)
+	if derr != nil {
+		t.Fatal(derr)
+	}
+	if _, err := RunWithOptions(context.Background(), dir, "mangled", direct, "s", opts2adaptive()); err == nil ||
+		!strings.Contains(err.Error(), "refusing to treat an unreadable state as fresh") {
+		t.Fatalf("direct run must refuse unreadable state, got %v", err)
+	}
+	if n := storeObjects(t, directDir); n != 0 {
+		t.Fatalf("refused direct run wrote %d objects", n)
+	}
+}
+
+func opts2adaptive() Options {
+	return Options{PackBytes: 4 << 20, AdaptivePackThresholdBytes: 1}
+}
+
+// TestScanRoundReconcilePreservesLayout: convergence after a crash between
+// INDEX commit and the state write must keep a decided layout — the
+// republish that follows still owes the artifact that layout. Legacy
+// states without a layout converge to a published state without one.
+func TestScanRoundReconcilePreservesLayout(t *testing.T) {
+	root := t.TempDir()
+	store, err := chunkstore.NewLocal(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	adaptivePackedFixtureIn(t, root, "recov-pack", adaptivePatternData())
+	publishOpts := ScanRoundOptions{Roots: []string{root}, Store: store, StoreName: "s",
+		Timeout: time.Minute, PackBytes: 4 << 20, AdaptivePackThresholdBytes: 1}
+	if res := ScanRound(context.Background(), publishOpts); len(res.Failed) != 0 || len(res.Published) != 1 {
+		t.Fatalf("publish round = %+v (failed=%v)", res, res.Failed)
+	}
+	// Simulate the crash window: keep layout=pack, rewind the state to
+	// publishing. The remote INDEX stays committed.
+	if err := rewriteStateField(filepath.Join(root, "recov-pack"), StatePublishing); err != nil {
+		t.Fatal(err)
+	}
+	res := ScanRound(context.Background(), publishOpts)
+	if len(res.Reconciled) != 1 || res.Reconciled[0] != "recov-pack" {
+		t.Fatalf("reconcile round = %+v", res)
+	}
+	st, _ := Status(filepath.Join(root, "recov-pack"))
+	if st == nil || st.State != StatePublished || st.Layout != layoutPack {
+		t.Fatalf("reconcile must preserve layout=pack: %+v", st)
+	}
+
+	// Legacy converge: a pre-adaptive state (no layout) stays layout-free.
+	root2 := t.TempDir()
+	store2, err := chunkstore.NewLocal(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	adaptivePackedFixtureIn(t, root2, "recov-legacy", adaptivePatternData())
+	legacyOpts := publishOpts
+	legacyOpts.Roots = []string{root2}
+	legacyOpts.Store = store2
+	legacyOpts.AdaptivePackThresholdBytes = 0 // plain publish, no decision
+	if res := ScanRound(context.Background(), legacyOpts); len(res.Failed) != 0 || len(res.Published) != 1 {
+		t.Fatalf("legacy publish = %+v", res.Failed)
+	}
+	if err := rewriteStateField(filepath.Join(root2, "recov-legacy"), StatePublishing); err != nil {
+		t.Fatal(err)
+	}
+	if err := stripLayout(filepath.Join(root2, "recov-legacy")); err != nil {
+		t.Fatal(err)
+	}
+	res2 := ScanRound(context.Background(), legacyOpts)
+	if len(res2.Reconciled) != 1 {
+		t.Fatalf("legacy reconcile = %+v", res2)
+	}
+	st2, _ := Status(filepath.Join(root2, "recov-legacy"))
+	if st2 == nil || st2.State != StatePublished || st2.Layout != "" {
+		t.Fatalf("legacy converge must stay layout-free: %+v", st2)
+	}
+}
+
+// rewriteStateField flips the persisted state string in place (test seam
+// for the crash-window simulations above).
+func rewriteStateField(checkpointDir, state string) error {
+	p := StatePath(checkpointDir)
+	raw, err := os.ReadFile(p)
+	if err != nil {
+		return err
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return err
+	}
+	doc["state"] = state
+	delete(doc, "published_at")
+	out, err := json.Marshal(doc)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(p, out, 0o600)
+}
+
+func stripLayout(checkpointDir string) error {
+	p := StatePath(checkpointDir)
+	raw, err := os.ReadFile(p)
+	if err != nil {
+		return err
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return err
+	}
+	delete(doc, "layout")
+	out, err := json.Marshal(doc)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(p, out, 0o600)
+}
+
+func storeObjects(t *testing.T, root string) int {
+	t.Helper()
+	n := 0
+	filepath.WalkDir(root, func(_ string, d os.DirEntry, err error) error {
+		if err == nil && !d.IsDir() {
+			n++
+		}
+		return nil
+	})
+	return n
+}
+
+// packBodyTypeStore records, for every pack-object PUT, whether the body
+// (under the instrument layer's counting wrapper) implements the streaming
+// pack reader — the buffer path would hand the store a *bytes.Reader — and
+// whether it arrives still SEEKABLE, which is what keeps Remote.PutKey on
+// its streaming Seeker path instead of buffering the whole body.
+type packBodyTypeStore struct {
+	chunkstore.Store
+	packBodies     atomic.Int64
+	streamBodies   atomic.Int64
+	seekableBodies atomic.Int64
+}
+
+func instrumentedBody(r io.Reader) io.Reader {
+	if sc, ok := r.(*seekableCountingReader); ok {
+		return sc.inner
+	}
+	if cr, ok := r.(*countingReader); ok {
+		return cr.inner
+	}
+	return r
+}
+
+func (s *packBodyTypeStore) PutKey(ctx context.Context, key string, r io.Reader) error {
+	if isPackObjectKey(key) {
+		s.packBodies.Add(1)
+		if _, ok := instrumentedBody(r).(packStreamReader); ok {
+			s.streamBodies.Add(1)
+		}
+		if _, ok := r.(io.Seeker); ok {
+			s.seekableBodies.Add(1)
+		}
+	}
+	return s.Store.(chunkstore.Keyed).PutKey(ctx, key, r)
+}
+
+func (s *packBodyTypeStore) GetKey(ctx context.Context, key string) (io.ReadCloser, error) {
+	return s.Store.(chunkstore.Keyed).GetKey(ctx, key)
+}
+
+func (s *packBodyTypeStore) HasKey(ctx context.Context, key string) (bool, error) {
+	return s.Store.(chunkstore.Keyed).HasKey(ctx, key)
+}
+
+// TestScanRoundPackIdentityAndStreamingPassthrough: the daemon's
+// -pack-identity/-pack-streaming-put knobs must reach the publish attempt.
+// Identity is observable in the store namespace (chunks-v1 packs land under
+// memory-chunk-packs-v1/, legacy under memory-packs/); streaming is
+// observable in the PUT body type (every pack body must be the verified
+// streaming reader, never a buffered *bytes.Reader).
+func TestScanRoundPackIdentityAndStreamingPassthrough(t *testing.T) {
+	root := t.TempDir()
+	storeRoot := t.TempDir()
+	underlying, err := chunkstore.NewLocal(storeRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	observed := &packBodyTypeStore{Store: underlying}
+	adaptivePackedFixtureIn(t, root, "pid-stream", adaptivePatternData())
+
+	res := ScanRound(context.Background(), ScanRoundOptions{Roots: []string{root}, Store: observed,
+		StoreName: "test", Timeout: time.Minute, PackBytes: 4 << 20,
+		PackIdentity: checkpointchunks.PackIdentityChunks, PackStreamingPut: true})
+	if len(res.Failed) != 0 || len(res.Published) != 1 || res.Published[0] != "pid-stream" {
+		t.Fatalf("streaming round = %+v (failed=%v)", res, res.Failed)
+	}
+	if observed.packBodies.Load() == 0 || observed.packBodies.Load() != observed.streamBodies.Load() {
+		t.Fatalf("pack PUT bodies: total=%d streaming=%d, want every pack body to be the streaming reader",
+			observed.packBodies.Load(), observed.streamBodies.Load())
+	}
+	if observed.packBodies.Load() != observed.seekableBodies.Load() {
+		t.Fatalf("seekable pack bodies=%d of %d: the instrument layer must not hide the reader's Seeker (that would reroute Remote.PutKey into buffered ReadAll)",
+			observed.seekableBodies.Load(), observed.packBodies.Load())
+	}
+
+	v1, legacy := 0, 0
+	filepath.WalkDir(storeRoot, func(p string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		switch {
+		case strings.Contains(p, "memory-chunk-packs-v1"):
+			v1++
+		case strings.Contains(p, "memory-packs"):
+			legacy++
+		}
+		return nil
+	})
+	if v1 == 0 {
+		t.Fatal("no chunks-v1 pack objects: -pack-identity did not reach the attempt")
+	}
+	if legacy != 0 {
+		t.Fatalf("legacy pack objects appeared under chunks-v1 identity: %d", legacy)
+	}
+	lk := chunkstore.Keyed(underlying)
+	if _, e := lk.GetKey(context.Background(), ArtifactKey("pid-stream", IndexName)); e != nil {
+		t.Fatalf("INDEX: %v", e)
 	}
 }

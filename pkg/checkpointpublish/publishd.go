@@ -42,6 +42,34 @@ type ScanRoundOptions struct {
 	Timeout time.Duration
 	// CompressChunks passes through to RunWithOptions.
 	CompressChunks bool
+	// OverlayWorkers bounds the overlay chunk upload pool; zero keeps the
+	// package default (8).
+	OverlayWorkers int
+	// PackAutoBase opts into automatic pack-baseline resolution (see
+	// Options.PackAutoBase). Zero keeps it off.
+	PackAutoBase bool
+	// PackIdentity selects the pack key namespace (see Options.PackIdentity):
+	// empty keeps the legacy whole-pack SHA256, chunks-v1 the versioned
+	// chunk root. Required for PackStreamingPut to take effect.
+	PackIdentity string
+	// PackStreamingPut opts into verified streaming PUT for pack objects
+	// (see Options.PackStreamingPut). It only takes effect on packed runs
+	// with chunks-v1 pack identity; zero keeps the buffer path.
+	PackStreamingPut bool
+	// AdaptivePackThresholdBytes opts into adaptive layout selection per
+	// artifact (see Options.AdaptivePackThresholdBytes). Zero keeps the
+	// explicit-flag semantics.
+	AdaptivePackThresholdBytes int64
+	// Workers bounds the memory upload pool; zero keeps Run's default
+	// (min(GOMAXPROCS, 8)). B-sweep findings must be deliverable through
+	// the PRODUCTION daemon chain, not only through cn-publish.
+	Workers int
+	// PackBytes enables packed memory publication (1-8 MiB packs); zero
+	// keeps version-1 single-chunk publication. Same delivery rationale.
+	PackBytes int
+	// PackPayloadBytes caps the active pack payload budget; zero keeps the
+	// package default (16 MiB).
+	PackPayloadBytes int
 
 	// StaleAfter re-queues a "publishing" record older than this (crash
 	// leftover; historical default 10m).
@@ -75,18 +103,20 @@ type ScanRoundOptions struct {
 // decomposition of T_remote; a CLI cn-publish wall time is a DIFFERENT span
 // (no queue, no discovery) and must not be mixed with it.
 type ArtifactPhases struct {
-	ID            string        `json:"id"`
-	SealedAt      time.Time     `json:"sealed_at"`
-	DiscoveredAt  time.Time     `json:"discovered_at"`
-	PublishStart  time.Time     `json:"publish_start"`
-	PublishEnd    time.Time     `json:"publish_end"`
-	DiscoveryLag  time.Duration `json:"discovery_lag"`
-	QueueWait     time.Duration `json:"queue_wait"`
-	PublishWall   time.Duration `json:"publish_wall"`
-	SealToReady   time.Duration `json:"seal_to_ready"`
-	Publish       PublishPhases `json:"publish"`
-	Reconciled    bool          `json:"reconciled,omitempty"`
-	RetriesBefore int           `json:"retries_before,omitempty"`
+	ID             string            `json:"id"`
+	SealedAt       time.Time         `json:"sealed_at"`
+	DiscoveredAt   time.Time         `json:"discovered_at"`
+	PublishStart   time.Time         `json:"publish_start"`
+	PublishEnd     time.Time         `json:"publish_end"`
+	DiscoveryLag   time.Duration     `json:"discovery_lag"`
+	QueueWait      time.Duration     `json:"queue_wait"`
+	PublishWall    time.Duration     `json:"publish_wall"`
+	SealToReady    time.Duration     `json:"seal_to_ready"`
+	Publish        PublishPhases     `json:"publish"`
+	LayoutDecision *LayoutDecision   `json:"layout_decision,omitempty"`
+	AutoBase       *AutoBaseDecision `json:"auto_base,omitempty"`
+	Reconciled     bool              `json:"reconciled,omitempty"`
+	RetriesBefore  int               `json:"retries_before,omitempty"`
 }
 
 // RoundResult is the machine-readable summary of one scan round. It
@@ -169,7 +199,17 @@ func ScanRound(ctx context.Context, opts ScanRoundOptions) RoundResult {
 			// otherwise be erased).
 			discoveredAt := nowFn()
 			state, err := Status(dir)
-			if err != nil || state == nil {
+			if err != nil {
+				// An UNREADABLE state file must not be treated as "never
+				// published" — enqueueing here would OVERWRITE the record
+				// (destroying the evidence and any layout decision it
+				// carries) and hand the artifact to a publisher that would
+				// then see a fresh queued state. Fail the artifact for this
+				// round instead; the operator repairs or removes the file.
+				result.Failed[entry.Name()] = fmt.Sprintf("read publish state: %v", err)
+				continue
+			}
+			if state == nil {
 				// Never published: an implicit local_ready. Persist the
 				// queued record so the enqueue itself survives crashes and
 				// is observable as a lifecycle state (M1).
@@ -272,11 +312,28 @@ func ScanRound(ctx context.Context, opts ScanRoundOptions) RoundResult {
 			_ = rerr
 		}
 
-		runRes, err := RunWithOptions(attemptCtx, artifact.dir, artifact.id, opts.Store, opts.StoreName, Options{CompressChunks: opts.CompressChunks})
+		runRes, err := RunWithOptions(attemptCtx, artifact.dir, artifact.id, opts.Store, opts.StoreName, Options{
+			CompressChunks:             opts.CompressChunks,
+			OverlayWorkers:             opts.OverlayWorkers,
+			Workers:                    opts.Workers,
+			PackBytes:                  opts.PackBytes,
+			PackPayloadBytes:           opts.PackPayloadBytes,
+			AdaptivePackThresholdBytes: opts.AdaptivePackThresholdBytes,
+			PackAutoBase:               opts.PackAutoBase,
+			PackIdentity:               opts.PackIdentity,
+			PackStreamingPut:           opts.PackStreamingPut,
+		})
 		cancelAttempt()
 		if runRes.Phases != nil {
 			phases.Publish = *runRes.Phases
 		}
+		// The adaptive layout decision travels with the attempt — success
+		// and failure alike (a failed attempt still shows which layout it
+		// chose and what it measured). Reconciled artifacts never get one:
+		// they did not run a publish attempt in this round. Same for the
+		// auto-base resolution.
+		phases.LayoutDecision = runRes.LayoutDecision
+		phases.AutoBase = runRes.AutoBase
 		// Merge the reconcile probe traffic either way (fall-through
 		// attempts repeat the INDEX GET but upload nothing while failing).
 		if hasReqs, hasTotal, getReqs, getOpenTotal, getTotal, getBytes := probeCounters.hasAndGet(); hasReqs+getReqs > 0 {

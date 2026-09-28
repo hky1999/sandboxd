@@ -36,6 +36,7 @@ import (
 	"github.com/inclusionAI/sandboxd/config"
 	"github.com/inclusionAI/sandboxd/internal/firecrackerproto"
 	"github.com/inclusionAI/sandboxd/internal/util"
+	"github.com/inclusionAI/sandboxd/pkg/chunkcache"
 	"github.com/inclusionAI/sandboxd/pkg/errord"
 	runtimecore "github.com/inclusionAI/sandboxd/pkg/runtime"
 	runtimecommon "github.com/inclusionAI/sandboxd/pkg/runtime/internal/common"
@@ -430,6 +431,10 @@ type Handler struct {
 	uffdChunkKB        uint
 	uffdCopyKB         uint
 	uffdPersistWorkers int
+	// uffdChunkCacheHighMB/LowMB bound the shared node chunk cache with a
+	// watermark pair (MiB); 0/0 keeps the historical unbounded behavior.
+	uffdChunkCacheHighMB int64
+	uffdChunkCacheLowMB  int64
 
 	// digestMemory records a sha256 of the memory artifact in the sealed
 	// manifest so restores can reject corrupted transfers. Default on; the
@@ -439,6 +444,12 @@ type Handler struct {
 	// uffdChunkStore serves uffd restores from a content-addressed chunk
 	// store when the artifact carries a chunk manifest.
 	uffdChunkStore string
+
+	// uffdChunkPrefetchWorkers/BudgetMB configure chunk-store background
+	// prefetch (P1-D): opt-in (default 0 = lazy restore, zero background
+	// GETs) and — when enabled — bounded by a mandatory finite budget.
+	uffdChunkPrefetchWorkers  int
+	uffdChunkPrefetchBudgetMB int
 
 	// digestMemoryMode selects the memory digest derivation; see
 	// FirecrackerConfig.DigestMemoryMode.
@@ -548,6 +559,21 @@ func NewHandler(
 	if firecrackerConfig.UffdPersistWorkers < 0 || firecrackerConfig.UffdPersistWorkers > 64 {
 		return nil, errors.New("uffd_persist_workers must be 0 (handler default) or 1-64")
 	}
+	if err := chunkcache.ValidWatermarkMiB(firecrackerConfig.UffdChunkCacheHighMB, firecrackerConfig.UffdChunkCacheLowMB); err != nil {
+		return nil, fmt.Errorf("uffd_chunk_cache_high_mb/uffd_chunk_cache_low_mb: %w", err)
+	}
+	// Chunk-store prefetch is opt-in and must be bounded (P1-D): workers>0
+	// without a finite budget is exactly the "lazy restore silently
+	// downloads the whole artifact" failure mode. Workers are capped at the
+	// execution ceiling of 16 and never silently clamped (P1-G).
+	if firecrackerConfig.UffdChunkPrefetchWorkers < 0 || firecrackerConfig.UffdChunkPrefetchWorkers > 16 ||
+		firecrackerConfig.UffdChunkPrefetchBudgetMB < 0 ||
+		int64(firecrackerConfig.UffdChunkPrefetchBudgetMB) > chunkcache.MaxWatermarkMiB {
+		return nil, fmt.Errorf("uffd_chunk_prefetch_workers/uffd_chunk_prefetch_budget_mb: workers must be 0..16, values non-negative, budget within the %d MiB bound", chunkcache.MaxWatermarkMiB)
+	}
+	if firecrackerConfig.UffdChunkPrefetchWorkers > 0 && firecrackerConfig.UffdChunkPrefetchBudgetMB == 0 {
+		return nil, errors.New("uffd_chunk_prefetch_workers > 0 requires uffd_chunk_prefetch_budget_mb > 0 (whole-artifact background download is not allowed)")
+	}
 	binary = firecrackerConfigPath(binary)
 	for description, path := range map[string]string{
 		"Firecracker binary": binary,
@@ -598,38 +624,42 @@ func NewHandler(
 		}
 	}
 	handler := &Handler{
-		binary:                 binary,
-		vmmLogLevel:            firecrackerConfig.VMMLogLevel,
-		sandboxRoot:            sandboxRoot,
-		storageRoot:            storageRoot,
-		runtimeRoot:            firecrackerproto.HostRuntimeRoot,
-		writableIOEngine:       firecrackerConfig.WritableIOEngine,
-		writableCacheType:      firecrackerConfig.WritableCacheType,
-		kernelPath:             firecrackerConfig.KernelImagePath,
-		initrdPath:             firecrackerConfig.InitrdPath,
-		kernelArgs:             firecrackerConfig.KernelArgs,
-		kvmDevice:              firecrackerConfig.KVMDevice,
-		defaultVCPUs:           firecrackerConfig.DefaultVCPUCount,
-		defaultMem:             firecrackerConfig.DefaultMemoryMiB,
-		shrinkBeforeCheckpoint: firecrackerConfig.ShrinkBeforeCheckpoint,
-		checkpointMode:         firecrackerConfig.CheckpointMode,
-		sparseFull:             firecrackerConfig.SparseFull,
-		skipUnchanged:          firecrackerConfig.SkipUnchanged,
-		checkpointWriteback:    newCheckpointWritebackScheduler(),
-		memBackend:             firecrackerConfig.MemBackend,
-		uffdHandlerBin:         firecrackerConfig.UffdHandlerBin,
-		uffdRemoteURL:          firecrackerConfig.UffdRemoteURLTemplate,
-		uffdCacheDir:           firecrackerConfig.UffdCacheDir,
-		uffdChunkKB:            firecrackerConfig.UffdChunkKB,
-		uffdPersistWorkers:     firecrackerConfig.UffdPersistWorkers,
-		digestMemory:           firecrackerConfig.DigestMemoryOrDefault(),
-		uffdChunkStore:         firecrackerConfig.UffdChunkStore,
-		digestMemoryMode:       firecrackerConfig.DigestMemoryMode,
-		defaultDisk:            firecrackerConfig.DefaultOverlaySizeBytes,
-		ociLoader:              loader,
-		virtiofsdPath:          firecrackerConfig.VirtioFSDPath,
-		virtioFSEnabled:        firecrackerConfig.VirtioFSEnabled,
-		instances:              make(map[string]*firecrackerInstance),
+		binary:                    binary,
+		vmmLogLevel:               firecrackerConfig.VMMLogLevel,
+		sandboxRoot:               sandboxRoot,
+		storageRoot:               storageRoot,
+		runtimeRoot:               firecrackerproto.HostRuntimeRoot,
+		writableIOEngine:          firecrackerConfig.WritableIOEngine,
+		writableCacheType:         firecrackerConfig.WritableCacheType,
+		kernelPath:                firecrackerConfig.KernelImagePath,
+		initrdPath:                firecrackerConfig.InitrdPath,
+		kernelArgs:                firecrackerConfig.KernelArgs,
+		kvmDevice:                 firecrackerConfig.KVMDevice,
+		defaultVCPUs:              firecrackerConfig.DefaultVCPUCount,
+		defaultMem:                firecrackerConfig.DefaultMemoryMiB,
+		shrinkBeforeCheckpoint:    firecrackerConfig.ShrinkBeforeCheckpoint,
+		checkpointMode:            firecrackerConfig.CheckpointMode,
+		sparseFull:                firecrackerConfig.SparseFull,
+		skipUnchanged:             firecrackerConfig.SkipUnchanged,
+		checkpointWriteback:       newCheckpointWritebackScheduler(),
+		memBackend:                firecrackerConfig.MemBackend,
+		uffdHandlerBin:            firecrackerConfig.UffdHandlerBin,
+		uffdRemoteURL:             firecrackerConfig.UffdRemoteURLTemplate,
+		uffdCacheDir:              firecrackerConfig.UffdCacheDir,
+		uffdChunkKB:               firecrackerConfig.UffdChunkKB,
+		uffdPersistWorkers:        firecrackerConfig.UffdPersistWorkers,
+		uffdChunkCacheHighMB:      firecrackerConfig.UffdChunkCacheHighMB,
+		uffdChunkCacheLowMB:       firecrackerConfig.UffdChunkCacheLowMB,
+		digestMemory:              firecrackerConfig.DigestMemoryOrDefault(),
+		uffdChunkStore:            firecrackerConfig.UffdChunkStore,
+		uffdChunkPrefetchWorkers:  firecrackerConfig.UffdChunkPrefetchWorkers,
+		uffdChunkPrefetchBudgetMB: firecrackerConfig.UffdChunkPrefetchBudgetMB,
+		digestMemoryMode:          firecrackerConfig.DigestMemoryMode,
+		defaultDisk:               firecrackerConfig.DefaultOverlaySizeBytes,
+		ociLoader:                 loader,
+		virtiofsdPath:             firecrackerConfig.VirtioFSDPath,
+		virtioFSEnabled:           firecrackerConfig.VirtioFSEnabled,
+		instances:                 make(map[string]*firecrackerInstance),
 	}
 	handler.recoverInstances()
 	return handler, nil

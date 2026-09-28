@@ -118,7 +118,7 @@ func (l *Local) Get(ctx context.Context, digest string) (io.ReadCloser, error) {
 	}
 	f, err := os.Open(path)
 	if os.IsNotExist(err) {
-		return nil, fmt.Errorf("chunk %s not in store", digest)
+		return nil, fmt.Errorf("chunk %s: %w", digest, ErrObjectNotFound)
 	}
 	return f, err
 }

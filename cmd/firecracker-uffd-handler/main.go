@@ -31,6 +31,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
@@ -38,6 +39,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/inclusionAI/sandboxd/pkg/checkpointchunks"
+	"github.com/inclusionAI/sandboxd/pkg/chunkcache"
 	"github.com/inclusionAI/sandboxd/pkg/chunkstore"
 )
 
@@ -112,6 +114,16 @@ type pageSource struct {
 	// an http chunk-store: hits never touch the network; misses are verified
 	// and persisted here for the next sandbox on this node.
 	chunkLocal string
+	// chunkCache is the M2 capacity-managed front for chunkLocal (same
+	// directory, same layout). Non-nil only for http stores with -chunk-local
+	// configured; it adds cross-process missing-chunk dedup, watermark
+	// eviction, pins and crash reconciliation while preserving the verified
+	// read / atomic publish semantics of the legacy path below.
+	chunkCache *chunkcache.Manager
+	// foreground counts in-flight fault-path fetches. Background prefetch
+	// yields while it is positive: a missing page must never queue behind
+	// speculative bulk work.
+	foreground atomic.Int32
 
 	inflightMu sync.Mutex
 	inflight   map[uint64]chan struct{} // chunk index -> leader completion
@@ -198,7 +210,12 @@ func (s *faultServer) resolveChunk(fileOff, want uint64) ([]byte, error) {
 	_, ready := src.fetched[chunkIdx]
 	src.inflightMu.Unlock()
 	if !ready {
-		if err := s.fetchChunk(chunkIdx); err != nil {
+		// Fault-path fetches count as foreground: background prefetch
+		// yields while any of them is in flight (see the prefetch wrapper).
+		src.foreground.Add(1)
+		err := s.fetchChunk(chunkIdx)
+		src.foreground.Add(-1)
+		if err != nil {
 			return nil, err
 		}
 	}
@@ -324,7 +341,9 @@ func (s *faultServer) fetchChunkRange(chunkIdx uint64) error {
 		return fmt.Errorf("range fetch %s [%d,+%d): %w", src.remote, start, src.chunk, err)
 	}
 	defer resp.Body.Close()
-	log.Printf("DEBUG fetch chunk=%d status=%s contentLen=%s", chunkIdx, resp.Status, resp.Header.Get("Content-Length"))
+	if chunkDebug {
+		log.Printf("DEBUG fetch chunk=%d status=%s contentLen=%s", chunkIdx, resp.Status, resp.Header.Get("Content-Length"))
+	}
 	if resp.StatusCode != http.StatusPartialContent && resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("range fetch %s: status %s", src.remote, resp.Status)
 	}
@@ -447,155 +466,54 @@ func (s *faultServer) fetchChunkFromStore(chunkIdx uint64) error {
 	var buf []byte
 	localHit := false
 	httpSource := strings.HasPrefix(src.chunkStore, "http://") || strings.HasPrefix(src.chunkStore, "https://")
-	fill := func() error {
-		if httpSource && src.chunkLocal != "" {
-			localPath := filepath.Join(src.chunkLocal, entry.Digest[:2], entry.Digest)
-			if fileExists(localPath) {
-				f, err := os.Open(localPath)
-				if err != nil {
-					os.Remove(localPath)
-					return fmt.Errorf("persistent chunk %s unreadable (evicted): %w", entry.Digest, err)
-				}
-				buf = make([]byte, length)
-				n, rerr := io.ReadFull(f, buf)
-				f.Close()
-				if rerr != nil && !errors.Is(rerr, io.EOF) && !errors.Is(rerr, io.ErrUnexpectedEOF) {
-					os.Remove(localPath)
-					return fmt.Errorf("persistent chunk %s unreadable (evicted): %w", entry.Digest, rerr)
-				}
-				if uint64(n) != length {
-					os.Remove(localPath)
-					return fmt.Errorf("persistent chunk %s short: %d bytes, want %d (evicted)",
-						entry.Digest, n, length)
-				}
-				log.Printf("DEBUG local-hit chunk=%d digest=%s", chunkIdx, entry.Digest[:12])
-				localHit = true
-				return nil
-			}
+	if src.chunkCache != nil && httpSource {
+		// M2 managed node cache: verified read, cross-process missing-chunk
+		// dedup, atomic publish, watermark eviction and pins live inside the
+		// manager. The miss closure is the plain store download below.
+		body, err := src.chunkCache.Fetch(src.requestContext(), entry.Digest, int64(length), func(c context.Context) ([]byte, error) {
+			return s.fetchStoreBody(c, manifest, entry, int(length), httpSource)
+		})
+		if err != nil {
+			return err
 		}
-		if ref, ok := manifest.Packs[entry.Digest]; ok {
-			store, err := chunkstore.Open(src.chunkStore)
-			if err != nil {
-				return err
-			}
-			parent := src.ctx
-			if parent == nil {
-				parent = context.Background()
-			}
-			ctx, cancel := context.WithTimeout(parent, 60*time.Second)
-			defer cancel()
-			key, err := ref.Key()
-			if err != nil {
-				return err
-			}
-			data, err := store.(chunkstore.RangeReader).ReadKeyRange(ctx, key, chunkstore.ObjectRange{Offset: ref.Offset, Length: ref.Length, ObjectSize: ref.ObjectSize})
-			if err != nil {
-				return fmt.Errorf("fetch packed chunk %s: %w", entry.Digest, err)
-			}
-			buf = data
-			return nil
-		}
-		if buf == nil {
-			buf = make([]byte, length)
-		}
-		if manifest.Compression == checkpointchunks.CompressionZstd {
-			// Compressed transport body: the object at the ".z" key holds
-			// a zstd stream decoding to exactly this chunk's bytes. A
-			// missing compressed object is not an error — chunks shared
-			// with pre-compression generations keep their plain objects,
-			// so fall through to the plain fetch. Verification below
-			// still hashes the DECODED bytes against the digest.
-			fillCompressed := func() (bool, error) {
-				land := func(compressed []byte) error {
-					plain, err := chunkstore.DecompressChunkBody(compressed, int(length))
+		buf = body
+		localHit = true
+	} else {
+		fill := func() error {
+			if httpSource && src.chunkLocal != "" {
+				localPath := filepath.Join(src.chunkLocal, entry.Digest[:2], entry.Digest)
+				if fileExists(localPath) {
+					f, err := os.Open(localPath)
 					if err != nil {
-						return fmt.Errorf("decompress store chunk %s: %w", entry.Digest, err)
+						os.Remove(localPath)
+						return fmt.Errorf("persistent chunk %s unreadable (evicted): %w", entry.Digest, err)
 					}
-					copy(buf, plain)
+					buf = make([]byte, length)
+					// Exact length on the legacy persistent path too: stat
+					// decides, so short AND overlong files are both evicted.
+					_, rerr := readExactLocal(f, buf)
+					f.Close()
+					if rerr != nil {
+						os.Remove(localPath)
+						return fmt.Errorf("persistent chunk %s length mismatch (evicted): %w", entry.Digest, rerr)
+					}
+					if chunkDebug {
+						log.Printf("DEBUG local-hit chunk=%d digest=%s", chunkIdx, entry.Digest[:12])
+					}
+					localHit = true
 					return nil
 				}
-				limit := chunkstore.MaxCompressedChunkBytes(int64(length))
-				if httpSource {
-					req, err := http.NewRequestWithContext(src.requestContext(), http.MethodGet,
-						strings.TrimRight(src.chunkStore, "/")+"/"+chunkstore.CompressedKey(entry.Digest), nil)
-					if err != nil {
-						return false, fmt.Errorf("build compressed chunk request %s: %w", entry.Digest, err)
-					}
-					resp, err := storeHTTPClient.Do(req)
-					if err != nil {
-						return false, fmt.Errorf("fetch compressed chunk %s: %w", entry.Digest, err)
-					}
-					defer resp.Body.Close()
-					if resp.StatusCode == http.StatusNotFound {
-						return false, nil
-					}
-					if resp.StatusCode != http.StatusOK {
-						return false, fmt.Errorf("fetch compressed chunk %s: status %d", entry.Digest, resp.StatusCode)
-					}
-					compressed, err := chunkstore.ReadBounded(resp.Body, limit)
-					if err != nil {
-						return false, fmt.Errorf("read compressed chunk %s: %w", entry.Digest, err)
-					}
-					return true, land(compressed)
-				}
-				f, err := os.Open(filepath.Join(src.chunkStore, chunkstore.CompressedKey(entry.Digest)))
-				if err != nil {
-					if os.IsNotExist(err) {
-						return false, nil
-					}
-					return false, fmt.Errorf("open compressed chunk %s: %w", entry.Digest, err)
-				}
-				defer f.Close()
-				compressed, err := chunkstore.ReadBounded(f, limit)
-				if err != nil {
-					return false, fmt.Errorf("read compressed chunk %s: %w", entry.Digest, err)
-				}
-				return true, land(compressed)
 			}
-			done, err := fillCompressed()
+			body, err := s.fetchStoreBody(src.requestContext(), manifest, entry, int(length), httpSource)
 			if err != nil {
 				return err
 			}
-			if done {
-				return nil
-			}
-		}
-		if httpSource {
-			req, err := http.NewRequestWithContext(src.requestContext(), http.MethodGet,
-				strings.TrimRight(src.chunkStore, "/")+"/"+entry.Digest[:2]+"/"+entry.Digest, nil)
-			if err != nil {
-				return fmt.Errorf("build store chunk request %s: %w", entry.Digest, err)
-			}
-			resp, err := storeHTTPClient.Do(req)
-			if err != nil {
-				return fmt.Errorf("fetch store chunk %s: %w", entry.Digest, err)
-			}
-			defer resp.Body.Close()
-			if resp.StatusCode != http.StatusOK {
-				return fmt.Errorf("fetch store chunk %s: status %d", entry.Digest, resp.StatusCode)
-			}
-			if _, err := io.ReadFull(resp.Body, buf); err != nil {
-				return fmt.Errorf("fetch store chunk %s: %w", entry.Digest, err)
-			}
+			buf = body
 			return nil
 		}
-		objectPath := filepath.Join(src.chunkStore, entry.Digest[:2], entry.Digest)
-		f, err := os.Open(objectPath)
-		if err != nil {
-			return fmt.Errorf("open store chunk %s: %w", entry.Digest, err)
+		if err := fill(); err != nil {
+			return err
 		}
-		defer f.Close()
-		n, rerr := io.ReadFull(f, buf)
-		if rerr != nil && !errors.Is(rerr, io.EOF) && !errors.Is(rerr, io.ErrUnexpectedEOF) {
-			return fmt.Errorf("read store chunk %s: %w", entry.Digest, rerr)
-		}
-		if uint64(n) != length {
-			return fmt.Errorf("store chunk %s short: %d bytes, want %d", entry.Digest, n, length)
-		}
-		return nil
-	}
-	if err := fill(); err != nil {
-		return err
 	}
 	sum := sha256.Sum256(buf)
 	if got := hex.EncodeToString(sum[:]); got != entry.Digest {
@@ -626,13 +544,303 @@ func (s *faultServer) fetchChunkFromStore(chunkIdx uint64) error {
 	src.verifiedDigests[key] = start
 	src.fetched[chunkIdx] = struct{}{}
 	src.inflightMu.Unlock()
-	log.Printf("DEBUG store chunk=%d digest=%s bytes=%d", chunkIdx, entry.Digest[:12], length)
+	if chunkDebug {
+		log.Printf("DEBUG store chunk=%d digest=%s bytes=%d", chunkIdx, entry.Digest[:12], length)
+	}
 	return nil
+}
+
+// yieldingFetch adapts fetchChunk for background prefetch: while any
+// fault-path fetch is in flight (foreground > 0), speculative bulk work
+// stands down instead of competing for store bandwidth and fetch slots.
+func (s *faultServer) yieldingFetch(stop <-chan struct{}) func(uint64) error {
+	return func(idx uint64) error {
+		for s.source.foreground.Load() > 0 {
+			select {
+			case <-stop:
+				return nil
+			case <-time.After(2 * time.Millisecond):
+			}
+		}
+		return s.fetchChunk(idx)
+	}
+}
+
+// validateChunkPrefetchFlags enforces the chunk-store prefetch contract
+// (P1-D): non-negative values, workers within the execution ceiling of 16
+// (the runner never silently caps a configured value), a budget within the
+// watermark MiB ceiling, and — the load-bearing rule — workers > 0
+// REQUIRES a finite budget. An unbounded background walk is exactly the
+// "lazy restore silently downloads the whole artifact" failure mode this
+// path must not have.
+func validateChunkPrefetchFlags(workers, budgetMB int) error {
+	if workers < 0 {
+		return fmt.Errorf("-chunk-prefetch must not be negative")
+	}
+	if workers > maxPrefetchWorkers {
+		return fmt.Errorf("-chunk-prefetch must not exceed %d workers", maxPrefetchWorkers)
+	}
+	if budgetMB < 0 {
+		return fmt.Errorf("-chunk-prefetch-budget-mb must not be negative")
+	}
+	if int64(budgetMB) > chunkcache.MaxWatermarkMiB {
+		return fmt.Errorf("-chunk-prefetch-budget-mb exceeds the %d MiB bound", chunkcache.MaxWatermarkMiB)
+	}
+	if workers > 0 && budgetMB == 0 {
+		return fmt.Errorf("-chunk-prefetch requires -chunk-prefetch-budget-mb > 0 (whole-artifact background download is not allowed on the chunk-store path)")
+	}
+	return nil
+}
+
+// maxPrefetchWorkers is the execution ceiling for background prefetch
+// concurrency; configured values are REJECTED above it (never silently
+// capped — P1-G). Legacy remote-memory prefetch keeps its historical
+// clamp semantics and is unaffected.
+const maxPrefetchWorkers = 16
+
+// strictEOFProbe proves a body ended EXACTLY at the expected length: any
+// further byte is overlong, a clean io.EOF is success, any other error
+// fails, and repeated (0, nil) no-progress reads fail with io.ErrNoProgress
+// — a zero read without EOF is NOT evidence the body ended (P1-E).
+func strictEOFProbe(r io.Reader, what string, length int) error {
+	var probe [1]byte
+	tries := 0
+	for {
+		n, err := r.Read(probe[:])
+		if n > 0 {
+			return fmt.Errorf("%s: body longer than %d bytes", what, length)
+		}
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("%s: length probe after %d bytes: %w", what, length, err)
+		}
+		tries++
+		if tries >= 4 {
+			return fmt.Errorf("%s: length probe after %d bytes: %w", what, length, io.ErrNoProgress)
+		}
+	}
+}
+
+// prefetchPlan separates the two prefetch regimes (P1-D). The legacy
+// remote-memory URL keeps its historical flags and semantics (default 4
+// workers, budget 0 = walk the whole artifact). The chunk-store CAS path is
+// OPT-IN: default workers 0 (no background GETs at all), and any explicit
+// enable carries the finite budget validated above. Returns the effective
+// worker count and budget in bytes (0 = unbounded legacy walk).
+func prefetchPlan(remote, chunkStore string, legacyWorkers, legacyBudgetMB, chunkWorkers, chunkBudgetMB int) (workers int, budgetBytes uint64) {
+	if chunkStore != "" {
+		if chunkWorkers <= 0 {
+			return 0, 0 // chunk-store default: zero background prefetch
+		}
+		return chunkWorkers, uint64(chunkBudgetMB) << 20
+	}
+	if remote != "" && legacyWorkers > 0 {
+		if legacyBudgetMB > 0 {
+			return legacyWorkers, uint64(legacyBudgetMB) << 20
+		}
+		return legacyWorkers, 0 // legacy whole-artifact walk stays allowed
+	}
+	return 0, 0
+}
+
+// fetchStoreBody downloads one chunk's bytes from the store — a pack range
+// read, the compressed transport body, or the plain object, in that order —
+// without consulting or updating any cache. When the node cache manager is
+// active this runs under its per-digest lock, making it the single network
+// fetch for the digest on the node. The body is NOT yet verified: callers
+// (or the cache manager) hash it against the manifest digest before use.
+func (s *faultServer) fetchStoreBody(ctx context.Context, manifest *checkpointchunks.Manifest, entry checkpointchunks.Chunk, length int, httpSource bool) ([]byte, error) {
+	src := s.source
+	if ref, ok := manifest.Packs[entry.Digest]; ok {
+		store, err := chunkstore.Open(src.chunkStore)
+		if err != nil {
+			return nil, err
+		}
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		rctx, cancel := context.WithTimeout(ctx, 60*time.Second)
+		defer cancel()
+		key, err := ref.Key()
+		if err != nil {
+			return nil, err
+		}
+		data, err := store.(chunkstore.RangeReader).ReadKeyRange(rctx, key, chunkstore.ObjectRange{Offset: ref.Offset, Length: ref.Length, ObjectSize: ref.ObjectSize})
+		if err != nil {
+			return nil, fmt.Errorf("fetch packed chunk %s: %w", entry.Digest, err)
+		}
+		return data, nil
+	}
+	buf := make([]byte, length)
+	if manifest.Compression == checkpointchunks.CompressionZstd {
+		// Compressed transport body: the object at the ".z" key holds
+		// a zstd stream decoding to exactly this chunk's bytes. A
+		// missing compressed object is not an error — chunks shared
+		// with pre-compression generations keep their plain objects,
+		// so fall through to the plain fetch. Verification by the
+		// caller hashes the DECODED bytes against the digest.
+		fillCompressed := func() (bool, error) {
+			land := func(compressed []byte) error {
+				plain, err := chunkstore.DecompressChunkBody(compressed, length)
+				if err != nil {
+					return fmt.Errorf("decompress store chunk %s: %w", entry.Digest, err)
+				}
+				if len(plain) != length {
+					return fmt.Errorf("decompress store chunk %s: %d bytes, want %d", entry.Digest, len(plain), length)
+				}
+				copy(buf, plain)
+				return nil
+			}
+			limit := chunkstore.MaxCompressedChunkBytes(int64(length))
+			if httpSource {
+				req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+					strings.TrimRight(src.chunkStore, "/")+"/"+chunkstore.CompressedKey(entry.Digest), nil)
+				if err != nil {
+					return false, fmt.Errorf("build compressed chunk request %s: %w", entry.Digest, err)
+				}
+				resp, err := storeHTTPClient.Do(req)
+				if err != nil {
+					return false, fmt.Errorf("fetch compressed chunk %s: %w", entry.Digest, err)
+				}
+				defer resp.Body.Close()
+				if resp.StatusCode == http.StatusNotFound {
+					return false, nil
+				}
+				if resp.StatusCode != http.StatusOK {
+					return false, fmt.Errorf("fetch compressed chunk %s: status %d", entry.Digest, resp.StatusCode)
+				}
+				compressed, err := chunkstore.ReadBounded(resp.Body, limit)
+				if err != nil {
+					return false, fmt.Errorf("read compressed chunk %s: %w", entry.Digest, err)
+				}
+				return true, land(compressed)
+			}
+			f, err := os.Open(filepath.Join(src.chunkStore, chunkstore.CompressedKey(entry.Digest)))
+			if err != nil {
+				if chunkstore.IsNotFound(err) {
+					return false, nil // plain-object fallback (shared semantic)
+				}
+				return false, fmt.Errorf("open compressed chunk %s: %w", entry.Digest, err)
+			}
+			defer f.Close()
+			compressed, err := chunkstore.ReadBounded(f, limit)
+			if err != nil {
+				return false, fmt.Errorf("read compressed chunk %s: %w", entry.Digest, err)
+			}
+			return true, land(compressed)
+		}
+		done, err := fillCompressed()
+		if err != nil {
+			return nil, err
+		}
+		if done {
+			return buf, nil
+		}
+	}
+	if httpSource {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+			strings.TrimRight(src.chunkStore, "/")+"/"+entry.Digest[:2]+"/"+entry.Digest, nil)
+		if err != nil {
+			return nil, fmt.Errorf("build store chunk request %s: %w", entry.Digest, err)
+		}
+		resp, err := storeHTTPClient.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("fetch store chunk %s: %w", entry.Digest, err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("fetch store chunk %s: status %d", entry.Digest, resp.StatusCode)
+		}
+		if _, err := io.ReadFull(resp.Body, buf); err != nil {
+			return nil, fmt.Errorf("fetch store chunk %s: %w", entry.Digest, err)
+		}
+		// Exact length: an overlong body must be rejected, not silently
+		// truncated at the chunk boundary — and the end-of-body must be
+		// PROVEN, never assumed (strictEOFProbe, P1-E).
+		if err := strictEOFProbe(resp.Body, fmt.Sprintf("fetch store chunk %s", entry.Digest[:12]), length); err != nil {
+			return nil, err
+		}
+		return buf, nil
+	}
+	objectPath := filepath.Join(src.chunkStore, entry.Digest[:2], entry.Digest)
+	f, err := os.Open(objectPath)
+	if err != nil {
+		return nil, fmt.Errorf("open store chunk %s: %w", entry.Digest, err)
+	}
+	defer f.Close()
+	if _, rerr := readExactLocal(f, buf); rerr != nil {
+		return nil, fmt.Errorf("store chunk %s: %w", entry.Digest, rerr)
+	}
+	return buf, nil
+}
+
+// readExactLocal reads exactly len(buf) bytes and requires the FILE to be
+// exactly that long: short and overlong are both length errors (an overlong
+// file must not be silently truncated at the chunk boundary).
+func readExactLocal(f *os.File, buf []byte) (int, error) {
+	n, err := io.ReadFull(f, buf)
+	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+		return n, err
+	}
+	fi, serr := f.Stat()
+	if serr != nil {
+		return n, serr
+	}
+	if fi.Size() != int64(len(buf)) {
+		return n, fmt.Errorf("file length %d bytes, want %d", fi.Size(), len(buf))
+	}
+	return n, nil
 }
 
 func fileExists(path string) bool {
 	info, err := os.Stat(path)
 	return err == nil && info.Mode().IsRegular()
+}
+
+// maxWatermarkMiB bounds every MiB<<20 shift site (chunkcache owns the
+// exact value: MaxInt64>>20, so the shift can never overflow int64).
+const maxWatermarkMiB = chunkcache.MaxWatermarkMiB
+
+// nodeCacheEnabled reports whether the M2 chunk-cache manager fronts this
+// handler: an http(s) chunk store AND an explicitly configured -chunk-local
+// directory. An empty -chunk-local historically means "no local persistent
+// cache" and must keep working without one.
+func nodeCacheEnabled(store, localDir string) bool {
+	if localDir == "" {
+		return false
+	}
+	return strings.HasPrefix(store, "http://") || strings.HasPrefix(store, "https://")
+}
+
+// chunkDebug gates the per-chunk DEBUG lines: the fault path stays log-free
+// in formal runs (per-chunk logging would dominate p95 on multi-thousand
+// chunk artifacts); UFFD_TRACE opts in for diagnosis.
+var chunkDebug = os.Getenv("UFFD_TRACE") != ""
+
+// runtimePinDigests lists the unique chunk digests this handler may fetch:
+// every manifest entry except all-zero chunks (which never have store
+// objects or cache entries). Inherited entries are included — their bytes
+// are fetched by digest from the content-addressed store like any other.
+func runtimePinDigests(m *checkpointchunks.Manifest) []string {
+	if m == nil {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(m.Entries))
+	digests := make([]string, 0, len(m.Entries))
+	for _, e := range m.Entries {
+		length := min(int64(m.ChunkBytes), m.FileSize-e.Offset)
+		if length > 0 && e.Digest == checkpointchunks.ZeroChunkDigest(int(length)) {
+			continue
+		}
+		if _, dup := seen[e.Digest]; dup {
+			continue
+		}
+		seen[e.Digest] = struct{}{}
+		digests = append(digests, e.Digest)
+	}
+	return digests
 }
 
 // offsetWriter adapts io.Copy onto an *os.File section.
@@ -1079,15 +1287,33 @@ func main() {
 	workers := flag.Int("workers", 8, "concurrent UFFDIO_COPY workers")
 	copyKB := flag.Int("copy-kb", 4, "forward UFFD population span in KiB (4..256, multiple of 4; experimental above 4)")
 	zeroPage := flag.Bool("zero-page", false, "experimentally supply manifest-proven zero chunks with UFFDIO_ZEROPAGE")
-	prefetch := flag.Int("prefetch", 4, "background chunk prefetch concurrency (0 = disabled)")
-	prefetchBudgetMB := flag.Int("prefetch-budget-mb", 0, "cap background prefetch to this many MiB (0 = walk the whole artifact)")
+	prefetch := flag.Int("prefetch", 4, "background chunk prefetch concurrency (legacy remote-memory path only; 0 = disabled)")
+	prefetchBudgetMB := flag.Int("prefetch-budget-mb", 0, "cap background prefetch to this many MiB (legacy remote-memory path; 0 = walk the whole artifact)")
+	chunkPrefetch := flag.Int("chunk-prefetch", 0,
+		"background prefetch concurrency for the chunk-store path (0 = disabled, the default; this path is opt-in and never implicitly warms the whole artifact)")
+	chunkPrefetchBudgetMB := flag.Int("chunk-prefetch-budget-mb", 0,
+		"hard cap in MiB for chunk-store background prefetch; REQUIRED > 0 whenever -chunk-prefetch is set")
 	persistWorkers := flag.Int("persist-workers", persistenceWorkers, "background persistent cache IO workers (1-64)")
+	cacheHighMB := flag.Int64("chunk-cache-high-mb", 0, "node cache high watermark in MiB (0 keeps the historical unbounded cache)")
+	cacheLowMB := flag.Int64("chunk-cache-low-mb", 0, "node cache low watermark in MiB; eviction (when enabled) stops here")
 	flag.Parse()
 	if *copyKB < 4 || *copyKB > 256 || *copyKB%4 != 0 {
 		log.Fatal("-copy-kb must be a multiple of 4 between 4 and 256")
 	}
 	if *persistWorkers < 1 || *persistWorkers > 64 {
 		log.Fatal("-persist-workers must be between 1 and 64")
+	}
+	if err := chunkcache.ValidWatermarkMiB(*cacheHighMB, *cacheLowMB); err != nil {
+		log.Fatalf("-chunk-cache-high-mb/-chunk-cache-low-mb: %v", err)
+	}
+	if *prefetchBudgetMB < 0 {
+		log.Fatal("-prefetch-budget-mb must not be negative (0 = whole artifact)")
+	}
+	if int64(*prefetchBudgetMB) > chunkcache.MaxWatermarkMiB {
+		log.Fatalf("-prefetch-budget-mb exceeds the %d MiB bound", chunkcache.MaxWatermarkMiB)
+	}
+	if err := validateChunkPrefetchFlags(*chunkPrefetch, *chunkPrefetchBudgetMB); err != nil {
+		log.Fatal(err)
 	}
 	if *sockPath == "" || (*backingPath == "" && *remoteURL == "") {
 		log.Fatal("-sock plus -backing or -remote is required")
@@ -1165,6 +1391,38 @@ func main() {
 			source.chunkManifest = manifest
 			source.chunkStore = *chunkStorePath
 			source.chunkLocal = *chunkLocalDir
+			// M2 node cache: only when -chunk-local is CONFIGURED does the
+			// manager front it — an http store with an empty -chunk-local
+			// keeps the historical no-local-persistent-cache behavior (D:
+			// opening a manager on an empty root would fatal and break
+			// those restores).
+			if nodeCacheEnabled(*chunkStorePath, *chunkLocalDir) {
+				manager, err := chunkcache.Open(chunkcache.Config{
+					Root:          *chunkLocalDir,
+					HighWatermark: *cacheHighMB << 20,
+					LowWatermark:  *cacheLowMB << 20,
+					StoreDomain:   *chunkStorePath,
+					Logger:        log.New(os.Stderr, "uffd-chunkcache ", log.LstdFlags|log.Lmicroseconds),
+				})
+				if err != nil {
+					log.Fatalf("open node chunk cache %s: %v", *chunkLocalDir, err)
+				}
+				defer manager.Close()
+				source.chunkCache = manager
+				// Runtime pin: this handler's whole working set stays
+				// eviction-protected for the process lifetime; process exit
+				// (crash included) drops the flock, so the pin never leaks.
+				if release, err := manager.PinContext(sourceCtx, fmt.Sprintf("uffd-%d", os.Getpid()), runtimePinDigests(manifest)); err != nil {
+					if manager.WatermarksArmed() {
+						// With eviction armed, serving unpinned would silently
+						// drop the pin gate: fail closed.
+						log.Fatalf("node cache runtime pin failed (eviction armed): %v", err)
+					}
+					log.Printf("node cache runtime pin failed (eviction disabled, continuing): %v", err)
+				} else {
+					defer release()
+				}
+			}
 			if uint64(manifest.ChunkBytes) != chunk {
 				log.Printf("chunk size %dKiB from manifest overrides flag (%dKiB)",
 					manifest.ChunkBytes>>10, chunk>>10)
@@ -1272,14 +1530,21 @@ func main() {
 
 	// Background bulk download: sequentially fetchChunk every chunk. This
 	// runs concurrently with fault serving — the inflight dedup in
-	// Background prefetch warms the whole artifact with a bounded worker
-	// pool; -prefetch is the concurrency, and it now covers the S3 chunk
-	// path too (the old remote-only gate silently disabled prefetch for
-	// exactly the deployments that needed it). fetchChunk's inflight
-	// tracking makes concurrent prefetch with fault serving safe: each
-	// chunk moves at most once, faults wait on the same cancelable completion channel.
-	if *prefetch > 0 && (source.remote != "" || source.chunkStore != "") &&
-		os.Getenv("UFFD_NO_BULK") == "" {
+	// Background prefetch warms the artifact with a bounded worker pool.
+	// The two source regimes are deliberately different (P1-D):
+	//   - legacy remote-memory URL: -prefetch keeps its historical default
+	//     (4 workers, budget 0 = whole artifact);
+	//   - chunk-store CAS: prefetch is OPT-IN via -chunk-prefetch and MUST
+	//     carry a finite -chunk-prefetch-budget-mb — the default is lazy
+	//     restore with ZERO background GETs, so a chunk-store deployment
+	//     never implicitly downloads an entire artifact's memory.
+	// fetchChunk's inflight tracking makes concurrent prefetch with fault
+	// serving safe: each chunk moves at most once, faults wait on the same
+	// cancelable completion channel, and yieldingFetch keeps foreground
+	// faults ahead of queued speculative work.
+	pfWorkers, pfBudgetBytes := prefetchPlan(source.remote, source.chunkStore,
+		*prefetch, *prefetchBudgetMB, *chunkPrefetch, *chunkPrefetchBudgetMB)
+	if pfWorkers > 0 && os.Getenv("UFFD_NO_BULK") == "" {
 		background.Add(1)
 		go func() {
 			defer background.Done()
@@ -1291,32 +1556,29 @@ func main() {
 			if source.chunkManifest != nil && source.chunkManifest.ChunkBytes > 0 {
 				walk = uint64(source.chunkManifest.ChunkBytes)
 			}
-			var budgetBytes uint64
-			if *prefetchBudgetMB > 0 {
-				budgetBytes = uint64(*prefetchBudgetMB) << 20
-			}
+			budgetBytes := pfBudgetBytes
 			totalChunks := uint64(0)
 			for _, r := range regions {
 				totalChunks += (r.Size + walk - 1) / walk
 			}
 			log.Printf("prefetch: starting walk=%dKiB totalChunks=%d workers=%d manifest=%v",
-				walk>>10, totalChunks, *prefetch, source.chunkManifest != nil)
+				walk>>10, totalChunks, pfWorkers, source.chunkManifest != nil)
 			if budgetBytes > 0 {
 				maxByBudget := budgetBytes / walk
 				if maxByBudget < totalChunks {
 					totalChunks = maxByBudget
-					log.Printf("prefetch: budget %dMiB caps walk at %d chunks", *prefetchBudgetMB, totalChunks)
+					log.Printf("prefetch: budget %dMiB caps walk at %d chunks", budgetBytes>>20, totalChunks)
 				}
 			}
-			workers := *prefetch
-			if workers > 16 {
-				workers = 16
+			workers := pfWorkers
+			if workers > maxPrefetchWorkers {
+				workers = maxPrefetchWorkers
 			}
 			if workers > int(totalChunks) {
 				workers = int(totalChunks)
 			}
 			startT := time.Now()
-			completed, err := runPrefetch(stop, totalChunks, workers, s.fetchChunk)
+			completed, err := runPrefetch(stop, totalChunks, workers, s.yieldingFetch(stop))
 			if err != nil {
 				log.Printf("prefetch stopped after %d/%d chunks: %v", completed, totalChunks, err)
 				return
@@ -1433,5 +1695,14 @@ done:
 	s.mu.Lock()
 	total := s.served
 	s.mu.Unlock()
-	log.Printf("handler exiting, total faults served=%d", total)
+	if source.chunkCache != nil {
+		// One summary line per handler LIFETIME (never per fault: the hot
+		// path stays log-free). Observers diff this across restores to
+		// prove memory chunks were served from the node cache.
+		cs := source.chunkCache.Status()
+		log.Printf("handler exiting, total faults served=%d chunk_cache hits=%d misses=%d hit_bytes=%d miss_bytes=%d evictions=%d pinned=%d",
+			total, cs.Hits, cs.Misses, cs.HitBytes, cs.MissBytes, cs.Evictions, cs.PinnedEntries)
+	} else {
+		log.Printf("handler exiting, total faults served=%d", total)
+	}
 }

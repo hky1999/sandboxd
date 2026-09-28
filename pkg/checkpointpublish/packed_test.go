@@ -41,7 +41,7 @@ func TestMaterializePackedTransportClosure(t *testing.T) {
 	if _, err := Run(ctx, source, id, store, "test-local"); err != nil {
 		t.Fatal(err)
 	}
-	raw, err := fetchKey(ctx, store, ArtifactKey(id, IndexName))
+	raw, err := fetchKeyBounded(ctx, store, ArtifactKey(id, IndexName), maxIndexBytes)
 	if err != nil {
 		t.Fatal(err)
 	}

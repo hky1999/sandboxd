@@ -320,6 +320,11 @@ func validateManifest(manifest *Manifest) error {
 	return nil
 }
 
+// ValidDigest reports whether digest is a valid content key: exactly 64
+// lowercase ASCII hexadecimal bytes. It is the shared admission check for
+// anything that addresses cache or store entries by chunk digest.
+func ValidDigest(digest string) bool { return validDigest(digest) }
+
 // validDigest accepts exactly 64 lowercase ASCII hexadecimal bytes.
 // Check bytes rather than runes: non-ASCII and malformed UTF-8 are invalid.
 func validDigest(digest string) bool {

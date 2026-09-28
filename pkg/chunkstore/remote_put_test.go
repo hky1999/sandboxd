@@ -190,3 +190,123 @@ func TestRemotePutOwnsVerifiedBuffer(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// seekableFailReader is a known-length ReadSeeker whose body fails after
+// failAfter bytes. It accepts exactly the two seeks Remote.PutKey's Seeker
+// path issues and counts them, so the test can prove the client neither
+// retried nor implicitly rewound the body.
+type seekableFailReader struct {
+	data       []byte
+	pos        int
+	failAfter  int
+	seekEnds   atomic.Int64
+	seekStarts atomic.Int64
+}
+
+var errSeekableBodyFailed = errors.New("injected seekable body failure")
+
+func (s *seekableFailReader) Read(p []byte) (int, error) {
+	if remaining := s.failAfter - s.pos; remaining <= 0 {
+		return 0, errSeekableBodyFailed
+	}
+	n := copy(p, s.data[s.pos:])
+	if n > s.failAfter-s.pos {
+		n = s.failAfter - s.pos
+	}
+	s.pos += n
+	return n, nil
+}
+
+func (s *seekableFailReader) Seek(offset int64, whence int) (int64, error) {
+	switch whence {
+	case io.SeekEnd:
+		if offset != 0 {
+			return 0, errors.New("unsupported seek")
+		}
+		s.seekEnds.Add(1)
+		return int64(len(s.data)), nil
+	case io.SeekStart:
+		if offset != 0 {
+			return 0, errors.New("unsupported seek")
+		}
+		s.seekStarts.Add(1)
+		s.pos = 0
+		return 0, nil
+	default:
+		return 0, errors.New("unsupported seek")
+	}
+}
+
+// TestRemotePutKeySeekerMidBodyErrorNoCommit: a seekable body that fails
+// mid-stream must abort the PUT with the error, leave NOTHING committed on
+// the server (an object store that committed partial bodies would poison
+// the namespace), issue exactly the SeekEnd+SeekStart prologue with no
+// hidden retry, and a normal retry on the same key must succeed.
+func TestRemotePutKeySeekerMidBodyErrorNoCommit(t *testing.T) {
+	var mu sync.Mutex
+	committed := map[string][]byte{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPut:
+			body, err := io.ReadAll(r.Body)
+			// Commit only a COMPLETE body: a truncated/failed upload must
+			// never become visible under the key.
+			if err != nil || r.ContentLength != int64(len(body)) {
+				w.WriteHeader(400)
+				return
+			}
+			mu.Lock()
+			committed[r.URL.Path] = body
+			mu.Unlock()
+			w.WriteHeader(200)
+		case http.MethodHead:
+			mu.Lock()
+			_, ok := committed[r.URL.Path]
+			mu.Unlock()
+			if ok {
+				w.WriteHeader(200)
+			} else {
+				w.WriteHeader(404)
+			}
+		default:
+			w.WriteHeader(405)
+		}
+	}))
+	defer server.Close()
+	store, _ := Open(server.URL)
+	keyed := store.(Keyed)
+
+	data := bytes.Repeat([]byte{41}, 1<<20)
+	failer := &seekableFailReader{data: data, failAfter: 100 * 1024}
+	if err := keyed.PutKey(context.Background(), "k1", failer); err == nil || !strings.Contains(err.Error(), errSeekableBodyFailed.Error()) {
+		t.Fatalf("PutKey error = %v, want the injected mid-body failure", err)
+	}
+	if failer.seekEnds.Load() != 1 || failer.seekStarts.Load() != 1 {
+		t.Fatalf("seeks: End=%d Start=%d, want exactly 1 each (no hidden retry or rewind)",
+			failer.seekEnds.Load(), failer.seekStarts.Load())
+	}
+	mu.Lock()
+	n := len(committed)
+	mu.Unlock()
+	if n != 0 {
+		t.Fatalf("server committed %d objects after a failed body", n)
+	}
+	ok, err := keyed.HasKey(context.Background(), "k1")
+	if err != nil || ok {
+		t.Fatalf("HasKey after failed PUT = (%v, %v), want (false, nil)", ok, err)
+	}
+
+	// Normal retry on the same key succeeds and commits exactly the bytes.
+	if err := keyed.PutKey(context.Background(), "k1", bytes.NewReader(data)); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	got := committed["/k1"]
+	mu.Unlock()
+	if !bytes.Equal(got, data) {
+		t.Fatalf("committed body = %d bytes, want %d identical", len(got), len(data))
+	}
+	if ok, _ := keyed.HasKey(context.Background(), "k1"); !ok {
+		t.Fatal("retry did not commit")
+	}
+}

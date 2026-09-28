@@ -29,9 +29,11 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -85,6 +87,14 @@ func main() {
 	bin := flag.String("bin", "/mnt/cn/bin", "per-node CLI binary directory")
 	wait := flag.Duration("wait", 180*time.Second, "per-step timeout")
 	jsonOut := flag.Bool("json", false, "machine-readable report")
+	// Node chunk cache: propagated to cn-fetch on the target so overlay
+	// materialization shares the SAME cache root the target daemon's uffd
+	// handler uses for memory chunks (the daemon configures that root via
+	// plugin.runtime.firecracker uffd_cache_dir; the root itself is
+	// <uffd_cache_dir>/chunk-store). Empty keeps cn-fetch uncached.
+	chunkCache := flag.String("chunk-cache", "", "target node chunk cache directory passed to cn-fetch (use the target daemon's <uffd_cache_dir>/chunk-store)")
+	cacheHighMB := flag.Int64("cache-high-mb", 0, "chunk cache high watermark in MiB passed to cn-fetch (0/0 = unbounded)")
+	cacheLowMB := flag.Int64("cache-low-mb", 0, "chunk cache low watermark in MiB passed to cn-fetch")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "usage: cn-migrate -sandbox ID -source NODE -exec TPL -store SPEC -nodes ADDR[,ADDR...] [-to NODE] [-json]\n")
 		flag.PrintDefaults()
@@ -92,6 +102,18 @@ func main() {
 	flag.Parse()
 	if *sandbox == "" || *source == "" || *execTpl == "" || *storeSpec == "" || *nodes == "" {
 		flag.Usage()
+		os.Exit(2)
+	}
+	// Same strict watermark shape as chunkcache.ValidWatermarks, inlined to
+	// keep this CLI's flag surface self-contained: 0/0 or 0 < low <= high.
+
+	if *cacheHighMB < 0 || *cacheLowMB < 0 ||
+		!((*cacheHighMB == 0 && *cacheLowMB == 0) || (*cacheHighMB > 0 && *cacheLowMB > 0 && *cacheLowMB <= *cacheHighMB)) {
+		fmt.Fprintln(os.Stderr, "error: -cache-high-mb/-cache-low-mb must be 0/0 (disabled) or 0 < low <= high")
+		os.Exit(2)
+	}
+	if *cacheHighMB > int64(math.MaxInt64>>20) || *cacheLowMB > int64(math.MaxInt64>>20) {
+		fmt.Fprintln(os.Stderr, "error: -cache-high-mb/-cache-low-mb exceed MaxInt64>>20; the MiB<<20 shift would overflow")
 		os.Exit(2)
 	}
 
@@ -150,6 +172,9 @@ func main() {
 			jsonOut:     *jsonOut,
 			journalPath: *journalPath,
 			migrationID: *migrationID,
+			chunkCache:  *chunkCache,
+			cacheHighMB: *cacheHighMB,
+			cacheLowMB:  *cacheLowMB,
 		})
 		return
 	}
@@ -327,8 +352,13 @@ func main() {
 	report.Target = placement.NodeID
 
 	// 6. Materialize + restore on the target.
-	if _, ok := run(placement.NodeID, "materialize", *bin+"/cn-fetch",
-		"-into", report.Checkpoint, "-id", dirBase(report.Checkpoint), "-store", *storeSpec); !ok {
+	fetchArgs := []string{"-into", report.Checkpoint, "-id", dirBase(report.Checkpoint), "-store", *storeSpec}
+	if *chunkCache != "" {
+		fetchArgs = append(fetchArgs, "-chunk-cache", *chunkCache,
+			"-cache-high-mb", strconv.FormatInt(*cacheHighMB, 10),
+			"-cache-low-mb", strconv.FormatInt(*cacheLowMB, 10))
+	}
+	if _, ok := run(placement.NodeID, "materialize", append([]string{*bin + "/cn-fetch"}, fetchArgs...)...); !ok {
 		failPastCheckpoint("materialize", "cn-fetch failed on target")
 	}
 	// The restore command is about to be issued: from here a lost or

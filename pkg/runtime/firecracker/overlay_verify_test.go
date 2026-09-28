@@ -26,6 +26,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/inclusionAI/sandboxd/pkg/checkpointchunks"
 )
@@ -434,8 +435,20 @@ func TestVerifyCheckpointOverlaySidecarCancellation(t *testing.T) {
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("mid-scan cancellation error = %v", err)
 	}
-	if after := countScanFileChunksGoroutines(t); after != before {
-		t.Errorf("scan goroutines before=%d after=%d", before, after)
+	// The scan joins its workers before returning (close(jobs) + wg.Wait),
+	// but a worker that has already run wg.Done() may still be visible in
+	// the runtime goroutine table for a moment. An exact immediate count
+	// is therefore an observation race, not a resource leak proof: wait
+	// BOUNDED for the count to converge back to `before` and report the
+	// final observed values on failure.
+	deadline := time.Now().Add(5 * time.Second)
+	after := countScanFileChunksGoroutines(t)
+	for after != before && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+		after = countScanFileChunksGoroutines(t)
+	}
+	if after != before {
+		t.Errorf("scan goroutines before=%d after=%d (did not converge in 5s)", before, after)
 	}
 }
 

@@ -194,8 +194,11 @@ func (b *fakeBucket) serve(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// publishArtifactAsBundle stages a bundle-era artifact: INDEX + BUNDLE
-// with the memory sidecar (entries digests) inside.
+// publishArtifactAsBundle stages a REAL-shape bundle-era artifact: INDEX
+// with the full Files set, MemoryRoot and ChunkCount; a bundle whose parts
+// exactly cover the expected file set (manifest.json closed against the
+// sidecar, chunks sidecar, vmstate, and the overlay sidecar when overlay
+// chunks are declared, else the whole overlay.ext4 file).
 func publishArtifactAsBundle(b *fakeBucket, id string, digests []string, packRefs map[string]string, overlay []string) {
 	m := &checkpointchunks.Manifest{
 		Version: 2, File: "memory", FileSize: int64(len(digests)) * 4096,
@@ -214,20 +217,16 @@ func publishArtifactAsBundle(b *fakeBucket, id string, digests []string, packRef
 	if err := json.NewEncoder(&jsonBuf).Encode(m); err != nil {
 		panic(err)
 	}
-	var bundle []byte
-	parts := []checkpointpublish.BundlePart{}
-	addPart := func(name string, body []byte) {
-		sum := sha256.Sum256(body)
-		var prefix [8]byte
-		prefix[0] = byte(len(body) >> 56)
-		parts = append(parts, checkpointpublish.BundlePart{
-			Name: name, Offset: int64(len(bundle)) + 8, Length: int64(len(body)),
-			Digest: hex.EncodeToString(sum[:]),
-		})
-		bundle = append(bundle, prefix[:]...)
-		bundle = append(bundle, body...)
+	fcObj := map[string]any{
+		"version": 2, "memory_size": m.FileSize,
+		"memory_digest_mode": checkpointchunks.FileDigestChunks,
+		"digests":            map[string]string{"memory": m.FileDigest},
 	}
-	addPart(checkpointchunks.ManifestName, jsonBuf.Bytes())
+	var fcBuf bytes.Buffer
+	if err := json.NewEncoder(&fcBuf).Encode(fcObj); err != nil {
+		panic(err)
+	}
+	var overlaySidecar []byte
 	if len(overlay) > 0 {
 		om := &checkpointchunks.Manifest{Version: 1, File: "overlay.ext4",
 			FileSize: int64(len(overlay)) * 4096, ChunkBytes: 4096, ChunkCount: len(overlay),
@@ -240,17 +239,16 @@ func publishArtifactAsBundle(b *fakeBucket, id string, digests []string, packRef
 		if err := json.NewEncoder(&ob).Encode(om); err != nil {
 			panic(err)
 		}
-		addPart(checkpointpublish.OverlaySidecarName, ob.Bytes())
+		overlaySidecar = ob.Bytes()
 	}
+	bundle, parts, files := buildBundle(jsonBuf.Bytes(), fcBuf.Bytes(), overlaySidecar)
 	b.put(fmt.Sprintf("artifacts/%s/%s", id, checkpointpublish.BundleName), bundle, 2*time.Hour)
-	sum := sha256.Sum256(bundle)
 	index := checkpointpublish.ArtifactIndex{
-		CheckpointID: id, ChunkCount: len(digests),
-		Files: map[string]string{checkpointchunks.ManifestName: "x"},
+		CheckpointID: id, ChunkCount: len(digests), MemoryRoot: m.FileDigest,
+		Files: files, OverlayChunks: len(overlay) > 0,
 		Bundle: &checkpointpublish.BundleInfo{
-			Digest: hex.EncodeToString(sum[:]), Size: int64(len(bundle)), Parts: parts,
+			Digest: hexDigest(bundle), Size: int64(len(bundle)), Parts: parts,
 		},
-		OverlayChunks: len(overlay) > 0,
 	}
 	var ib bytes.Buffer
 	if err := json.NewEncoder(&ib).Encode(&index); err != nil {

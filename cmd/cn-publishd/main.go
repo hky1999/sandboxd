@@ -49,6 +49,14 @@ func main() {
 	timeout := flag.Duration("timeout", 10*time.Minute, "per-publish deadline")
 	stale := flag.Duration("stale", 10*time.Minute, "publishing state older than this is a crash leftover and is re-queued")
 	compressChunks := flag.Bool("compress-chunks", false, "publish standalone memory chunks as zstd transport bodies (digests keep naming uncompressed bytes)")
+	overlayWorkers := flag.Int("overlay-workers", 0, "overlay chunk upload concurrency (1-64; 0 = package default 8; overlay is never packed or compressed)")
+	workers := flag.Int("workers", 0, "memory upload concurrency (1-64; 0 = at most 8 GOMAXPROCS workers) — the B-sweep winner must be deliverable on the production daemon path")
+	packMiB := flag.Int("pack-mib", 0, "pack memory into 1-8MiB objects (0 disables; requires -pack-payload-mib compatible settings)")
+	packPayloadMiB := flag.Int("pack-payload-mib", 0, "active pack payload budget (0 = 16MiB; up to 64MiB, requires packing)")
+	packAutoBase := flag.Bool("pack-auto-base", false, "opt-in automatic pack baseline: read the sealed manifest's base_memory hint (explicit -base-id always wins)")
+	packIdentity := flag.String("pack-identity", "", "pack identity: empty for legacy SHA256, chunks-v1 for versioned chunk root (requires -pack-mib)")
+	packStreamingPut := flag.Bool("pack-streaming-put", false, "stream pack uploads without assembling the full pack buffer: a verified reader reads and sha256-checks each chunk from the memory file while the store consumes it (packed runs with chunks-v1 pack identity only; default off keeps the buffer path)")
+	adaptivePackMiB := flag.Int64("adaptive-pack-threshold-mib", 0, "opt-in adaptive layout: one classification measures actual missing bytes; plain below this threshold, pack at or above (0 = off; requires -pack-mib; excludes -compress-chunks)")
 	backoffBase := flag.Duration("backoff-base", 30*time.Second, "exponential retry base for publish_failed records (0 retries every round, the historical behavior)")
 	backoffCap := flag.Duration("backoff-cap", 10*time.Minute, "retry backoff ceiling")
 	starveAfter := flag.Duration("starve-after", time.Hour, "pending artifacts older than this are promoted ahead of newest-first (0 disables)")
@@ -60,6 +68,11 @@ func main() {
 		flag.PrintDefaults()
 	}
 	flag.Parse()
+	adaptiveThreshold, err := checkpointpublish.AdaptiveMiBToBytes(*adaptivePackMiB)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(2)
+	}
 	if *roots == "" || *storeSpec == "" {
 		flag.Usage()
 		os.Exit(2)
@@ -67,6 +80,26 @@ func main() {
 	store, err := chunkstore.Open(*storeSpec)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(2)
+	}
+	if *workers < 0 || *workers > 64 {
+		fmt.Fprintln(os.Stderr, "error: -workers must be between 0 and 64")
+		os.Exit(2)
+	}
+	if *compressChunks && *packMiB != 0 {
+		fmt.Fprintln(os.Stderr, "error: -compress-chunks requires unpacked publication (-pack-mib 0)")
+		os.Exit(2)
+	}
+	if *overlayWorkers < 0 || *overlayWorkers > 64 {
+		fmt.Fprintln(os.Stderr, "error: -overlay-workers must be between 0 and 64")
+		os.Exit(2)
+	}
+	if *packMiB < 0 || *packMiB > 8 {
+		fmt.Fprintln(os.Stderr, "error: -pack-mib must be between 0 and 8")
+		os.Exit(2)
+	}
+	if *packPayloadMiB < 0 || *packPayloadMiB > 64 || (*packPayloadMiB != 0 && (*packMiB == 0 || *packPayloadMiB < *packMiB)) {
+		fmt.Fprintln(os.Stderr, "error: -pack-payload-mib requires packing and must fit a pack, up to 64MiB")
 		os.Exit(2)
 	}
 	var minFreeBytes int64
@@ -90,16 +123,24 @@ func main() {
 	rootsList := checkpointpublish.SplitRoots(*roots)
 	for {
 		outcome := checkpointpublish.ScanRound(context.Background(), checkpointpublish.ScanRoundOptions{
-			Roots:          rootsList,
-			Store:          store,
-			StoreName:      storeSpecName(store),
-			Timeout:        *timeout,
-			CompressChunks: *compressChunks,
-			StaleAfter:     *stale,
-			BackoffBase:    *backoffBase,
-			BackoffCap:     *backoffCap,
-			StarveAfter:    *starveAfter,
-			PriorityIDs:    checkpointpublish.SplitRoots(*priorityIDs),
+			Roots:                      rootsList,
+			Store:                      store,
+			StoreName:                  storeSpecName(store),
+			Timeout:                    *timeout,
+			CompressChunks:             *compressChunks,
+			OverlayWorkers:             *overlayWorkers,
+			Workers:                    *workers,
+			PackBytes:                  *packMiB << 20,
+			PackPayloadBytes:           *packPayloadMiB << 20,
+			AdaptivePackThresholdBytes: adaptiveThreshold,
+			PackAutoBase:               *packAutoBase,
+			PackIdentity:               *packIdentity,
+			PackStreamingPut:           *packStreamingPut,
+			StaleAfter:                 *stale,
+			BackoffBase:                *backoffBase,
+			BackoffCap:                 *backoffCap,
+			StarveAfter:                *starveAfter,
+			PriorityIDs:                checkpointpublish.SplitRoots(*priorityIDs),
 		})
 		roundGauges.Store(&outcome)
 		if minFreeBytes > 0 {

@@ -87,6 +87,13 @@ type State struct {
 	// FailedAt timestamps the last failed attempt; the scanner defers a
 	// retry until FailedAt + StateNextAttempt(Retries, base, cap).
 	FailedAt *time.Time `json:"failed_at,omitempty"`
+	// Layout records the layout an adaptive decision chose for this
+	// artifact ("plain" or "pack"). Retries of the same artifact reuse it,
+	// so one artifact never mixes layouts across attempts. Absent on
+	// records written before adaptive selection existed, and absent
+	// whenever the feature is off — either way the next attempt decides
+	// from scratch if the feature is enabled.
+	Layout string `json:"layout,omitempty"`
 }
 
 // StateNextAttempt is the bounded exponential backoff delay before retry
@@ -225,6 +232,32 @@ type Result struct {
 	State             State          `json:"state"`
 	ChunksPut         int            `json:"chunks_put"`  // unique chunks written this run
 	ChunksSkip        int            `json:"chunks_skip"` // unique chunks reused or synthesized
+	// LayoutDecision records the adaptive layout choice when
+	// Options.AdaptivePackThresholdBytes is enabled. It is deliberately a
+	// separate struct — never inside Phases, which is a duration map — and
+	// omitempty so old consumers and old state files are unaffected.
+	LayoutDecision *LayoutDecision `json:"layout_decision,omitempty"`
+	// AutoBase records the automatic pack-baseline resolution when
+	// Options.PackAutoBase is enabled. Separate from Phases for the same
+	// reason; omitempty so non-auto runs are unaffected.
+	AutoBase *AutoBaseDecision `json:"auto_base,omitempty"`
+}
+
+// LayoutDecision is the observable record of one adaptive choice. It is
+// emitted ONLY when adaptive selection is enabled — explicit -pack-mib and
+// default runs keep their old semantics and record nothing. Reason is a
+// stable enum: "below_threshold" (fresh decision chose plain),
+// "at_or_above_threshold" (fresh decision chose pack), "sticky_retry"
+// (the recorded layout was reused without re-probing). The actual-missing
+// fields are POINTERS with omitempty precisely so a sticky retry — which
+// does not re-classify — omits them instead of emitting a misleading zero
+// that could be read as a real measurement.
+type LayoutDecision struct {
+	ActualMissingBytes  *int64 `json:"actual_missing_bytes,omitempty"`
+	ActualMissingChunks *int   `json:"actual_missing_chunks,omitempty"`
+	ThresholdBytes      int64  `json:"threshold_bytes"`
+	Chosen              string `json:"chosen"` // "plain" or "pack"
+	Reason              string `json:"reason"`
 }
 
 // Run publishes the checkpoint's memory chunks: it computes (or reuses) the
@@ -236,6 +269,15 @@ func Run(ctx context.Context, checkpointDir, id string, store chunkstore.Store, 
 	return RunWithOptions(ctx, checkpointDir, id, store, storeName, Options{})
 }
 
+// newPackStreamReader builds the streaming pack reader for one PUT or
+// verification drain, honoring the per-run instrumentation hook.
+func (o *Options) newPackStreamReader(ctx context.Context, src io.ReaderAt, m *checkpointchunks.Manifest, chunks []checkpointchunks.Chunk) packStreamReader {
+	if o.packStreamFactory != nil {
+		return o.packStreamFactory(ctx, src, m, chunks)
+	}
+	return newVerifiedPackReadSeeker(ctx, src, m, chunks)
+}
+
 // Options bounds memory upload concurrency independently of host CPU count.
 // Zero Workers preserves Run's default (at most eight GOMAXPROCS workers).
 type Options struct {
@@ -244,8 +286,12 @@ type Options struct {
 	PackPayloadBytes   int    // zero keeps the 16MiB active pack payload budget
 	PackIdentity       string // empty = legacy whole-pack SHA256; chunks-v1 = versioned chunk root
 	Workers            int
-	PackBytes          int    // zero keeps version-1 single-chunk publication
-	BaseID             string // optional verified published baseline in the same store
+	// OverlayWorkers bounds the overlay chunk upload pool; zero keeps the
+	// package default (8). Overlay chunks are never packed or compressed,
+	// so this is the only overlay throughput knob.
+	OverlayWorkers int
+	PackBytes      int    // zero keeps version-1 single-chunk publication
+	BaseID         string // optional verified published baseline in the same store
 	// CompressChunks uploads standalone memory chunk objects as zstd
 	// bodies under the ".z" content key and marks the transport sidecar
 	// accordingly. Digests keep naming uncompressed bytes, and readers
@@ -253,11 +299,64 @@ type Options struct {
 	// so verification and cross-format reuse are unchanged. Packs carry
 	// range-readable payloads and are never compressed by this option.
 	CompressChunks bool
+	// PackStreamingPut opts into verified streaming PUT for pack objects:
+	// instead of assembling the full pack buffer in memory and calling
+	// PutKey with a bytes.Reader, a verified io.ReadSeeker streams chunks
+	// directly from the memory file (ReadAt + sha256 per chunk, bytes
+	// verified before exposure). Only active when PackIdentity ==
+	// chunks-v1 (the pack key is derivable from the parts list without
+	// reading the pack bytes). Default false keeps the exact buffer path.
+	PackStreamingPut bool
+	// PackAutoBase opts into automatic pack-baseline resolution: the
+	// sealed manifest's base_memory field (the parent generation's
+	// checkpoint directory name, recorded at seal time) is read as a HINT
+	// and, when the layout enters the packed stage, adopted as this
+	// attempt's BaseID — passing through the same validPackedID gate and
+	// the same loadPackBaseline verification chain as an explicit -base-id.
+	// An explicit BaseID is always authoritative (the hint is not even
+	// read). The resolution is observable on the Result as AutoBase.
+	// Default false keeps the exact historical behavior.
+	PackAutoBase bool
+	// autoBaseOrigin marks that BaseID was set by the auto-base resolver,
+	// not by the caller. It controls the loadPackBaseline failure
+	// semantics inside runPacked: an auto-resolved base that fails to
+	// load (parent absent/corrupt) falls back to a no-base publish; an
+	// explicit BaseID keeps its historical hard error. Unexported — the
+	// resolver sets it, callers never do.
+	autoBaseOrigin bool
+	// packStreamFactory substitutes the streaming pack reader constructor.
+	// Unexported and PER-RUN (an Options field, never a package global):
+	// test instrumentation only, so an integration test can observe exact
+	// reader creation and per-reader chunk loads across a full publish.
+	// Nil keeps newVerifiedPackReadSeeker.
+	packStreamFactory func(ctx context.Context, src io.ReaderAt, m *checkpointchunks.Manifest, chunks []checkpointchunks.Chunk) packStreamReader
+	// AdaptivePackThresholdBytes opts into adaptive layout selection:
+	// one probe-only classification measures the ACTUAL missing standalone
+	// bytes (missing + sweep-marked refresh, never a manifest estimate)
+	// and the artifact is published plain while that stays BELOW this
+	// threshold, packed at or above it. Zero (the default) disables the
+	// feature and keeps the explicit-flag semantics: PackBytes > 0 forces
+	// packing, zero forces plain. Requires PackBytes to be configured;
+	// mutually exclusive with CompressChunks, BaseID, and
+	// PackSkipChunkProbe (the classification must probe standalone reuse).
+	// The chosen layout is recorded in the artifact's publish state and
+	// reused by retries of the same artifact, so one artifact never mixes
+	// layouts across attempts.
+	AdaptivePackThresholdBytes int64
 }
 
 // RunWithOptions is Run with an explicit memory-upload concurrency bound.
 // Overlay publication retains its own bounded worker pool.
 func RunWithOptions(ctx context.Context, checkpointDir, id string, store chunkstore.Store, storeName string, opts Options) (Result, error) {
+	if opts.OverlayWorkers < 0 || opts.OverlayWorkers > 64 {
+		return Result{}, fmt.Errorf("overlay workers %d out of range [0,64] — reject instead of clamping so a misconfigured knob is visible", opts.OverlayWorkers)
+	}
+	if opts.PackPayloadBytes < 0 || opts.PackPayloadBytes > 64<<20 {
+		return Result{}, fmt.Errorf("pack payload budget %d out of range [0,%d]", opts.PackPayloadBytes, 64<<20)
+	}
+	if opts.CompressChunks && opts.PackBytes != 0 {
+		return Result{}, fmt.Errorf("compressed chunks require unpacked publication")
+	}
 	if opts.PackBatchHash && opts.PackBytes == 0 {
 		return Result{}, fmt.Errorf("batch hashing requires packing")
 	}
@@ -282,6 +381,29 @@ func RunWithOptions(ctx context.Context, checkpointDir, id string, store chunkst
 	if opts.BaseID != "" && (opts.PackBytes == 0 || !validPackedID(opts.BaseID) || opts.BaseID == id) {
 		return Result{}, fmt.Errorf("pack base ID must be a distinct checkpoint ID with packing enabled")
 	}
+	if opts.AdaptivePackThresholdBytes < 0 || opts.AdaptivePackThresholdBytes > maxAdaptiveThresholdBytes {
+		return Result{}, fmt.Errorf("adaptive pack threshold must be zero (off) or between 1 and %d bytes", maxAdaptiveThresholdBytes)
+	}
+	if opts.AdaptivePackThresholdBytes != 0 {
+		// The opt-in feature defines its own probing semantics, so it is
+		// rejected (not silently ignored) against every flag combination
+		// that would change or bypass them.
+		if opts.PackBytes == 0 {
+			return Result{}, errors.New("adaptive pack layout requires packing to be configured (pack-mib defines the pack size)")
+		}
+		if opts.CompressChunks {
+			return Result{}, errors.New("adaptive pack layout cannot be combined with compressed standalone chunks")
+		}
+		if opts.BaseID != "" {
+			return Result{}, errors.New("adaptive pack layout cannot be combined with an explicit pack base")
+		}
+		if opts.PackSkipChunkProbe {
+			return Result{}, errors.New("adaptive pack layout requires standalone probes and cannot skip them")
+		}
+	}
+	if err := validateAutoBaseOptions(opts); err != nil {
+		return Result{}, err
+	}
 	claim, err := acquirePublishClaim(ctx, checkpointDir)
 	if err != nil {
 		return Result{}, err
@@ -299,8 +421,49 @@ func RunWithOptions(ctx context.Context, checkpointDir, id string, store chunkst
 		Store:        storeName,
 		StartedAt:    time.Now().UTC(),
 	}
-	if previous, err := Status(checkpointDir); err == nil && previous != nil {
+	if previous, err := Status(checkpointDir); err != nil {
+		// An UNREADABLE state file used to be silently treated as "no
+		// state", which let a malformed record bypass every protection
+		// built on it (layout authority, resume accounting). Fail closed
+		// before any store IO: only a genuinely absent file means fresh.
+		return Result{}, fmt.Errorf("read publish state for %s: %w (refusing to treat an unreadable state as fresh; repair or remove the state file deliberately)", id, err)
+	} else if previous != nil {
+		// NOTE on identity: previous.CheckpointID may legitimately differ
+		// from id — republishing one directory under a new label is a
+		// supported flow (existing tests: claim_test's owner/retry,
+		// pack_publish_test's base/warm). The state is directory-scoped
+		// by construction (StatePath), and the recorded ID is the LAST
+		// publication's label, not an ownership proof; refusing here
+		// would change that contract. The layout-authority rules below
+		// are unaffected: they bind the DIRECTORY's layout, whichever
+		// label the republish uses.
 		state.ChunksTotal, state.ChunksPut = previous.ChunksTotal, previous.ChunksPut
+		// An adaptive decision is sticky per artifact: a retry reuses the
+		// recorded layout so one artifact never mixes plain and pack
+		// objects across attempts. Records predating the feature (or
+		// published with it off) carry no layout and decide afresh.
+		state.Layout = previous.Layout
+		if state.Layout != "" {
+			// A persisted layout is authoritative in EVERY later invocation,
+			// not only adaptive ones. Unknown strings are state corruption:
+			// fail closed before any store IO instead of silently treating
+			// them as plain. A layout recorded under adaptive selection with
+			// the feature now off is configuration drift — the forced run
+			// would silently change this artifact's layout, so refuse and
+			// name the remedy (restore the adaptive configuration; to
+			// deliberately change layout, retire the artifact's state).
+			if state.Layout != layoutPlain && state.Layout != layoutPack {
+				return Result{}, fmt.Errorf("publish state for %s carries unknown layout %q (corrupt state); refusing to publish", id, state.Layout)
+			}
+			if opts.AdaptivePackThresholdBytes == 0 {
+				return Result{}, fmt.Errorf(
+					"artifact %s already decided layout %q under adaptive selection; this run has adaptive off — restore the adaptive configuration (or retire the artifact's publish state to change layout deliberately); refusing a layout-changing forced run",
+					id, state.Layout)
+			}
+			if state.Layout == layoutPack && opts.PackBytes == 0 {
+				return Result{}, fmt.Errorf("artifact %s already decided pack layout but no pack size is configured", id)
+			}
+		}
 		// Stamp THIS attempt's own start: cn-publishd's stale-lease requeue
 		// judges liveness by StartedAt, and an inherited first-generation
 		// timestamp would let a retry in flight be re-claimed as a crash
@@ -369,8 +532,64 @@ func RunWithOptions(ctx context.Context, checkpointDir, id string, store chunkst
 		}
 	}
 	state.ChunksTotal = manifest.ChunkCount
-	if opts.PackBytes > 0 {
-		return runPacked(ctx, checkpointDir, id, store, manifest, state, result, opts)
+	// Adaptive layout (opt-in): one probe-only classification measures the
+	// ACTUAL missing standalone bytes, decides the layout, and feeds the
+	// chosen stage — the probes are never repeated downstream. The pass
+	// runs inside the claim and GC publication intent this attempt already
+	// opened, so the F3 claim lifecycle and sweep fences are unchanged.
+	var adaptiveClass *chunkClassification
+	if opts.AdaptivePackThresholdBytes != 0 && state.Layout == "" {
+		var err error
+		adaptiveClass, err = classifyUniqueChunks(ctx, store, uniqueSortedChunks(manifest), manifest, workers)
+		if err != nil {
+			return failAttempt(&result, counters, state, err)
+		}
+		reason := layoutReasonAtOrAbove
+		if adaptiveClass.missingBytes < opts.AdaptivePackThresholdBytes {
+			state.Layout = layoutPlain
+			reason = layoutReasonBelow
+		} else {
+			state.Layout = layoutPack
+		}
+		measuredBytes, measuredChunks := adaptiveClass.missingBytes, adaptiveClass.missingChunks
+		result.LayoutDecision = &LayoutDecision{
+			ActualMissingBytes:  &measuredBytes,
+			ActualMissingChunks: &measuredChunks,
+			ThresholdBytes:      opts.AdaptivePackThresholdBytes,
+			Chosen:              state.Layout,
+			Reason:              reason,
+		}
+	} else if opts.AdaptivePackThresholdBytes != 0 {
+		// Sticky retry of an already-decided artifact: keep the recorded
+		// layout and do not re-probe just for telemetry — the chosen
+		// stage reclassifies inline exactly as a non-adaptive attempt
+		// would, so a retry's probes are never skipped. The actual-missing
+		// pointers stay nil: a sticky retry did not measure, and a
+		// synthetic zero would be ambiguous telemetry.
+		result.LayoutDecision = &LayoutDecision{
+			ThresholdBytes: opts.AdaptivePackThresholdBytes,
+			Chosen:         state.Layout,
+			Reason:         layoutReasonSticky,
+		}
+	}
+	// Auto-base resolution: only when the feature is enabled, and only
+	// when we know the attempt is entering the packed stage. A plain
+	// layout (adaptive-chosen or forced) never reads the manifest hint.
+	goingToPack := (opts.AdaptivePackThresholdBytes != 0 && state.Layout == layoutPack) ||
+		(opts.AdaptivePackThresholdBytes == 0 && opts.PackBytes > 0)
+	if opts.PackAutoBase {
+		opts, result.AutoBase = resolveAutoBase(opts, checkpointDir, id, goingToPack)
+	}
+	if opts.AdaptivePackThresholdBytes != 0 {
+		// The adaptive decision is authoritative: plain falls through to
+		// the plain stage below even though PackBytes is configured (the
+		// feature requires it as the pack-size definition).
+		if state.Layout == layoutPack {
+			return runPacked(ctx, checkpointDir, id, store, manifest, state, result, opts, adaptiveClass)
+		}
+	} else if opts.PackBytes > 0 {
+		// Explicit packing without adaptive keeps its forced semantics.
+		return runPacked(ctx, checkpointDir, id, store, manifest, state, result, opts, nil)
 	}
 	if opts.CompressChunks {
 		// Compressed chunk objects live under explicit keys; a backend
@@ -475,7 +694,38 @@ func RunWithOptions(ctx context.Context, checkpointDir, id string, store chunkst
 						heldClaims = nil
 					}
 					defer releaseClaims()
-					if ok, err := store.Has(ctx, job.chunk.Digest); err != nil {
+					if adaptiveClass != nil {
+						// Adaptive plain: reuse the decision-time
+						// classification — no second Has round. Present
+						// chunks skip; sweep-marked chunks take the fence
+						// claim at their own upload point (a narrower claim
+						// window than the probe-time acquisition below — the
+						// safe direction). Inherited entries arrive here as
+						// classification FACTS (missing/refresh): the plain
+						// stage cannot serve a hole, so the inherited checks
+						// below fail the attempt closed BEFORE any local
+						// byte is read.
+						switch adaptiveClass.classByDigest[job.chunk.Digest] {
+						case classPresent:
+							atomic.AddInt64(&skippedCount, 1)
+							return
+						case classRefresh:
+							plainClaim, fenced, err := gcFenceClaim(ctx, keyed, chunkstore.PlainKey(job.chunk.Digest))
+							if err != nil {
+								failUpload(err)
+								return
+							}
+							if !fenced {
+								// The mark vanished between the probe and
+								// the claim: the object is safe to reuse.
+								atomic.AddInt64(&skippedCount, 1)
+								return
+							}
+							heldClaims = append(heldClaims, heldClaim{key: chunkstore.PlainKey(job.chunk.Digest), body: plainClaim})
+						default:
+							// classMissing: fall through and upload.
+						}
+					} else if ok, err := store.Has(ctx, job.chunk.Digest); err != nil {
 						failUpload(fmt.Errorf("has chunk %s: %w", job.chunk.Digest[:12], err))
 						return
 					} else if ok {
@@ -648,7 +898,7 @@ func RunWithOptions(ctx context.Context, checkpointDir, id string, store chunkst
 			view.Compression = checkpointchunks.CompressionZstd
 			transport = &view
 		}
-		if err := publishArtifactSetWithTransport(ctx, checkpointDir, id, keyed, &state, transport, phases); err != nil {
+		if err := publishArtifactSetWithTransport(ctx, checkpointDir, id, keyed, &state, transport, phases, opts.OverlayWorkers); err != nil {
 			return failAttempt(&result, counters, state, err)
 		}
 	} else {

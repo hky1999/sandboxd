@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
 	"time"
 
@@ -58,6 +59,9 @@ func ReconcilePublished(ctx context.Context, dir, id string, store chunkstore.St
 	}
 	if index.CheckpointID != id {
 		return false, fmt.Errorf("reconcile %s: remote INDEX names %q", id, index.CheckpointID)
+	}
+	if err := validateIndexBundle(&index); err != nil {
+		return false, fmt.Errorf("reconcile %s: %w", id, err)
 	}
 	// Identity against the local sealed artifact: the sidecar's memory root
 	// and geometry must be exactly what the remote INDEX advertises. A
@@ -137,7 +141,10 @@ func ReconcilePublished(ctx context.Context, dir, id string, store chunkstore.St
 	}
 	// Identity proven AND every dependency present: converge the local
 	// record to published. The committed INDEX is the protocol's
-	// remote_ready point.
+	// remote_ready point. A layout an earlier attempt decided MUST survive
+	// the convergence — the next republish still owes this artifact the
+	// same layout, and dropping the field here would silently release the
+	// authority the state machine grants it.
 	state := State{
 		CheckpointID: id,
 		Dir:          dir,
@@ -146,6 +153,22 @@ func ReconcilePublished(ctx context.Context, dir, id string, store chunkstore.St
 		ChunksTotal:  local.ChunkCount,
 		ChunksPut:    local.ChunkCount,
 		ArtifactSet:  true,
+	}
+	if previous, serr := Status(dir); serr == nil && previous != nil {
+		// The ID in the prior state may differ from this attempt's label
+		// (republishing one directory under a new id is supported); only
+		// the layout decision is carried forward, and an unknown layout
+		// string is corruption — refuse so the normal-attempt path fails
+		// closed on it instead of converging past it.
+		if previous.Layout != "" && previous.Layout != layoutPlain && previous.Layout != layoutPack {
+			return false, fmt.Errorf("reconcile %s: publish state carries unknown layout %q (corrupt state)", id, previous.Layout)
+		}
+		state.Layout = previous.Layout
+	} else if serr != nil && !os.IsNotExist(serr) {
+		// Same fail-closed rule as the publisher: an unreadable state is
+		// never converged past. Return the error so the round reports the
+		// artifact instead of silently publishing over it.
+		return false, fmt.Errorf("reconcile %s: read publish state: %w", id, serr)
 	}
 	if now == nil {
 		now = time.Now

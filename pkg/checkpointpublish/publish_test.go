@@ -176,7 +176,10 @@ func TestPublishMaterializeRoundtrip(t *testing.T) {
 	if err := Materialize(context.Background(), second, id, keyed); err == nil {
 		t.Fatal("tampered artifact set materialized")
 	} else if !strings.Contains(err.Error(), "digest mismatch") &&
-		!strings.Contains(err.Error(), "bundle size") {
+		!strings.Contains(err.Error(), "bundle size") &&
+		!strings.Contains(err.Error(), "declared") {
+		// "declared": the bounded exact-length bundle read rejects a body
+		// whose length disagrees with the INDEX before any digest work.
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
@@ -445,7 +448,7 @@ func TestMaterializeOverlayExactLengths(t *testing.T) {
 			if err := checkpointchunks.WriteNamed(dir, OverlaySidecarName, scan); err != nil {
 				t.Fatal(err)
 			}
-			err = materializeOverlayChunks(context.Background(), dir, "test", store)
+			err = materializeOverlayChunks(context.Background(), dir, "test", store, nil, 0)
 			if tc.wantError {
 				if err == nil || !strings.Contains(err.Error(), "length") {
 					t.Fatalf("want length rejection, got %v", err)

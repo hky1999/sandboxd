@@ -1612,6 +1612,15 @@ func (handler *Handler) launchUffdHandler(
 			}
 			args = append(args, "-chunk-local", local)
 		}
+		// Chunk-store prefetch config goes ONLY to this path (P1-D): the
+		// legacy -prefetch flags stay remote-memory-only. Defaults (0/0)
+		// keep the restore fully lazy; an explicit enable always carries
+		// its finite budget (validated at handler construction).
+		if handler.uffdChunkPrefetchWorkers > 0 {
+			args = append(args,
+				"-chunk-prefetch", strconv.Itoa(handler.uffdChunkPrefetchWorkers),
+				"-chunk-prefetch-budget-mb", strconv.Itoa(handler.uffdChunkPrefetchBudgetMB))
+		}
 	} else {
 		args = append(args, "-backing", backingPath)
 	}
@@ -1623,6 +1632,14 @@ func (handler *Handler) launchUffdHandler(
 	}
 	if handler.uffdPersistWorkers > 0 {
 		args = append(args, "-persist-workers", strconv.Itoa(handler.uffdPersistWorkers))
+	}
+	// Node cache watermarks: 0/0 keeps the handler's historical unbounded
+	// shared cache; an explicit pair arms watermark eviction inside the
+	// handler's cache manager.
+	if handler.uffdChunkCacheHighMB > 0 {
+		args = append(args,
+			"-chunk-cache-high-mb", strconv.FormatInt(handler.uffdChunkCacheHighMB, 10),
+			"-chunk-cache-low-mb", strconv.FormatInt(handler.uffdChunkCacheLowMB, 10))
 	}
 	// Durable launch intent before any child can exist. A crash from here on
 	// leaves a record that names this launch; a failure below that proves no

@@ -25,12 +25,15 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/inclusionAI/sandboxd/pkg/checkpointchunks"
+	"github.com/inclusionAI/sandboxd/pkg/chunkcache"
 	"github.com/inclusionAI/sandboxd/pkg/chunkstore"
 )
 
@@ -85,6 +88,33 @@ type BundlePart struct {
 	Digest string `json:"digest"`
 }
 
+// validateIndexBundle guards the INDEX's BUNDLE descriptor (P1-E): a bundle
+// with a zero-or-negative declared size is malformed — it would degenerate
+// the bounded fetch into a zero-byte expectation — and its digest must be
+// a valid content digest before anything streams it.
+func validateIndexBundle(index *ArtifactIndex) error {
+	if index.Bundle == nil {
+		return nil
+	}
+	if index.Bundle.Size <= 0 {
+		return fmt.Errorf("index bundle size %d must be > 0", index.Bundle.Size)
+	}
+	// Same ceiling the streaming fetchers enforce: a declared size near
+	// MaxInt64 would overflow the declared+1 stream bound and disguise the
+	// rejection as a bogus "short" read.
+	if index.Bundle.Size > 1<<40 {
+		return fmt.Errorf("index bundle size %d exceeds the %d-byte ceiling", index.Bundle.Size, int64(1<<40))
+	}
+	if !checkpointchunks.ValidDigest(index.Bundle.Digest) {
+		return fmt.Errorf("index bundle digest %q is not a valid digest", index.Bundle.Digest)
+	}
+	return nil
+}
+
+// ValidateIndexBundle is the exported form for out-of-package INDEX
+// consumers (cn-gcsweep) so every decode site applies the same rule.
+func ValidateIndexBundle(index *ArtifactIndex) error { return validateIndexBundle(index) }
+
 func ArtifactKey(id, name string) string {
 	return ArtifactNamespace + "/" + id + "/" + name
 }
@@ -109,8 +139,20 @@ func legacyOverlayChunkKey(id, digest string) string {
 	return ArtifactKey(id, "overlay-chunks/"+digest)
 }
 
-// overlayWorkers bounds overlay publish/materialize concurrency.
-const overlayWorkers = 8
+// defaultOverlayWorkers bounds overlay publish/materialize concurrency
+// when the caller does not override it (Options.OverlayWorkers /
+// MaterializeOptions.OverlayWorkers, 0 = this default).
+const defaultOverlayWorkers = 8
+
+func overlayWorkerCount(n int) int {
+	if n <= 0 {
+		return defaultOverlayWorkers
+	}
+	if n > 64 {
+		return 64
+	}
+	return n
+}
 
 // publishOverlayChunks ships the writable layer chunk-by-chunk when its
 // sidecar exists (chunks-digest deployments): chunks are keyed by content
@@ -120,6 +162,7 @@ func publishOverlayChunks(
 	ctx context.Context,
 	checkpointDir, id string,
 	store chunkstore.Keyed,
+	overlayWorkers int,
 ) (bool, error) {
 	scan, err := checkpointchunks.LoadNamed(checkpointDir, OverlaySidecarName)
 	if err != nil {
@@ -166,7 +209,8 @@ func publishOverlayChunks(
 	}
 	queue := make(chan job)
 	var wg sync.WaitGroup
-	for w := 0; w < overlayWorkers; w++ {
+	workers := overlayWorkerCount(overlayWorkers)
+	for w := 0; w < workers; w++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -270,7 +314,7 @@ func publishOverlayChunks(
 // phases (optional) receives the attribution split: MetaWall spans entry
 // through the BUNDLE PUT (overlay chunk PUTs + bundle assembly + bundle
 // upload) and IndexWall the INDEX commit PUT.
-func publishArtifactSetWithTransport(ctx context.Context, checkpointDir, id string, store chunkstore.Keyed, state *State, transport *checkpointchunks.Manifest, phases *PublishPhases) error {
+func publishArtifactSetWithTransport(ctx context.Context, checkpointDir, id string, store chunkstore.Keyed, state *State, transport *checkpointchunks.Manifest, phases *PublishPhases, overlayWorkers int) error {
 	metaStart := time.Now()
 	defer func() {
 		if phases != nil && phases.MetaWall == 0 {
@@ -309,7 +353,7 @@ func publishArtifactSetWithTransport(ctx context.Context, checkpointDir, id stri
 		ChunkCount:   chunks.ChunkCount,
 		Files:        make(map[string]string, 4),
 	}
-	overlayChunked, ocErr := publishOverlayChunks(ctx, checkpointDir, id, store)
+	overlayChunked, ocErr := publishOverlayChunks(ctx, checkpointDir, id, store, overlayWorkers)
 	if ocErr != nil {
 		return ocErr
 	}
@@ -396,7 +440,29 @@ func publishArtifactSetWithTransport(ctx context.Context, checkpointDir, id stri
 // overwritten — an in-use generation must never be mutated under a live
 // restorer.
 func Materialize(ctx context.Context, targetDir, id string, store chunkstore.Keyed) error {
-	indexRaw, err := fetchKey(ctx, store, ArtifactKey(id, IndexName))
+	return MaterializeWithOptions(ctx, targetDir, id, store, MaterializeOptions{})
+}
+
+// MaterializeOptions carries optional node-level services for
+// materialization. Cache fronts overlay chunk GETs with the node's
+// content-addressed cache: concurrent or repeat restores of overlapping
+// artifacts stop re-downloading unchanged overlay blocks.
+type MaterializeOptions struct {
+	Cache *chunkcache.Manager
+	// OverlayWorkers bounds the overlay chunk download pool; zero keeps the
+	// package default (8).
+	OverlayWorkers int
+}
+
+// MaterializeWithOptions is Materialize with node services. When a cache is
+// configured, a restore pin protects the artifact's overlay chunk set for
+// the duration of the rebuild (released on return; a crash drops the pin's
+// flock with the process).
+func MaterializeWithOptions(ctx context.Context, targetDir, id string, store chunkstore.Keyed, opts MaterializeOptions) error {
+	if opts.OverlayWorkers < 0 || opts.OverlayWorkers > 64 {
+		return fmt.Errorf("materialize overlay workers %d out of range [0,64]", opts.OverlayWorkers)
+	}
+	indexRaw, err := fetchKeyBounded(ctx, store, ArtifactKey(id, IndexName), maxIndexBytes)
 	if err != nil {
 		return fmt.Errorf("fetch artifact index: %w", err)
 	}
@@ -406,6 +472,9 @@ func Materialize(ctx context.Context, targetDir, id string, store chunkstore.Key
 	}
 	if index.CheckpointID != id {
 		return fmt.Errorf("index is for %q, requested %q", index.CheckpointID, id)
+	}
+	if err := validateIndexBundle(&index); err != nil {
+		return fmt.Errorf("artifact %s: %w", id, err)
 	}
 	// Refuse to clobber a live target before doing any work.
 	if entries, err := os.ReadDir(targetDir); err == nil && len(entries) > 0 {
@@ -440,56 +509,99 @@ func Materialize(ctx context.Context, targetDir, id string, store chunkstore.Key
 	}
 	switch {
 	case index.Bundle != nil:
-		// One GET for every small file: split by the recorded spans,
-		// verify each part's own digest against the INDEX, land it.
-		bundle, err := fetchKey(ctx, store, ArtifactKey(id, BundleName))
+		// One GET for every small file. The bundle streams to a staging
+		// temp file (never an allocation by declared size — a hostile
+		// INDEX cannot OOM us), is sha-verified as a whole, and each part
+		// is then served via a SectionReader with its own digest check.
+		// The streamed bundle file lives OUTSIDE staging (a sibling temp
+		// dir under .materialize): only the SPLIT part files may land in
+		// the final artifact — a stray BUNDLE object would ship with it
+		// and break the operation-root verifier.
+		bundleDir, berr := os.MkdirTemp(stagingRoot, "bundle-")
+		if berr != nil {
+			return berr
+		}
+		defer os.RemoveAll(bundleDir)
+		bundlePath, err := fetchKeyToFile(ctx, store, ArtifactKey(id, BundleName), index.Bundle.Digest, index.Bundle.Size, bundleDir)
 		if err != nil {
 			return fmt.Errorf("fetch bundle: %w", err)
 		}
-		if int64(len(bundle)) != index.Bundle.Size {
-			return fmt.Errorf("bundle size %d, index says %d", len(bundle), index.Bundle.Size)
+		bundleFile, err := os.Open(bundlePath)
+		if err != nil {
+			return err
 		}
-		sum := sha256.Sum256(bundle)
-		if hex.EncodeToString(sum[:]) != index.Bundle.Digest {
-			return fmt.Errorf("bundle digest mismatch: index %s fetched %s",
-				index.Bundle.Digest, hex.EncodeToString(sum[:]))
+		defer bundleFile.Close()
+		bfi, err := bundleFile.Stat()
+		if err != nil {
+			return err
+		}
+		// Part whitelist FIRST: the parts must EXACTLY cover the LOCAL
+		// expected file set (computed above from the artifact shape, not
+		// trusted from the INDEX), every name a safe basename (a traversal
+		// would escape staging), no duplicates, no extras, no omissions.
+		expected := make(map[string]struct{}, len(files))
+		for _, name := range files {
+			expected[name] = struct{}{}
+		}
+		seenParts := make(map[string]struct{}, len(index.Bundle.Parts))
+		for _, part := range index.Bundle.Parts {
+			if part.Name == "" || part.Name == "." || part.Name == ".." || strings.ContainsAny(part.Name, "/\\\x00") {
+				return fmt.Errorf("bundle part name %q is not a safe basename", part.Name)
+			}
+			if _, ok := expected[part.Name]; !ok {
+				return fmt.Errorf("bundle part %s is not among the artifact's expected files", part.Name)
+			}
+			want, ok := index.Files[part.Name]
+			if !ok || !checkpointchunks.ValidDigest(want) {
+				return fmt.Errorf("bundle part %s has no valid index digest", part.Name)
+			}
+			if part.Digest != want {
+				return fmt.Errorf("bundle part %s digest %s disagrees with the index file digest", part.Name, part.Digest)
+			}
+			if _, dup := seenParts[part.Name]; dup {
+				return fmt.Errorf("bundle part %s listed twice", part.Name)
+			}
+			seenParts[part.Name] = struct{}{}
+		}
+		for name := range expected {
+			if _, covered := seenParts[name]; !covered {
+				return fmt.Errorf("expected file %s missing from the bundle parts", name)
+			}
+		}
+		// EXACT set equality, both directions: index.Files may not carry
+		// extra keys beyond the artifact's expected file set either.
+		for name := range index.Files {
+			if _, ok := expected[name]; !ok {
+				return fmt.Errorf("index lists unexpected file %s", name)
+			}
 		}
 		for _, part := range index.Bundle.Parts {
-			want, recorded := index.Files[part.Name]
-			if !recorded {
-				return fmt.Errorf("index has no entry for %s", part.Name)
-			}
-			if part.Offset < 8 || part.Offset+part.Length > int64(len(bundle)) {
+			want := index.Files[part.Name]
+			// Subtraction-based bound: part.Offset+part.Length can overflow
+			// int64 on a hostile INDEX; bfi.Size()-part.Offset cannot.
+			// Zero/negative lengths are rejected outright.
+			if part.Length <= 0 || part.Offset < 8 || bfi.Size()-part.Offset < part.Length {
 				return fmt.Errorf("bundle part %s span out of range", part.Name)
 			}
-			body := bundle[part.Offset : part.Offset+part.Length]
-			got := sha256.Sum256(body)
-			if hex.EncodeToString(got[:]) != want {
-				return fmt.Errorf("artifact %s digest mismatch: index %s bundle %s",
-					part.Name, want, hex.EncodeToString(got[:]))
-			}
-			if err := os.WriteFile(filepath.Join(staging, part.Name), body, 0o600); err != nil {
-				return err
+			// STREAM the part out (SectionReader -> temp file, hashing while
+			// copying): memory is O(copy buffer), never O(part) — a
+			// multi-hundred-MiB overlay part must not be allocated whole.
+			if err := streamSectionToFile(ctx, bundleFile, part.Offset, part.Length, want, staging, part.Name); err != nil {
+				return fmt.Errorf("bundle part %s: %w", part.Name, err)
 			}
 		}
 	default:
-		// Pre-bundle artifact: per-file objects under the ID namespace.
+		// Pre-bundle artifact: per-file objects under the ID namespace,
+		// streamed to staging with digest verification — the whole-file
+		// overlay object of legacy artifacts can be arbitrarily large and
+		// must never be buffered in memory.
 		for _, name := range files {
 			want, recorded := index.Files[name]
 			if !recorded {
 				return fmt.Errorf("index has no entry for %s", name)
 			}
-			body, err := fetchKey(ctx, store, ArtifactKey(id, name))
-			if err != nil {
+			if _, err := fetchKeyToFile(ctx, store, ArtifactKey(id, name), want, -1, staging); err != nil {
 				return fmt.Errorf("fetch %s: %w", name, err)
-			}
-			got := sha256.Sum256(body)
-			if hex.EncodeToString(got[:]) != want {
-				return fmt.Errorf("artifact %s digest mismatch: index %s fetched %s",
-					name, want, hex.EncodeToString(got[:]))
-			}
-			if err := os.WriteFile(filepath.Join(staging, name), body, 0o600); err != nil {
-				return err
 			}
 		}
 	}
@@ -543,7 +655,24 @@ func Materialize(ctx context.Context, targetDir, id string, store chunkstore.Key
 			fcDigest, sidecar.FileDigest)
 	}
 	if index.OverlayChunks {
-		if err := materializeOverlayChunks(ctx, staging, id, store); err != nil {
+		if opts.Cache != nil {
+			// Restore pin: keep the overlay working set eviction-protected
+			// while this rebuild runs (memory chunks are fetched lazily by
+			// the uffd handler later, which holds its own runtime pin). With
+			// eviction armed a failed pin is FATAL — continuing unpinned
+			// would silently drop the pin gate (G); unarmed, the pin has
+			// nothing to protect against and the failure is non-fatal.
+			if scan, serr := checkpointchunks.LoadNamed(staging, OverlaySidecarName); serr == nil {
+				release, perr := opts.Cache.PinContext(ctx, fmt.Sprintf("materialize-%s-%d", id, os.Getpid()), overlayPinDigests(scan))
+				if err := restorePinDecision(opts.Cache, perr); err != nil {
+					return err
+				}
+				if release != nil {
+					defer release()
+				}
+			}
+		}
+		if err := materializeOverlayChunks(ctx, staging, id, store, opts.Cache, opts.OverlayWorkers); err != nil {
 			return err
 		}
 	}
@@ -573,6 +702,307 @@ func Materialize(ctx context.Context, targetDir, id string, store chunkstore.Key
 	return commit()
 }
 
+// MemoryVerification summarizes a full memory-transport walk.
+type MemoryVerification struct {
+	ChunksVerified int   `json:"chunks_verified"`
+	ZeroSkipped    int   `json:"zero_skipped"`
+	PacksRead      int   `json:"packs_read"`
+	CompressedRead int   `json:"compressed_read"`
+	PlainRead      int   `json:"plain_read"`
+	BytesVerified  int64 `json:"bytes_verified"`
+}
+
+// VerifyMemoryTransport verifies a LOCAL transport sidecar against the
+// store. The sidecar must already carry the encoding view (pack refs /
+// compression marker): a sealed local sidecar describes only plain,
+// unpacked publication, because publishers never rewrite it in compress or
+// pack mode. Verifying a PUBLISHED artifact must use VerifyMemoryArtifact,
+// which resolves the encoding view from the remote INDEX.
+
+func VerifyMemoryTransport(ctx context.Context, dir string, store chunkstore.Keyed) (MemoryVerification, error) {
+	var out MemoryVerification
+	transport, err := checkpointchunks.LoadTransport(dir)
+	if err != nil {
+		return out, fmt.Errorf("load transport sidecar: %w", err)
+	}
+	return verifyTransportEntries(ctx, transport, store)
+}
+
+// VerifyMemoryArtifact verifies the memory transport of a PUBLISHED
+// artifact: it resolves the transport sidecar from the remote INDEX (the
+// publisher uploads its encoding view there — pack/compress markers never
+// touch the sealed local sidecar), cross-checks the sidecar's memory
+// identity against what the INDEX declares, then checks every chunk
+// against the store exactly as a materializing consumer would read it.
+func VerifyMemoryArtifact(ctx context.Context, id string, store chunkstore.Keyed) (MemoryVerification, error) {
+	var out MemoryVerification
+	index, sidecarRaw, err := resolveArtifactSidecar(ctx, id, store)
+	if err != nil {
+		return out, err
+	}
+	transport, err := checkpointchunks.DecodeTransport(sidecarRaw)
+	if err != nil {
+		return out, fmt.Errorf("decode transport sidecar: %w", err)
+	}
+	// Identity closure: the sidecar must describe EXACTLY the memory the
+	// INDEX vouches for — root digest, chunk count and declared file size —
+	// otherwise the verification only proves a self-consistent sidecar+chunk
+	// set, not this artifact's memory.
+	if transport.FileDigest != index.MemoryRoot {
+		return out, fmt.Errorf("transport root %s disagrees with index memory root %s", transport.FileDigest, index.MemoryRoot)
+	}
+	if transport.ChunkCount != index.ChunkCount {
+		return out, fmt.Errorf("transport chunk count %d disagrees with index %d", transport.ChunkCount, index.ChunkCount)
+	}
+	if index.ChunkCount != len(transport.Entries) {
+		return out, fmt.Errorf("transport entries %d disagree with declared chunk count %d", len(transport.Entries), index.ChunkCount)
+	}
+	return verifyTransportEntries(ctx, transport, store)
+}
+
+// resolveArtifactSidecar validates the artifact INDEX (same rules
+// materialize applies to the file set it consumes) and returns the
+// digest-verified chunk sidecar bytes. Shared by Materialize and the
+// verifier so the two resolvers cannot drift.
+func resolveArtifactSidecar(ctx context.Context, id string, store chunkstore.Keyed) (*ArtifactIndex, []byte, error) {
+	indexRaw, err := fetchKeyBounded(ctx, store, ArtifactKey(id, IndexName), maxIndexBytes)
+	if err != nil {
+		return nil, nil, fmt.Errorf("fetch artifact index: %w", err)
+	}
+	var index ArtifactIndex
+	if err := json.Unmarshal(indexRaw, &index); err != nil {
+		return nil, nil, fmt.Errorf("decode artifact index: %w", err)
+	}
+	if index.CheckpointID != id {
+		return nil, nil, fmt.Errorf("index is for %q, requested %q", index.CheckpointID, id)
+	}
+	if err := validateIndexBundle(&index); err != nil {
+		return nil, nil, fmt.Errorf("artifact %s: %w", id, err)
+	}
+	want, recorded := index.Files[checkpointchunks.ManifestName]
+	if !recorded || !checkpointchunks.ValidDigest(want) {
+		return nil, nil, fmt.Errorf("index has no valid digest for the chunk sidecar")
+	}
+	var sidecarRaw []byte
+	switch {
+	case index.Bundle != nil:
+		// Same whitelist discipline as materialize: every part a safe
+		// basename, no duplicates, spans bounded by subtraction, part
+		// digest equal to the index file digest — then extract the sidecar.
+		seen := make(map[string]struct{}, len(index.Bundle.Parts))
+		var sidecar *BundlePart
+		for i := range index.Bundle.Parts {
+			part := index.Bundle.Parts[i]
+			if part.Name == "" || part.Name == "." || part.Name == ".." || strings.ContainsAny(part.Name, "/\\\x00") {
+				return nil, nil, fmt.Errorf("bundle part name %q is not a safe basename", part.Name)
+			}
+			if _, dup := seen[part.Name]; dup {
+				return nil, nil, fmt.Errorf("bundle part %s listed twice", part.Name)
+			}
+			seen[part.Name] = struct{}{}
+			partWant, ok := index.Files[part.Name]
+			if !ok || part.Digest != partWant {
+				return nil, nil, fmt.Errorf("bundle part %s digest disagrees with the index file digest", part.Name)
+			}
+			if part.Name == checkpointchunks.ManifestName {
+				sidecar = &index.Bundle.Parts[i]
+			}
+		}
+		if sidecar == nil {
+			return nil, nil, fmt.Errorf("bundle carries no chunk sidecar part")
+		}
+		bundlePath, err := fetchKeyToTempFile(ctx, store, ArtifactKey(id, BundleName), index.Bundle.Digest, index.Bundle.Size)
+		if err != nil {
+			return nil, nil, fmt.Errorf("fetch bundle: %w", err)
+		}
+		defer os.Remove(bundlePath)
+		bf, err := os.Open(bundlePath)
+		if err != nil {
+			return nil, nil, err
+		}
+		defer bf.Close()
+		bfi, err := bf.Stat()
+		if err != nil {
+			return nil, nil, err
+		}
+		if sidecar.Length <= 0 || sidecar.Length > maxIndexBytes || sidecar.Offset < 8 || bfi.Size()-sidecar.Offset < sidecar.Length {
+			return nil, nil, fmt.Errorf("chunk sidecar bundle span out of range")
+		}
+		body := make([]byte, sidecar.Length)
+		if _, err := io.ReadFull(io.NewSectionReader(bf, sidecar.Offset, sidecar.Length), body); err != nil {
+			return nil, nil, fmt.Errorf("read chunk sidecar part: %w", err)
+		}
+		if got := fmt.Sprintf("%x", sha256.Sum256(body)); got != want {
+			return nil, nil, fmt.Errorf("chunk sidecar digest mismatch: index %s bundle %s", want, got)
+		}
+		sidecarRaw = body
+	default:
+		// Legacy per-file object: EXCLUSIVE temp dir (never a shared fixed
+		// final name), declared-size bounded, digest verified, removed on
+		// exit, and hard-capped at maxIndexBytes before buffering.
+		tmpDir, derr := os.MkdirTemp("", "verify-sidecar-*")
+		if derr != nil {
+			return nil, nil, derr
+		}
+		defer os.RemoveAll(tmpDir)
+		path, size, err := fetchKeyToFileAtMost(ctx, store, ArtifactKey(id, checkpointchunks.ManifestName), want, maxIndexBytes, tmpDir)
+		if err != nil {
+			return nil, nil, fmt.Errorf("fetch chunk sidecar: %w", err)
+		}
+		if size > maxIndexBytes {
+			return nil, nil, fmt.Errorf("chunk sidecar exceeds the %d-byte bound", maxIndexBytes)
+		}
+		raw, rerr := os.ReadFile(path)
+		if rerr != nil {
+			return nil, nil, rerr
+		}
+		sidecarRaw = raw
+	}
+	return &index, sidecarRaw, nil
+}
+
+func verifyTransportEntries(ctx context.Context, transport *checkpointchunks.Manifest, store chunkstore.Keyed) (MemoryVerification, error) {
+	var out MemoryVerification
+	rangeReader, _ := store.(chunkstore.RangeReader)
+	for i, entry := range transport.Entries {
+		if err := ctx.Err(); err != nil {
+			return out, err
+		}
+		length := int64(min(int64(transport.ChunkBytes), transport.FileSize-entry.Offset))
+		if length <= 0 {
+			return out, fmt.Errorf("entry %d has non-positive length", i)
+		}
+		if entry.Digest == checkpointchunks.ZeroChunkDigest(int(length)) {
+			out.ZeroSkipped++
+			continue
+		}
+		var body []byte
+		switch {
+		case func() bool { _, ok := transport.Packs[entry.Digest]; return ok }():
+			ref := transport.Packs[entry.Digest]
+			if rangeReader == nil {
+				return out, fmt.Errorf("store cannot range-read pack for %s", entry.Digest[:12])
+			}
+			key, err := ref.Key()
+			if err != nil {
+				return out, err
+			}
+			data, err := rangeReader.ReadKeyRange(ctx, key, chunkstore.ObjectRange{Offset: ref.Offset, Length: ref.Length, ObjectSize: ref.ObjectSize})
+			if err != nil {
+				return out, fmt.Errorf("fetch packed chunk %s: %w", entry.Digest[:12], err)
+			}
+			body = data
+			out.PacksRead++
+		case transport.Compression == checkpointchunks.CompressionZstd:
+			rc, err := store.GetKey(ctx, chunkstore.CompressedKey(entry.Digest))
+			if err == nil {
+				compressed, rerr := chunkstore.ReadBounded(rc, chunkstore.MaxCompressedChunkBytes(length))
+				rc.Close()
+				if rerr != nil {
+					return out, fmt.Errorf("read compressed chunk %s: %w", entry.Digest[:12], rerr)
+				}
+				plain, derr := chunkstore.DecompressChunkBody(compressed, int(length))
+				if derr != nil {
+					return out, fmt.Errorf("decompress chunk %s: %w", entry.Digest[:12], derr)
+				}
+				body = plain
+				out.CompressedRead++
+			} else if chunkstore.IsNotFound(err) {
+				// Chunks shared with pre-compression generations keep their
+				// plain objects — same fallback the consumer performs
+				// (chunkstore.IsNotFound: local ENOENT and HTTP 404 alike).
+				// Same bounded exact-length read as the default branch: an
+				// overlong plain body is rejected, never buffered whole.
+				rc, err2 := store.GetKey(ctx, entry.Digest[:2]+"/"+entry.Digest)
+				if err2 != nil {
+					return out, fmt.Errorf("fetch chunk %s: %w (compressed: %v)", entry.Digest[:12], err2, err)
+				}
+				raw, rerr := io.ReadAll(io.LimitReader(rc, length+1))
+				rc.Close()
+				if rerr != nil {
+					return out, fmt.Errorf("read chunk %s: %w", entry.Digest[:12], rerr)
+				}
+				if int64(len(raw)) > length {
+					return out, fmt.Errorf("chunk %s body longer than %d bytes", entry.Digest[:12], length)
+				}
+				body = raw
+				out.PlainRead++
+			} else {
+				return out, fmt.Errorf("fetch compressed chunk %s: %w", entry.Digest[:12], err)
+			}
+		default:
+			rc, err := store.GetKey(ctx, entry.Digest[:2]+"/"+entry.Digest)
+			if err != nil {
+				return out, fmt.Errorf("fetch chunk %s: %w", entry.Digest[:12], err)
+			}
+			// Bounded exact-length read: short AND overlong bodies are both
+			// rejected (an unbounded ReadAll would buffer whatever the store
+			// sends and only the length check below would notice).
+			raw, rerr := io.ReadAll(io.LimitReader(rc, length+1))
+			rc.Close()
+			if rerr != nil {
+				return out, fmt.Errorf("read chunk %s: %w", entry.Digest[:12], rerr)
+			}
+			if int64(len(raw)) > length {
+				return out, fmt.Errorf("chunk %s body longer than %d bytes", entry.Digest[:12], length)
+			}
+			body = raw
+			out.PlainRead++
+		}
+		if int64(len(body)) != length {
+			return out, fmt.Errorf("chunk %s length %d, sidecar says %d", entry.Digest[:12], len(body), length)
+		}
+		sum := sha256.Sum256(body)
+		if hex.EncodeToString(sum[:]) != entry.Digest {
+			return out, fmt.Errorf("chunk %s digest mismatch: sidecar %s fetched %s",
+				entry.Digest[:12], entry.Digest[:12], hex.EncodeToString(sum[:]))
+		}
+		out.ChunksVerified++
+		out.BytesVerified += length
+	}
+	if transport.FileDigestMode == checkpointchunks.FileDigestChunks {
+		if root := checkpointchunks.RootDigest(transport.Entries); root != transport.FileDigest {
+			return out, fmt.Errorf("transport root mismatch")
+		}
+	}
+	return out, nil
+}
+
+// restorePinDecision encodes the pin gate (G): with eviction ARMED a
+// failed restore pin is fatal — continuing unpinned would silently drop the
+// pin gate; unarmed, the pin has nothing to protect against.
+func restorePinDecision(cache *chunkcache.Manager, pinErr error) error {
+	if pinErr == nil {
+		return nil
+	}
+	if cache.WatermarksArmed() {
+		return fmt.Errorf("restore pin (eviction armed): %w", pinErr)
+	}
+	return nil
+}
+
+// overlayPinDigests lists a sidecar's unique nonzero chunk digests — the
+// entries that have store objects (and therefore cache entries) to protect.
+func overlayPinDigests(scan *checkpointchunks.Manifest) []string {
+	if scan == nil {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(scan.Entries))
+	digests := make([]string, 0, len(scan.Entries))
+	for _, entry := range scan.Entries {
+		length := int(min(int64(scan.ChunkBytes), scan.FileSize-entry.Offset))
+		if length > 0 && entry.Digest == checkpointchunks.ZeroChunkDigest(length) {
+			continue
+		}
+		if _, dup := seen[entry.Digest]; dup {
+			continue
+		}
+		seen[entry.Digest] = struct{}{}
+		digests = append(digests, entry.Digest)
+	}
+	return digests
+}
+
 // materializeOverlayChunks reassembles the writable layer from digest-keyed
 // chunk objects: unique digests only, all-zero chunks synthesized as sparse
 // holes (no GET, no write), bounded-concurrency GETs, and legacy per-ID keys
@@ -580,10 +1010,14 @@ func Materialize(ctx context.Context, targetDir, id string, store chunkstore.Key
 // remain restorable. Each verified body is written straight to every
 // referencing offset and released, so peak heap is bounded by
 // overlayWorkers x chunk bytes rather than the total unique payload (F7).
+// A non-nil node cache fronts every GET: the cache verifies and publishes
+// atomically, so a repeated restore of the same blocks stays on-node.
 func materializeOverlayChunks(
 	ctx context.Context,
 	targetDir, id string,
 	store chunkstore.Keyed,
+	cache *chunkcache.Manager,
+	overlayWorkers int,
 ) error {
 	scan, err := checkpointchunks.LoadNamed(targetDir, OverlaySidecarName)
 	if err != nil {
@@ -633,39 +1067,61 @@ func materializeOverlayChunks(
 		failed.Store(true)
 	}
 	fetchBody := func(digest string) ([]byte, bool) {
-		rc, err := store.GetKey(ctx, OverlayChunkKey(digest))
-		if err != nil {
-			// Legacy namespace fallback for artifacts published before
-			// the global one.
-			rc2, err2 := store.GetKey(ctx, legacyOverlayChunkKey(id, digest))
-			if err2 != nil {
-				failJob(fmt.Errorf("fetch overlay chunk %s: %w (legacy: %w)", digest[:12], err, err2))
-				return nil, false
-			}
-			rc = rc2
-		}
-		defer rc.Close()
 		expected := jobs[digest][0].length
-		body, err := io.ReadAll(io.LimitReader(rc, int64(expected)+1))
+		download := func(c context.Context) ([]byte, error) {
+			rc, err := store.GetKey(c, OverlayChunkKey(digest))
+			if err != nil {
+				// Legacy namespace fallback for artifacts published before
+				// the global one — and ONLY for a genuinely absent global
+				// key (P1-E): a permission, network, or transport error on
+				// the global key must surface as-is, never be masked by a
+				// second probe against the legacy namespace.
+				if !chunkstore.IsNotFound(err) {
+					return nil, fmt.Errorf("fetch overlay chunk %s: %w", digest[:12], err)
+				}
+				rc2, err2 := store.GetKey(c, legacyOverlayChunkKey(id, digest))
+				if err2 != nil {
+					return nil, fmt.Errorf("fetch overlay chunk %s: %w (legacy: %w)", digest[:12], err, err2)
+				}
+				rc = rc2
+			}
+			defer rc.Close()
+			body, err := io.ReadAll(io.LimitReader(rc, int64(expected)+1))
+			if err != nil {
+				return nil, fmt.Errorf("read overlay chunk %s: %w", digest[:12], err)
+			}
+			if len(body) != expected {
+				return nil, fmt.Errorf("overlay chunk %s length mismatch: expected %d got %d", digest, expected, len(body))
+			}
+			return body, nil
+		}
+		var body []byte
+		var err error
+		if cache != nil {
+			// The cache verifies length+digest and publishes atomically;
+			// its miss closure is the store download above. Repeated
+			// restores of overlapping blocks stay on-node.
+			body, err = cache.Fetch(ctx, digest, int64(expected), download)
+		} else {
+			body, err = download(ctx)
+			if err == nil {
+				sum := sha256.Sum256(body)
+				if hex.EncodeToString(sum[:]) != digest {
+					err = fmt.Errorf("overlay chunk digest mismatch: sidecar %s fetched %s",
+						digest, hex.EncodeToString(sum[:]))
+				}
+			}
+		}
 		if err != nil {
-			failJob(fmt.Errorf("read overlay chunk %s: %w", digest[:12], err))
-			return nil, false
-		}
-		if len(body) != expected {
-			failJob(fmt.Errorf("overlay chunk %s length mismatch: expected %d got %d", digest, expected, len(body)))
-			return nil, false
-		}
-		sum := sha256.Sum256(body)
-		if hex.EncodeToString(sum[:]) != digest {
-			failJob(fmt.Errorf("overlay chunk digest mismatch: sidecar %s fetched %s",
-				digest, hex.EncodeToString(sum[:])))
+			failJob(err)
 			return nil, false
 		}
 		return body, true
 	}
 	queue := make(chan string)
 	var wg sync.WaitGroup
-	for w := 0; w < overlayWorkers; w++ {
+	workers := overlayWorkerCount(overlayWorkers)
+	for w := 0; w < workers; w++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -708,13 +1164,175 @@ func materializeOverlayChunks(
 	return overlay.Truncate(scan.FileSize)
 }
 
-func fetchKey(ctx context.Context, store chunkstore.Keyed, key string) ([]byte, error) {
+// copyWithContext copies with periodic context cancellation checks (the
+// HTTP body itself may block indefinitely otherwise) and SHORT-WRITE
+// detection: a Write that accepts fewer bytes than offered is an error,
+// not a silent truncation.
+func copyWithContext(ctx context.Context, dst io.Writer, src io.Reader, buf []byte) (int64, error) {
+	var written int64
+	for {
+		if err := ctx.Err(); err != nil {
+			return written, err
+		}
+		n, rerr := src.Read(buf)
+		if n > 0 {
+			wn, werr := dst.Write(buf[:n])
+			written += int64(wn)
+			if werr != nil {
+				return written, werr
+			}
+			if wn != n {
+				return written, io.ErrShortWrite
+			}
+		}
+		if rerr == io.EOF {
+			return written, nil
+		}
+		if rerr != nil {
+			return written, rerr
+		}
+	}
+}
+
+// streamSectionToFile copies [offset, offset+length) of f into
+// <staging>/.part-<name>, hashing while copying, and renames to the final
+// name only after the digest check — O(buffer) memory for any part size.
+func streamSectionToFile(ctx context.Context, f *os.File, offset, length int64, wantDigest, staging, name string) error {
+	tmp, err := os.CreateTemp(staging, ".part-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	final := filepath.Join(staging, name)
+	fail := func(e error) error {
+		tmp.Close()
+		os.Remove(tmpName)
+		return e
+	}
+	hash := sha256.New()
+	section := io.NewSectionReader(f, offset, length)
+	buf := make([]byte, 1<<20)
+	written, cerr := copyWithContext(ctx, io.MultiWriter(tmp, hash), section, buf)
+	if cerr != nil {
+		return fail(cerr)
+	}
+	// Close the contract: a short copy is an error even though the temp
+	// file is private.
+	if written != length {
+		return fail(fmt.Errorf("short copy: %d of %d bytes", written, length))
+	}
+	if got := hex.EncodeToString(hash.Sum(nil)); got != wantDigest {
+		return fail(fmt.Errorf("digest mismatch: index %s extracted %s", wantDigest, got))
+	}
+	if serr := tmp.Sync(); serr != nil {
+		return fail(serr)
+	}
+	if cerr := tmp.Close(); cerr != nil {
+		os.Remove(tmpName)
+		return cerr
+	}
+	return os.Rename(tmpName, final)
+}
+
+// maxIndexBytes bounds the INDEX object: it is a small manifest; anything
+// larger is a hostile or corrupt store, not something to buffer whole.
+// (Generic fetchKey stays UNBOUNDED for legitimate large objects; the
+// INDEX call site uses fetchKeyBounded explicitly.)
+const maxIndexBytes = 64 << 20
+
+// fetchKeyToFile streams an object to <staging>/.fetch-<basename(key)> ,
+// hashing while copying, and renames it to the FINAL name inside staging on
+// success. declared == -1 means no declared-size cross-check (digest still
+// binds the bytes). Memory use is O(buffer), never O(object): hostile or
+// simply large objects cannot OOM the restore path.
+func fetchKeyToFile(ctx context.Context, store chunkstore.Keyed, key, wantDigest string, declared int64, staging string) (string, error) {
+	if !checkpointchunks.ValidDigest(wantDigest) {
+		return "", fmt.Errorf("digest for %s is not a valid sha256 hex string", key)
+	}
+	if declared > 1<<40 {
+		return "", fmt.Errorf("object %s declared size %d exceeds the %d-byte ceiling", key, declared, int64(1<<40))
+	}
+	rc, err := store.GetKey(ctx, key)
+	if err != nil {
+		return "", err
+	}
+	defer rc.Close()
+	base := path.Base(strings.ReplaceAll(key, "\\", "/"))
+	if base == "." || base == ".." || base == "/" || strings.ContainsAny(base, "\x00") {
+		return "", fmt.Errorf("object key %q yields unsafe file name", key)
+	}
+	tmp, err := os.CreateTemp(staging, ".fetch-*")
+	if err != nil {
+		return "", err
+	}
+	tmpName := tmp.Name()
+	final := filepath.Join(staging, base)
+	fail := func(e error) (string, error) {
+		tmp.Close()
+		os.Remove(tmpName)
+		return "", e
+	}
+	hash := sha256.New()
+	buf := make([]byte, 1<<20)
+	// A declared size is a HARD STREAM BOUND: the copy reads at most
+	// declared+1 bytes (one extra detects overlong bodies), so a hostile
+	// INDEX cannot make an arbitrarily large object fill the staging disk
+	// before the length check. declared < 0 keeps the historical unbounded
+	// stream for legacy artifacts whose sizes were never declared.
+	var src io.Reader = rc
+	if declared >= 0 {
+		src = io.LimitReader(rc, declared+1)
+	}
+	written, cerr := copyWithContext(ctx, io.MultiWriter(tmp, hash), src, buf)
+	if cerr != nil {
+		return fail(cerr)
+	}
+	if declared >= 0 {
+		if written > declared {
+			return fail(fmt.Errorf("object %s exceeds its declared %d bytes (read %d)", key, declared, written))
+		}
+		if written < declared {
+			return fail(fmt.Errorf("object %s is short: read %d, declared %d", key, written, declared))
+		}
+	}
+	got := hex.EncodeToString(hash.Sum(nil))
+	if got != wantDigest {
+		return fail(fmt.Errorf("digest mismatch: index %s fetched %s", wantDigest, got))
+	}
+	if serr := tmp.Sync(); serr != nil {
+		return fail(serr)
+	}
+	if cerr := tmp.Close(); cerr != nil {
+		os.Remove(tmpName)
+		return "", cerr
+	}
+	if rerr := os.Rename(tmpName, final); rerr != nil {
+		os.Remove(tmpName)
+		return "", rerr
+	}
+	return final, nil
+}
+
+// fetchKeyBounded reads at most limit bytes (bounded allocation). An object
+// LARGER than the limit is rejected explicitly; shorter objects are the
+// caller's business (digests and downstream checks bind content).
+func fetchKeyBounded(ctx context.Context, store chunkstore.Keyed, key string, limit int64) ([]byte, error) {
+	if limit <= 0 {
+		return nil, fmt.Errorf("object %s bound %d not positive", key, limit)
+	}
 	rc, err := store.GetKey(ctx, key)
 	if err != nil {
 		return nil, err
 	}
 	defer rc.Close()
-	return io.ReadAll(rc)
+	raw, rerr := io.ReadAll(io.LimitReader(rc, limit+1))
+	if rerr != nil {
+		return nil, rerr
+	}
+	if int64(len(raw)) > limit {
+		return nil, fmt.Errorf("object %s exceeds the %d-byte bound", key, limit)
+	}
+	return raw, nil
 }
 
 func jsonReader(b []byte) io.Reader {

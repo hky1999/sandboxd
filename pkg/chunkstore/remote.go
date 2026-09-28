@@ -20,8 +20,10 @@ import (
 	"crypto/md5"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"os"
 	"path"
@@ -80,6 +82,19 @@ func Open(spec string) (Store, error) {
 		}, nil
 	}
 	return NewLocal(spec)
+}
+
+// ErrObjectNotFound is the single not-found semantic across backends: the
+// HTTP Remote maps 404 to it, the Local directory backend maps ENOENT to
+// it, and IsNotFound recognizes both (plus bare os.ErrNotExist/fs.ErrNotExist
+// for paths that pre-date the sentinel). Consumers (uffd handler, memory
+// transport verifier) share it so a compressed-body miss falls back to the
+// plain object on every backend — never by string matching.
+var ErrObjectNotFound = errors.New("object not in store")
+
+// IsNotFound reports whether err means "this object does not exist here".
+func IsNotFound(err error) bool {
+	return err != nil && (errors.Is(err, ErrObjectNotFound) || errors.Is(err, os.ErrNotExist) || errors.Is(err, fs.ErrNotExist))
 }
 
 // Keyed is the streaming object surface artifact-set publication and
@@ -358,7 +373,7 @@ func (r *Remote) getKey(ctx context.Context, url string) (io.ReadCloser, error) 
 	}
 	if resp.StatusCode == http.StatusNotFound {
 		resp.Body.Close()
-		return nil, fmt.Errorf("object %s not in store", url)
+		return nil, fmt.Errorf("object %s: %w", url, ErrObjectNotFound)
 	}
 	if resp.StatusCode != http.StatusOK {
 		resp.Body.Close()
@@ -415,7 +430,7 @@ func (l *Local) PutKey(ctx context.Context, key string, r io.Reader) error {
 func (l *Local) GetKey(ctx context.Context, key string) (io.ReadCloser, error) {
 	f, err := os.Open(path.Join(l.root, strings.TrimLeft(key, "/")))
 	if os.IsNotExist(err) {
-		return nil, fmt.Errorf("object %s not in store", key)
+		return nil, fmt.Errorf("object %s: %w", key, ErrObjectNotFound)
 	}
 	return f, err
 }

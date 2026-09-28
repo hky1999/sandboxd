@@ -21,6 +21,19 @@ import (
 	"sync/atomic"
 )
 
+// capChunksByBudget bounds a prefetch walk by a byte budget: at most
+// budgetBytes/walk chunks are walked. A zero budget means unbounded (the
+// legacy remote path); a budget smaller than one walk unit walks nothing.
+func capChunksByBudget(totalChunks, walk, budgetBytes uint64) uint64 {
+	if budgetBytes == 0 || walk == 0 {
+		return totalChunks
+	}
+	if max := budgetBytes / walk; max < totalChunks {
+		return max
+	}
+	return totalChunks
+}
+
 // runPrefetch stops scheduling on the first fetch error and joins every worker.
 // It does not cancel the shared page source: foreground faults still need it.
 // An already-running fetch must finish under its own I/O cancellation policy.

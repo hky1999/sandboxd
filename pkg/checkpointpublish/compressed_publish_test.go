@@ -118,7 +118,7 @@ func TestCompressedPublishRoundtripAndMarker(t *testing.T) {
 		if entry.Digest == checkpointchunks.ZeroChunkDigest(length) {
 			continue
 		}
-		raw, err := fetchKey(ctx, store, chunkstore.CompressedKey(entry.Digest))
+		raw, err := fetchKeyBounded(ctx, store, chunkstore.CompressedKey(entry.Digest), 1<<30)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -223,7 +223,7 @@ func chunkLen(t *testing.T, m *checkpointchunks.Manifest, i int) int {
 
 func fetchIndex(t *testing.T, ctx context.Context, store chunkstore.Keyed, id string) *ArtifactIndex {
 	t.Helper()
-	raw, err := fetchKey(ctx, store, ArtifactKey(id, IndexName))
+	raw, err := fetchKeyBounded(ctx, store, ArtifactKey(id, IndexName), maxIndexBytes)
 	if err != nil {
 		t.Fatal(err)
 	}

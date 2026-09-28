@@ -53,13 +53,23 @@ func main() {
 	packMiB := flag.Int("pack-mib", 0, "pack memory into 1-8MiB objects (0 disables; candidate 4)")
 	baseID := flag.String("base-id", "", "verified published baseline in the same store for pack reuse")
 	compressChunks := flag.Bool("compress-chunks", false, "upload standalone memory chunks as zstd bodies (digests keep naming uncompressed bytes; requires unpacked publication)")
+	packAutoBase := flag.Bool("pack-auto-base", false, "opt-in automatic pack baseline: read the sealed manifest's base_memory hint and adopt it as this attempt's base when the layout enters the packed stage (an explicit -base-id always wins; the hint passes the same verification chain)")
+	packStreamingPut := flag.Bool("pack-streaming-put", false, "stream pack uploads without assembling the full pack buffer: a verified reader reads and sha256-checks each chunk from the memory file while the store consumes it (requires -pack-identity chunks-v1; default off keeps the buffer path)")
+	adaptivePackMiB := flag.Int64("adaptive-pack-threshold-mib", 0, "opt-in adaptive layout: one classification measures actual missing bytes; plain below this threshold, pack at or above (0 = off; requires -pack-mib; excludes -compress-chunks/-base-id/-pack-skip-chunk-probe)")
 	workers := flag.Int("workers", 0, "memory upload concurrency (1-64; 0 = at most 8 GOMAXPROCS workers)")
+	overlayWorkers := flag.Int("overlay-workers", 0, "overlay chunk upload concurrency (1-64; 0 = package default 8; overlay is never packed or compressed)")
+	jsonOut := flag.String("json-out", "", "write the full result JSON (including the phase attribution columns) to this file")
 	timeout := flag.Duration("timeout", 10*time.Minute, "overall deadline")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "usage: cn-publish -checkpoint-dir DIR -store DIR | cn-publish -status -checkpoint-dir DIR\n")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
+	adaptiveThreshold, err := checkpointpublish.AdaptiveMiBToBytes(*adaptivePackMiB)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(2)
+	}
 	if *packBatchHash && *packMiB == 0 {
 		fmt.Fprintln(os.Stderr, "error: -pack-batch-hash requires -pack-mib")
 		os.Exit(2)
@@ -82,6 +92,10 @@ func main() {
 	}
 	if *workers < 0 || *workers > 64 {
 		fmt.Fprintln(os.Stderr, "error: -workers must be between 0 and 64")
+		os.Exit(2)
+	}
+	if *overlayWorkers < 0 || *overlayWorkers > 64 {
+		fmt.Fprintln(os.Stderr, "error: -overlay-workers must be between 0 and 64")
 		os.Exit(2)
 	}
 	if *compressChunks && *packMiB != 0 {
@@ -133,7 +147,7 @@ func main() {
 		stopProfile = func() { pprof.StopCPUProfile(); file.Close() }
 	}
 	start := time.Now()
-	result, err := checkpointpublish.RunWithOptions(ctx, *checkpointDir, id, store, *storePath, checkpointpublish.Options{PackBatchHash: *packBatchHash, PackSkipChunkProbe: *packSkipChunkProbe, PackPayloadBytes: *packPayloadMiB << 20, PackIdentity: *packIdentity, Workers: *workers, PackBytes: *packMiB << 20, BaseID: *baseID, CompressChunks: *compressChunks})
+	result, err := checkpointpublish.RunWithOptions(ctx, *checkpointDir, id, store, *storePath, checkpointpublish.Options{PackBatchHash: *packBatchHash, PackSkipChunkProbe: *packSkipChunkProbe, PackPayloadBytes: *packPayloadMiB << 20, PackIdentity: *packIdentity, Workers: *workers, OverlayWorkers: *overlayWorkers, PackBytes: *packMiB << 20, BaseID: *baseID, CompressChunks: *compressChunks, AdaptivePackThresholdBytes: adaptiveThreshold, PackAutoBase: *packAutoBase, PackStreamingPut: *packStreamingPut})
 	elapsed := time.Since(start)
 	stopProfile()
 	if err != nil {
@@ -154,8 +168,26 @@ func main() {
 		encoded, _ := json.Marshal(result.PackTimings)
 		fmt.Printf("pack_timings=%s\n", encoded)
 	}
+	if result.LayoutDecision != nil {
+		encoded, _ := json.Marshal(result.LayoutDecision)
+		fmt.Printf("layout_decision=%s\n", encoded)
+	}
+	if result.AutoBase != nil {
+		encoded, _ := json.Marshal(result.AutoBase)
+		fmt.Printf("auto_base=%s\n", encoded)
+	}
 	fmt.Printf("published %s: %d logical chunks, %d unique (%d written, %d reused), artifact_set=%v workers=%d compressed=%v in %s\n",
 		id, result.State.ChunksTotal, result.State.ChunksPut,
 		result.ChunksPut, result.ChunksSkip, result.State.ArtifactSet, result.Workers, *compressChunks,
 		elapsed.Round(time.Millisecond))
+	if *jsonOut != "" {
+		encoded, err := json.MarshalIndent(result, "", "  ")
+		if err == nil {
+			err = os.WriteFile(*jsonOut, append(encoded, '\n'), 0o644)
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "json-out: %v\n", err)
+			os.Exit(1)
+		}
+	}
 }

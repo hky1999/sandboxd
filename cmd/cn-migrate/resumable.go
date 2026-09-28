@@ -121,6 +121,22 @@ type resumableConfig struct {
 	jsonOut     bool
 	journalPath string
 	migrationID string
+	chunkCache  string
+	cacheHighMB int64
+	cacheLowMB  int64
+}
+
+// fetchArgs builds the cn-fetch argument vector for the materialize stage,
+// propagating the node chunk cache flags so the target shares one cache
+// root with its daemon's uffd handler.
+func (c resumableConfig) fetchArgs(into, id string) []string {
+	args := []string{"-into", into, "-id", id, "-store", c.storeSpec}
+	if c.chunkCache != "" {
+		args = append(args, "-chunk-cache", c.chunkCache,
+			"-cache-high-mb", strconv.FormatInt(c.cacheHighMB, 10),
+			"-cache-low-mb", strconv.FormatInt(c.cacheLowMB, 10))
+	}
+	return args
 }
 
 // runResumableMigration executes the journaled migration flow. It either
@@ -762,8 +778,8 @@ func runResumableMigration(cfg resumableConfig) {
 					journal.Target, journal.CheckpointDir, root, journal.RootDigest))
 			}
 		default:
-			if _, ok := run(journal.Target, "materialize", cfg.bin+"/cn-fetch",
-				"-into", journal.CheckpointDir, "-id", dirBase(journal.CheckpointDir), "-store", cfg.storeSpec); !ok {
+			if _, ok := run(journal.Target, "materialize",
+				append([]string{cfg.bin + "/cn-fetch"}, cfg.fetchArgs(journal.CheckpointDir, dirBase(journal.CheckpointDir))...)...); !ok {
 				fail("materialize", "cn-fetch failed on target — materialization is idempotent, retry this migration")
 			}
 			landed, code := runCode(journal.Target, "verify-target-root", cfg.bin+"/checkpoint-restore",

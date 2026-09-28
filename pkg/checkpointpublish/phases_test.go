@@ -20,6 +20,7 @@ package checkpointpublish
 // methods and fake capabilities the backend does not have).
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"strings"
@@ -200,5 +201,73 @@ func TestInstrumentStoreCounterClassification(t *testing.T) {
 	}
 	if snap.HasReqs != 1 {
 		t.Fatalf("has_reqs = %d, want 1", snap.HasReqs)
+	}
+}
+
+// TestPlanBodyCountPreservesSeekerAndCounts: the attribution wrapper's PUT
+// body counting must keep a seekable body SEEKABLE (Remote.PutKey's Seeker
+// path depends on the type assertion surviving instrumentation) while
+// counting exactly the consumed bytes; a non-seekable body must NOT be
+// promoted to a Seeker, and the bytes/strings fast paths must keep the
+// original reader with an immediate exact count.
+func TestPlanBodyCountPreservesSeekerAndCounts(t *testing.T) {
+	data := []byte("0123456789abcdef")
+
+	// Seekable custom reader (like the verified streaming pack reader):
+	// wrapped body still implements io.Seeker with working End/Start.
+	count, body := planBodyCount(bytes.NewReader(data))
+	sk, ok := body.(io.Seeker)
+	if !ok {
+		t.Fatal("seekable input lost io.Seeker through the counting wrapper")
+	}
+	end, err := sk.Seek(0, io.SeekEnd)
+	if err != nil || end != int64(len(data)) {
+		t.Fatalf("SeekEnd = (%d, %v), want (%d, nil)", end, err, len(data))
+	}
+	start, err := sk.Seek(0, io.SeekStart)
+	if err != nil || start != 0 {
+		t.Fatalf("SeekStart = (%d, %v), want (0, nil)", start, err)
+	}
+	got, err := io.ReadAll(body)
+	if err != nil || !bytes.Equal(got, data) {
+		t.Fatalf("body = %q (%v), want the original bytes", got, err)
+	}
+	if count() != int64(len(data)) {
+		t.Fatalf("count = %d, want %d consumed bytes", count(), len(data))
+	}
+
+	// Non-seekable input must not be fake-promoted: Remote.PutKey would
+	// otherwise attempt seeks, fail them, and fall into its chunked-PUT
+	// branch (a 411 on S3-like backends) instead of the buffered path.
+	nonSeek := struct{ io.Reader }{strings.NewReader("abc")}
+	count2, body2 := planBodyCount(nonSeek)
+	if _, ok := body2.(io.Seeker); ok {
+		t.Fatal("non-seekable input was promoted to io.Seeker")
+	}
+	got2, err := io.ReadAll(body2)
+	if err != nil || string(got2) != "abc" {
+		t.Fatalf("non-seekable body = %q (%v)", got2, err)
+	}
+	if count2() != 3 {
+		t.Fatalf("non-seekable count = %d, want 3", count2())
+	}
+
+	// Fast paths keep the ORIGINAL reader (no wrapper) and answer the
+	// count immediately, before any byte is consumed.
+	br := bytes.NewReader(data)
+	count3, body3 := planBodyCount(br)
+	if same, ok := body3.(*bytes.Reader); !ok || same != br {
+		t.Fatal("*bytes.Reader fast path must return the original reader")
+	}
+	if count3() != int64(len(data)) {
+		t.Fatalf("fast-path count = %d, want %d before any read", count3(), len(data))
+	}
+	sr := strings.NewReader("xyz")
+	count4, body4 := planBodyCount(sr)
+	if same, ok := body4.(*strings.Reader); !ok || same != sr {
+		t.Fatal("*strings.Reader fast path must return the original reader")
+	}
+	if count4() != 3 {
+		t.Fatalf("strings fast-path count = %d, want 3", count4())
 	}
 }

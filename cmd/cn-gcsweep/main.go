@@ -827,28 +827,46 @@ func artifactIDOfKey(key string) (string, bool) {
 // compressed forms), the packs it maps chunks into, and its overlay
 // chunks. INDEX and artifact-set objects of the ID namespace are handled
 // by the caller (they live or die with the artifact).
+//
+// The extraction chain is the SHARED materialize-grade verifier
+// (checkpointpublish/artifact_verify.go): INDEX identity + bundle
+// declaration, ONE bundle GET with exact declared length and whole-object
+// digest, part whitelist/digest/overflow-safe spans, per-sidecar digest
+// checks, and the sidecar/INDEX memory closure. A corrupted object that
+// still decodes a reference-poorer sidecar therefore FAILS the whole sweep
+// instead of silently shrinking the live set (which would delete live
+// objects); the caller treats any error here as fatal for the round.
 func artifactReferences(ctx context.Context, client *http.Client, base, id string) (map[string]struct{}, error) {
-	refs := make(map[string]struct{})
-	raw, err := getObject(ctx, client, base, checkpointpublish.ArtifactKey(id, checkpointpublish.IndexName))
+	store, err := chunkstore.Open(base)
 	if err != nil {
-		return nil, fmt.Errorf("fetch INDEX: %w", err)
+		return nil, err
 	}
-	var index checkpointpublish.ArtifactIndex
-	if err := json.Unmarshal(raw, &index); err != nil {
-		return nil, fmt.Errorf("decode INDEX: %w", err)
+	keyed, ok := store.(chunkstore.Keyed)
+	if !ok {
+		return nil, fmt.Errorf("store backend cannot serve keyed objects")
 	}
-	sidecars := []string{checkpointchunks.ManifestName}
+	index, err := checkpointpublish.FetchVerifiedIndex(ctx, keyed, id)
+	if err != nil {
+		return nil, err
+	}
+	names := []string{checkpointchunks.ManifestName}
 	if index.OverlayChunks {
-		sidecars = append(sidecars, checkpointpublish.OverlaySidecarName)
+		names = append(names, checkpointpublish.OverlaySidecarName)
 	}
-	for _, name := range sidecars {
-		raw, err := artifactFile(ctx, client, base, id, &index, name)
-		if err != nil {
-			return nil, fmt.Errorf("fetch sidecar %s: %w", name, err)
-		}
-		m, err := checkpointchunks.DecodeTransport(raw)
+	files, err := checkpointpublish.FetchVerifiedSidecars(ctx, keyed, id, index, names)
+	if err != nil {
+		return nil, err
+	}
+	refs := make(map[string]struct{})
+	for _, name := range names {
+		m, err := checkpointchunks.DecodeTransport(files[name])
 		if err != nil {
 			return nil, fmt.Errorf("decode sidecar %s: %w", name, err)
+		}
+		if name == checkpointchunks.ManifestName {
+			if err := checkpointpublish.VerifySidecarIndexClosure(m, index); err != nil {
+				return nil, err
+			}
 		}
 		// Overlay chunks live in their own global namespace
 		// (overlay-chunks/<aa>/<digest>) and are never uploaded compressed
@@ -875,28 +893,6 @@ func artifactReferences(ctx context.Context, client *http.Client, base, id strin
 		}
 	}
 	return refs, nil
-}
-
-// artifactFile returns one artifact-set file's bytes, from the bundle
-// object when the INDEX advertises one or the per-file object otherwise.
-func artifactFile(ctx context.Context, client *http.Client, base, id string, index *checkpointpublish.ArtifactIndex, name string) ([]byte, error) {
-	if index.Bundle == nil {
-		return getObject(ctx, client, base, checkpointpublish.ArtifactKey(id, name))
-	}
-	bundle, err := getObject(ctx, client, base, checkpointpublish.ArtifactKey(id, checkpointpublish.BundleName))
-	if err != nil {
-		return nil, err
-	}
-	for _, part := range index.Bundle.Parts {
-		if part.Name != name {
-			continue
-		}
-		if part.Offset < 8 || part.Offset+part.Length > int64(len(bundle)) {
-			return nil, fmt.Errorf("bundle part %s span out of range", name)
-		}
-		return bundle[part.Offset : part.Offset+part.Length], nil
-	}
-	return nil, fmt.Errorf("bundle has no part %s", name)
 }
 
 func getObject(ctx context.Context, client *http.Client, base, key string) ([]byte, error) {

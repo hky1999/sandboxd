@@ -255,6 +255,13 @@ type FirecrackerConfig struct {
 	// UffdPersistWorkers overrides the handler's persistent-cache IO budget.
 	// Zero inherits the handler default; explicit values must be 1-64.
 	UffdPersistWorkers int `toml:"uffd_persist_workers" json:"uffdPersistWorkers,omitempty"`
+	// UffdChunkCacheHighMB/LowMB bound the node chunk cache (the shared
+	// -chunk-local directory) with a high/low watermark in MiB: crossing the
+	// high watermark evicts least-recently-used unpinned verified entries
+	// down to the low watermark. Both zero keeps the historical unbounded
+	// cache; when high is set, low must satisfy 0 < low <= high.
+	UffdChunkCacheHighMB int64 `toml:"uffd_chunk_cache_high_mb" json:"uffdChunkCacheHighMB,omitempty"`
+	UffdChunkCacheLowMB  int64 `toml:"uffd_chunk_cache_low_mb" json:"uffdChunkCacheLowMB,omitempty"`
 
 	// DigestMemory seals a sha256 of the memory artifact into the
 	// checkpoint manifest so restores reject corrupted artifacts up front
@@ -275,6 +282,18 @@ type FirecrackerConfig struct {
 	// then served per-chunk by digest (verified while copying); artifacts
 	// without one fall back to the plain backing file.
 	UffdChunkStore string `toml:"uffd_chunk_store" json:"uffdChunkStore,omitempty"`
+	// UffdChunkPrefetchWorkers is the background prefetch concurrency for
+	// the chunk-store path. Unlike the legacy remote-memory prefetch it
+	// defaults to 0 (off): a chunk-store restore is lazy by default and
+	// never implicitly background-downloads an artifact's whole memory.
+	// Values are capped at 16 and rejected above it (never silently
+	// clamped by the executor).
+	UffdChunkPrefetchWorkers int `toml:"uffd_chunk_prefetch_workers" json:"uffdChunkPrefetchWorkers,omitempty"`
+	// UffdChunkPrefetchBudgetMB bounds chunk-store background prefetch in
+	// MiB. It MUST be > 0 whenever uffd_chunk_prefetch_workers > 0 (an
+	// unbounded walk is rejected at startup); it is capped by the same MiB
+	// ceiling as the cache watermarks.
+	UffdChunkPrefetchBudgetMB int `toml:"uffd_chunk_prefetch_budget_mb" json:"uffdChunkPrefetchBudgetMB,omitempty"`
 	// WritableIOEngine selects Sync, Async, SyncDirect, or AsyncDirect for
 	// the private ext4 disk. Direct engines require a compatible VMM.
 	// The host must provide STATX_DIOALIGN for direct engines and io_uring
