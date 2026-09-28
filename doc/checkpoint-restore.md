@@ -16,7 +16,10 @@ The API has three operations:
 
 Restore is a form of sandbox creation: both entries allocate the target
 sandbox's filesystem, network, cgroup, and other resources through the
-normal `Start` path and differ only in entry semantics.
+shared `createSandbox` primitives. Beyond that shared creation core, the
+explicit managed `Restore` entry adds checkpoint-artifact identity
+verification, idempotent retry and ownership handling, and restoration-
+result verification before a success is reported.
 
 sandboxd coordinates the runtime operation and cleans partial output. It does
 not manage checkpoint names, catalogs, storage, transfer, retention, or
