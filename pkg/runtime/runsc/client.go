@@ -450,9 +450,9 @@ func (c *Client) Restore(ctx context.Context, args StartArgs, imagePath string) 
 // passes one StartArgs to both calls, so deriving here cannot drift.
 func newRestoreOpts(args StartArgs, files []*os.File, havePagesFile bool) *restoreOpts {
 	return &restoreOpts{
-		payload:         filePayload{Files: files},
-		HavePagesFile:   havePagesFile,
-		SplitFSRestore:  args.FsRestoreImagePath != "",
+		payload:        filePayload{Files: files},
+		HavePagesFile:  havePagesFile,
+		SplitFSRestore: args.FsRestoreImagePath != "",
 	}
 }
 

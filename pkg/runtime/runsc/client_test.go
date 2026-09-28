@@ -357,7 +357,6 @@ func fileNames(files []*os.File) []string {
 	return names
 }
 
-
 func TestRestoreOptsSerializationShapeAndDimensionIndependence(t *testing.T) {
 	// json.Marshal(clientCall) is the exact payload shape rpcClient.marshal
 	// puts on the wire for containerManager.Restore. This is a
