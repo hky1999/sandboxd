@@ -258,14 +258,23 @@ func (c *Client) Start(ctx context.Context, args StartArgs) error {
 }
 
 // Checkpoint saves a sandbox to imageDir using the stable upstream runsc CLI.
+// A non-empty fsCheckpointPaths adds runsc's --fs-checkpoint-paths so ONE
+// invocation writes both the sentry state and the filesystem artifact under
+// imageDir/fs; runsc then excludes those private memory files from the sentry
+// state, which is exactly the split the restore-side duplicate guard requires.
 func (c *Client) Checkpoint(
-	ctx context.Context, id, imageDir string, compress, leaveRunning bool,
+	ctx context.Context, id, imageDir string, compress, leaveRunning bool, fsCheckpointPaths ...string,
 ) error {
 	if id == "" {
 		return fmt.Errorf("container id is empty")
 	}
 	if imageDir == "" {
 		return fmt.Errorf("checkpoint image directory is empty for %s", id)
+	}
+	for _, p := range fsCheckpointPaths {
+		if p == "" {
+			return fmt.Errorf("empty filesystem checkpoint path for %s", id)
+		}
 	}
 
 	args := append(c.globalArgs(), "checkpoint")
@@ -276,6 +285,9 @@ func (c *Client) Checkpoint(
 	args = append(args, "--compression="+compression)
 	if leaveRunning {
 		args = append(args, "--leave-running")
+	}
+	if len(fsCheckpointPaths) > 0 {
+		args = append(args, "--fs-checkpoint-paths="+strings.Join(fsCheckpointPaths, ","))
 	}
 	args = append(args, "--image-path", imageDir, id)
 	cmd := exec.CommandContext(ctx, c.Binary, args...)

@@ -64,7 +64,7 @@ type Handler struct {
 type runscClient interface {
 	Create(context.Context, StartArgs) error
 	Start(context.Context, StartArgs) error
-	Checkpoint(context.Context, string, string, bool, bool) error
+	Checkpoint(context.Context, string, string, bool, bool, ...string) error
 	FsCheckpoint(context.Context, string, string, bool) error
 	Pause(context.Context, string) error
 	Resume(context.Context, string) error
@@ -224,11 +224,12 @@ func (r *Handler) Checkpoint(
 		defer cancel()
 		return errors.Join(cause, r.runsc.Resume(cleanupCtx, sandboxID))
 	}
-	if err := r.runsc.FsCheckpoint(ctx, sandboxID, filepath.Join(imagePath, checkpoint.FsArtifactDirName), true); err != nil {
-		// Never terminate the source after failing to capture its files.
-		return resumeSource(err)
-	}
-	ckptErr := r.runsc.Checkpoint(ctx, sandboxID, imagePath, true, options.LeaveRunning)
+	// ONE combined invocation: runsc checkpoint --fs-checkpoint-paths=/ writes
+	// the filesystem artifact under imagePath/fs AND excludes the filesystem-
+	// checkpointed private memory files from the sentry state. Two separate
+	// subcommands wrote the root file into BOTH inventories and the
+	// restore-side duplicate guard correctly rejected the pair.
+	ckptErr := r.runsc.Checkpoint(ctx, sandboxID, imagePath, true, options.LeaveRunning, "/")
 	if options.LeaveRunning || ckptErr != nil {
 		return resumeSource(ckptErr)
 	}

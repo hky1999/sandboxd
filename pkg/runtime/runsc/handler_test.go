@@ -180,7 +180,7 @@ func (successfulRunscClient) FsCheckpoint(context.Context, string, string, bool)
 func (successfulRunscClient) Pause(context.Context, string) error                      { return nil }
 func (successfulRunscClient) Resume(context.Context, string) error                     { return nil }
 func (successfulRunscClient) Start(context.Context, StartArgs) error                   { return nil }
-func (successfulRunscClient) Checkpoint(context.Context, string, string, bool, bool) error {
+func (successfulRunscClient) Checkpoint(context.Context, string, string, bool, bool, ...string) error {
 	return nil
 }
 func (successfulRunscClient) Restore(context.Context, StartArgs, string) error {
@@ -207,4 +207,119 @@ func TestRunscHandlerResolvesWritableLayerOverlay(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, "root:dir=/home/akernel/xfs,size=10G", overlay)
 	assert.Equal(t, "10G", size)
+}
+
+type recordingCheckpointClient struct {
+	successfulRunscClient
+	pauseCount, resumeCount, fsCheckpointCount, checkpointCount int
+	checkpointPaths                                             []string
+	leaveRunning                                                bool
+	checkpointErr                                               error
+	pauseErr                                                    error
+}
+
+func (c *recordingCheckpointClient) FsCheckpoint(context.Context, string, string, bool) error {
+	c.fsCheckpointCount++
+	return nil
+}
+
+func (c *recordingCheckpointClient) Pause(context.Context, string) error {
+	c.pauseCount++
+	return c.pauseErr
+}
+
+func (c *recordingCheckpointClient) Resume(context.Context, string) error {
+	c.resumeCount++
+	return nil
+}
+
+func (c *recordingCheckpointClient) Checkpoint(
+	_ context.Context, _, _ string, _, leaveRunning bool, paths ...string,
+) error {
+	c.checkpointCount++
+	c.checkpointPaths = paths
+	c.leaveRunning = leaveRunning
+	return c.checkpointErr
+}
+
+func newCheckpointTestHandler(t *testing.T, client *recordingCheckpointClient) *Handler {
+	t.Helper()
+	cfg := config.Config{RootDir: filepath.Join(t.TempDir(), "sandboxd", "root")}
+	cfg.RuntimeConfig.FilestoreDir = "/home/akernel/xfs"
+	handler, err := NewHandler(cfg, "/usr/local/bin/runsc", staticOciLoader{bundlePath: t.TempDir(), spec: &runtimecore.Spec{}})
+	assert.NoError(t, err)
+	handler.runsc = client
+	return handler
+}
+
+func TestCheckpointIncludeFilesystemUsesSingleCombinedCall(t *testing.T) {
+	client := &recordingCheckpointClient{}
+	handler := newCheckpointTestHandler(t, client)
+
+	err := handler.Checkpoint(context.Background(), "sbox", "/images/cp", runtimecore.CheckpointOptions{
+		IncludeFilesystem: true,
+	})
+	assert.NoError(t, err)
+	// Exactly ONE runsc checkpoint carrying the root path; NO separate
+	// fscheckpoint subcommand may run anymore.
+	assert.Equal(t, 1, client.checkpointCount)
+	assert.Equal(t, 0, client.fsCheckpointCount)
+	assert.Equal(t, []string{"/"}, client.checkpointPaths)
+	assert.True(t, client.leaveRunning)
+	assert.Equal(t, 1, client.pauseCount)
+	// LeaveRunning=false stops the source: the single combined call runs
+	// without --leave-running, so no sandboxd-side Resume happens.
+	assert.Equal(t, 0, client.resumeCount)
+}
+
+func TestCheckpointIncludeFilesystemLeaveRunningResumes(t *testing.T) {
+	client := &recordingCheckpointClient{}
+	handler := newCheckpointTestHandler(t, client)
+
+	err := handler.Checkpoint(context.Background(), "sbox", "/images/cp", runtimecore.CheckpointOptions{
+		IncludeFilesystem: true,
+		LeaveRunning:      true,
+	})
+	assert.NoError(t, err)
+	assert.Equal(t, 1, client.pauseCount)
+	assert.Equal(t, 1, client.resumeCount)
+	assert.Equal(t, 1, client.checkpointCount)
+}
+
+func TestCheckpointIncludeFilesystemFailureStillResumes(t *testing.T) {
+	client := &recordingCheckpointClient{checkpointErr: errors.New("checkpoint boom")}
+	handler := newCheckpointTestHandler(t, client)
+
+	err := handler.Checkpoint(context.Background(), "sbox", "/images/cp", runtimecore.CheckpointOptions{
+		IncludeFilesystem: true,
+	})
+	assert.Error(t, err)
+	assert.Equal(t, 1, client.resumeCount, "failed combined checkpoint must still resume the source")
+}
+
+func TestCheckpointIncludeFilesystemCancelledRequestStillResumes(t *testing.T) {
+	client := &recordingCheckpointClient{}
+	handler := newCheckpointTestHandler(t, client)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	client.checkpointErr = context.Canceled
+	client.pauseErr = nil
+	err := handler.Checkpoint(ctx, "sbox", "/images/cp", runtimecore.CheckpointOptions{
+		IncludeFilesystem: true,
+	})
+	_ = cancel()
+	assert.Error(t, err)
+	assert.Equal(t, 1, client.resumeCount, "cancelled request must still unfreeze the source")
+}
+
+func TestCheckpointPlainCompatSkipsPauseAndPaths(t *testing.T) {
+	client := &recordingCheckpointClient{}
+	handler := newCheckpointTestHandler(t, client)
+
+	err := handler.Checkpoint(context.Background(), "sbox", "/images/cp", runtimecore.CheckpointOptions{})
+	assert.NoError(t, err)
+	assert.Equal(t, 0, client.pauseCount)
+	assert.Equal(t, 0, client.resumeCount)
+	assert.Equal(t, 1, client.checkpointCount)
+	assert.Empty(t, client.checkpointPaths)
 }

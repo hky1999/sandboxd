@@ -425,3 +425,73 @@ func TestRestoreOptsSerializationShapeAndDimensionIndependence(t *testing.T) {
 		})
 	}
 }
+
+func TestCheckpointCombinedFSPathsArgument(t *testing.T) {
+	// The split-fs checkpoint must be ONE invocation carrying runsc's
+	// --fs-checkpoint-paths; the flag bytes and the join format are pinned so
+	// the combined form cannot silently regress to two subcommands.
+	tempDir := t.TempDir()
+	argsFile := filepath.Join(tempDir, "args")
+	binary := filepath.Join(tempDir, "runsc")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$RUNSC_TEST_ARGS\"\n"
+	if err := os.WriteFile(binary, []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("RUNSC_TEST_ARGS", argsFile)
+	client := NewClient(binary, filepath.Join(tempDir, "root"))
+	if err := client.Checkpoint(
+		context.Background(),
+		"sbox-checkpoint",
+		filepath.Join(tempDir, "checkpoint"),
+		true, true, "/",
+	); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	arguments := string(data)
+	if !strings.Contains(arguments, "--fs-checkpoint-paths=/\n") {
+		t.Fatalf("checkpoint arguments = %q, want --fs-checkpoint-paths=/", arguments)
+	}
+	if strings.Count(arguments, "checkpoint\n") != 1 {
+		t.Fatalf("expected exactly one checkpoint subcommand, arguments = %q", arguments)
+	}
+	if !strings.Contains(arguments, "--leave-running\n") {
+		t.Fatalf("checkpoint arguments = %q, want --leave-running", arguments)
+	}
+	if err := client.Checkpoint(
+		context.Background(), "sbox", filepath.Join(tempDir, "checkpoint"),
+		false, false, "", "/",
+	); err == nil {
+		t.Fatal("empty fs checkpoint path must be rejected")
+	}
+}
+
+func TestCheckpointPlainBranchHasNoFSFlag(t *testing.T) {
+	// The compatibility branch (no fsCheckpointPaths) must not carry the
+	// combined flag: the legacy state-dump shape stays byte-identical.
+	tempDir := t.TempDir()
+	argsFile := filepath.Join(tempDir, "args")
+	binary := filepath.Join(tempDir, "runsc")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$RUNSC_TEST_ARGS\"\n"
+	if err := os.WriteFile(binary, []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("RUNSC_TEST_ARGS", argsFile)
+	client := NewClient(binary, filepath.Join(tempDir, "root"))
+	if err := client.Checkpoint(
+		context.Background(), "sbox", filepath.Join(tempDir, "checkpoint"),
+		false, false,
+	); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "--fs-checkpoint-paths") {
+		t.Fatalf("plain checkpoint arguments = %q, must not carry fs flag", data)
+	}
+}
