@@ -5,14 +5,18 @@ directory and starting a new sandbox from that checkpoint.
 
 ## Design
 
-The API has two operations:
+The API has three operations:
 
 1. `SandboxService.Checkpoint` checkpoints an existing sandbox.
 2. The existing `Start` RPC restores a sandbox when `checkpoint_info` is set.
+   This remains the compatibility restore entry.
+3. `SandboxService.Restore` (`RestoreRequest` -> `StartResponse`) is the
+   explicit managed-restore entry used by the scheduler line; it accepts a
+   prepared checkpoint image and drives the same restore pipeline.
 
-There is no separate restore RPC. Restore is a form of sandbox creation, so it
-uses the normal `Start` path to allocate the target sandbox's filesystem,
-network, cgroup, and other resources.
+Restore is a form of sandbox creation: both entries allocate the target
+sandbox's filesystem, network, cgroup, and other resources through the
+normal `Start` path and differ only in entry semantics.
 
 sandboxd coordinates the runtime operation and cleans partial output. It does
 not manage checkpoint names, catalogs, storage, transfer, retention, or
@@ -388,6 +392,14 @@ the equivalent guest-agent endpoints at `/run/sandboxd/checkpoint` and
 `/run/sandboxd/restore-environ`. These paths are runtime-neutral transport
 metadata: sandboxd does not inject or interpret application-specific
 environment variables.
+
+runsc restores are split-filesystem restores whenever Create donated
+filesystem-restore files through `--fs-restore-image-path`. The
+`containerManager.Restore` control RPC payload must then carry
+`split_fsrestore: true`: runsc rejects a Restore whose donated-files fact and
+this flag disagree, and both are derived from the same StartArgs so they
+cannot drift. Restores without donated filesystem files send
+`split_fsrestore: false` explicitly.
 
 Unsupported runtimes return `Unimplemented`.
 

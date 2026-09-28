@@ -16,6 +16,7 @@ package runsc
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -354,4 +355,74 @@ func fileNames(files []*os.File) []string {
 		names = append(names, file.Name())
 	}
 	return names
+}
+
+
+func TestRestoreOptsSerializationShapeAndDimensionIndependence(t *testing.T) {
+	// json.Marshal(clientCall) is the exact payload shape rpcClient.marshal
+	// puts on the wire for containerManager.Restore. This is a
+	// serialization-shape test: it does not run a live urpc server or a
+	// physical Restore.
+	//
+	// FsRestoreImagePath and HavePagesFile are independent dimensions; the
+	// matrix below pins that split_fsrestore follows ONLY the donated-files
+	// argument and can never be derived from pages presence.
+	f1, err := os.CreateTemp(t.TempDir(), "payload-one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f1.Close()
+	f2, err := os.CreateTemp(t.TempDir(), "payload-two")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f2.Close()
+	files := []*os.File{f1, f2}
+
+	cases := []struct {
+		name      string
+		fsPath    string
+		havePages bool
+		wantSplit bool
+	}{
+		{"fs-with-pages", "/filestore/image", true, true},
+		{"fs-without-pages", "/filestore/image", false, true},
+		{"no-fs-with-pages", "", true, false},
+		{"no-fs-without-pages", "", false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := newRestoreOpts(StartArgs{FsRestoreImagePath: tc.fsPath}, files, tc.havePages)
+			payload, err := json.Marshal(clientCall{Method: contMgrRestore, Arg: opts})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var decoded map[string]any
+			if err := json.Unmarshal(payload, &decoded); err != nil {
+				t.Fatal(err)
+			}
+			if decoded["method"] != contMgrRestore {
+				t.Fatalf("method = %v, want %s", decoded["method"], contMgrRestore)
+			}
+			arg, ok := decoded["arg"].(map[string]any)
+			if !ok {
+				t.Fatalf("arg not an object: %v", decoded["arg"])
+			}
+			if v, present := arg["split_fsrestore"]; !present || v != tc.wantSplit {
+				t.Fatalf("arg.split_fsrestore = %v (present=%t), want %t", v, present, tc.wantSplit)
+			}
+			if opts.HavePagesFile != tc.havePages {
+				t.Fatalf("HavePagesFile = %t, want %t", opts.HavePagesFile, tc.havePages)
+			}
+			if opts.SplitFSRestore != tc.wantSplit {
+				t.Fatalf("SplitFSRestore = %t, want %t", opts.SplitFSRestore, tc.wantSplit)
+			}
+			// The donated file payload must preserve the ORIGINAL file
+			// pointers and their order, not just the count.
+			got := opts.filePayload()
+			if len(got) != 2 || got[0] != f1 || got[1] != f2 {
+				t.Fatalf("file payload = %v, want the original [f1 f2] order", got)
+			}
+		})
+	}
 }

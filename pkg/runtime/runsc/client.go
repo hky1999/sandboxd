@@ -351,6 +351,12 @@ type restoreOpts struct {
 	HaveDeviceFile     bool
 	Background         bool
 	UseCheckpointGofer bool `json:"use_checkpoint_gofer"`
+	// SplitFSRestore mirrors runsc's RestoreOpts.SplitFSRestore (wire name
+	// "split_fsrestore"). runsc rejects a Restore whose donated filesystem
+	// restore files — handed to the loader by Create through
+	// --fs-restore-image-path — disagree with this flag, so it must be
+	// derived from the same StartArgs.FsRestoreImagePath Create consumed.
+	SplitFSRestore bool `json:"split_fsrestore"`
 }
 
 const (
@@ -419,10 +425,7 @@ func (c *Client) Restore(ctx context.Context, args StartArgs, imagePath string) 
 	}
 	defer closeFiles(files)
 
-	opts := &restoreOpts{
-		payload:       filePayload{Files: files},
-		HavePagesFile: havePagesFile,
-	}
+	opts := newRestoreOpts(args, files, havePagesFile)
 	device, err := c.openPlatformDevice()
 	if err != nil {
 		return fmt.Errorf("open platform device for %s: %w", args.ID, err)
@@ -439,6 +442,18 @@ func (c *Client) Restore(ctx context.Context, args StartArgs, imagePath string) 
 		return fmt.Errorf("mark runsc state running for %s: %w", args.ID, err)
 	}
 	return nil
+}
+
+// newRestoreOpts assembles the containerManager.Restore payload. SplitFSRestore
+// is derived from the same StartArgs.FsRestoreImagePath that Create consumed:
+// runsc requires the donated-files fact and the flag to agree, and the handler
+// passes one StartArgs to both calls, so deriving here cannot drift.
+func newRestoreOpts(args StartArgs, files []*os.File, havePagesFile bool) *restoreOpts {
+	return &restoreOpts{
+		payload:         filePayload{Files: files},
+		HavePagesFile:   havePagesFile,
+		SplitFSRestore:  args.FsRestoreImagePath != "",
+	}
 }
 
 func openRestoreFiles(imagePath string) ([]*os.File, bool, error) {
