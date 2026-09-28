@@ -404,14 +404,7 @@ this flag disagree, and both are derived from the same StartArgs so they
 cannot drift. Restores without donated filesystem files send
 `split_fsrestore: false` explicitly.
 
-The matching checkpoint side is ONE combined `runsc checkpoint
---fs-checkpoint-paths=/` invocation: runsc writes the filesystem artifact
-under `<image>/fs` (the exact layout restore consumes) and EXCLUDES the
-filesystem-checkpointed private memory files from the sentry state. Taking
-the two artifacts through separate subcommands duplicates the root private
-memory file into both inventories, and the restore-side duplicate guard
-correctly rejects that pair. The filesystem artifact itself is never deleted
-or bypassed; the restore-side consistency checks stay authoritative.
+The matching checkpoint side is ONE combined `runsc checkpoint --fs-checkpoint-paths=/` invocation: runsc writes the filesystem artifact under `<image>/fs` (the exact layout restore consumes) and EXCLUDES the filesystem-checkpointed private memory files from the sentry state. Taking the two artifacts through separate subcommands duplicates the root private memory file into both inventories, and the restore-side duplicate guard correctly rejects that pair. The filesystem artifact itself is never deleted or bypassed; the restore-side consistency checks stay authoritative.
 
 Unsupported runtimes return `Unimplemented`.
 

@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"syscall"
 	"testing"
+	"time"
 
 	runtimeapi "github.com/inclusionAI/sandboxd/api/runtime/v1"
 	"github.com/inclusionAI/sandboxd/config"
@@ -216,6 +217,9 @@ type recordingCheckpointClient struct {
 	leaveRunning                                                bool
 	checkpointErr                                               error
 	pauseErr                                                    error
+	cancelDuringCheckpoint                                      func()
+	resumeCtx                                                   context.Context
+	order                                                       []string
 }
 
 func (c *recordingCheckpointClient) FsCheckpoint(context.Context, string, string, bool) error {
@@ -223,22 +227,32 @@ func (c *recordingCheckpointClient) FsCheckpoint(context.Context, string, string
 	return nil
 }
 
-func (c *recordingCheckpointClient) Pause(context.Context, string) error {
+func (c *recordingCheckpointClient) Pause(_ context.Context, _ string) error {
 	c.pauseCount++
+	c.order = append(c.order, "pause")
 	return c.pauseErr
 }
 
-func (c *recordingCheckpointClient) Resume(context.Context, string) error {
+func (c *recordingCheckpointClient) Resume(ctx context.Context, _ string) error {
 	c.resumeCount++
+	c.resumeCtx = ctx
+	c.order = append(c.order, "resume")
 	return nil
 }
 
 func (c *recordingCheckpointClient) Checkpoint(
-	_ context.Context, _, _ string, _, leaveRunning bool, paths ...string,
+	ctx context.Context, _, _ string, _, leaveRunning bool, paths ...string,
 ) error {
 	c.checkpointCount++
+	c.order = append(c.order, "checkpoint")
 	c.checkpointPaths = paths
 	c.leaveRunning = leaveRunning
+	if c.cancelDuringCheckpoint != nil {
+		c.cancelDuringCheckpoint()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	return c.checkpointErr
 }
 
@@ -265,10 +279,10 @@ func TestCheckpointIncludeFilesystemUsesSingleCombinedCall(t *testing.T) {
 	assert.Equal(t, 1, client.checkpointCount)
 	assert.Equal(t, 0, client.fsCheckpointCount)
 	assert.Equal(t, []string{"/"}, client.checkpointPaths)
-	assert.True(t, client.leaveRunning)
+	// LeaveRunning=false stops the source: the combined call runs WITHOUT
+	// --leave-running and no sandboxd-side Resume happens.
+	assert.False(t, client.leaveRunning)
 	assert.Equal(t, 1, client.pauseCount)
-	// LeaveRunning=false stops the source: the single combined call runs
-	// without --leave-running, so no sandboxd-side Resume happens.
 	assert.Equal(t, 0, client.resumeCount)
 }
 
@@ -284,6 +298,7 @@ func TestCheckpointIncludeFilesystemLeaveRunningResumes(t *testing.T) {
 	assert.Equal(t, 1, client.pauseCount)
 	assert.Equal(t, 1, client.resumeCount)
 	assert.Equal(t, 1, client.checkpointCount)
+	assert.True(t, client.leaveRunning)
 }
 
 func TestCheckpointIncludeFilesystemFailureStillResumes(t *testing.T) {
@@ -302,14 +317,25 @@ func TestCheckpointIncludeFilesystemCancelledRequestStillResumes(t *testing.T) {
 	handler := newCheckpointTestHandler(t, client)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	client.checkpointErr = context.Canceled
-	client.pauseErr = nil
+	defer cancel()
+	// The mock cancels the REQUEST after Pause succeeded, then Checkpoint
+	// observes the cancellation — exactly the mid-flight cancellation shape.
+	client.cancelDuringCheckpoint = cancel
 	err := handler.Checkpoint(ctx, "sbox", "/images/cp", runtimecore.CheckpointOptions{
 		IncludeFilesystem: true,
 	})
-	_ = cancel()
 	assert.Error(t, err)
+	assert.True(t, errors.Is(err, context.Canceled), "original cancellation error must survive: %v", err)
 	assert.Equal(t, 1, client.resumeCount, "cancelled request must still unfreeze the source")
+	// The unfreeze must run on its OWN context: not the cancelled request...
+	assert.NotNil(t, client.resumeCtx)
+	assert.NoError(t, client.resumeCtx.Err(), "resume context must be live, not the cancelled request")
+	// ...and it must be bounded by a deadline.
+	deadline, hasDeadline := client.resumeCtx.Deadline()
+	assert.True(t, hasDeadline, "resume context must carry a bounded deadline")
+	assert.True(t, deadline.After(time.Now()), "deadline must still be in the future")
+	// Execution order proves the unfreeze happened after the failed checkpoint.
+	assert.Equal(t, []string{"pause", "checkpoint", "resume"}, client.order)
 }
 
 func TestCheckpointPlainCompatSkipsPauseAndPaths(t *testing.T) {

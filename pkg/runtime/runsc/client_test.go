@@ -451,15 +451,18 @@ func TestCheckpointCombinedFSPathsArgument(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	arguments := string(data)
-	if !strings.Contains(arguments, "--fs-checkpoint-paths=/\n") {
-		t.Fatalf("checkpoint arguments = %q, want --fs-checkpoint-paths=/", arguments)
+	// Judge on the complete argv ELEMENTS, not substrings: paths like
+	// .../checkpoint and IDs like sbox-checkpoint must not be counted as the
+	// checkpoint SUBCOMMAND.
+	argv := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if !containsArg(argv, "--fs-checkpoint-paths=/") {
+		t.Fatalf("checkpoint argv = %q, want --fs-checkpoint-paths=/", argv)
 	}
-	if strings.Count(arguments, "checkpoint\n") != 1 {
-		t.Fatalf("expected exactly one checkpoint subcommand, arguments = %q", arguments)
+	if countArg(argv, "checkpoint") != 1 {
+		t.Fatalf("expected exactly one checkpoint subcommand element, argv = %q", argv)
 	}
-	if !strings.Contains(arguments, "--leave-running\n") {
-		t.Fatalf("checkpoint arguments = %q, want --leave-running", arguments)
+	if !containsArg(argv, "--leave-running") {
+		t.Fatalf("checkpoint argv = %q, want --leave-running", argv)
 	}
 	if err := client.Checkpoint(
 		context.Background(), "sbox", filepath.Join(tempDir, "checkpoint"),
@@ -467,6 +470,25 @@ func TestCheckpointCombinedFSPathsArgument(t *testing.T) {
 	); err == nil {
 		t.Fatal("empty fs checkpoint path must be rejected")
 	}
+}
+
+func containsArg(argv []string, want string) bool {
+	for _, a := range argv {
+		if a == want {
+			return true
+		}
+	}
+	return false
+}
+
+func countArg(argv []string, want string) int {
+	n := 0
+	for _, a := range argv {
+		if a == want {
+			n++
+		}
+	}
+	return n
 }
 
 func TestCheckpointPlainBranchHasNoFSFlag(t *testing.T) {
@@ -491,7 +513,10 @@ func TestCheckpointPlainBranchHasNoFSFlag(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(data), "--fs-checkpoint-paths") {
-		t.Fatalf("plain checkpoint arguments = %q, must not carry fs flag", data)
+	argv := strings.Split(strings.TrimSpace(string(data)), "\n")
+	for _, a := range argv {
+		if strings.HasPrefix(a, "--fs-checkpoint-paths") {
+			t.Fatalf("plain checkpoint argv = %q, must not carry fs flag", argv)
+		}
 	}
 }
