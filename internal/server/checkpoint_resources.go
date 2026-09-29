@@ -13,6 +13,7 @@ package server
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 
@@ -141,6 +142,33 @@ func applyCheckpointResourceLimits(startConfig *runtime.StartRequest, checkpoint
 	}
 	if startConfig.Resources == nil {
 		startConfig.Resources = make(map[string]float64)
+	}
+	// Trusted-restore ceiling admission: the scheduler reserves the elastic
+	// CEILING for a named restore because restore loading (sentry page loads,
+	// gofer, state deserialization) transiently needs more memory than the
+	// steady-state working set; validateElasticResources already accepts any
+	// effective limit within [initial, ceiling] for restores. The sidecar
+	// records the SOURCE's checkpoint-time limit, which is typically the
+	// initial floor — honoring it alone re-created the restore OOM this
+	// feature exists to fix. For elastic restores keep the LARGER of the
+	// caller's requested memory and the sidecar's, clamped to the (source's
+	// winning) policy ceiling; the prepared-limit readback below still
+	// records whatever is actually applied as birth evidence.
+	if elastic {
+		if caller, ok := startConfig.Resources["Memory"]; ok && caller > mb {
+			var ceiling float64
+			var policy elasticResourcePolicy
+			if json.Unmarshal([]byte(startConfig.Labels[elasticResourcesLabel]), &policy) == nil &&
+				policy.Memory.Ceiling >= mb && !math.IsNaN(policy.Memory.Ceiling) {
+				ceiling = policy.Memory.Ceiling
+			}
+			if ceiling > 0 && caller > ceiling {
+				caller = ceiling
+			}
+			if caller > mb {
+				mb = caller
+			}
+		}
 	}
 	startConfig.Resources["Memory"] = mb
 	return nil
