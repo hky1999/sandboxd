@@ -32,6 +32,7 @@ import (
 	"github.com/inclusionAI/sandboxd/pkg/networkmanager"
 	svc "github.com/inclusionAI/sandboxd/pkg/runtime"
 	"github.com/inclusionAI/sandboxd/pkg/runtime/firecracker"
+	"github.com/inclusionAI/sandboxd/pkg/runtime/runsc"
 	"github.com/inclusionAI/sandboxd/pkg/sandbox"
 	"github.com/inclusionAI/sandboxd/pkg/store"
 	"github.com/inclusionAI/sandboxd/pkg/volumemanager"
@@ -146,6 +147,7 @@ func TestListAvailableRuntimes(t *testing.T) {
 	s := newTestService(t, map[string]svc.Handler{
 		"other":       svc.NewFakeRuntimeHandler(),
 		"firecracker": &firecracker.Handler{},
+		"runsc":       &runsc.Handler{},
 	})
 	s.config.PluginConfig.RuntimeConfig.RuntimeBinary["unavailable"] = "/fake/unavailable"
 
@@ -154,7 +156,7 @@ func TestListAvailableRuntimes(t *testing.T) {
 		&runtime.ListAvailableRuntimesRequest{},
 	)
 	assert.NoError(t, err)
-	assert.Equal(t, []string{"firecracker", "other"}, resp.RuntimeClasses)
+	assert.Equal(t, []string{"firecracker", "other", "runsc"}, resp.RuntimeClasses)
 	assert.Equal(t, []*runtime.RuntimeInfo{
 		{
 			RuntimeClass:              "firecracker",
@@ -163,6 +165,12 @@ func TestListAvailableRuntimes(t *testing.T) {
 			RestoreEnvPath:            firecrackerproto.RestoreEnvPath,
 		},
 		{RuntimeClass: "other"},
+		{
+			RuntimeClass:              "runsc",
+			SupportsCheckpointRestore: true,
+			CheckpointHandoffPath:     "/proc/gvisor/checkpoint",
+			RestoreEnvPath:            "/proc/gvisor/spec_environ",
+		},
 	}, resp.Runtimes)
 }
 

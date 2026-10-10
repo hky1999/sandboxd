@@ -690,6 +690,12 @@ func (h *sandboxService) resourceStats(id string) (*runtime.StatsResponse, error
 	}, nil
 }
 
+func supportsCheckpointRestore(handler svc.Handler) bool {
+	_, managed := handler.(svc.ManagedCheckpointHandler)
+	_, compatibility := handler.(svc.CheckpointHandler)
+	return managed || compatibility
+}
+
 // ListAvailableRuntimes returns a stable snapshot of runtime classes whose
 // handlers initialized successfully. Configured classes that failed to load
 // are absent from serviceHandler and therefore from this list.
@@ -714,7 +720,7 @@ func (h *sandboxService) ListAvailableRuntimes(
 			runtimes = append(runtimes, info)
 			continue
 		}
-		if _, ok := handler.(svc.CheckpointHandler); ok {
+		if supportsCheckpointRestore(handler) {
 			info.SupportsCheckpointRestore = true
 		}
 		if provider, ok := handler.(svc.CheckpointRestoreCapabilitiesProvider); ok {
@@ -1642,7 +1648,7 @@ func (h *sandboxService) createSandbox(
 			return &runtime.StartResponse{Code: -1, Message: "runtime is unavailable"},
 				errord.ToGRPC(errord.ErrNotImplemented)
 		}
-		if _, ok := handler.(svc.CheckpointHandler); !ok {
+		if !supportsCheckpointRestore(handler) {
 			return &runtime.StartResponse{Code: -1, Message: "runtime does not support checkpoint restore"},
 				errord.ToGRPC(errord.ErrNotImplemented)
 		}

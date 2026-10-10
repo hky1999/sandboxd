@@ -33,6 +33,8 @@ to configure cooperative workloads and reject unsupported requests early, but
 the `Checkpoint` and restore `Start` RPCs remain authoritative and validate the
 runtime again when they execute.
 
+能力通告和 `Start` 的恢复准入同时识别 `ManagedCheckpointHandler` 与 `CheckpointHandler`。runsc 通过前者保存和恢复配对的进程状态与可写文件系统；不能因为它未实现后者，就把已注册的 runsc 标为不支持检查点。这里只说明守护进程的能力选择，实际平台暂停恢复仍须单独验收。
+
 ## Checkpoint API
 
 `CheckpointRequest` contains:
