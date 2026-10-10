@@ -1654,12 +1654,15 @@ type StartResponse struct {
 	Message string `protobuf:"bytes,2,opt,name=message,proto3" json:"message,omitempty"`
 	// ID is the unique sandbox ID.
 	ID string `protobuf:"bytes,3,opt,name=id,proto3" json:"id,omitempty"`
-	// Ports contains the concrete host/container mappings committed by sandboxd.
-	Ports []string `protobuf:"bytes,4,rep,name=ports,proto3" json:"ports,omitempty"`
+	// Address assigned to the sandbox network endpoint (agent-dx upstream field).
+	SandboxIp string `protobuf:"bytes,4,opt,name=sandbox_ip,json=sandboxIp,proto3" json:"sandbox_ip,omitempty"`
 	// Physical incarnation assigned by the daemon when this sandbox was created.
 	ResourceGeneration string `protobuf:"bytes,5,opt,name=resource_generation,json=resourceGeneration,proto3" json:"resource_generation,omitempty"`
-	unknownFields      protoimpl.UnknownFields
-	sizeCache          protoimpl.SizeCache
+	// Concrete mappings; moved from 4 to 6 in the agent-dx scheduler branch.
+	// This branch intentionally does not preserve the YuanRong ports-at-4 contract.
+	Ports         []string `protobuf:"bytes,6,rep,name=ports,proto3" json:"ports,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *StartResponse) Reset() {
@@ -1713,11 +1716,11 @@ func (x *StartResponse) GetID() string {
 	return ""
 }
 
-func (x *StartResponse) GetPorts() []string {
+func (x *StartResponse) GetSandboxIp() string {
 	if x != nil {
-		return x.Ports
+		return x.SandboxIp
 	}
-	return nil
+	return ""
 }
 
 func (x *StartResponse) GetResourceGeneration() string {
@@ -1727,34 +1730,30 @@ func (x *StartResponse) GetResourceGeneration() string {
 	return ""
 }
 
-// CheckpointRequest describes a synchronous sandbox checkpoint request.
+func (x *StartResponse) GetPorts() []string {
+	if x != nil {
+		return x.Ports
+	}
+	return nil
+}
+
+// CheckpointRequest preserves agent-dx upstream fields 1-6. Scheduler
+// extensions start at 7; old YuanRong request numbers are not accepted here.
 type CheckpointRequest struct {
-	state protoimpl.MessageState `protogen:"open.v1"`
-	// SandboxID is the source sandbox ID.
-	ID string `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
-	// CheckpointDir is the caller-owned artifact directory.
-	CheckpointDir string `protobuf:"bytes,2,opt,name=checkpoint_dir,json=checkpointDir,proto3" json:"checkpoint_dir,omitempty"`
-	Timeout       int64  `protobuf:"varint,3,opt,name=timeout,proto3" json:"timeout,omitempty"`
-	Compress      bool   `protobuf:"varint,4,opt,name=compress,proto3" json:"compress,omitempty"`
-	TraceID       string `protobuf:"bytes,5,opt,name=trace_id,json=traceId,proto3" json:"trace_id,omitempty"`
-	CheckpointID  string `protobuf:"bytes,6,opt,name=checkpoint_id,json=checkpointId,proto3" json:"checkpoint_id,omitempty"`
-	// LeaveRunning keeps the source sandbox alive after publishing the
-	// checkpoint. The committed manifest persists this physical mode so an
-	// RPC replay after sandboxd restart cannot change it.
-	LeaveRunning bool `protobuf:"varint,7,opt,name=leave_running,json=leaveRunning,proto3" json:"leave_running,omitempty"`
-	// IncludeFilesystem additionally captures the runtime writable layer
-	// (runsc fscheckpoint) next to the memory-state image, so a restore
-	// reproduces the workload's on-disk state. Both artifacts are taken at
-	// one paused consistency point and the manifest binds them together.
-	IncludeFilesystem bool `protobuf:"varint,8,opt,name=include_filesystem,json=includeFilesystem,proto3" json:"include_filesystem,omitempty"`
-	// TimeoutSeconds bounds the complete checkpoint operation (upstream
-	// contract, seconds). The scheduler line's int64 Timeout at 3 keeps its
-	// wire number; this variant takes the next free slot.
-	TimeoutSeconds uint32 `protobuf:"varint,9,opt,name=timeout_seconds,json=timeoutSeconds,proto3" json:"timeout_seconds,omitempty"`
-	// SnapshotType requests a specific checkpoint flavor (upstream contract):
-	// Full, Incremental, or SoftDirty. Empty leaves automatic tier selection
-	// to the runtime; runtimes without incremental checkpoints ignore it.
-	SnapshotType  string `protobuf:"bytes,10,opt,name=snapshot_type,json=snapshotType,proto3" json:"snapshot_type,omitempty"`
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	ID             string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
+	CheckpointDir  string                 `protobuf:"bytes,2,opt,name=checkpoint_dir,json=checkpointDir,proto3" json:"checkpoint_dir,omitempty"`
+	TimeoutSeconds uint32                 `protobuf:"varint,3,opt,name=timeout_seconds,json=timeoutSeconds,proto3" json:"timeout_seconds,omitempty"`
+	Compress       bool                   `protobuf:"varint,4,opt,name=compress,proto3" json:"compress,omitempty"`
+	LeaveRunning   bool                   `protobuf:"varint,5,opt,name=leave_running,json=leaveRunning,proto3" json:"leave_running,omitempty"`
+	SnapshotType   string                 `protobuf:"bytes,6,opt,name=snapshot_type,json=snapshotType,proto3" json:"snapshot_type,omitempty"`
+	// Immutable scheduler artifact identity.
+	CheckpointID string `protobuf:"bytes,7,opt,name=checkpoint_id,json=checkpointId,proto3" json:"checkpoint_id,omitempty"`
+	// Capture writable files at the same consistency point as memory state.
+	IncludeFilesystem bool   `protobuf:"varint,8,opt,name=include_filesystem,json=includeFilesystem,proto3" json:"include_filesystem,omitempty"`
+	TraceID           string `protobuf:"bytes,9,opt,name=trace_id,json=traceId,proto3" json:"trace_id,omitempty"`
+	// Legacy internal timeout alias; new clients use timeout_seconds at 3.
+	Timeout       int64 `protobuf:"varint,10,opt,name=timeout,proto3" json:"timeout,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1803,9 +1802,9 @@ func (x *CheckpointRequest) GetCheckpointDir() string {
 	return ""
 }
 
-func (x *CheckpointRequest) GetTimeout() int64 {
+func (x *CheckpointRequest) GetTimeoutSeconds() uint32 {
 	if x != nil {
-		return x.Timeout
+		return x.TimeoutSeconds
 	}
 	return 0
 }
@@ -1817,9 +1816,16 @@ func (x *CheckpointRequest) GetCompress() bool {
 	return false
 }
 
-func (x *CheckpointRequest) GetTraceID() string {
+func (x *CheckpointRequest) GetLeaveRunning() bool {
 	if x != nil {
-		return x.TraceID
+		return x.LeaveRunning
+	}
+	return false
+}
+
+func (x *CheckpointRequest) GetSnapshotType() string {
+	if x != nil {
+		return x.SnapshotType
 	}
 	return ""
 }
@@ -1831,13 +1837,6 @@ func (x *CheckpointRequest) GetCheckpointID() string {
 	return ""
 }
 
-func (x *CheckpointRequest) GetLeaveRunning() bool {
-	if x != nil {
-		return x.LeaveRunning
-	}
-	return false
-}
-
 func (x *CheckpointRequest) GetIncludeFilesystem() bool {
 	if x != nil {
 		return x.IncludeFilesystem
@@ -1845,18 +1844,18 @@ func (x *CheckpointRequest) GetIncludeFilesystem() bool {
 	return false
 }
 
-func (x *CheckpointRequest) GetTimeoutSeconds() uint32 {
+func (x *CheckpointRequest) GetTraceID() string {
 	if x != nil {
-		return x.TimeoutSeconds
-	}
-	return 0
-}
-
-func (x *CheckpointRequest) GetSnapshotType() string {
-	if x != nil {
-		return x.SnapshotType
+		return x.TraceID
 	}
 	return ""
+}
+
+func (x *CheckpointRequest) GetTimeout() int64 {
+	if x != nil {
+		return x.Timeout
+	}
+	return 0
 }
 
 // CheckpointResponse is returned after the checkpoint artifact is published.
@@ -4339,25 +4338,27 @@ const file_api_runtime_v1_sandbox_api_proto_rawDesc = "" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\x1a?\n" +
 	"\x11MetricLabelsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x94\x01\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xb3\x01\n" +
 	"\rStartResponse\x12\x12\n" +
 	"\x04code\x18\x01 \x01(\x05R\x04code\x12\x18\n" +
 	"\amessage\x18\x02 \x01(\tR\amessage\x12\x0e\n" +
-	"\x02id\x18\x03 \x01(\tR\x02id\x12\x14\n" +
-	"\x05ports\x18\x04 \x03(\tR\x05ports\x12/\n" +
-	"\x13resource_generation\x18\x05 \x01(\tR\x12resourceGeneration\"\xe2\x02\n" +
+	"\x02id\x18\x03 \x01(\tR\x02id\x12\x1d\n" +
+	"\n" +
+	"sandbox_ip\x18\x04 \x01(\tR\tsandboxIp\x12/\n" +
+	"\x13resource_generation\x18\x05 \x01(\tR\x12resourceGeneration\x12\x14\n" +
+	"\x05ports\x18\x06 \x03(\tR\x05ports\"\xe2\x02\n" +
 	"\x11CheckpointRequest\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12%\n" +
-	"\x0echeckpoint_dir\x18\x02 \x01(\tR\rcheckpointDir\x12\x18\n" +
-	"\atimeout\x18\x03 \x01(\x03R\atimeout\x12\x1a\n" +
-	"\bcompress\x18\x04 \x01(\bR\bcompress\x12\x19\n" +
-	"\btrace_id\x18\x05 \x01(\tR\atraceId\x12#\n" +
-	"\rcheckpoint_id\x18\x06 \x01(\tR\fcheckpointId\x12#\n" +
-	"\rleave_running\x18\a \x01(\bR\fleaveRunning\x12-\n" +
-	"\x12include_filesystem\x18\b \x01(\bR\x11includeFilesystem\x12'\n" +
-	"\x0ftimeout_seconds\x18\t \x01(\rR\x0etimeoutSeconds\x12#\n" +
-	"\rsnapshot_type\x18\n" +
-	" \x01(\tR\fsnapshotType\"\xe8\x01\n" +
+	"\x0echeckpoint_dir\x18\x02 \x01(\tR\rcheckpointDir\x12'\n" +
+	"\x0ftimeout_seconds\x18\x03 \x01(\rR\x0etimeoutSeconds\x12\x1a\n" +
+	"\bcompress\x18\x04 \x01(\bR\bcompress\x12#\n" +
+	"\rleave_running\x18\x05 \x01(\bR\fleaveRunning\x12#\n" +
+	"\rsnapshot_type\x18\x06 \x01(\tR\fsnapshotType\x12#\n" +
+	"\rcheckpoint_id\x18\a \x01(\tR\fcheckpointId\x12-\n" +
+	"\x12include_filesystem\x18\b \x01(\bR\x11includeFilesystem\x12\x19\n" +
+	"\btrace_id\x18\t \x01(\tR\atraceId\x12\x18\n" +
+	"\atimeout\x18\n" +
+	" \x01(\x03R\atimeout\"\xe8\x01\n" +
 	"\x12CheckpointResponse\x12\x18\n" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x18\n" +
 	"\amessage\x18\x02 \x01(\tR\amessage\x12#\n" +

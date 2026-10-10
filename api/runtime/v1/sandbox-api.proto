@@ -298,39 +298,31 @@ message StartResponse {
   string message = 2;
   // ID is the unique sandbox ID.
   string id = 3;
-  // Ports contains the concrete host/container mappings committed by sandboxd.
-  repeated string ports = 4;
+  // Address assigned to the sandbox network endpoint (agent-dx upstream field).
+  string sandbox_ip = 4;
   // Physical incarnation assigned by the daemon when this sandbox was created.
   string resource_generation = 5;
+  // Concrete mappings; moved from 4 to 6 in the agent-dx scheduler branch.
+  // This branch intentionally does not preserve the YuanRong ports-at-4 contract.
+  repeated string ports = 6;
 }
 
-// CheckpointRequest describes a synchronous sandbox checkpoint request.
+// CheckpointRequest preserves agent-dx upstream fields 1-6. Scheduler
+// extensions start at 7; old YuanRong request numbers are not accepted here.
 message CheckpointRequest {
-  // SandboxID is the source sandbox ID.
   string id = 1;
-  // CheckpointDir is the caller-owned artifact directory.
   string checkpoint_dir = 2;
-  int64 timeout = 3;
+  uint32 timeout_seconds = 3;
   bool compress = 4;
-  string trace_id = 5;
-  string checkpoint_id = 6;
-  // LeaveRunning keeps the source sandbox alive after publishing the
-  // checkpoint. The committed manifest persists this physical mode so an
-  // RPC replay after sandboxd restart cannot change it.
-  bool leave_running = 7;
-  // IncludeFilesystem additionally captures the runtime writable layer
-  // (runsc fscheckpoint) next to the memory-state image, so a restore
-  // reproduces the workload's on-disk state. Both artifacts are taken at
-  // one paused consistency point and the manifest binds them together.
+  bool leave_running = 5;
+  string snapshot_type = 6;
+  // Immutable scheduler artifact identity.
+  string checkpoint_id = 7;
+  // Capture writable files at the same consistency point as memory state.
   bool include_filesystem = 8;
-  // TimeoutSeconds bounds the complete checkpoint operation (upstream
-  // contract, seconds). The scheduler line's int64 Timeout at 3 keeps its
-  // wire number; this variant takes the next free slot.
-  uint32 timeout_seconds = 9;
-  // SnapshotType requests a specific checkpoint flavor (upstream contract):
-  // Full, Incremental, or SoftDirty. Empty leaves automatic tier selection
-  // to the runtime; runtimes without incremental checkpoints ignore it.
-  string snapshot_type = 10;
+  string trace_id = 9;
+  // Legacy internal timeout alias; new clients use timeout_seconds at 3.
+  int64 timeout = 10;
 }
 
 // CheckpointResponse is returned after the checkpoint artifact is published.

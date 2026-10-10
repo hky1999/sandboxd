@@ -16,6 +16,7 @@ package firecracker
 
 import (
 	"encoding/binary"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -184,7 +185,7 @@ func TestPrepareFirecrackerStorageUsesLastMountForTarget(t *testing.T) {
 	}
 }
 
-func TestPrepareFirecrackerStorageRejectsWritableBind(t *testing.T) {
+func TestPrepareFirecrackerStorageRejectsWritableFileBind(t *testing.T) {
 	source := filepath.Join(t.TempDir(), "file")
 	if err := os.WriteFile(source, []byte("data"), 0644); err != nil {
 		t.Fatal(err)
@@ -205,6 +206,60 @@ func TestPrepareFirecrackerStorageRejectsWritableBind(t *testing.T) {
 	)
 	if err == nil || !strings.Contains(err.Error(), "explicitly read-only") {
 		t.Fatalf("writable bind error = %v", err)
+	}
+}
+
+func TestPrepareFirecrackerStorageMixedVirtioFSAccess(t *testing.T) {
+	for _, directoryRoot := range []bool{false, true} {
+		t.Run(fmt.Sprintf("directory-root-%t", directoryRoot), func(t *testing.T) {
+			root := fakeEROFSImage(t, "root.erofs")
+			if directoryRoot {
+				root = t.TempDir()
+			}
+			plan, err := prepareFirecrackerStorage(&runtimecore.Spec{
+				Root:    &runtimecore.Root{Path: root},
+				Process: &runtimecore.Process{Args: []string{"/bin/true"}},
+				Mounts: []runtimecore.Mount{
+					{Type: "bind", Source: t.TempDir(), Destination: "/app/logs", Options: []string{"rbind", "rw", "nosuid"}},
+					{Type: "bind", Source: t.TempDir(), Destination: "/data", Options: []string{"rbind", "ro"}},
+				},
+			}, runtimecore.StartConfig{Network: firecrackerTestNetwork()}, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !plan.configure.VirtioFSWritable {
+				t.Fatal("shared guest filesystem is not writable")
+			}
+			writable := 0
+			for _, export := range plan.virtioFSExports {
+				if export.Writable {
+					writable++
+					if export.RelativePath == "rootfs" {
+						t.Fatal("image root became writable")
+					}
+				}
+			}
+			if writable != 1 {
+				t.Fatalf("writable export count = %d", writable)
+			}
+			for _, mount := range plan.configure.Mounts {
+				want := "ro"
+				if mount.Target == "/app/logs" {
+					want = "rw,nosuid"
+				}
+				if strings.Join(mount.Options, ",") != want {
+					t.Fatalf("mount %s options = %v, want %s", mount.Target, mount.Options, want)
+				}
+			}
+		})
+	}
+}
+
+func TestFirecrackerVirtioFSMountOptionsRequireExplicitAccess(t *testing.T) {
+	for _, options := range [][]string{nil, {"rbind"}, {"ro", "rw"}, {"rw", "shared"}} {
+		if _, err := firecrackerVirtioFSMountOptions(options); err == nil {
+			t.Fatalf("accepted invalid mount options %v", options)
+		}
 	}
 }
 

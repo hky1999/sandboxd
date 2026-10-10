@@ -90,6 +90,9 @@ func NewHandler(cfg config.Config, bin string, loader runtimecore.OciLoader) (*H
 	if err := os.Chmod(checkpointRoot, 0700); err != nil {
 		return nil, err
 	}
+	if err := validateExtraArgs(cfg.RuntimeConfig.Runsc.ExtraArgs); err != nil {
+		return nil, fmt.Errorf("configure runsc: %w", err)
+	}
 	runscRoot := filepath.Join(root, config.RuntimeNameRunsc)
 	if err := os.MkdirAll(runscRoot, 0711); err != nil {
 		return nil, err
@@ -106,6 +109,7 @@ func NewHandler(cfg config.Config, bin string, loader runtimecore.OciLoader) (*H
 
 	return &Handler{
 		runsc: NewClientWithOptions(bin, runscRoot, Options{
+			ExtraArgs:        cfg.RuntimeConfig.Runsc.ExtraArgs,
 			Platform:         platform,
 			FilestoreDir:     cfg.RuntimeConfig.FilestoreDir,
 			OverlayTmpfsSize: cfg.RuntimeConfig.OverlayTmpfsSize,

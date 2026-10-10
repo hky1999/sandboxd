@@ -41,11 +41,15 @@ RUN apt-get update && \
 COPY output/sandboxd /usr/local/bin/sandboxd
 COPY output/sbox /usr/local/bin/sbox
 COPY output/runsc /usr/local/bin/runsc
+COPY output/containerd-shim-runsc-v1 /usr/local/bin/containerd-shim-runsc-v1
+COPY output/gvisor-bin/ /usr/local/bin/gvisor-bin/
 COPY output/runc /usr/local/bin/runc
 COPY output/runc-shim /usr/local/bin/runc-shim
 COPY output/oom-hog /usr/local/bin/oom-hog
 COPY output/network-policy-client /usr/local/bin/network-policy-client
+COPY output/checkpoint-restore /usr/local/bin/checkpoint-restore
 COPY test/e2e/e2e-run.sh /usr/local/bin/sandboxd-e2e-run
+COPY test/e2e/host-mount-rw.sh /usr/local/bin/sandboxd-host-mount-rw
 
 RUN chmod 0755 \
         /usr/local/bin/sandboxd \

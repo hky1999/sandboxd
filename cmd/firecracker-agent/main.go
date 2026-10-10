@@ -320,7 +320,7 @@ func configure(request firecrackerproto.ConfigureRequest) error {
 		rootFSType = "erofs"
 	}
 	if request.VirtioFSTag != "" {
-		if err := mountSharedVirtioFS(request.VirtioFSTag); err != nil {
+		if err := mountSharedVirtioFS(request.VirtioFSTag, request.VirtioFSWritable); err != nil {
 			return err
 		}
 	}
@@ -979,15 +979,19 @@ func mountNativeWritableUnder(
 	return nil
 }
 
-func mountSharedVirtioFS(tag string) error {
+func mountSharedVirtioFS(tag string, writable bool) error {
 	if tag == "" {
 		return errors.New("virtio-fs mount tag is empty")
+	}
+	flags := uintptr(unix.MS_NODEV)
+	if !writable {
+		flags |= unix.MS_RDONLY
 	}
 	if err := unix.Mount(
 		tag,
 		containerShared,
 		"virtiofs",
-		unix.MS_RDONLY|unix.MS_NODEV,
+		flags,
 		"",
 	); err != nil {
 		return fmt.Errorf("mount shared virtio-fs %s: %w", tag, err)
@@ -1019,6 +1023,9 @@ func mountGuestVirtioFS(mount firecrackerproto.MountSpec) error {
 	for _, option := range mount.Options {
 		switch option {
 		case "ro":
+			flags |= unix.MS_RDONLY
+		case "rw":
+			flags &^= unix.MS_RDONLY
 		case "nodev":
 			flags |= unix.MS_NODEV
 		case "noexec":
@@ -1030,7 +1037,7 @@ func mountGuestVirtioFS(mount firecrackerproto.MountSpec) error {
 		}
 	}
 	if err := unix.Mount("", target, "", flags, ""); err != nil {
-		return fmt.Errorf("remount virtio-fs target %s read-only: %w", mount.Target, err)
+		return fmt.Errorf("remount virtio-fs target %s: %w", mount.Target, err)
 	}
 	return nil
 }

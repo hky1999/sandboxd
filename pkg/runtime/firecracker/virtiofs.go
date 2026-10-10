@@ -41,6 +41,7 @@ type firecrackerVirtioFSState struct {
 	PID        int    `json:"pid"`
 	SocketPath string `json:"socket_path"`
 	SharedDir  string `json:"shared_dir"`
+	Writable   bool   `json:"writable,omitempty"`
 }
 
 type firecrackerVirtioFSProcess struct {
@@ -131,15 +132,20 @@ func prepareFirecrackerVirtioFSShared(
 		if err := unix.Mount(source, target, "", unix.MS_BIND|unix.MS_REC, ""); err != nil {
 			return fmt.Errorf("bind virtio-fs export %s: %w", source, err)
 		}
-		if err := unix.Mount(
-			"",
-			target,
-			"",
-			unix.MS_BIND|unix.MS_REMOUNT|unix.MS_RDONLY|unix.MS_NODEV,
-			"",
-		); err != nil {
-			return fmt.Errorf("remount virtio-fs export %s read-only: %w", source, err)
+		// Enforce access on the host, including nested mounts. A guest may
+		// remount its own view, so guest mount flags alone are not sufficient.
+		attrs := unix.MountAttr{Attr_set: unix.MOUNT_ATTR_NODEV | unix.MOUNT_ATTR_NOSUID}
+		if !export.Writable {
+			attrs.Attr_set |= unix.MOUNT_ATTR_RDONLY
 		}
+		if err := unix.MountSetattr(unix.AT_FDCWD, target, unix.AT_RECURSIVE, &attrs); err != nil {
+			return fmt.Errorf("set virtio-fs export %s access: %w", source, err)
+		}
+	}
+	// Protect the export layout while allowing writes through RW submounts.
+	// Do not recursively apply RDONLY here.
+	if err := unix.Mount("", sharedDir, "", unix.MS_REMOUNT|unix.MS_RDONLY|unix.MS_NOSUID|unix.MS_NODEV, ""); err != nil {
+		return fmt.Errorf("protect virtio-fs staging root: %w", err)
 	}
 	return nil
 }
@@ -165,23 +171,29 @@ func startFirecrackerVirtioFS(
 	binary,
 	sharedDir,
 	socketPath string,
+	writable bool,
 	stdout,
 	stderr io.Writer,
 ) (*firecrackerVirtioFSState, *firecrackerVirtioFSProcess, error) {
 	if err := removeFirecrackerSocket(socketPath); err != nil {
 		return nil, nil, err
 	}
-	command := exec.Command(
-		binary,
+	arguments := []string{
 		"--shared-dir", sharedDir,
 		"--socket-path", socketPath,
-		"--readonly",
 		"--no-announce-submounts",
 		"--sandbox", "namespace",
 		"--inode-file-handles=never",
 		"--migration-mode", "find-paths",
 		"--migration-on-error", "abort",
-	)
+	}
+	if !writable {
+		arguments = append(arguments, "--readonly")
+	}
+	// Keep the default write-through policy: --writeback must not be enabled
+	// for directories also accessed by host log collectors. Retain cache=auto
+	// so executable directory roots can still be mapped by the guest.
+	command := exec.Command(binary, arguments...)
 	command.Stdout = stdout
 	command.Stderr = stderr
 	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -195,6 +207,7 @@ func startFirecrackerVirtioFS(
 		PID:        command.Process.Pid,
 		SocketPath: socketPath,
 		SharedDir:  sharedDir,
+		Writable:   writable,
 	}
 	ticker := time.NewTicker(5 * time.Millisecond)
 	defer ticker.Stop()
@@ -306,7 +319,7 @@ func firecrackerVirtioFSProcessMatches(
 		commandHasOption(arguments, "--sandbox", "namespace") &&
 		commandHasOption(arguments, "--migration-mode", "find-paths") &&
 		commandHasOption(arguments, "--migration-on-error", "abort") &&
-		commandHasFlag(arguments, "--readonly") &&
+		commandHasFlag(arguments, "--readonly") == !state.Writable &&
 		commandHasFlag(arguments, "--no-announce-submounts") &&
 		commandHasFlag(arguments, "--inode-file-handles=never")
 }

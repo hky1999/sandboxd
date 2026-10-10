@@ -45,6 +45,7 @@ COPY output/firecracker /usr/local/bin/firecracker
 COPY output/firecracker-vmlinux /opt/firecracker/vmlinux
 COPY output/firecracker-initrd.img /opt/firecracker/initrd.img
 COPY test/e2e/e2e-run.sh /usr/local/bin/sandboxd-e2e-run
+COPY output/checkpoint-restore /usr/local/bin/checkpoint-restore
 
 RUN chmod 0755 \
         /usr/local/bin/sandboxd \

@@ -13,12 +13,12 @@ import (
 )
 
 type testSidecar struct {
-	ElasticPolicy     string `json:"elastic_policy,omitempty"`
-	MemoryLimitBytes  uint64 `json:"memory_limit_bytes"`
-	MemoryLimitKnown  bool   `json:"memory_limit_known"`
-	CPUQuotaUsec      int64  `json:"cpu_quota_usec"`
-	CPUPeriodUsec     int64  `json:"cpu_period_usec"`
-	CPULimitsKnown    bool   `json:"cpu_limits_known"`
+	ElasticPolicy    string `json:"elastic_policy,omitempty"`
+	MemoryLimitBytes uint64 `json:"memory_limit_bytes"`
+	MemoryLimitKnown bool   `json:"memory_limit_known"`
+	CPUQuotaUsec     int64  `json:"cpu_quota_usec"`
+	CPUPeriodUsec    int64  `json:"cpu_period_usec"`
+	CPULimitsKnown   bool   `json:"cpu_limits_known"`
 }
 
 func writeElasticSidecar(t *testing.T, dir, policy string, memBytes uint64) {

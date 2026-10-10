@@ -650,6 +650,7 @@ func (handler *Handler) Start(
 			handler.virtiofsdPath,
 			virtioFSState.SharedDir,
 			virtioFSState.SocketPath,
+			plan.configure.VirtioFSWritable,
 			stdout,
 			stderr,
 		)

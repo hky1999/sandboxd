@@ -57,6 +57,7 @@ type firecrackerStoragePlan struct {
 type firecrackerVirtioFSExport struct {
 	Source       string
 	RelativePath string
+	Writable     bool
 }
 
 func prepareFirecrackerStorage(
@@ -199,9 +200,6 @@ func prepareFirecrackerStorage(
 				},
 			)
 		case "bind":
-			if err := validateFirecrackerReadOnlyBind(mount); err != nil {
-				return nil, err
-			}
 			info, err := os.Stat(mount.Source)
 			if err != nil {
 				return nil, err
@@ -224,7 +222,10 @@ func prepareFirecrackerStorage(
 				relative := fmt.Sprintf("mounts/%04d", len(plan.virtioFSExports))
 				plan.virtioFSExports = append(
 					plan.virtioFSExports,
-					firecrackerVirtioFSExport{Source: source, RelativePath: relative},
+					firecrackerVirtioFSExport{
+						Source: source, RelativePath: relative,
+						Writable: slices.Contains(options, "rw"),
+					},
 				)
 				plan.configure.Mounts = append(
 					plan.configure.Mounts,
@@ -288,6 +289,9 @@ func prepareFirecrackerStorage(
 	}
 	if len(plan.virtioFSExports) > 0 {
 		plan.configure.VirtioFSTag = firecrackerVirtioFSTag
+		for _, export := range plan.virtioFSExports {
+			plan.configure.VirtioFSWritable = plan.configure.VirtioFSWritable || export.Writable
+		}
 	}
 	return plan, nil
 }
@@ -421,16 +425,23 @@ func validateFirecrackerDirectory(path string) (string, error) {
 }
 
 func firecrackerVirtioFSMountOptions(options []string) ([]string, error) {
-	result := []string{"ro"}
+	readOnly := slices.Contains(options, "ro")
+	writable := slices.Contains(options, "rw")
+	if readOnly == writable {
+		return nil, errors.New("virtio-fs directory mount requires exactly one of ro or rw")
+	}
+	mode := "ro"
+	if writable {
+		mode = "rw"
+	}
+	result := []string{mode}
 	for _, option := range options {
 		switch option {
-		case "ro", "bind", "rbind", "private", "rprivate":
+		case "ro", "rw", "bind", "rbind", "private", "rprivate":
 		case "nodev", "noexec", "nosuid":
 			if !slices.Contains(result, option) {
 				result = append(result, option)
 			}
-		case "rw":
-			return nil, errors.New("virtio-fs directory mount cannot be writable")
 		default:
 			return nil, fmt.Errorf("unsupported virtio-fs mount option %q", option)
 		}

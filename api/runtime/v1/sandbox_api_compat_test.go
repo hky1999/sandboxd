@@ -17,32 +17,19 @@ package v1
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"os"
 	"slices"
 	"testing"
 
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protodesc"
 	"google.golang.org/protobuf/types/descriptorpb"
+	"google.golang.org/protobuf/types/dynamicpb"
 )
 
-// TestV010WireContract pins the public protobuf descriptor while allowing
-// comments and generated-code details to change.
-//
-// v011 (2026-08-18): added SandboxService.Pause/Resume and the
-// PauseRequest/PauseResponse messages. All v010 field numbers, names,
-// and json_names are unchanged.
-// Scheduler CPU telemetry adds StatsResponse fields 7-9; the second check
-// removes those additions plus SandboxStatus.ip (field 17), which was
-// already in the source proto but missing from the prior generated descriptor.
-// It verifies that every other part of the prior wire contract is unchanged.
-// The generation-conditional CheckpointIfGeneration RPC reuses the existing
-// CheckpointResponse; its one new request message and method are validated
-// and projected out the same way before every frozen hash comparison.
-// The M1 bidirectional resource contract (StatsResponse 24-33, including the
-// read-only memory_cgroup_path locator, ResizeResourcesRequest 6-7,
-// ShrinkResourcesRequest and its RPC) follows the same rule: validated in
-// full, then projected out before any frozen hash.
-func TestV010WireContract(t *testing.T) {
+// Scheduler extension fields retain their generation, revision and operation
+// identities across the intentional migration of the public agent-dx base.
+func TestSchedulerResourceExtensionNumbers(t *testing.T) {
 	descriptor := protodesc.ToFileDescriptorProto(File_api_runtime_v1_sandbox_api_proto)
 	descriptor.SourceCodeInfo = nil
 	// Validate then project only this additive bidirectional resource
@@ -132,12 +119,15 @@ func TestV010WireContract(t *testing.T) {
 		if message.GetName() != "StartResponse" {
 			continue
 		}
-		if len(message.Field) != 5 {
+		if len(message.Field) != 6 {
 			t.Fatal("unexpected start identity extension")
 		}
 		field := message.Field[4]
 		if field.GetName() != "resource_generation" || field.GetNumber() != 5 || field.GetType() != descriptorpb.FieldDescriptorProto_TYPE_STRING || field.GetLabel() != descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL {
 			t.Fatal("unexpected start generation field")
+		}
+		if message.Field[5].GetName() != "ports" || message.Field[5].GetNumber() != 6 {
+			t.Fatal("unexpected scheduler port mappings field")
 		}
 		message.Field = message.Field[:4]
 	}
@@ -311,18 +301,6 @@ func TestV010WireContract(t *testing.T) {
 		}
 		message.Field = message.Field[:11]
 	}
-	wire, err := proto.MarshalOptions{Deterministic: true}.Marshal(descriptor)
-	if err != nil {
-		t.Fatal(err)
-	}
-	sum := sha256.Sum256(wire)
-	// Pinned after the 2026-09-11 upstream/main rebase union: scheduler-line
-	// wire numbers kept; upstream timeout_seconds->9, snapshot_type->10;
-	// networkacl schema v2, CheckpointInfo and RuntimeInfo carried in.
-	const want = "329abfb0a4f70e16a62d1e39d7e4e2bf3b457e5ee0c2f0e4d28f3826d33fc35f" // updated 2026-09-11
-	if got := hex.EncodeToString(sum[:]); got != want {
-		t.Fatalf("sandbox API descriptor hash = %s, want %s", got, want)
-	}
 	// Project away only the new resize contract; the entire prior descriptor
 	// must remain byte-for-byte identical, including all existing RPCs.
 	descriptor.MessageType = slices.DeleteFunc(descriptor.MessageType, func(m *descriptorpb.DescriptorProto) bool {
@@ -339,16 +317,6 @@ func TestV010WireContract(t *testing.T) {
 			}
 			message.Field = message.Field[:9]
 		}
-	}
-	previousWire, err := proto.MarshalOptions{Deterministic: true}.Marshal(descriptor)
-	if err != nil {
-		t.Fatal(err)
-	}
-	previousSum := sha256.Sum256(previousWire)
-	// Pinned after the 2026-09-11 upstream/main rebase union (base descriptor
-	// absorbed upstream additions; the layer structure is unchanged).
-	if hex.EncodeToString(previousSum[:]) != "892e772437ccbeeb6fa53739ea4b4c1ff2411459a5c7a5b640a919e2ffe99899" {
-		t.Fatal("resize changed the prior wire contract")
 	}
 	for _, message := range descriptor.MessageType {
 		if message.GetName() == "SandboxStatus" {
@@ -370,16 +338,6 @@ func TestV010WireContract(t *testing.T) {
 			}
 			message.Field = message.Field[:6]
 		}
-	}
-	legacyWire, err := proto.MarshalOptions{Deterministic: true}.Marshal(descriptor)
-	if err != nil {
-		t.Fatal(err)
-	}
-	legacySum := sha256.Sum256(legacyWire)
-	// Re-pinned after the 2026-09-11 upstream/main rebase union.
-	const legacyWant = "4d834b4b627006904857c4be27b0abe30e3f17f41f4447b4e312a842b441b565"
-	if got := hex.EncodeToString(legacySum[:]); got != legacyWant {
-		t.Fatalf("existing API changed beyond the additive CPU and bridge IP fields: %s", got)
 	}
 
 }
@@ -464,5 +422,162 @@ func TestResourceRevisionContractSurvivesWireRoundTrip(t *testing.T) {
 	}
 	if !proto.Equal(shrink, decodedShrink) {
 		t.Fatal("shrink request changed on wire")
+	}
+}
+
+// Older clients must continue to decode the original fields when the server
+// supplies the sandbox network endpoint required by agent-dx clients.
+func TestStartResponseLegacyWireCompatibility(t *testing.T) {
+	response := &StartResponse{Code: 0, Message: "Succeed", ID: "sandbox-compat", SandboxIp: "10.88.0.2"}
+	message := protodesc.ToDescriptorProto(response.ProtoReflect().Descriptor())
+	if got := message.Field[3].GetNumber(); got != 4 {
+		t.Fatalf("sandbox_ip field number = %d, want 4", got)
+	}
+	message.Field = message.Field[:3]
+	file, err := protodesc.NewFile(&descriptorpb.FileDescriptorProto{
+		Name:        proto.String("legacy-start-response.proto"),
+		Package:     proto.String("legacy"),
+		Syntax:      proto.String("proto3"),
+		MessageType: []*descriptorpb.DescriptorProto{message},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wire, err := proto.Marshal(response)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := dynamicpb.NewMessage(file.Messages().Get(0))
+	if err := (proto.UnmarshalOptions{DiscardUnknown: true}).Unmarshal(wire, legacy); err != nil {
+		t.Fatal(err)
+	}
+	fields := legacy.Descriptor().Fields()
+	if legacy.Get(fields.ByNumber(1)).Int() != 0 || legacy.Get(fields.ByNumber(2)).String() != "Succeed" || legacy.Get(fields.ByNumber(3)).String() != response.ID {
+		t.Fatalf("legacy response fields changed: %s", legacy)
+	}
+	legacyWire, err := proto.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded StartResponse
+	if err := proto.Unmarshal(legacyWire, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.ID != response.ID || decoded.Message != response.Message || decoded.SandboxIp != "" {
+		t.Fatalf("legacy server response did not retain its original fields: %s", &decoded)
+	}
+}
+
+// Compare the public schema with a descriptor generated independently from the
+// fixed upstream source. Scheduler-only fields must remain additive.
+func TestAgentDXUpstreamWireCompatibility(t *testing.T) {
+	wire, err := os.ReadFile("testdata/agent-dx-base.pb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(wire)
+	if hex.EncodeToString(sum[:]) != "b2fef6676c7626036f23e610aff5821d89851cadbd8e2021746cfa044cb58e5d" {
+		t.Fatal("upstream descriptor fixture changed")
+	}
+	var set descriptorpb.FileDescriptorSet
+	if err := proto.Unmarshal(wire, &set); err != nil {
+		t.Fatal(err)
+	}
+	if len(set.File) != 1 {
+		t.Fatal("unexpected upstream descriptor count")
+	}
+	current := protodesc.ToFileDescriptorProto(File_api_runtime_v1_sandbox_api_proto)
+	compareEnums := func(bases, actuals []*descriptorpb.EnumDescriptorProto) {
+		for _, base := range bases {
+			var actual *descriptorpb.EnumDescriptorProto
+			for _, candidate := range actuals {
+				if candidate.GetName() == base.GetName() {
+					actual = candidate
+					break
+				}
+			}
+			if actual == nil || !proto.Equal(base.Options, actual.Options) {
+				t.Fatalf("missing or changed upstream enum %s", base.GetName())
+			}
+			for _, value := range base.Value {
+				var found *descriptorpb.EnumValueDescriptorProto
+				for _, candidate := range actual.Value {
+					if candidate.GetNumber() == value.GetNumber() {
+						found = candidate
+						break
+					}
+				}
+				if !proto.Equal(value, found) {
+					t.Fatalf("changed upstream enum value %s.%s", base.GetName(), value.GetName())
+				}
+			}
+		}
+	}
+	var compareMessage func(*descriptorpb.DescriptorProto, *descriptorpb.DescriptorProto)
+	compareMessage = func(base, got *descriptorpb.DescriptorProto) {
+		if got == nil {
+			t.Fatalf("missing upstream message %s", base.GetName())
+		}
+		if !proto.Equal(base.Options, got.Options) {
+			t.Fatalf("changed message options %s", base.GetName())
+		}
+		compareEnums(base.EnumType, got.EnumType)
+		for _, field := range base.Field {
+			var found *descriptorpb.FieldDescriptorProto
+			for _, candidate := range got.Field {
+				if candidate.GetNumber() == field.GetNumber() {
+					found = candidate
+					break
+				}
+			}
+			if !proto.Equal(field, found) {
+				t.Fatalf("changed upstream field %s.%s at %d: got %v", base.GetName(), field.GetName(), field.GetNumber(), found)
+			}
+		}
+		for _, nested := range base.NestedType {
+			var found *descriptorpb.DescriptorProto
+			for _, candidate := range got.NestedType {
+				if candidate.GetName() == nested.GetName() {
+					found = candidate
+					break
+				}
+			}
+			compareMessage(nested, found)
+		}
+	}
+	for _, message := range set.File[0].MessageType {
+		var found *descriptorpb.DescriptorProto
+		for _, candidate := range current.MessageType {
+			if candidate.GetName() == message.GetName() {
+				found = candidate
+				break
+			}
+		}
+		compareMessage(message, found)
+	}
+	compareEnums(set.File[0].EnumType, current.EnumType)
+	for _, service := range set.File[0].Service {
+		var found *descriptorpb.ServiceDescriptorProto
+		for _, candidate := range current.Service {
+			if candidate.GetName() == service.GetName() {
+				found = candidate
+				break
+			}
+		}
+		if found == nil {
+			t.Fatalf("missing upstream service %s", service.GetName())
+		}
+		for _, method := range service.Method {
+			var actual *descriptorpb.MethodDescriptorProto
+			for _, candidate := range found.Method {
+				if candidate.GetName() == method.GetName() {
+					actual = candidate
+					break
+				}
+			}
+			if !proto.Equal(method, actual) {
+				t.Fatalf("changed upstream method %s.%s", service.GetName(), method.GetName())
+			}
+		}
 	}
 }

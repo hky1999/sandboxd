@@ -1044,6 +1044,7 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 		OSSAuthsPath:      cfg.OSSAuthsPath,
 		RegistryAuthsPath: cfg.RegistryAuthsPath,
 		CgroupMemoryLimit: cfg.CgroupMemoryLimit,
+		ChunkDBSize:       cfg.ChunkDBSize,
 		DisableCgroup:     cfg.DisableCgroup,
 	})
 	if err != nil {
@@ -2025,6 +2026,7 @@ func (h *sandboxService) createSandbox(
 		ID:                 sandboxID,
 		Ports:              clonePorts(startReq.Ports),
 		ResourceGeneration: metadata.Labels[resourceGenerationLabel],
+		SandboxIp:          preparedResources.sandboxIP,
 	}, nil
 }
 

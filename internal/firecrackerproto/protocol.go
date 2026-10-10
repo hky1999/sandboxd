@@ -124,6 +124,7 @@ type ConfigureRequest struct {
 	RootFSType           string                    `json:"root_fs_type,omitempty"`
 	RootSource           string                    `json:"root_source,omitempty"`
 	VirtioFSTag          string                    `json:"virtio_fs_tag,omitempty"`
+	VirtioFSWritable     bool                      `json:"virtio_fs_writable,omitempty"`
 	OverlayDevice        string                    `json:"overlay_device"`
 	RootReadonly         bool                      `json:"root_readonly,omitempty"`
 	Process              ProcessSpec               `json:"process"`

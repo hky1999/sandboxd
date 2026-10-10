@@ -58,6 +58,7 @@ type PluginConfig struct {
 
 // ImageManagerConfig configures image and mount lifecycle management.
 type ImageManagerConfig struct {
+	ChunkDBSize       string `toml:"chunk_db_size" json:"chunkDbSize"`
 	ImageManagerRoot  string `toml:"root" json:"root"`
 	DistillFsBin      string `toml:"distill_fs_bin" json:"distillFsBin"`
 	OSSTemplate       string `toml:"oss_template" json:"ossTemplate"`
@@ -142,6 +143,9 @@ type RuntimeConfig struct {
 type RunscConfig struct {
 	// Platform selects gVisor's syscall interception platform.
 	Platform string `toml:"platform" json:"platform"`
+	// ExtraArgs supplies operator-owned runsc flags. Nil preserves --net-raw;
+	// an explicitly empty list disables that default.
+	ExtraArgs []string `toml:"extra_args" json:"extraArgs"`
 }
 
 // KataConfig contains the host paths and storage settings used by Kata.

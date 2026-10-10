@@ -48,6 +48,7 @@ COPY output/virtiofsd /usr/local/bin/virtiofsd
 COPY output/firecracker-vmlinux /opt/firecracker/vmlinux
 COPY output/firecracker-initrd.img /opt/firecracker/initrd.img
 COPY test/e2e/e2e-run.sh /usr/local/bin/sandboxd-e2e-run
+COPY test/e2e/host-mount-rw.sh /usr/local/bin/sandboxd-host-mount-rw
 
 RUN chmod 0755 \
         /usr/local/bin/sandboxd \

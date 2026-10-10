@@ -49,6 +49,7 @@ required_versions=(
     FIRECRACKER_RELEASE
     FIRECRACKER_AMD64_SHA256
     FIRECRACKER_AMD64_URL
+    VIRTIOFSD_REVISION
 )
 for version_name in "${required_versions[@]}"; do
     [ -n "${!version_name:-}" ] ||
@@ -74,6 +75,13 @@ case "${E2E_CASE}" in
         needs_kvm=1
         run_cgroup_disabled=0
         ;;
+    firecracker-virtiofs)
+        runtime=firecracker
+        platform=systrap
+        needs_kvm=1
+        run_cgroup_disabled=0
+        fc_virtiofs=1
+        ;;
     firecracker-incremental)
         # Same runtime as the plain firecracker case, but the sandboxd
         # config opts into the incremental checkpoint chain so CI exercises
@@ -91,7 +99,7 @@ case "${E2E_CASE}" in
         run_cgroup_disabled=0
         ;;
     *)
-        fail "E2E_CASE must be runsc-systrap, runsc-kvm, kata, firecracker, firecracker-incremental, or runc"
+        fail "E2E_CASE must be runsc-systrap, runsc-kvm, kata, firecracker, firecracker-incremental, firecracker-virtiofs, or runc"
         ;;
 esac
 
@@ -116,6 +124,8 @@ image="${SANDBOXD_E2E_IMAGE:-sandboxd-runtime-e2e:${E2E_CASE}}"
 log "building targeted image ${image}"
 "${DOCKER}" build \
     --build-arg "E2E_RUNTIME=${runtime}" \
+    --build-arg "E2E_VIRTIOFS=${fc_virtiofs:-0}" \
+    --build-arg "VIRTIOFSD_REVISION=${VIRTIOFSD_REVISION}" \
     --build-arg "GVISOR_RELEASE=${GVISOR_RELEASE}" \
     --build-arg "GVISOR_AMD64_SHA512=${GVISOR_AMD64_SHA512}" \
     --build-arg "GVISOR_AMD64_URL=${GVISOR_AMD64_URL}" \
@@ -140,6 +150,7 @@ SANDBOXD_E2E_IMAGE="${image}" \
     E2E_RUNSC_PLATFORM="${platform}" \
     E2E_RUN_CGROUP_DISABLED="${run_cgroup_disabled}" \
     E2E_FIRECRACKER_CHECKPOINT_MODE="${fc_checkpoint_mode:-}" \
+    E2E_FIRECRACKER_VIRTIOFS="${fc_virtiofs:-0}" \
     E2E_NETWORK_SOAK=1 \
     E2E_SKIP_BUILD=1 \
     RUN_UNIT_TESTS=0 \

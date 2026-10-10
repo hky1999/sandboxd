@@ -876,6 +876,7 @@ func (handler *Handler) Restore(
 			handler.virtiofsdPath,
 			virtioFSState.SharedDir,
 			virtioFSState.SocketPath,
+			plan.configure.VirtioFSWritable,
 			stdout,
 			stderr,
 		)

@@ -780,6 +780,16 @@ run_dnat_check() {
     SANDBOX_ID=""
 }
 
+run_host_mount_rw_check() {
+    local runtime="$1"
+    local rootfs="$2"
+    local suffix="$3"
+    log "testing ${suffix} writable host mounts, rotation, and checkpoint/restore"
+    RUNTIME="${runtime}" ROOTFS="${rootfs}" SOCKET="${SOCKET}" \
+        CASE_ID="${suffix}-rw" TEST_DIR="${SANDBOXD_HOME}/${suffix}-rw" \
+        KEEP_RUNNING=0 bash /usr/local/bin/sandboxd-host-mount-rw
+}
+
 run_checkpoint_restore_check() {
     local runtime="$1"
     local rootfs="$2"
@@ -1009,9 +1019,18 @@ run_checkpoint_restore_check() {
     [[ "${restored}" =~ ^[0-9]+$ ]] &&
         [ "${restored}" -ge "${restore_floor}" ] ||
         fail "${suffix} restored counter lost final checkpoint state: before=${restore_floor} restored=${restored}"
-    sleep 0.3
-    local advanced
-    advanced="$(sbox_cmd exec "${SANDBOX_ID}" /bin/cat /var/checkpoint-counter)"
+    # Each iteration syncs the guest filesystems. With virtio-fs that can
+    # exceed 300ms, so use the same bounded progress wait as the source.
+    local advanced=""
+    for attempt in $(seq 1 600); do
+        advanced="$(sbox_cmd exec "${SANDBOX_ID}" \
+            /bin/cat /var/checkpoint-counter 2>/dev/null || true)"
+        if [[ "${advanced}" =~ ^[0-9]+$ ]] &&
+            [ "${advanced}" -gt "${restored}" ]; then
+            break
+        fi
+        sleep 0.1
+    done
     [[ "${advanced}" =~ ^[0-9]+$ ]] && [ "${advanced}" -gt "${restored}" ] ||
         fail "${suffix} restored process stopped: ${restored} -> ${advanced}"
     local restored_network
@@ -2139,6 +2158,10 @@ run_firecracker_checks() {
     run_dnat_check firecracker "Firecracker" "${rootfs}" 256
 
     run_checkpoint_restore_check firecracker "${rootfs}"
+    if [ "${FIRECRACKER_VIRTIOFS}" = "1" ]; then
+        run_host_mount_rw_check firecracker "${EROFS_ROOTFS}" firecracker-erofs
+        run_host_mount_rw_check firecracker "${ROOTFS}" firecracker-directory
+    fi
     run_storage_quota_check firecracker "${rootfs}"
     run_stress_checks firecracker "${rootfs}"
 }
@@ -2198,6 +2221,7 @@ run_runsc_checks() {
 
     run_dnat_check runsc "runsc" "${ROOTFS}" 128
     run_checkpoint_restore_check runsc "${ROOTFS}"
+    run_host_mount_rw_check runsc "${ROOTFS}" "runsc-${RUNSC_PLATFORM}"
     run_storage_quota_check
 
     log "starting immediate OOM sandbox"

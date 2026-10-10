@@ -233,8 +233,10 @@ serializes virtiofsd into `virtiofs.state`, collects the shared vhost dirty
 bitmap, and includes those guest-memory ranges in every snapshot flavor before
 re-enabling the queues. Restore requires the same virtio-fs/non-virtio-fs
 storage layout, starts a replacement virtiofsd over the newly prepared
-read-only exports, loads its sidecar before enabling queues, and resumes the
+exports with their requested access modes, loads its sidecar before enabling queues, and resumes the
 guest only after the device and memory state agree.
+
+Writable host directory mounts are external, caller-owned state. Local restore requires the same mount layout and access modes and the original backing directories and referenced files. The checkpoint does not copy, roll back, or retain their contents; sandbox deletion only tears down the export and does not delete the source. Keep those files available for as long as checkpoints may need them. Restoring into an empty replacement directory, automatically creating new log segments, and cross-node migration of writable host directories are not supported. For append logs, use `O_APPEND`; ordinary writes retain the saved offset and can overwrite data written after the checkpoint. Replayed application execution can produce duplicate logs even with append mode. The virtiofsd export uses its default write-through policy, not `--writeback`.
 
 Firecracker native writable mounts do not add checkpoint components. Their
 directories reside in the same `overlay.ext4` as the root overlay's upper and
@@ -424,3 +426,9 @@ New sandboxes default to `writable_io_engine = "AsyncDirect"` and `writable_cach
 The VMM persists the engine and cache policy in device state and reopens the writable disk with the saved policy on restore. Changing sandboxd's defaults affects newly created VMs; it does not override the policy captured in an existing checkpoint. Checkpoint compatibility still requires matching runtime digests. Direct-I/O alignment requirements are queried again for the restored image on its destination filesystem. Request-owned alignment buffers and in-flight I/O are completed before snapshotting; completed reads reach guest memory and dirty tracking before the device state is saved. Alignment buffers are not separate checkpoint artifacts.
 
 The destination host must support the saved I/O engine. In particular, direct engines require the destination kernel and backing filesystem to report `STATX_DIOALIGN`, normally available for ext4 and XFS on upstream Linux 6.1 or newer; asynchronous engines also require usable `io_uring`. Restore fails when those capabilities are unavailable and never automatically changes the saved engine to buffered I/O. Operators using hosts without Direct I/O alignment-query support must explicitly configure `Async` or `Sync` before creating new sandboxes; this setting cannot make an existing Direct I/O checkpoint compatible with such a host. See [host I/O compatibility and configuration](runtime.md) for details.
+
+## agent-dx 调度器协议迁移
+
+`scheduler/agent-dx-protocol-20261010` 分支采用上游 sandboxd 提交 `31d0749a85e269396cfc1c469c948345f9610906` 的公共 protobuf 字段，与 agent-dx 固定协议一致。StartResponse 的 `sandbox_ip`、`resource_generation`、调度器端口映射分别位于 4、5、6。CheckpointRequest 保留上游 1–6 号字段；调度器检查点身份、文件系统快照开关、trace 身份及内部 timeout 别名分别占用 7–10。该分支有意停止兼容旧 YuanRong 调度器的字段编号，不得部署到旧环境。
+
+generation 条件删除及检查点 RPC、持久资源 revision、operation ID、deadline 和结果未知语义继续作为独立扩展保留。CheckpointResponse 的附加产物事实可由上游客户端忽略。`api/runtime/v1/testdata/` 中从固定上游原件独立生成的 descriptor 检查每个公共消息字段及 RPC。协议匹配不等于运行时或重启验收通过。

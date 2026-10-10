@@ -53,7 +53,7 @@ run_case() {
     fi
 }
 
-for name in runsc-systrap runsc-kvm kata firecracker runc; do
+for name in runsc-systrap runsc-kvm kata firecracker firecracker-incremental firecracker-virtiofs runc; do
     run_case "${name}"
 done
 

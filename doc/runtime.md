@@ -13,6 +13,7 @@ binaries, boot artifacts, and host prerequisites pass validation.
 | Network lifecycle | Reusable TAP from the interface pool | New netns and veth per sandbox, deleted on release | Reusable TAP from the interface pool | Reusable TAP from the interface pool |
 | Root filesystem | Directory or EROFS | Directory or EROFS with a host overlay | Directory or EROFS passed into the VM | Immutable EROFS drive or opt-in virtio-fs directory, plus a private ext4 overlay |
 | Read-only mounts | Bind, EROFS, and runtime-supported OCI mounts | Bind, EROFS, and OCI mounts | Bind, EROFS, and runtime-supported OCI mounts | EROFS drives, virtio-fs directories, and bounded regular-file injection |
+| Writable host directory mounts | Supported | Supported | Supported | Explicit `rw` binds through virtio-fs; caller-owned data |
 | Exec, interactive TTY, wait, stats, and recovery | Supported | Supported | Supported | Supported |
 | Network ACL and managed DNS | Supported | Not supported | Supported | Supported |
 | Published-port DNAT | Supported | Supported | Supported | Supported |
@@ -80,14 +81,15 @@ its root filesystem. The file may be local or exposed by an image provider
 such as distill-fs, so object-storage range reads and lazy caching remain
 outside the runtime adapter.
 
-Set `virtiofs_enabled = true` to use directory-backed root filesystems and explicitly read-only host-directory mounts, including OCI/Nydus rootfs directories resolved by the image manager. OCI image mounts remain unsupported. sandboxd creates one private staging tmpfs per sandbox, recursively bind-mounts each source below fixed relative paths, and starts one upstream virtiofsd selected by `virtiofsd_path` (default `/usr/local/bin/virtiofsd`). The daemon is always started with `--readonly`, namespace sandboxing, submount announcements disabled, inode file handles disabled, and `find-paths` migration mode. Disabling submount announcements makes the staging bind mounts ordinary virtio-fs directories in the guest, so they can serve as an overlayfs lower layer. The staging binds are also remounted read-only. The image manager keeps owning and garbage-collecting the source; Firecracker creates no independent image cache. OCI and Nydus rootfs directories require this mode and are never eagerly converted to EROFS.
+Set `virtiofs_enabled = true` to use directory-backed root filesystems and host-directory mounts with exactly one explicit access option, `ro` or `rw`. This includes OCI/Nydus rootfs directories resolved by the image manager; root image exports always remain read-only, and OCI image mounts remain unsupported. sandboxd creates one private staging tmpfs per sandbox, recursively bind-mounts each source below fixed relative paths, and starts one upstream virtiofsd selected by `virtiofsd_path` (default `/usr/local/bin/virtiofsd`). The daemon uses namespace sandboxing, disabled submount announcements and inode file handles, and `find-paths` migration mode. It adds `--readonly` when all exports are read-only. Each read-only export is protected recursively on the host with `mount_setattr`, requiring Linux 5.12 or newer; guest remounts cannot make it writable. The staging root is also read-only. Submount announcements stay disabled so directory roots can serve as overlayfs lower layers. The default `cache=auto` supports executable directory roots; virtiofsd writeback caching is not enabled.
+
+Host binds remain caller-owned: sandbox deletion removes only the staging mounts, not their source directories or contents. Their data is outside the sandbox's `storage_mb` quota and checkpoint artifacts. Local checkpoint/restore requires retaining the original backing directories and referenced files; their content is not rolled back. There is no automatic directory allocation, retention/GC, missing-file recreation, or cross-node data migration. The image manager continues owning and garbage-collecting image sources; Firecracker creates no independent image cache or eager OCI/Nydus-to-EROFS conversion.
 
 This mode requires the AKernel Firecracker build with the MMIO virtio-fs
 frontend and vhost-user migration support, plus virtiofsd 1.14 or newer. The
 frontend requires `MQ`, `REPLY_ACK`, `LOG_SHMFD`, `DEVICE_STATE`, and
 `VHOST_F_LOG_ALL`; startup fails rather than silently disabling checkpoint
-correctness when a backend lacks them. DAX and writable host sharing are not
-supported. The sandbox's private ext4 overlay remains the only writable layer.
+correctness when a backend lacks them. DAX is not supported. The private ext4 overlay remains separate from writable host binds.
 
 Every sandbox gets a sparse ext4 image under `filestore_dir/.firecracker` and
 uses it as the overlay upper and work filesystem. For a read-only root, the
@@ -147,9 +149,9 @@ attached as read-only drives. Read-only regular files are injected into the
 guest, limited to 1 MiB per file and 4 MiB in total; this narrow path supports
 managed files such as `resolv.conf`. With virtio-fs disabled, directory roots
 that were not explicitly materialized and directory binds are rejected. With
-virtio-fs enabled, directory roots and explicitly read-only directory binds use
+virtio-fs enabled, directory roots and explicit `ro`/`rw` directory binds use
 the single shared filesystem instead of block drives. At most 24 block drives,
-including an EROFS root and the overlay, may be attached. Writable binds, host
+including an EROFS root and the overlay, may be attached. Writable regular-file binds, host
 device-provider OCI updates, NVIDIA devices, and nested KVM are always
 rejected instead of being silently weakened.
 Private tmpfs mounts are supported with a bounded set of standard security,

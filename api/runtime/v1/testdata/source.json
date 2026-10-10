@@ -1,0 +1,8 @@
+{
+  "repository": "https://github.com/inclusionAI/sandboxd.git",
+  "revision": "31d0749a85e269396cfc1c469c948345f9610906",
+  "source": "api/runtime/v1/sandbox-api.proto",
+  "source_sha256": "a0053b7d6b5f9f4ce1e344e96741192a98a11e79d6b1cac4d17fea5a36b716ab",
+  "descriptor_sha256": "b2fef6676c7626036f23e610aff5821d89851cadbd8e2021746cfa044cb58e5d",
+  "descriptor_generator": "libprotoc 3.12.4; descriptor only, no SourceCodeInfo"
+}

@@ -17,6 +17,7 @@ set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+. "${SCRIPT_DIR}/gvisor-bundle.sh"
 
 DOCKER="${DOCKER:-docker}"
 IMAGE="${SANDBOXD_E2E_IMAGE:-sandboxd-e2e:local}"
@@ -314,6 +315,8 @@ if [ "${E2E_SKIP_BUILD}" = "0" ]; then
     if [ "${E2E_RUNTIME}" = "all" ] || [ "${E2E_RUNTIME}" = "runsc" ]; then
         [ -x "${RUNSC_BINARY}" ] ||
             fail "RUNSC_BINARY is not executable; set RUNSC_BINARY=/path/to/upstream/runsc"
+        validate_gvisor_bundle "${RUNSC_BINARY}" ||
+            fail "RUNSC_BINARY requires its complete adjacent gVisor bundle"
     fi
     if [ -z "${RUNC_BINARY}" ]; then
         for candidate in output/runc /usr/local/bin/runc /usr/bin/runc; do
@@ -397,12 +400,14 @@ if [ "${E2E_SKIP_BUILD}" = "0" ]; then
         GOMODCACHE=/tmp/go-mod-official GOTOOLCHAIN=auto \
         go build -o output/network-policy-client \
         ./test/e2e/network-policy-client
+    CGO_ENABLED=0 GOWORK=off GOCACHE=/tmp/go-build \
+        GOMODCACHE=/tmp/go-mod-official GOTOOLCHAIN=auto \
+        go build -o output/checkpoint-restore ./test/e2e/checkpoint-restore
 
     DOCKERFILE="test/e2e/Dockerfile"
     if [ "${E2E_RUNTIME}" = "all" ] || [ "${E2E_RUNTIME}" = "runsc" ]; then
-        log "copying runsc from ${RUNSC_BINARY}"
-        cp "${RUNSC_BINARY}" output/runsc
-        chmod 0755 output/runsc
+        log "copying complete gVisor bundle from ${RUNSC_BINARY}"
+        copy_gvisor_bundle "${RUNSC_BINARY}" output
     fi
 
     if [ "${E2E_RUNTIME}" = "all" ] || [ "${E2E_RUNTIME}" = "runc" ]; then
@@ -426,10 +431,6 @@ if [ "${E2E_SKIP_BUILD}" = "0" ]; then
         install -m 0644 "${FIRECRACKER_INITRD}" output/firecracker-initrd.img
         if [ "${E2E_FIRECRACKER_VIRTIOFS}" = "1" ]; then
             DOCKERFILE="test/e2e/firecracker-virtiofs.Dockerfile"
-            CGO_ENABLED=0 GOWORK=off GOCACHE=/tmp/go-build \
-                GOMODCACHE=/tmp/go-mod-official GOTOOLCHAIN=auto \
-                go build -o output/checkpoint-restore \
-                ./test/e2e/checkpoint-restore
             install -m 0755 "${FIRECRACKER_VIRTIOFSD}" output/virtiofsd
         fi
     fi
