@@ -67,33 +67,55 @@ type HttpWorkerConfig struct {
 }
 
 func NewHttpWorker(cfg *HttpWorkerConfig) (*HttpWorker, error) {
+	owner, _ := cfg.Manager.(distillfs.ManagerLifecycle)
+	var releaseOwner func()
+	if owner != nil {
+		var err error
+		releaseOwner, err = owner.RetainOwnership()
+		if err != nil {
+			return nil, err
+		}
+	}
 	var mountStore *MountStore
 	if cfg.DBPath != "" {
 		var err error
 		mountStore, err = OpenMountStore(cfg.DBPath)
 		if err != nil {
+			if releaseOwner != nil {
+				releaseOwner()
+			}
 			return nil, fmt.Errorf("failed to open mount store: %w", err)
 		}
 	}
 	return &HttpWorker{
-		ctx:         context.Background(),
-		mgr:         cfg.Manager,
-		ociMgr:      cfg.OCIManager,
-		nydusClient: cfg.NydusClient,
-		nydusSuffix: cfg.NydusSuffix,
-		nydusCache:  NewNydusImageCache(),
-		mountStore:  mountStore,
+		owner:        owner,
+		releaseOwner: releaseOwner,
+		ctx:          context.Background(),
+		mgr:          cfg.Manager,
+		ociMgr:       cfg.OCIManager,
+		nydusClient:  cfg.NydusClient,
+		nydusSuffix:  cfg.NydusSuffix,
+		nydusCache:   NewNydusImageCache(),
+		mountStore:   mountStore,
 	}, nil
 }
 
 type HttpWorker struct {
-	ctx         context.Context
-	mgr         distillfs.Manager
-	ociMgr      *oci.Manager
-	nydusClient *nydus.RegistryClient
-	nydusSuffix string
-	nydusCache  *NydusImageCache
-	mountStore  *MountStore
+	owner        distillfs.ManagerLifecycle
+	releaseOwner func()
+	lifecycleMu  sync.Mutex
+	closed       bool
+	active       sync.WaitGroup
+	closeOnce    sync.Once
+	closeDone    chan struct{}
+	closeErr     error
+	ctx          context.Context
+	mgr          distillfs.Manager
+	ociMgr       *oci.Manager
+	nydusClient  *nydus.RegistryClient
+	nydusSuffix  string
+	nydusCache   *NydusImageCache
+	mountStore   *MountStore
 
 	nydusDetectSF    singleflight.Group
 	routeLocksMu     sync.Mutex
@@ -102,11 +124,61 @@ type HttpWorker struct {
 	operationLocks   map[string]*mountRouteLock
 }
 
-// Close releases resources held by the HttpWorker (e.g., mount store DB).
+// Close rejects new requests, drains admitted work, then closes the database.
 func (w *HttpWorker) Close() {
-	if w.mountStore != nil {
-		w.mountStore.Close()
+	_ = w.CloseWithContext(context.Background())
+}
+
+// A caller timeout leaves the database and ownership lease with the drain.
+func (w *HttpWorker) CloseWithContext(ctx context.Context) error {
+	w.closeOnce.Do(func() {
+		w.lifecycleMu.Lock()
+		w.closed = true
+		w.closeDone = make(chan struct{})
+		w.lifecycleMu.Unlock()
+		go func() {
+			w.active.Wait()
+			if w.mountStore != nil {
+				w.closeErr = w.mountStore.Close()
+			}
+			if w.releaseOwner != nil {
+				w.releaseOwner()
+			}
+			close(w.closeDone)
+		}()
+	})
+	select {
+	case <-w.closeDone:
+		return w.closeErr
+	case <-ctx.Done():
+		return ctx.Err()
 	}
+}
+
+func (w *HttpWorker) admit() (func(), error) {
+	w.lifecycleMu.Lock()
+	defer w.lifecycleMu.Unlock()
+	if w.closed {
+		return nil, fmt.Errorf("image worker is closing")
+	}
+	var releaseOwner func()
+	if w.owner != nil {
+		var err error
+		releaseOwner, err = w.owner.RetainOwnership()
+		if err != nil {
+			return nil, err
+		}
+	}
+	w.active.Add(1)
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			if releaseOwner != nil {
+				releaseOwner()
+			}
+			w.active.Done()
+		})
+	}, nil
 }
 
 // SetContext sets the context for tracing (should be called after creation if tracing is enabled)
@@ -137,6 +209,11 @@ func splitObject(object string) (string, string, error) {
 }
 
 func (w *HttpWorker) MountOSS(req *OSSMountRequest) (*MountInfo, error) {
+	release, err := w.admit()
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 	if req != nil && req.OperationID != "" {
 		return w.executeMountOperation(req.OperationID, "oss", "", req.PhysicalGeneration, req, func(bind mountBinding) (*MountInfo, error) { return w.mountOSS(req, bind) })
 	}
@@ -242,6 +319,11 @@ func (w *HttpWorker) mountOSS(req *OSSMountRequest, bind mountBinding) (*MountIn
 }
 
 func (w *HttpWorker) UnmountOSS(req *OSSUmountRequest) (*MountInfo, error) {
+	release, err := w.admit()
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 	if req == nil || !validMountGeneration(req.PhysicalGeneration) {
 		return nil, fmt.Errorf("original mount generation is required")
 	}
@@ -269,7 +351,7 @@ func (w *HttpWorker) UnmountOSS(req *OSSUmountRequest) (*MountInfo, error) {
 		"mount_point": d.MountPoint(),
 		"source_type": "oss",
 	}).Info("unmount path begin daemon unmount")
-	err := d.UnmountIfPhysicalGeneration(req.PhysicalGeneration)
+	err = d.UnmountIfPhysicalGeneration(req.PhysicalGeneration)
 	if err != nil {
 		timing.Fail(err)
 		return nil, fmt.Errorf("failed to umount daemon %s: %w", id, err)
@@ -288,6 +370,11 @@ func (w *HttpWorker) UnmountOSS(req *OSSUmountRequest) (*MountInfo, error) {
 }
 
 func (w *HttpWorker) MountNydus(req *NydusMountRequest) (*MountInfo, error) {
+	release, err := w.admit()
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 	if req != nil && req.OperationID != "" {
 		return w.executeMountOperation(req.OperationID, "nydus", "", req.PhysicalGeneration, req, func(bind mountBinding) (*MountInfo, error) { return w.mountNydus(req, bind) })
 	}
@@ -425,6 +512,11 @@ func (w *HttpWorker) mountNydus(req *NydusMountRequest, bind mountBinding) (*Mou
 }
 
 func (w *HttpWorker) UnmountNydus(req *NydusUmountRequest) (*MountInfo, error) {
+	release, err := w.admit()
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 	if req == nil || !validMountGeneration(req.PhysicalGeneration) {
 		return nil, fmt.Errorf("original mount generation is required")
 	}
@@ -462,7 +554,7 @@ func (w *HttpWorker) UnmountNydus(req *NydusUmountRequest) (*MountInfo, error) {
 		"source_type": "nydus",
 		"image_url":   req.ImageURL,
 	}).Info("unmount path begin daemon unmount")
-	err := d.UnmountIfPhysicalGeneration(req.PhysicalGeneration)
+	err = d.UnmountIfPhysicalGeneration(req.PhysicalGeneration)
 	if err != nil {
 		timing.Fail(err)
 		return nil, fmt.Errorf("failed to umount daemon %s: %w", id, err)
@@ -575,6 +667,11 @@ func (w *HttpWorker) mountNydusOnce(imageURL string, fn func() (nydusMountAttemp
 }
 
 func (w *HttpWorker) MountOCI(req *OCIMountRequest) (*OCIMountResponse, error) {
+	release, err := w.admit()
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 	if req != nil && req.OperationID != "" {
 		if !req.RequirePhysicalGeneration {
 			return nil, fmt.Errorf("mount operation requires physical ownership")
@@ -662,6 +759,11 @@ func (w *HttpWorker) mountOCI(req *OCIMountRequest, bind mountBinding) (*OCIMoun
 // image. It is separate from MountOCI so old cached mounts need registry access
 // only when a caller explicitly requests inherited image startup.
 func (w *HttpWorker) ImageProcess(imageURL string) (*imageconfig.Process, error) {
+	release, err := w.admit()
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 	if imageURL == "" {
 		return nil, fmt.Errorf("image_url is required")
 	}
@@ -762,6 +864,11 @@ func validateMountRoute(imageURL string, r *MountRecord) error {
 }
 
 func (w *HttpWorker) UnmountOCI(req *OCIUmountRequest) error {
+	release, err := w.admit()
+	if err != nil {
+		return err
+	}
+	defer release()
 	if req == nil || req.ImageURL == "" {
 		return fmt.Errorf("image_url is required")
 	}
@@ -884,6 +991,11 @@ func (w *HttpWorker) unmountOCILegacy(req *OCIUmountRequest) error {
 }
 
 func (w *HttpWorker) CleanupDaemon(req *CleanupDaemonRequest) error {
+	release, err := w.admit()
+	if err != nil {
+		return err
+	}
+	defer release()
 	if req.DaemonID == "" {
 		return fmt.Errorf("daemon_id is required")
 	}
@@ -891,10 +1003,20 @@ func (w *HttpWorker) CleanupDaemon(req *CleanupDaemonRequest) error {
 }
 
 func (w *HttpWorker) ListDaemons() ([]distillfs.DaemonInfo, error) {
+	release, err := w.admit()
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 	return w.mgr.ListDaemons(), nil
 }
 
 func (w *HttpWorker) ListMountedOCIImages() ([]string, error) {
+	release, err := w.admit()
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 	if w.ociMgr == nil {
 		return nil, fmt.Errorf("oci manager is not initialized")
 	}
@@ -902,6 +1024,11 @@ func (w *HttpWorker) ListMountedOCIImages() ([]string, error) {
 }
 
 func (w *HttpWorker) ListMountedOCIDetails() ([]oci.OciMountRecord, error) {
+	release, err := w.admit()
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 	if w.ociMgr == nil {
 		return nil, fmt.Errorf("oci manager is not initialized")
 	}

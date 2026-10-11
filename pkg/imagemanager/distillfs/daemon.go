@@ -213,6 +213,7 @@ type DaemonInfo struct {
 }
 
 type Daemon struct {
+	ownership                  *managerOwnership
 	physicalMu                 sync.Mutex
 	physicalPublicationPending bool
 	physicalScopeFunc          func() (physicalScope, error)
@@ -312,6 +313,11 @@ func (d *Daemon) ImageProcess() *imageconfig.Process {
 // ResolveImageProcess returns cached image process metadata or upgrades daemon
 // metadata created by an older sandboxd release on demand.
 func (d *Daemon) ResolveImageProcess(ctx context.Context) (*imageconfig.Process, error) {
+	release, err := d.ownership.acquire()
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.meta.SourceType != "nydus" {
@@ -453,6 +459,9 @@ func (d *Daemon) tick() bool {
 }
 
 func (d *Daemon) shouldRemount() bool {
+	if d.ownership != nil && d.ownership.closeRequested.Load() {
+		return false
+	}
 	// Never remount if explicitly stopped by user/API
 	if d.userStopped.Load() {
 		return false
@@ -490,8 +499,14 @@ func (d *Daemon) watch(stopChan chan struct{}, kickStop *Stopper) {
 			}
 		case <-kickStop.Done():
 			for d.IsAlive() {
-				time.Sleep(10 * time.Millisecond)
+				select {
+				case <-d.ownership.closingSignal():
+					return
+				case <-time.After(10 * time.Millisecond):
+				}
 			}
+			return
+		case <-d.ownership.closingSignal():
 			return
 		}
 	}
@@ -586,6 +601,11 @@ func (d *Daemon) Mount() error {
 // rejected if the daemon was explicitly unmounted, closing the race window between remount()
 // checking the flag and acquiring the lock.
 func (d *Daemon) mount(userInitiated bool) error {
+	release, err := d.ownership.acquire()
+	if err != nil {
+		return err
+	}
+	defer release()
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return d.mountLocked(userInitiated)
@@ -705,6 +725,12 @@ func (d *Daemon) startDaemonProcessWithBinding(bind func(generation, target stri
 			d.setState(DaemonStateStopped)
 		}
 	}()
+	release, err := d.ownership.acquire()
+	if err != nil {
+		timing.Fail(err)
+		return
+	}
+	defer release()
 
 	if !d.watcherActive.Load() {
 		if err := d.initializeDaemonWithBinding(ctx, timing, bind); err != nil {
@@ -722,6 +748,12 @@ func (d *Daemon) startDaemonProcessWithBinding(bind func(generation, target stri
 	logrus.WithFields(d.daemonLogFields()).Info("waiting for mount readiness via statfs zero blocks")
 	for {
 		select {
+		case <-d.ownership.closingSignal():
+			timing.Fail(fmt.Errorf("original owner closed during mount readiness"))
+			return
+		case <-ctx.Done():
+			timing.Fail(ctx.Err())
+			return
 		case <-d.stopChan:
 			d.setState(DaemonStateStopped)
 			logrus.WithFields(d.daemonLogFields()).Error("daemon exited abnormally")
@@ -797,6 +829,11 @@ func (d *Daemon) initializeDaemon(ctx context.Context, timing *TimedOperation) e
 }
 
 func (d *Daemon) initializeDaemonWithBinding(ctx context.Context, timing *TimedOperation, bind func(generation, target string) error) error {
+	release, err := d.ownership.acquire()
+	if err != nil {
+		return err
+	}
+	defer release()
 	// For Nydus: download bootstrap if not exists
 	if d.meta.SourceType == "nydus" && d.meta.BootstrapPath == "" {
 		if d.meta.ImageURL == "" || d.nydusClient == nil {
@@ -883,7 +920,7 @@ func (d *Daemon) initializeDaemonWithBinding(ctx context.Context, timing *TimedO
 	// Apply cgroup settings before starting (v2: CgroupFD for clone3)
 	d.cgroupCtrl.Apply(c)
 
-	err := d.startOriginalDaemonCommand(c, original)
+	err = d.startOriginalDaemonCommand(c, original)
 	if err != nil {
 		logrus.WithFields(d.daemonLogFields()).WithError(err).Error("failed to start distill daemon")
 		timing.Fail(err)
@@ -1008,6 +1045,11 @@ func (d *Daemon) cleanMountPoint() error {
 }
 
 func (d *Daemon) Unmount() error {
+	release, err := d.ownership.acquire()
+	if err != nil {
+		return err
+	}
+	defer release()
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return d.unmountLocked()
@@ -1015,6 +1057,11 @@ func (d *Daemon) Unmount() error {
 
 // Original generation comes from the acquisition, never a later lookup.
 func (d *Daemon) UnmountIfPhysicalGeneration(generation string) error {
+	release, err := d.ownership.acquire()
+	if err != nil {
+		return err
+	}
+	defer release()
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	p := d.originalPhysicalIdentity()
@@ -1029,6 +1076,11 @@ func (d *Daemon) UnmountIfPhysicalGeneration(generation string) error {
 // unmount is aborted. This closes the race window where GC releases mgr.mu
 // and a mount request arrives before unmount begins.
 func (d *Daemon) unmountForGC() bool {
+	release, err := d.ownership.acquire()
+	if err != nil {
+		return false
+	}
+	defer release()
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if !d.mountFailed.Load() {

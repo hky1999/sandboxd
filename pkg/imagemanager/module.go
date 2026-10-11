@@ -24,6 +24,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/sirupsen/logrus"
 
@@ -58,12 +59,16 @@ type Config struct {
 //	... use svc ...
 //	mod.Stop()
 type Module struct {
-	cfg        Config
-	mgr        distillfs.Manager
-	ociMgr     *oci.Manager
-	worker     *api.HttpWorker
-	closedOnce sync.Once
-	healthy    atomic.Bool
+	cfg          Config
+	mgr          distillfs.Manager
+	ociMgr       *oci.Manager
+	worker       *api.HttpWorker
+	closedOnce   sync.Once
+	owner        distillfs.ManagerLifecycle
+	releaseOwner func()
+	stopDone     chan struct{}
+	stopErr      error
+	healthy      atomic.Bool
 }
 
 // NewModule mirrors the standalone main.go setup: registry/nydus client
@@ -111,11 +116,25 @@ func NewModule(cfg Config) (*Module, error) {
 	if err != nil {
 		return nil, fmt.Errorf("imagemanager: distillfs manager: %w", err)
 	}
+	owner := mgr.(distillfs.ManagerLifecycle)
+	releaseOwner, err := owner.RetainOwnership()
+	if err != nil {
+		owner.StopAccepting()
+		return nil, fmt.Errorf("imagemanager: retain root ownership: %w", err)
+	}
+	m := &Module{cfg: cfg, mgr: mgr, owner: owner, releaseOwner: releaseOwner}
+	success := false
+	defer func() {
+		if !success {
+			m.Stop()
+		}
+	}()
 
 	ociMgr, err := oci.NewManager(cfg.Root, cfg.NydusTemplate, sharedRegistryClient)
 	if err != nil {
 		return nil, fmt.Errorf("imagemanager: oci manager: %w", err)
 	}
+	m.ociMgr = ociMgr
 
 	// Mount records stay in the image-manager root, separate from sandbox
 	// lifecycle metadata.
@@ -128,12 +147,12 @@ func NewModule(cfg Config) (*Module, error) {
 		DBPath:      dbPath,
 	})
 	if err != nil {
-		ociMgr.Close()
 		return nil, fmt.Errorf("imagemanager: http worker: %w", err)
 	}
 
-	m := &Module{cfg: cfg, mgr: mgr, ociMgr: ociMgr, worker: worker}
+	m.worker = worker
 	m.healthy.Store(true)
+	success = true
 	return m, nil
 }
 
@@ -151,19 +170,49 @@ func (m *Module) ReconcileRecoveredDaemons() error {
 	return m.mgr.ReconcileRecoveredDaemons()
 }
 
-// Stop closes the worker (drains in-flight requests, persists mount state
-// to mount_records.db) and the OCI manager (releases overlay mounts). It
-// is safe to call multiple times; only the first call performs work.
+// Stop gives shutdown five seconds. A timeout retains ownership until the
+// admitted work and backend workers have actually stopped.
 func (m *Module) Stop() {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := m.StopWithContext(ctx); err != nil {
+		logrus.WithError(err).Warn("imagemanager shutdown has not completed")
+	}
+}
+
+func (m *Module) StopWithContext(ctx context.Context) error {
 	m.closedOnce.Do(func() {
 		m.healthy.Store(false)
-		if m.worker != nil {
-			m.worker.Close()
+		m.stopDone = make(chan struct{})
+		if m.owner != nil {
+			m.owner.StopAccepting()
 		}
-		if m.ociMgr != nil {
-			m.ociMgr.Close()
-		}
+		go func() {
+			if m.worker != nil {
+				m.stopErr = m.worker.CloseWithContext(context.Background())
+			}
+			if m.ociMgr != nil {
+				if err := m.ociMgr.Close(); err != nil && m.stopErr == nil {
+					m.stopErr = err
+				}
+			}
+			if m.releaseOwner != nil {
+				m.releaseOwner()
+			}
+			if m.owner != nil {
+				if err := m.owner.Close(context.Background()); err != nil && m.stopErr == nil {
+					m.stopErr = err
+				}
+			}
+			close(m.stopDone)
+		}()
 	})
+	select {
+	case <-m.stopDone:
+		return m.stopErr
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // Healthy returns true while the module is constructed and not yet

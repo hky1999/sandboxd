@@ -13,6 +13,11 @@ import (
 // publication. A release that wins this lock prevents late exec; a Start that
 // wins keeps an interrupted birth unresolved until the original facts arrive.
 func (d *Daemon) startOriginalDaemonCommand(command *exec.Cmd, expected *physicalIdentity) error {
+	release, err := d.ownership.acquire()
+	if err != nil {
+		return err
+	}
+	defer release()
 	d.physicalMu.Lock()
 	defer d.physicalMu.Unlock()
 	current := d.meta.PhysicalIdentity
@@ -37,7 +42,11 @@ func (d *Daemon) startOriginalDaemonCommand(command *exec.Cmd, expected *physica
 	if err != nil || metadataSHA(executable) != expected.ExecutableSHA256 {
 		return fmt.Errorf("original daemon dispatch executable changed")
 	}
-	if err := command.Start(); err != nil {
+	dispatched, err := d.ownership.dispatch(command.Start)
+	if err != nil {
+		if !dispatched {
+			return err // An owner rejection does not prove an attempted Start failed.
+		}
 		failed := clonePhysicalIdentity(current)
 		failed.Phase = "not_started"
 		failed.NoDispatchConfirmed = true

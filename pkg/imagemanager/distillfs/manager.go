@@ -68,6 +68,8 @@ type Manager interface {
 }
 
 type manager struct {
+	ownership   *managerOwnership
+	cancel      context.CancelFunc
 	chunkDBSize string
 	mu          sync.RWMutex
 	ctx         context.Context
@@ -146,16 +148,45 @@ func NewManager(config *ManagerConfig) (Manager, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	ctx, cancel := context.WithCancel(ctx)
+	ownership, err := openManagerOwnership(ctx, config.Root)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	release, err := ownership.acquire()
+	if err != nil {
+		ownership.requestClose()
+		cancel()
+		return nil, err
+	}
+	defer release()
+	success := false
+	defer func() {
+		if !success {
+			ownership.requestClose()
+			cancel()
+		}
+	}()
+	go func() {
+		select {
+		case <-ctx.Done():
+			ownership.requestClose()
+		case <-ownership.done:
+		}
+	}()
 
 	var cgroupCtrl *imgcgroup.Controller
 	if !config.DisableCgroup {
 		cgroupCtrl = imgcgroup.NewController(config.CgroupMemoryLimit)
 	}
 	mgr := &manager{
+		ownership:        ownership,
+		cancel:           cancel,
 		chunkDBSize:      size,
 		ctx:              ctx,
 		binPath:          config.BinPath,
-		root:             config.Root,
+		root:             ownership.root,
 		ossCfgTemplate:   BackendConfig{},
 		nydusCfgTemplate: BackendConfig{},
 		daemons:          map[string]*Daemon{},
@@ -170,8 +201,12 @@ func NewManager(config *ManagerConfig) (Manager, error) {
 		return nil, fmt.Errorf("failed to load existed daemons: %w", err)
 	}
 	mgr.addExistingDaemonsToCgroup()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	go mgr.gcWorker()
 	go mgr.chunkDBCleanupWorker()
+	success = true
 	return mgr, nil
 }
 
@@ -216,7 +251,7 @@ func (mgr *manager) loadExistedDaemons() error {
 		if !entry.Type().IsRegular() {
 			return fmt.Errorf("daemon ownership record is not a regular file")
 		}
-		d := &Daemon{ctx: mgr.ctx, binPath: mgr.binPath, cgroupCtrl: mgr.cgroupCtrl, chunkDBSize: mgr.chunkDBSize}
+		d := &Daemon{ownership: mgr.ownership, ctx: mgr.ctx, binPath: mgr.binPath, cgroupCtrl: mgr.cgroupCtrl, chunkDBSize: mgr.chunkDBSize}
 		metaFilePath := filepath.Join(daemonConfigDir, entry.Name())
 		if err = d.loadDaemonMetadata(metaFilePath); err != nil {
 			return fmt.Errorf("preserve unresolved daemon ownership: %w", err)
@@ -370,6 +405,7 @@ func (mgr *manager) newDaemon(opts *DaemonCreateOpt) (*Daemon, error) {
 // setupOSSDaemon creates a daemon for OSS source type
 func (mgr *manager) setupOSSDaemon(opts *DaemonCreateOpt) (*Daemon, error) {
 	d := &Daemon{
+		ownership:   mgr.ownership,
 		chunkDBSize: mgr.chunkDBSize,
 		ctx:         mgr.ctx,
 		config:      &BackendConfig{},
@@ -445,6 +481,7 @@ func (mgr *manager) setupOSSDaemon(opts *DaemonCreateOpt) (*Daemon, error) {
 // setupNydusDaemon creates a daemon for Nydus source type
 func (mgr *manager) setupNydusDaemon(opts *DaemonCreateOpt) (*Daemon, error) {
 	d := &Daemon{
+		ownership:   mgr.ownership,
 		chunkDBSize: mgr.chunkDBSize,
 		ctx:         mgr.ctx,
 		config:      &BackendConfig{},
@@ -535,6 +572,14 @@ func (mgr *manager) setupNydusDaemon(opts *DaemonCreateOpt) (*Daemon, error) {
 }
 
 func (mgr *manager) CreateDaemon(opts *DaemonCreateOpt) error {
+	release, err := mgr.ownership.acquire()
+	if err != nil {
+		return err
+	}
+	defer release()
+	if opts == nil {
+		return fmt.Errorf("daemon creation options are required")
+	}
 	mgr.mu.Lock()
 	defer mgr.mu.Unlock()
 
@@ -572,6 +617,11 @@ func (mgr *manager) GetDaemon(id string) *Daemon {
 // cleanupDaemonResources removes all daemon resources from disk
 // Caller must hold mgr.mu lock
 func (mgr *manager) cleanupDaemonResources(d *Daemon) error {
+	release, err := mgr.ownership.acquire()
+	if err != nil {
+		return err
+	}
+	defer release()
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.releasePending || d.getState() != DaemonStateStopped || d.IsAlive() {
@@ -772,7 +822,12 @@ func (mgr *manager) gcWorker() {
 	gcTicker := time.NewTicker(2 * time.Minute)
 	defer gcTicker.Stop()
 
-	for range gcTicker.C {
+	for {
+		select {
+		case <-mgr.commandContext().Done():
+			return
+		case <-gcTicker.C:
+		}
 		mgr.mu.RLock()
 		total := len(mgr.daemons)
 		recovering := mgr.recovered != nil
@@ -828,6 +883,11 @@ func (mgr *manager) SetDaemonReferenced(daemonID string, referenced bool) {
 }
 
 func (mgr *manager) SetDaemonReferencedIfPhysicalGeneration(id, generation string, referenced bool) error {
+	release, err := mgr.ownership.acquire()
+	if err != nil {
+		return err
+	}
+	defer release()
 	mgr.mu.Lock()
 	defer mgr.mu.Unlock()
 	d := mgr.daemons[id]
@@ -931,8 +991,13 @@ func (mgr *manager) ListDaemons() []DaemonInfo {
 
 // checkChunkDBStats runs 'distill_fs stats-chunk' and returns the parsed stats
 func (mgr *manager) checkChunkDBStats() (*ChunkDBStats, error) {
+	release, err := mgr.ownership.acquire()
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 	chunkDBDir := filepath.Join(mgr.root, "chunk_db")
-	cmd := exec.Command(mgr.binPath, chunkDBArgs("stats-chunk", chunkDBDir, mgr.chunkDBSize)...)
+	cmd := exec.CommandContext(mgr.commandContext(), mgr.binPath, chunkDBArgs("stats-chunk", chunkDBDir, mgr.chunkDBSize)...)
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -994,8 +1059,13 @@ func formatChunkDBStats(stats *ChunkDBStats) string {
 
 // gcChunkDB runs 'distill_fs gc-chunk' to clean up the ChunkDB
 func (mgr *manager) gcChunkDB() error {
+	release, err := mgr.ownership.acquire()
+	if err != nil {
+		return err
+	}
+	defer release()
 	chunkDBDir := filepath.Join(mgr.root, "chunk_db")
-	cmd := exec.Command(mgr.binPath, chunkDBArgs("gc-chunk", chunkDBDir, mgr.chunkDBSize)...)
+	cmd := exec.CommandContext(mgr.commandContext(), mgr.binPath, chunkDBArgs("gc-chunk", chunkDBDir, mgr.chunkDBSize)...)
 
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -1011,7 +1081,12 @@ func (mgr *manager) chunkDBCleanupWorker() {
 	ticker := time.NewTicker(10 * time.Minute)
 	defer ticker.Stop()
 
-	for range ticker.C {
+	for {
+		select {
+		case <-mgr.commandContext().Done():
+			return
+		case <-ticker.C:
+		}
 		stats, err := mgr.checkChunkDBStats()
 		if err != nil {
 			logrus.Errorf("failed to check ChunkDB stats: %v", err)

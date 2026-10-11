@@ -1,5 +1,7 @@
 # Checkpoint and restore
 
+镜像管理模块关闭期间拒绝新的挂载、卸载、查询和元数据解析请求，已准入请求及后台维护退出前继续持有原根目录独占锁；关闭超时不能交出锁或声称物理清理完成，见 [镜像管理器所有权契约](scheduler-image-mount-release.md)。这只协调本地镜像管理器的生命周期，不证明检查点源执行已经退役，不改变恢复预算准入或未绑定操作的未知结果语义。
+
 sandboxd supports checkpointing a running sandbox into a caller-owned
 directory and starting a new sandbox from that checkpoint.
 

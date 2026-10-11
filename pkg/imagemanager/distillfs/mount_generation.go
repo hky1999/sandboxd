@@ -14,6 +14,11 @@ func (d *Daemon) MountWithPhysicalGeneration() (string, error) {
 // The binding must become durable before a new process is dispatched. Each
 // shared owner also binds the existing generation under the lifecycle lock.
 func (d *Daemon) MountWithPhysicalBinding(bind func(generation, target string) error) (string, error) {
+	release, err := d.ownership.acquire()
+	if err != nil {
+		return "", err
+	}
+	defer release()
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if err := d.mountLockedWithBinding(true, bind); err != nil {
@@ -46,6 +51,11 @@ func (d *Daemon) bindOriginalMount(bind func(generation, target string) error) e
 // InspectPhysicalGeneration reattaches only a known original record. It NEVER
 // starts a process, remounts a URL, or borrows a replacement generation.
 func (d *Daemon) InspectPhysicalGeneration(generation string) (string, error) {
+	release, err := d.ownership.acquire()
+	if err != nil {
+		return "", err
+	}
+	defer release()
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	p := d.originalPhysicalIdentity()

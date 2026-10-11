@@ -148,6 +148,11 @@ func (w *HttpWorker) executeMountOperation(id, kind, imageURL, expected string, 
 // This query never dispatches, reconstructs a route, or changes references. A
 // bound result can be inspected even if the success confirmation was not saved.
 func (w *HttpWorker) QueryMountOperation(query *MountOperationQuery) (*MountOperationResult, error) {
+	release, err := w.admit()
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 	if w.mountStore == nil {
 		return nil, fmt.Errorf("mount operation requires its persistent journal")
 	}

@@ -106,6 +106,7 @@ type Manager struct {
 
 	stopOnce sync.Once
 	stopCh   chan struct{}
+	pruneWG  sync.WaitGroup
 
 	now       func() time.Time
 	mountFn   func(target string, lowerDirs []string) error
@@ -217,7 +218,11 @@ func NewManager(rootWorkDir string, cfgTempPath string, sharedRegistryClient ...
 		logrus.Warnf("failed to reconcile OCI metadata at startup: %v", err)
 	}
 
-	go mgr.pruneImagesLoop()
+	mgr.pruneWG.Add(1)
+	go func() {
+		defer mgr.pruneWG.Done()
+		mgr.pruneImagesLoop()
+	}()
 	return mgr, nil
 }
 
@@ -852,6 +857,7 @@ func (m *Manager) Close() error {
 	})
 	m.layerPoolWG.Wait()
 	m.layerPoolMu.Unlock()
+	m.pruneWG.Wait()
 
 	m.mutex.Lock()
 	images := make([]string, 0, len(m.containers))
