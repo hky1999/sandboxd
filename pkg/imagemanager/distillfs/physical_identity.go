@@ -61,6 +61,7 @@ type physicalIdentity struct {
 	NoDispatchConfirmed bool                     `json:"no_dispatch_confirmed,omitempty"`
 	BirthProtocol       uint8                    `json:"birth_protocol,omitempty"`
 	BirthDirectory      *directoryBirth          `json:"birth_directory,omitempty"`
+	ManagedLaunch       *managedLaunchIntent     `json:"managed_launch,omitempty"`
 }
 
 func clonePhysicalIdentity(p *physicalIdentity) *physicalIdentity {
@@ -68,6 +69,10 @@ func clonePhysicalIdentity(p *physicalIdentity) *physicalIdentity {
 		return nil
 	}
 	out := *p
+	if p.ManagedLaunch != nil {
+		launch := *p.ManagedLaunch
+		out.ManagedLaunch = &launch
+	}
 	if p.BirthDirectory != nil {
 		birth := *p.BirthDirectory
 		out.BirthDirectory = &birth
@@ -418,11 +423,17 @@ func (d *Daemon) preparePhysicalLaunch() error {
 	}
 	args := append([]string{d.binPath}, d.buildMountArgsForPIDFile(pidFile)...)
 	p := &physicalIdentity{Generation: generation, Scope: scope, Target: d.meta.MountPoint, PIDFile: pidFile, ExecutableSHA256: metadataSHA(exe), ArgumentsSHA256: metadataSHA([]byte(strings.Join(args, "\x00") + "\x00")), SourceSHA256: source, Phase: "launching", BirthProtocol: 1, BirthDirectory: birth}
+	if err := d.prepareManagedLaunch(p, args[1:]); err != nil {
+		return err
+	}
 	return d.publishPhysicalIdentity(p) // Durable before process dispatch.
 }
 
 func (d *Daemon) captureOriginalProcess() error {
 	p := d.originalPhysicalIdentity()
+	if p != nil && p.ManagedLaunch != nil {
+		return d.adoptManagedLaunchFacts(false, true)
+	}
 	if p == nil {
 		return fmt.Errorf("original physical launch intent is missing")
 	}
@@ -449,6 +460,9 @@ func (d *Daemon) captureOriginalProcess() error {
 
 func (d *Daemon) captureOriginalMount() error {
 	p := d.originalPhysicalIdentity()
+	if p != nil && p.ManagedLaunch != nil {
+		return d.adoptManagedLaunchFacts(true, true)
+	}
 	if p == nil || p.Process == nil {
 		return fmt.Errorf("original process birth is missing")
 	}
@@ -574,6 +588,9 @@ func validatePhysicalMetadata(meta DaemonMeta) error {
 	}
 	if p.BirthProtocol > 1 || p.BirthProtocol == 0 && p.BirthDirectory != nil || p.BirthProtocol == 1 && (p.BirthDirectory == nil || p.BirthDirectory.Inode == 0) {
 		return fmt.Errorf("original physical birth protocol or directory is invalid")
+	}
+	if err := validateManagedLaunch(meta, p); err != nil {
+		return err
 	}
 	if p.Process != nil && (p.Process.PID <= 0 || p.Process.StartTicks == 0 || p.Process.ExecutableSHA256 != p.ExecutableSHA256 || p.Process.ArgumentsSHA256 != p.ArgumentsSHA256) {
 		return fmt.Errorf("original process birth identity is invalid")

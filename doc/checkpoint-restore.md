@@ -49,6 +49,8 @@ runtime again when they execute.
 
 能力通告和 `Start` 的恢复准入同时识别 `ManagedCheckpointHandler` 与 `CheckpointHandler`。runsc 通过前者保存和恢复配对的进程状态与可写文件系统；不能因为它未实现后者，就把已注册的 runsc 标为不支持检查点。这里只说明守护进程的能力选择，实际平台暂停恢复仍须单独验收。
 
+具有完整准备操作关联的新文件系统启动已接入直接子进程确认候选：派发前保存清单与摘要，继承原所有权句柄，严格读取生产端原事实并持久补交主元数据。清理先保存 releasing，持久补交原进程身份后才停止原初始化，并确认退出后继续原挂载清理。旧协议不升级，缺失第一条事实仍保持未知；本地两端非特权通信通过不等于真实挂载、完整预算结算或物理验收。见 [直接子进程启动契约](scheduler-image-mount-release.md#调度器管理的直接子进程启动确认候选)。
+
 ## Checkpoint API
 
 `CheckpointRequest` contains:

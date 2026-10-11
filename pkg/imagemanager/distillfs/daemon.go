@@ -216,6 +216,7 @@ type DaemonInfo struct {
 type Daemon struct {
 	ownership                     *managerOwnership
 	physicalMu                    sync.Mutex
+	managedChild                  *managedLaunchChild // Protected by physicalMu.
 	physicalPublicationPending    bool
 	preparationPublicationPending bool
 	preparationObservation        atomic.Pointer[PreparationInfo]
@@ -383,6 +384,12 @@ func (d *Daemon) compareAndSwapState(old, new DaemonState) bool {
 }
 
 func (d *Daemon) getPid() int {
+	if p := d.originalPhysicalIdentity(); p != nil && p.ManagedLaunch != nil {
+		if p.Process == nil {
+			return -1
+		}
+		return p.Process.PID
+	}
 	info, err := os.ReadFile(d.meta.PidFilePath)
 	if err != nil {
 		return -1
@@ -546,7 +553,14 @@ func (d *Daemon) applyConfig() error {
 
 // buildMountArgs generates CLI arguments for distill_fs based on source type
 func (d *Daemon) buildMountArgs() []string {
-	return d.buildMountArgsForPIDFile(d.meta.PidFilePath)
+	args := d.buildMountArgsForPIDFile(d.meta.PidFilePath)
+	if p := d.originalPhysicalIdentity(); p != nil && p.ManagedLaunch != nil {
+		managed, err := managedMountArgs(args)
+		if err == nil {
+			return managed
+		}
+	}
+	return args
 }
 
 func (d *Daemon) buildMountArgsForPIDFile(pidFile string) []string {
@@ -922,6 +936,11 @@ func (d *Daemon) initializeDaemonWithBinding(ctx context.Context, timing *TimedO
 	}
 	args := d.buildMountArgs()
 	c := exec.CommandContext(ctx, d.binPath, args...)
+	if original.ManagedLaunch != nil {
+		// This direct child outlives the request. Cancellation belongs to its
+		// original generation, not CommandContext's implicit unconditional kill.
+		c = exec.Command(d.binPath, args...)
+	}
 	logrus.WithFields(d.daemonLogFields()).WithField("command", fmt.Sprintf("%s %s", d.binPath, strings.Join(args, " "))).Info("mounting daemon")
 
 	// Apply cgroup settings before starting (v2: CgroupFD for clone3)
@@ -933,7 +952,15 @@ func (d *Daemon) initializeDaemonWithBinding(ctx context.Context, timing *TimedO
 		timing.Fail(err)
 		return err
 	}
-	if err = c.Wait(); err != nil {
+	if original.ManagedLaunch != nil {
+		d.physicalMu.Lock()
+		child := d.managedChild
+		d.physicalMu.Unlock()
+		if err := d.waitManagedLaunchProcess(child); err != nil {
+			timing.Fail(err)
+			return err
+		}
+	} else if err = c.Wait(); err != nil {
 		logrus.WithFields(d.daemonLogFields()).WithError(err).Error("distill daemon exited abnormal")
 		timing.Fail(err)
 		return err
@@ -1137,6 +1164,9 @@ func (d *Daemon) unmountLocked() (retErr error) {
 		if err := d.publishPhysicalIdentity(physical); err != nil {
 			return err
 		}
+		if err := d.stopManagedLaunchChild(); err != nil {
+			return err
+		}
 		if err := d.reconcilePhysicalBirthForRetirement(); err != nil {
 			return err
 		}
@@ -1165,13 +1195,22 @@ func (d *Daemon) unmountLocked() (retErr error) {
 			}
 		}
 		stageStart := time.Now()
+		if err := d.reconcileManagedMountAfterProcessExit(); err != nil {
+			retErr = err
+			return
+		}
 		if err := d.cleanMountPoint(); err != nil {
 			timing.Fail(err)
 			retErr = err
 			return
 		}
 		timing.Stage("clean_mount_point", time.Since(stageStart))
-		if err := os.Remove(d.meta.PidFilePath); err != nil && !os.IsNotExist(err) {
+		if p := d.originalPhysicalIdentity(); p != nil && p.ManagedLaunch != nil {
+			if _, err := os.Lstat(d.meta.PidFilePath); !os.IsNotExist(err) {
+				retErr = fmt.Errorf("unexpected PID file in original managed launch")
+				return
+			}
+		} else if err := os.Remove(d.meta.PidFilePath); err != nil && !os.IsNotExist(err) {
 			retErr = fmt.Errorf("remove original daemon PID record: %w", err)
 			timing.Fail(retErr)
 			return

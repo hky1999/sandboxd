@@ -84,7 +84,7 @@ func readPhysicalBirthFile(directory *os.File, name string) ([]byte, error) {
 	f := os.NewFile(uintptr(fd), name)
 	defer f.Close()
 	var stat unix.Stat_t
-	if err := unix.Fstat(fd, &stat); err != nil || stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Mode&0777 != 0600 || stat.Uid != uint32(os.Geteuid()) || stat.Nlink != 1 || stat.Size > physicalBirthLimit {
+	if err := unix.Fstat(fd, &stat); err != nil || stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Mode&07777 != 0600 || stat.Uid != uint32(os.Geteuid()) || stat.Nlink != 1 || stat.Size > physicalBirthLimit {
 		return nil, fmt.Errorf("physical birth is not a private bounded regular file")
 	}
 	data, err := io.ReadAll(io.LimitReader(f, physicalBirthLimit+1))
@@ -217,6 +217,9 @@ func (d *Daemon) persistPhysicalBirthLocked(p *physicalIdentity, kind string) er
 }
 
 func (d *Daemon) reconcilePhysicalBirthForRetirement() error {
+	if p := d.originalPhysicalIdentity(); p != nil && p.ManagedLaunch != nil {
+		return d.adoptManagedLaunchFacts(false, false)
+	}
 	d.physicalMu.Lock()
 	defer d.physicalMu.Unlock()
 	p := clonePhysicalIdentity(d.meta.PhysicalIdentity)

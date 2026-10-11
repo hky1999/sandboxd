@@ -5,6 +5,8 @@ package distillfs
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -28,6 +30,7 @@ type managerOwnership struct {
 	mu             sync.Mutex
 	ctx            context.Context
 	root           string
+	session        string
 	directory      *os.File
 	lock           *os.File
 	directoryStat  unix.Stat_t
@@ -100,6 +103,11 @@ func openManagerOwnership(ctx context.Context, root string) (*managerOwnership, 
 	if err := o.directory.Sync(); err != nil {
 		return nil, fmt.Errorf("sync image-manager owner directory: %w", err)
 	}
+	var session [32]byte
+	if _, err := rand.Read(session[:]); err != nil {
+		return nil, fmt.Errorf("allocate original image-manager session: %w", err)
+	}
+	o.session = hex.EncodeToString(session[:])
 	ok = true
 	return o, nil
 }

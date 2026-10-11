@@ -52,6 +52,21 @@ func (d *Daemon) startOriginalDaemonCommand(command *exec.Cmd, expected *physica
 		}
 		directory.Close()
 	}
+	files, err := d.managedLaunchFiles(current)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		for _, file := range files {
+			file.Close()
+		}
+	}()
+	if current.ManagedLaunch != nil {
+		if len(command.ExtraFiles) != 0 || command.Cancel != nil || d.managedChild != nil {
+			return fmt.Errorf("original direct-child dispatch state changed")
+		}
+		command.ExtraFiles = files
+	}
 	dispatched, err := d.ownership.dispatch(command.Start)
 	if err != nil {
 		if !dispatched {
@@ -64,6 +79,14 @@ func (d *Daemon) startOriginalDaemonCommand(command *exec.Cmd, expected *physica
 			return persistErr
 		}
 		return err
+	}
+	if current.ManagedLaunch != nil {
+		child := &managedLaunchChild{Generation: current.Generation, Command: command, Done: make(chan struct{})}
+		d.managedChild = child
+		go func() {
+			child.Err = command.Wait()
+			close(child.Done)
+		}()
 	}
 	return nil
 }
