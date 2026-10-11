@@ -586,13 +586,18 @@ func (d *Daemon) Mount() error {
 // rejected if the daemon was explicitly unmounted, closing the race window between remount()
 // checking the flag and acquiring the lock.
 func (d *Daemon) mount(userInitiated bool) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.mountLocked(userInitiated)
+}
+
+// Caller holds the lifecycle lock through result capture.
+func (d *Daemon) mountLocked(userInitiated bool) error {
 	// Start timing operation
 	timing, _ := StartTimedOperation(d.ctx, "daemon.Mount", d.meta.ID)
 	defer timing.End()
 	logrus.WithFields(d.daemonLogFields()).Info("daemon mount path started")
 
-	d.mu.Lock()
-	defer d.mu.Unlock()
 	if d.releasePending {
 		return fmt.Errorf("daemon mount release is unconfirmed")
 	}

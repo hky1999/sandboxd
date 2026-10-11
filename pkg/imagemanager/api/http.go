@@ -135,6 +135,12 @@ func splitObject(object string) (string, string, error) {
 }
 
 func (w *HttpWorker) MountOSS(req *OSSMountRequest) (*MountInfo, error) {
+	if req == nil {
+		return nil, fmt.Errorf("mount source is required")
+	}
+	if req.PhysicalGeneration != "" {
+		return w.recoverDaemonMount(generateOSSID(req.Endpoint, req.Bucket, req.Object), req.PhysicalGeneration, true)
+	}
 	// Generate daemon ID first for tracing
 	daemonID := generateOSSID(req.Endpoint, req.Bucket, req.Object)
 
@@ -205,11 +211,16 @@ func (w *HttpWorker) MountOSS(req *OSSMountRequest) (*MountInfo, error) {
 		"mount_point": d.MountPoint(),
 		"source_type": "oss",
 	}).Info("mount path begin daemon mount")
-	if err = d.Mount(); err != nil {
+	generation, mountErr := d.MountWithPhysicalGeneration()
+	if mountErr != nil {
+		err = mountErr
 		timing.Fail(err)
 		return nil, fmt.Errorf("failed to mount %s: %w", opts.ID, err)
 	}
-	w.mgr.SetDaemonReferenced(opts.ID, true)
+	info.PhysicalGeneration = generation
+	if err := w.mgr.SetDaemonReferencedIfPhysicalGeneration(opts.ID, generation, true); err != nil {
+		return nil, err
+	}
 	logrus.WithFields(logrus.Fields{
 		"daemon_id":   opts.ID,
 		"mount_point": d.MountPoint(),
@@ -222,6 +233,9 @@ func (w *HttpWorker) MountOSS(req *OSSMountRequest) (*MountInfo, error) {
 }
 
 func (w *HttpWorker) UnmountOSS(req *OSSUmountRequest) (*MountInfo, error) {
+	if req == nil || !validMountGeneration(req.PhysicalGeneration) {
+		return nil, fmt.Errorf("original mount generation is required")
+	}
 	// Generate daemon ID
 	id := generateOSSID(req.Endpoint, req.Bucket, req.Object)
 
@@ -246,12 +260,14 @@ func (w *HttpWorker) UnmountOSS(req *OSSUmountRequest) (*MountInfo, error) {
 		"mount_point": d.MountPoint(),
 		"source_type": "oss",
 	}).Info("unmount path begin daemon unmount")
-	err := d.Unmount()
+	err := d.UnmountIfPhysicalGeneration(req.PhysicalGeneration)
 	if err != nil {
 		timing.Fail(err)
 		return nil, fmt.Errorf("failed to umount daemon %s: %w", id, err)
 	}
-	w.mgr.SetDaemonReferenced(id, false)
+	if err := w.mgr.SetDaemonReferencedIfPhysicalGeneration(id, req.PhysicalGeneration, false); err != nil {
+		return nil, err
+	}
 	logrus.WithFields(logrus.Fields{
 		"daemon_id":   id,
 		"mount_point": d.MountPoint(),
@@ -263,6 +279,12 @@ func (w *HttpWorker) UnmountOSS(req *OSSUmountRequest) (*MountInfo, error) {
 }
 
 func (w *HttpWorker) MountNydus(req *NydusMountRequest) (*MountInfo, error) {
+	if req == nil {
+		return nil, fmt.Errorf("mount source is required")
+	}
+	if req.PhysicalGeneration != "" {
+		return w.recoverDaemonMount(generateNydusID(req.ImageURL), req.PhysicalGeneration, false)
+	}
 	// Generate daemon ID
 	id := generateNydusID(req.ImageURL)
 
@@ -300,11 +322,15 @@ func (w *HttpWorker) MountNydus(req *NydusMountRequest) (*MountInfo, error) {
 
 		// Mount if not already mounted
 		stageStart = time.Now()
-		if err := d.Mount(); err != nil {
+		generation, err := d.MountWithPhysicalGeneration()
+		if err != nil {
 			timing.Fail(err)
 			return nil, fmt.Errorf("failed to mount existing daemon %s: %w", id, err)
 		}
-		w.mgr.SetDaemonReferenced(id, true)
+		info.PhysicalGeneration = generation
+		if err := w.mgr.SetDaemonReferencedIfPhysicalGeneration(id, generation, true); err != nil {
+			return nil, err
+		}
 		timing.Stage("mount_existing_daemon", time.Since(stageStart))
 
 		return info, nil
@@ -360,11 +386,15 @@ func (w *HttpWorker) MountNydus(req *NydusMountRequest) (*MountInfo, error) {
 		"source_type": "nydus",
 		"image_url":   req.ImageURL,
 	}).Info("mount path begin daemon mount")
-	if err := d.Mount(); err != nil {
+	generation, err := d.MountWithPhysicalGeneration()
+	if err != nil {
 		timing.Fail(err)
 		return nil, fmt.Errorf("failed to mount %s: %w", opts.ID, err)
 	}
-	w.mgr.SetDaemonReferenced(opts.ID, true)
+	info.PhysicalGeneration = generation
+	if err := w.mgr.SetDaemonReferencedIfPhysicalGeneration(opts.ID, generation, true); err != nil {
+		return nil, err
+	}
 	info.Env = d.Env()
 	info.ImageProcess = d.ImageProcess()
 	logrus.WithFields(logrus.Fields{
@@ -379,6 +409,9 @@ func (w *HttpWorker) MountNydus(req *NydusMountRequest) (*MountInfo, error) {
 }
 
 func (w *HttpWorker) UnmountNydus(req *NydusUmountRequest) (*MountInfo, error) {
+	if req == nil || !validMountGeneration(req.PhysicalGeneration) {
+		return nil, fmt.Errorf("original mount generation is required")
+	}
 	// Generate daemon ID
 	id := generateNydusID(req.ImageURL)
 
@@ -413,12 +446,14 @@ func (w *HttpWorker) UnmountNydus(req *NydusUmountRequest) (*MountInfo, error) {
 		"source_type": "nydus",
 		"image_url":   req.ImageURL,
 	}).Info("unmount path begin daemon unmount")
-	err := d.Unmount()
+	err := d.UnmountIfPhysicalGeneration(req.PhysicalGeneration)
 	if err != nil {
 		timing.Fail(err)
 		return nil, fmt.Errorf("failed to umount daemon %s: %w", id, err)
 	}
-	w.mgr.SetDaemonReferenced(id, false)
+	if err := w.mgr.SetDaemonReferencedIfPhysicalGeneration(id, req.PhysicalGeneration, false); err != nil {
+		return nil, err
+	}
 	logrus.WithFields(logrus.Fields{
 		"daemon_id":   id,
 		"mount_point": d.MountPoint(),
@@ -431,10 +466,11 @@ func (w *HttpWorker) UnmountNydus(req *NydusUmountRequest) (*MountInfo, error) {
 }
 
 type nydusMountAttempt struct {
-	mountPoint   string
-	env          []string
-	imageProcess *imageconfig.Process
-	detected     bool
+	physicalGeneration string
+	mountPoint         string
+	env                []string
+	imageProcess       *imageconfig.Process
+	detected           bool
 }
 
 // tryMountNydus attempts to mount an image as Nydus format.
@@ -448,7 +484,7 @@ func (w *HttpWorker) tryMountNydus(imageURL string) (nydusMountAttempt, error) {
 			if err != nil {
 				return nydusMountAttempt{detected: true}, fmt.Errorf("failed to mount Nydus image: %w", err)
 			}
-			return nydusMountAttempt{mountPoint: info.MountPoint, env: info.Env, imageProcess: info.ImageProcess, detected: true}, nil
+			return nydusMountAttempt{physicalGeneration: info.PhysicalGeneration, mountPoint: info.MountPoint, env: info.Env, imageProcess: info.ImageProcess, detected: true}, nil
 		} else {
 			logrus.Debugf("cache hit: %s is not a Nydus image", imageURL)
 			return nydusMountAttempt{}, fmt.Errorf("not a Nydus image (cached)")
@@ -465,7 +501,7 @@ func (w *HttpWorker) tryMountNydus(imageURL string) (nydusMountAttempt, error) {
 			if err != nil {
 				return nydusMountAttempt{detected: true}, fmt.Errorf("failed to mount Nydus image: %w", err)
 			}
-			return nydusMountAttempt{mountPoint: info.MountPoint, env: info.Env, imageProcess: info.ImageProcess, detected: true}, nil
+			return nydusMountAttempt{physicalGeneration: info.PhysicalGeneration, mountPoint: info.MountPoint, env: info.Env, imageProcess: info.ImageProcess, detected: true}, nil
 		}
 
 		// Cache miss, fetch and check.
@@ -490,7 +526,7 @@ func (w *HttpWorker) tryMountNydus(imageURL string) (nydusMountAttempt, error) {
 		if err != nil {
 			return nydusMountAttempt{detected: true}, fmt.Errorf("failed to mount Nydus image: %w", err)
 		}
-		return nydusMountAttempt{mountPoint: info.MountPoint, env: info.Env, imageProcess: info.ImageProcess, detected: true}, nil
+		return nydusMountAttempt{physicalGeneration: info.PhysicalGeneration, mountPoint: info.MountPoint, env: info.Env, imageProcess: info.ImageProcess, detected: true}, nil
 	})
 }
 
@@ -520,6 +556,12 @@ func (w *HttpWorker) MountOCI(req *OCIMountRequest) (*OCIMountResponse, error) {
 	}
 	unlock := w.acquireMountRouteLock(req.ImageURL)
 	defer unlock()
+	if req.PhysicalGeneration != "" {
+		return w.recoverOCIMount(req)
+	}
+	if req.RequirePhysicalGeneration && w.mountStore == nil {
+		return nil, fmt.Errorf("original image mount requires its persistent route")
+	}
 	if w.ociMgr == nil {
 		return nil, fmt.Errorf("oci manager is not initialized")
 	}
@@ -531,10 +573,10 @@ func (w *HttpWorker) MountOCI(req *OCIMountRequest) (*OCIMountResponse, error) {
 	if w.nydusClient != nil {
 		// Try original URL
 		if attempt, err := w.tryMountNydus(req.ImageURL); err == nil {
-			if err := w.recordMount(req.ImageURL, "nydus", req.ImageURL, attempt.mountPoint); err != nil {
+			if err := w.recordMountGeneration(req.ImageURL, "nydus", req.ImageURL, attempt.mountPoint, attempt.physicalGeneration); err != nil {
 				return nil, err
 			}
-			return &OCIMountResponse{MountPath: attempt.mountPoint, Env: attempt.env, ImageProcess: attempt.imageProcess}, nil
+			return &OCIMountResponse{PhysicalGeneration: attempt.physicalGeneration, MountPath: attempt.mountPoint, Env: attempt.env, ImageProcess: attempt.imageProcess}, nil
 		} else if attempt.detected {
 			logrus.WithError(err).Warnf("detected Nydus image for %s but Nydus mount failed, skip OCI fallback", req.ImageURL)
 			return nil, err
@@ -545,15 +587,19 @@ func (w *HttpWorker) MountOCI(req *OCIMountRequest) (*OCIMountResponse, error) {
 			imageWithSuffix := req.ImageURL + w.nydusSuffix
 			logrus.Infof("trying Nydus detection with suffix: %s", imageWithSuffix)
 			if attempt, err := w.tryMountNydus(imageWithSuffix); err == nil {
-				if err := w.recordMount(req.ImageURL, "nydus", imageWithSuffix, attempt.mountPoint); err != nil {
+				if err := w.recordMountGeneration(req.ImageURL, "nydus", imageWithSuffix, attempt.mountPoint, attempt.physicalGeneration); err != nil {
 					return nil, err
 				}
-				return &OCIMountResponse{MountPath: attempt.mountPoint, Env: attempt.env, ImageProcess: attempt.imageProcess}, nil
+				return &OCIMountResponse{PhysicalGeneration: attempt.physicalGeneration, MountPath: attempt.mountPoint, Env: attempt.env, ImageProcess: attempt.imageProcess}, nil
 			} else if attempt.detected {
 				logrus.WithError(err).Warnf("detected Nydus image for %s via suffix %s but Nydus mount failed, skip OCI fallback", req.ImageURL, imageWithSuffix)
 				return nil, err
 			}
 		}
+	}
+
+	if req.RequirePhysicalGeneration {
+		return nil, fmt.Errorf("OCI physical mount ownership is not supported yet")
 	}
 
 	// Fallback to regular OCI mount flow.
@@ -623,10 +669,14 @@ func (w *HttpWorker) ImageProcess(imageURL string) (*imageconfig.Process, error)
 // Preserve the original routing record until both backend cleanup and the
 // conditional durable removal succeed. This is not a mount-generation proof.
 func (w *HttpWorker) recordMount(imageURL, mountType, nydusImageURL, mountPoint string) error {
+	return w.recordMountGeneration(imageURL, mountType, nydusImageURL, mountPoint, "")
+}
+
+func (w *HttpWorker) recordMountGeneration(imageURL, mountType, nydusImageURL, mountPoint, generation string) error {
 	if w.mountStore == nil {
 		return nil
 	}
-	record := &MountRecord{ImageURL: imageURL, MountType: mountType, NydusImageURL: nydusImageURL, MountPoint: mountPoint}
+	record := &MountRecord{PhysicalGeneration: generation, ImageURL: imageURL, MountType: mountType, NydusImageURL: nydusImageURL, MountPoint: mountPoint}
 	if err := validateMountRoute(imageURL, record); err != nil {
 		return err
 	}
@@ -638,9 +688,8 @@ func (w *HttpWorker) recordMount(imageURL, mountType, nydusImageURL, mountPoint 
 		if *existing != *record {
 			return fmt.Errorf("image mount route changed before publication")
 		}
-		return nil
 	}
-	if err := w.mountStore.Put(imageURL, record); err != nil {
+	if err := w.mountStore.Publish(imageURL, record); err != nil {
 		return fmt.Errorf("persist image mount route: %w", err)
 	}
 	return nil
@@ -649,6 +698,9 @@ func (w *HttpWorker) recordMount(imageURL, mountType, nydusImageURL, mountPoint 
 func validateMountRoute(imageURL string, r *MountRecord) error {
 	if r == nil || r.ImageURL != imageURL || r.MountPoint == "" {
 		return fmt.Errorf("image mount route is incomplete or changed")
+	}
+	if r.PhysicalGeneration != "" && (!validMountGeneration(r.PhysicalGeneration) || r.MountType != "nydus") {
+		return fmt.Errorf("original image mount generation is invalid or unsupported")
 	}
 	switch r.MountType {
 	case "nydus":
@@ -671,6 +723,18 @@ func (w *HttpWorker) UnmountOCI(req *OCIUmountRequest) error {
 	}
 	unlock := w.acquireMountRouteLock(req.ImageURL)
 	defer unlock()
+	if req.PhysicalGeneration != "" {
+		if w.mountStore == nil {
+			return fmt.Errorf("original mount requires its persistent route")
+		}
+		completed, err := w.mountStore.Completed(req.ImageURL, req.PhysicalGeneration)
+		if err != nil {
+			return err
+		}
+		if completed != nil {
+			return nil
+		}
+	}
 	if w.mountStore != nil {
 		record, err := w.mountStore.Get(req.ImageURL)
 		if err != nil {
@@ -679,12 +743,15 @@ func (w *HttpWorker) UnmountOCI(req *OCIUmountRequest) error {
 		if err := validateMountRoute(req.ImageURL, record); err != nil {
 			return err
 		}
+		if record.PhysicalGeneration != req.PhysicalGeneration {
+			return fmt.Errorf("original image mount generation changed or missing")
+		}
 		switch record.MountType {
 		case "nydus":
 			if w.mgr == nil {
 				return fmt.Errorf("distillfs manager is not initialized")
 			}
-			_, err = w.UnmountNydus(&NydusUmountRequest{ImageURL: record.NydusImageURL})
+			_, err = w.UnmountNydus(&NydusUmountRequest{ImageURL: record.NydusImageURL, PhysicalGeneration: req.PhysicalGeneration})
 		case "oci":
 			if w.ociMgr == nil {
 				return fmt.Errorf("oci manager is not initialized")

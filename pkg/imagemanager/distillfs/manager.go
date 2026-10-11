@@ -63,6 +63,7 @@ type Manager interface {
 	CleanupDaemon(daemonID string) error
 	ListDaemons() []DaemonInfo
 	SetDaemonReferenced(daemonID string, referenced bool)
+	SetDaemonReferencedIfPhysicalGeneration(daemonID, generation string, referenced bool) error
 	ReconcileRecoveredDaemons() error
 }
 
@@ -824,6 +825,29 @@ func (mgr *manager) SetDaemonReferenced(daemonID string, referenced bool) {
 	if _, ok := mgr.recovered[daemonID]; ok {
 		mgr.recovered[daemonID] = referenced
 	}
+}
+
+func (mgr *manager) SetDaemonReferencedIfPhysicalGeneration(id, generation string, referenced bool) error {
+	mgr.mu.Lock()
+	defer mgr.mu.Unlock()
+	d := mgr.daemons[id]
+	if d == nil {
+		return fmt.Errorf("original daemon reference is missing")
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	p := d.originalPhysicalIdentity()
+	if generation == "" || p == nil || p.Generation != generation {
+		return fmt.Errorf("original daemon reference generation changed")
+	}
+	if referenced && p.Phase != "running" {
+		return fmt.Errorf("original daemon mount is not running")
+	}
+	if mgr.recovered == nil {
+		mgr.recovered = make(map[string]bool)
+	}
+	mgr.recovered[id] = referenced
+	return nil
 }
 
 // ReconcileRecoveredDaemons removes daemons that are not referenced by any

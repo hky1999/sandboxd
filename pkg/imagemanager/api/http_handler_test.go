@@ -133,6 +133,8 @@ func (m *mockManager) ListDaemons() []distillfs.DaemonInfo {
 }
 
 func (m *mockManager) SetDaemonReferenced(string, bool) {}
+
+func (m *mockManager) SetDaemonReferencedIfPhysicalGeneration(string, string, bool) error { return nil }
 func (m *mockManager) ReconcileRecoveredDaemons() error {
 	return nil
 }

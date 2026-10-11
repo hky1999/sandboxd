@@ -15,6 +15,7 @@
 package server
 
 import (
+	"encoding/hex"
 	"fmt"
 	"strings"
 	"sync"
@@ -33,6 +34,7 @@ type imageMountEntry struct {
 	env                []string
 	imageProcess       *imageconfig.Process
 	releaseUnconfirmed bool
+	physicalGeneration string
 }
 
 // requireReadOnlyMount enforces that S3/OCI-image mounts carry the "ro" option.
@@ -98,41 +100,79 @@ func s3MountKey(cfg *runtime.S3Config) string {
 // mountS3 acquires a shared S3 mount. If the same S3 object is already mounted
 // by another sandbox, the existing path is returned without calling image-manager.
 func (m *s3MountManager) mountS3(cfg *runtime.S3Config) (string, error) {
+	entry, err := m.mountS3Generation(cfg, "", false, false)
+	return entry.path, err
+}
+
+func validFSPhysicalGeneration(g string) bool {
+	b, err := hex.DecodeString(g)
+	return err == nil && len(b) == 32 && hex.EncodeToString(b) == g
+}
+
+func validateMountEntry(entry imageMountEntry, expected string, required, allowReleased bool) error {
+	if expected != "" && (!validFSPhysicalGeneration(expected) || entry.physicalGeneration != expected) {
+		return fmt.Errorf("original mount generation changed")
+	}
+	if required && !validFSPhysicalGeneration(entry.physicalGeneration) {
+		return fmt.Errorf("original mount generation is unknown")
+	}
+	if entry.releaseUnconfirmed && (!allowReleased || expected == "") {
+		return fmt.Errorf("source release is unconfirmed")
+	}
+	return nil
+}
+
+// A nonempty expected generation queries the original lease and never creates
+// a mount. A retiring lease may be reconstructed only for its pending cleanup.
+func (m *s3MountManager) mountS3Generation(cfg *runtime.S3Config, expected string, required, allowReleased bool) (imageMountEntry, error) {
 	if cfg == nil {
-		return "", fmt.Errorf("s3_config is nil")
+		return imageMountEntry{}, fmt.Errorf("s3_config is nil")
 	}
 	if cfg.Endpoint == "" || cfg.Bucket == "" || cfg.Object == "" {
-		return "", fmt.Errorf("s3_config missing required fields: endpoint=%q, bucket=%q, object=%q", cfg.Endpoint, cfg.Bucket, cfg.Object)
+		return imageMountEntry{}, fmt.Errorf("s3_config missing required fields")
 	}
 
 	key := s3MountKey(cfg)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if entry, ok := m.entries[key]; ok {
-		if entry.releaseUnconfirmed {
-			return "", fmt.Errorf("S3 source release is unconfirmed")
+		if err := validateMountEntry(*entry, expected, required, allowReleased); err != nil {
+			return imageMountEntry{}, err
 		}
 		entry.refcount++
-		return entry.path, nil
+		return *entry, nil
+	}
+	if m.svc == nil || expected != "" && !validFSPhysicalGeneration(expected) {
+		return imageMountEntry{}, fmt.Errorf("original S3 mount service or identity is unavailable")
 	}
 	mi, err := m.svc.MountOSS(&imgApi.OSSMountRequest{
-		Endpoint: cfg.Endpoint, Bucket: cfg.Bucket, Object: cfg.Object,
+		PhysicalGeneration: expected,
+		Endpoint:           cfg.Endpoint, Bucket: cfg.Bucket, Object: cfg.Object,
 		AccessKeyID: cfg.AccessKeyID, AccessKeySecret: cfg.AccessKeySecret,
 	})
 	if err != nil {
-		return "", fmt.Errorf("mount S3: %w", err)
+		return imageMountEntry{}, fmt.Errorf("mount S3: %w", err)
 	}
 	if mi == nil || mi.FilePath == "" {
-		return "", fmt.Errorf("S3 mount returned no path")
+		return imageMountEntry{}, fmt.Errorf("S3 mount returned no path")
 	}
-	m.entries[key] = &imageMountEntry{refcount: 1, path: mi.FilePath,
+	entry := imageMountEntry{refcount: 1, path: mi.FilePath,
+		physicalGeneration: mi.PhysicalGeneration, releaseUnconfirmed: mi.Released || mi.ReleasePending,
 		env: append([]string(nil), mi.Env...), imageProcess: imageconfig.Clone(mi.ImageProcess)}
-	return mi.FilePath, nil
+	if err := validateMountEntry(entry, expected, required, allowReleased); err != nil {
+		return imageMountEntry{}, err
+	}
+	m.entries[key] = &entry
+	return entry, nil
 }
 
 // unmountS3 releases a reference to a shared S3 mount.
 // The FUSE daemon is only unmounted when refcount reaches zero.
 func (m *s3MountManager) unmountS3(cfg *runtime.S3Config) error {
+	return m.unmountS3Generation(cfg, "")
+}
+
+func (m *s3MountManager) unmountS3Generation(cfg *runtime.S3Config, expected string) error {
 	if cfg == nil {
 		return fmt.Errorf("s3_config is nil")
 	}
@@ -144,8 +184,17 @@ func (m *s3MountManager) unmountS3(cfg *runtime.S3Config) error {
 	if !ok || entry.refcount <= 0 {
 		return fmt.Errorf("S3 mount reference is not owned")
 	}
+	if expected != "" && (!validFSPhysicalGeneration(expected) || entry.physicalGeneration != expected) {
+		return fmt.Errorf("original S3 reference generation changed")
+	}
 	if entry.refcount == 1 {
-		if err := m.unmountF(cfg.Endpoint, cfg.Bucket, cfg.Object); err != nil {
+		var err error
+		if entry.physicalGeneration != "" && m.svc != nil {
+			err = m.svc.UmountOSS(&imgApi.OSSUmountRequest{Endpoint: cfg.Endpoint, Bucket: cfg.Bucket, Object: cfg.Object, PhysicalGeneration: entry.physicalGeneration})
+		} else {
+			err = m.unmountF(cfg.Endpoint, cfg.Bucket, cfg.Object)
+		}
+		if err != nil {
 			entry.releaseUnconfirmed = true
 			return err
 		}
@@ -208,34 +257,51 @@ func newOciMountManager(svc imgApi.Service) *ociMountManager {
 // mountOCI acquires a shared OCI image mount. If the same image is already mounted
 // by another sandbox, the existing path is returned without calling image-manager.
 func (m *ociMountManager) mountOCI(imageURL string) (string, error) {
+	entry, err := m.mountOCIGeneration(imageURL, "", false, false)
+	return entry.path, err
+}
+
+func (m *ociMountManager) mountOCIGeneration(imageURL, expected string, required, allowReleased bool) (imageMountEntry, error) {
 	if imageURL == "" {
-		return "", fmt.Errorf("image_url is empty")
+		return imageMountEntry{}, fmt.Errorf("image_url is empty")
 	}
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if entry, ok := m.entries[imageURL]; ok {
-		if entry.releaseUnconfirmed {
-			return "", fmt.Errorf("OCI source release is unconfirmed")
+		if err := validateMountEntry(*entry, expected, required, allowReleased); err != nil {
+			return imageMountEntry{}, err
 		}
 		entry.refcount++
-		return entry.path, nil
+		return *entry, nil
 	}
-	resp, err := m.svc.MountOCI(&imgApi.OCIMountRequest{ImageURL: imageURL})
+	if m.svc == nil || expected != "" && !validFSPhysicalGeneration(expected) {
+		return imageMountEntry{}, fmt.Errorf("original image mount service or identity is unavailable")
+	}
+	resp, err := m.svc.MountOCI(&imgApi.OCIMountRequest{ImageURL: imageURL, PhysicalGeneration: expected, RequirePhysicalGeneration: required})
 	if err != nil {
-		return "", fmt.Errorf("mount OCI image: %w", err)
+		return imageMountEntry{}, fmt.Errorf("mount OCI image: %w", err)
 	}
 	if resp == nil || resp.MountPath == "" {
-		return "", fmt.Errorf("OCI mount returned no path")
+		return imageMountEntry{}, fmt.Errorf("OCI mount returned no path")
 	}
-	m.entries[imageURL] = &imageMountEntry{refcount: 1, path: resp.MountPath,
+	entry := imageMountEntry{refcount: 1, path: resp.MountPath,
+		physicalGeneration: resp.PhysicalGeneration, releaseUnconfirmed: resp.Released || resp.ReleasePending,
 		env: append([]string(nil), resp.Env...), imageProcess: imageconfig.Clone(resp.ImageProcess)}
-	return resp.MountPath, nil
+	if err := validateMountEntry(entry, expected, required, allowReleased); err != nil {
+		return imageMountEntry{}, err
+	}
+	m.entries[imageURL] = &entry
+	return entry, nil
 }
 
 // unmountOCI releases a reference to a shared OCI image mount.
 // The image is only unmounted when refcount reaches zero.
 func (m *ociMountManager) unmountOCI(imageURL string) error {
+	return m.unmountOCIGeneration(imageURL, "")
+}
+
+func (m *ociMountManager) unmountOCIGeneration(imageURL, expected string) error {
 	if imageURL == "" {
 		return fmt.Errorf("image_url is empty")
 	}
@@ -246,8 +312,17 @@ func (m *ociMountManager) unmountOCI(imageURL string) error {
 	if !ok || entry.refcount <= 0 {
 		return fmt.Errorf("OCI mount reference is not owned")
 	}
+	if expected != "" && (!validFSPhysicalGeneration(expected) || entry.physicalGeneration != expected) {
+		return fmt.Errorf("original OCI reference generation changed")
+	}
 	if entry.refcount == 1 {
-		if err := m.unmountF(imageURL); err != nil {
+		var err error
+		if entry.physicalGeneration != "" && m.svc != nil {
+			err = m.svc.UmountOCI(&imgApi.OCIUmountRequest{ImageURL: imageURL, PhysicalGeneration: entry.physicalGeneration})
+		} else {
+			err = m.unmountF(imageURL)
+		}
+		if err != nil {
 			entry.releaseUnconfirmed = true
 			return err
 		}

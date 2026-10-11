@@ -116,6 +116,10 @@ func NewLanguageRuntimeManager(mounter ...ImageMounter) *LangRTManager {
 }
 
 func (lm *LangRTManager) AddLangRuntime(request *api.StartRequest, temporary bool) (*LanguageRuntime, error) {
+	return lm.AddLangRuntimeWithMountGeneration(request, temporary, "", false, false)
+}
+
+func (lm *LangRTManager) AddLangRuntimeWithMountGeneration(request *api.StartRequest, temporary bool, generation string, required, allowReleased bool) (*LanguageRuntime, error) {
 	if request == nil {
 		return nil, fmt.Errorf("start request is nil")
 	}
@@ -123,16 +127,7 @@ func (lm *LangRTManager) AddLangRuntime(request *api.StartRequest, temporary boo
 		return nil, fmt.Errorf("rootfs is nil")
 	}
 
-	// Fast path: check if already exists with read lock only.
 	id := request.SandboxID
-	lm.lrMu.RLock()
-	if lr, ok := lm.lrtMap[id]; ok {
-		lm.lrMu.RUnlock()
-		logrus.Debugf("Language runtime %v already exists!", id)
-		lr.SetTemporary(temporary)
-		return lr, nil
-	}
-	lm.lrMu.RUnlock()
 
 	// Build rootfs config without holding any lock.
 	var cfg RootfsConfig
@@ -172,9 +167,35 @@ func (lm *LangRTManager) AddLangRuntime(request *api.StartRequest, temporary boo
 	default:
 		return nil, fmt.Errorf("Rootfs Type not supported: %v", request.Rootfs.Type.String())
 	}
+	cfg.PhysicalGeneration = generation
+	cfg.RequirePhysicalGeneration = required && cfg.SrcType != api.RootfsSrcType_LOCAL
+	cfg.AllowReleasedMount = allowReleased
 	if id == "" {
 		id = cfg.key()
 	}
+	validateExisting := func(lr *LanguageRuntime) error {
+		if !cfg.RequirePhysicalGeneration && generation == "" {
+			return nil
+		}
+		old, next := lr.RootFS.Config(), cfg
+		old.PhysicalGeneration, next.PhysicalGeneration = "", ""
+		old.RequirePhysicalGeneration, next.RequirePhysicalGeneration = false, false
+		old.AllowReleasedMount, next.AllowReleasedMount = false, false
+		if old != next || lr.RootFS.PhysicalGeneration() == "" || generation != "" && lr.RootFS.PhysicalGeneration() != generation {
+			return fmt.Errorf("existing rootfs original mount identity changed")
+		}
+		return nil
+	}
+	lm.lrMu.RLock()
+	if lr, ok := lm.lrtMap[id]; ok {
+		lm.lrMu.RUnlock()
+		if err := validateExisting(lr); err != nil {
+			return nil, err
+		}
+		lr.SetTemporary(temporary)
+		return lr, nil
+	}
+	lm.lrMu.RUnlock()
 
 	// Slow path: create rootfs without holding lrMu.
 	var (
@@ -206,10 +227,13 @@ func (lm *LangRTManager) AddLangRuntime(request *api.StartRequest, temporary boo
 
 	if lr, ok := lm.lrtMap[id]; ok {
 		logrus.Debugf("Language runtime %v already exists (added concurrently)!", id)
-		lr.SetTemporary(temporary)
 		if err := rootfs.DecRef(); err != nil {
 			return nil, fmt.Errorf("release duplicate rootfs reference: %w", err)
 		}
+		if err := validateExisting(lr); err != nil {
+			return nil, err
+		}
+		lr.SetTemporary(temporary)
 		return lr, nil
 	}
 

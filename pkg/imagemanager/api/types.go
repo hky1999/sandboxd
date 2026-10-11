@@ -21,12 +21,13 @@ import (
 )
 
 type OSSMountRequest struct {
-	MountPoint      string `json:"mount_point,omitempty"`
-	Endpoint        string `json:"endpoint"`
-	Bucket          string `json:"bucket"`
-	Object          string `json:"object"`
-	AccessKeyID     string `json:"access_key_id,omitempty"`
-	AccessKeySecret string `json:"access_key_secret,omitempty"`
+	PhysicalGeneration string `json:"physical_generation,omitempty"`
+	MountPoint         string `json:"mount_point,omitempty"`
+	Endpoint           string `json:"endpoint"`
+	Bucket             string `json:"bucket"`
+	Object             string `json:"object"`
+	AccessKeyID        string `json:"access_key_id,omitempty"`
+	AccessKeySecret    string `json:"access_key_secret,omitempty"`
 }
 
 func (req *OSSMountRequest) String() string {
@@ -34,9 +35,10 @@ func (req *OSSMountRequest) String() string {
 }
 
 type OSSUmountRequest struct {
-	Endpoint string `json:"endpoint"`
-	Bucket   string `json:"bucket"`
-	Object   string `json:"object"`
+	PhysicalGeneration string `json:"physical_generation,omitempty"`
+	Endpoint           string `json:"endpoint"`
+	Bucket             string `json:"bucket"`
+	Object             string `json:"object"`
 }
 
 func (req *OSSUmountRequest) String() string {
@@ -44,22 +46,30 @@ func (req *OSSUmountRequest) String() string {
 }
 
 type MountInfo struct {
-	MountPoint   string               `json:"mount_point"`
-	FilePath     string               `json:"file_path"`
-	Env          []string             `json:"env,omitempty"`
-	ImageProcess *imageconfig.Process `json:"image_process,omitempty"`
+	ReleasePending     bool                 `json:"release_pending,omitempty"`
+	PhysicalGeneration string               `json:"physical_generation,omitempty"`
+	Released           bool                 `json:"released,omitempty"`
+	MountPoint         string               `json:"mount_point"`
+	FilePath           string               `json:"file_path"`
+	Env                []string             `json:"env,omitempty"`
+	ImageProcess       *imageconfig.Process `json:"image_process,omitempty"`
 }
 
 // OCIMountResponse is returned by the /oci_mount endpoint.
 type OCIMountResponse struct {
-	MountPath    string               `json:"mount_path"`
-	Env          []string             `json:"env,omitempty"`
-	ImageProcess *imageconfig.Process `json:"image_process,omitempty"`
+	ReleasePending     bool                 `json:"release_pending,omitempty"`
+	PhysicalGeneration string               `json:"physical_generation,omitempty"`
+	Released           bool                 `json:"released,omitempty"`
+	MountPath          string               `json:"mount_path"`
+	Env                []string             `json:"env,omitempty"`
+	ImageProcess       *imageconfig.Process `json:"image_process,omitempty"`
 }
 
 // OCIMountRequest is used to request mounting an OCI image
 type OCIMountRequest struct {
-	ImageURL string `json:"image_url"` // Image URL, e.g., "library/alpine:latest"
+	RequirePhysicalGeneration bool   `json:"require_physical_generation,omitempty"`
+	PhysicalGeneration        string `json:"physical_generation,omitempty"`
+	ImageURL                  string `json:"image_url"` // Image URL, e.g., "library/alpine:latest"
 }
 
 func (req *OCIMountRequest) String() string {
@@ -68,7 +78,8 @@ func (req *OCIMountRequest) String() string {
 
 // OCIUmountRequest is used to request unmounting an OCI image
 type OCIUmountRequest struct {
-	ImageURL string `json:"image_url"` // Image URL
+	PhysicalGeneration string `json:"physical_generation,omitempty"`
+	ImageURL           string `json:"image_url"` // Image URL
 }
 
 func (req *OCIUmountRequest) String() string {
@@ -77,8 +88,9 @@ func (req *OCIUmountRequest) String() string {
 
 // NydusMountRequest is used to request mounting a Nydus image
 type NydusMountRequest struct {
-	ImageURL   string `json:"image_url"`
-	MountPoint string `json:"mount_point,omitempty"`
+	PhysicalGeneration string `json:"physical_generation,omitempty"`
+	ImageURL           string `json:"image_url"`
+	MountPoint         string `json:"mount_point,omitempty"`
 }
 
 func (req *NydusMountRequest) String() string {
@@ -87,7 +99,8 @@ func (req *NydusMountRequest) String() string {
 
 // NydusUmountRequest is used to request unmounting a Nydus image
 type NydusUmountRequest struct {
-	ImageURL string `json:"image_url"`
+	PhysicalGeneration string `json:"physical_generation,omitempty"`
+	ImageURL           string `json:"image_url"`
 }
 
 func (req *NydusUmountRequest) String() string {

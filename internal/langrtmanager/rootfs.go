@@ -15,6 +15,7 @@
 package langrtmanager
 
 import (
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -32,6 +33,13 @@ type ImageMounter interface {
 	Umount(cfg RootfsConfig) error
 }
 
+// PhysicalImageMounter returns the birth identity in the same mount operation
+// and requires that identity when releasing the corresponding source reference.
+type PhysicalImageMounter interface {
+	MountWithPhysicalGeneration(cfg RootfsConfig) (string, []string, *imageconfig.Process, string, error)
+	UmountIfPhysicalGeneration(cfg RootfsConfig, generation string) error
+}
+
 type RootFS struct {
 	cfg                RootfsConfig
 	path               string
@@ -43,6 +51,7 @@ type RootFS struct {
 	refcnt             int64
 	deleted            bool
 	releaseUnconfirmed bool
+	physicalGeneration string
 }
 
 var ErrRootfsReleaseUnconfirmed = errors.New("rootfs release is unconfirmed")
@@ -62,10 +71,14 @@ type RootfsConfig struct {
 
 	// local
 	Path string
+
+	PhysicalGeneration        string
+	RequirePhysicalGeneration bool
+	AllowReleasedMount        bool
 }
 
 func (cfg RootfsConfig) key() string {
-	return fmt.Sprintf("%d:%s:%s:%s:%s:%s:%s:%s",
+	return fmt.Sprintf("%d:%s:%s:%s:%s:%s:%s:%s:%s:%t:%t",
 		cfg.SrcType,
 		cfg.Endpoint,
 		cfg.Bucket,
@@ -74,6 +87,7 @@ func (cfg RootfsConfig) key() string {
 		cfg.AccessKeySecret,
 		cfg.ImageUrl,
 		cfg.Path,
+		cfg.PhysicalGeneration, cfg.RequirePhysicalGeneration, cfg.AllowReleasedMount,
 	)
 }
 
@@ -110,21 +124,43 @@ func (rf *RootFS) Config() RootfsConfig {
 	return rf.cfg
 }
 
+func (rf *RootFS) PhysicalGeneration() string { return rf.physicalGeneration }
+
 func (rf *RootFS) MountImage() error {
 	if rf.path != "" {
 		return fmt.Errorf("already mounted")
 	}
-	path, env, imageProcess, err := rf.mounter.Mount(rf.cfg)
+	var path, generation string
+	var env []string
+	var imageProcess *imageconfig.Process
+	var err error
+	if mounter, ok := rf.mounter.(PhysicalImageMounter); ok {
+		path, env, imageProcess, generation, err = mounter.MountWithPhysicalGeneration(rf.cfg)
+	} else if rf.cfg.RequirePhysicalGeneration || rf.cfg.PhysicalGeneration != "" {
+		return fmt.Errorf("rootfs mounter cannot preserve the original physical generation")
+	} else {
+		path, env, imageProcess, err = rf.mounter.Mount(rf.cfg)
+	}
 	if err != nil {
 		return err
+	}
+	if rf.cfg.SrcType != runtime_api.RootfsSrcType_LOCAL && (rf.cfg.RequirePhysicalGeneration || rf.cfg.PhysicalGeneration != "") {
+		decoded, err := hex.DecodeString(generation)
+		if err != nil || len(decoded) != 32 || hex.EncodeToString(decoded) != generation || rf.cfg.PhysicalGeneration != "" && generation != rf.cfg.PhysicalGeneration {
+			return fmt.Errorf("original rootfs physical generation is missing or changed")
+		}
 	}
 	rf.path = path
 	rf.env = env
 	rf.imageProcess = imageconfig.Clone(imageProcess)
+	rf.physicalGeneration = generation
 	return nil
 }
 
 func (rf *RootFS) UmountImage() error {
+	if mounter, ok := rf.mounter.(PhysicalImageMounter); ok {
+		return mounter.UmountIfPhysicalGeneration(rf.cfg, rf.physicalGeneration)
+	}
 	return rf.mounter.Umount(rf.cfg)
 }
 
@@ -151,39 +187,52 @@ func (d *defaultMounter) client() api.Service {
 }
 
 func (d *defaultMounter) Mount(cfg RootfsConfig) (string, []string, *imageconfig.Process, error) {
+	path, env, process, _, err := d.MountWithPhysicalGeneration(cfg)
+	return path, env, process, err
+}
+
+func (d *defaultMounter) MountWithPhysicalGeneration(cfg RootfsConfig) (string, []string, *imageconfig.Process, string, error) {
 	switch cfg.SrcType {
 	case runtime_api.RootfsSrcType_S3:
 		mi, err := d.client().MountOSS(&api.OSSMountRequest{
-			Endpoint:        cfg.Endpoint,
-			Bucket:          cfg.Bucket,
-			Object:          cfg.Object,
-			AccessKeyID:     cfg.AccessKeyID,
-			AccessKeySecret: cfg.AccessKeySecret,
+			PhysicalGeneration: cfg.PhysicalGeneration,
+			Endpoint:           cfg.Endpoint,
+			Bucket:             cfg.Bucket,
+			Object:             cfg.Object,
+			AccessKeyID:        cfg.AccessKeyID,
+			AccessKeySecret:    cfg.AccessKeySecret,
 		})
 		if err != nil {
-			return "", nil, nil, err
+			return "", nil, nil, "", err
 		}
-		return mi.FilePath, mi.Env, mi.ImageProcess, nil
+		if mi == nil || mi.FilePath == "" || (mi.Released || mi.ReleasePending) && (!cfg.AllowReleasedMount || cfg.PhysicalGeneration == "") {
+			return "", nil, nil, "", fmt.Errorf("original S3 mount is unavailable")
+		}
+		return mi.FilePath, mi.Env, mi.ImageProcess, mi.PhysicalGeneration, nil
 
 	case runtime_api.RootfsSrcType_IMAGE:
 		resp, err := d.client().MountOCI(&api.OCIMountRequest{
-			ImageURL: cfg.ImageUrl,
+			ImageURL:           cfg.ImageUrl,
+			PhysicalGeneration: cfg.PhysicalGeneration, RequirePhysicalGeneration: cfg.RequirePhysicalGeneration,
 		})
 		if err != nil {
-			return "", nil, nil, err
+			return "", nil, nil, "", err
 		}
-		return resp.MountPath, resp.Env, resp.ImageProcess, nil
+		if resp == nil || resp.MountPath == "" || (resp.Released || resp.ReleasePending) && (!cfg.AllowReleasedMount || cfg.PhysicalGeneration == "") {
+			return "", nil, nil, "", fmt.Errorf("original image mount is unavailable")
+		}
+		return resp.MountPath, resp.Env, resp.ImageProcess, resp.PhysicalGeneration, nil
 
 	case runtime_api.RootfsSrcType_LOCAL:
 		// LOCAL rootfs is a pre-existing host path; no image-manager Service
 		// call is involved, so leaving d.svc nil (typical in tests) is fine.
 		if _, err := os.Stat(cfg.Path); err != nil {
-			return "", nil, nil, fmt.Errorf("failed to stat local rootfs path %s: %w", cfg.Path, err)
+			return "", nil, nil, "", fmt.Errorf("failed to stat local rootfs path %s: %w", cfg.Path, err)
 		}
-		return cfg.Path, nil, nil, nil
+		return cfg.Path, nil, nil, "", nil
 
 	default:
-		return "", nil, nil, fmt.Errorf("Unsupported image type: %v", cfg.SrcType.String())
+		return "", nil, nil, "", fmt.Errorf("Unsupported image type: %v", cfg.SrcType.String())
 	}
 }
 
@@ -195,16 +244,22 @@ func (d *defaultMounter) ImageProcess(cfg RootfsConfig) (*imageconfig.Process, e
 }
 
 func (d *defaultMounter) Umount(cfg RootfsConfig) error {
+	return d.UmountIfPhysicalGeneration(cfg, cfg.PhysicalGeneration)
+}
+
+func (d *defaultMounter) UmountIfPhysicalGeneration(cfg RootfsConfig, generation string) error {
 	switch cfg.SrcType {
 	case runtime_api.RootfsSrcType_S3:
 		return d.client().UmountOSS(&api.OSSUmountRequest{
-			Endpoint: cfg.Endpoint,
-			Bucket:   cfg.Bucket,
-			Object:   cfg.Object,
+			PhysicalGeneration: generation,
+			Endpoint:           cfg.Endpoint,
+			Bucket:             cfg.Bucket,
+			Object:             cfg.Object,
 		})
 	case runtime_api.RootfsSrcType_IMAGE:
 		return d.client().UmountOCI(&api.OCIUmountRequest{
-			ImageURL: cfg.ImageUrl,
+			PhysicalGeneration: generation,
+			ImageURL:           cfg.ImageUrl,
 		})
 	case runtime_api.RootfsSrcType_LOCAL:
 		return nil

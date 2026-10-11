@@ -15,7 +15,10 @@
 package server
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"sync"
 	"testing"
 
@@ -29,9 +32,11 @@ import (
 )
 
 type fsTestImageService struct {
-	mu             sync.Mutex
-	ociMountCalls  map[string]int
-	ociUmountCalls map[string]int
+	physicalGenerations  map[string]string
+	unmountedGenerations []string
+	mu                   sync.Mutex
+	ociMountCalls        map[string]int
+	ociUmountCalls       map[string]int
 }
 
 func newFSTestImageService() *fsTestImageService {
@@ -42,16 +47,40 @@ func newFSTestImageService() *fsTestImageService {
 }
 
 func (s *fsTestImageService) MountOSS(req *imageapi.OSSMountRequest) (*imageapi.MountInfo, error) {
-	return &imageapi.MountInfo{FilePath: "/mnt/s3/" + req.Object}, nil
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	g := s.physicalGenerationLocked(req.Endpoint + "\x00" + req.Bucket + "\x00" + req.Object)
+	if req.PhysicalGeneration != "" && req.PhysicalGeneration != g {
+		return nil, fmt.Errorf("original test mount generation changed")
+	}
+	return &imageapi.MountInfo{FilePath: "/mnt/s3/" + req.Object, PhysicalGeneration: g}, nil
 }
 
 func (s *fsTestImageService) UmountOSS(*imageapi.OSSUmountRequest) error { return nil }
 
 func (s *fsTestImageService) MountOCI(req *imageapi.OCIMountRequest) (*imageapi.OCIMountResponse, error) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	g := s.physicalGenerationLocked(req.ImageURL)
+	if req.PhysicalGeneration != "" {
+		if req.PhysicalGeneration != g {
+			return nil, fmt.Errorf("original test mount generation changed")
+		}
+		return &imageapi.OCIMountResponse{MountPath: "/mnt/oci/" + req.ImageURL, PhysicalGeneration: g}, nil
+	}
 	s.ociMountCalls[req.ImageURL]++
-	s.mu.Unlock()
-	return &imageapi.OCIMountResponse{MountPath: "/mnt/oci/" + req.ImageURL}, nil
+	return &imageapi.OCIMountResponse{MountPath: "/mnt/oci/" + req.ImageURL, PhysicalGeneration: g}, nil
+}
+
+func (s *fsTestImageService) physicalGenerationLocked(source string) string {
+	if s.physicalGenerations == nil {
+		s.physicalGenerations = make(map[string]string)
+	}
+	if s.physicalGenerations[source] == "" {
+		h := sha256.Sum256([]byte("controlled-original-mount:" + source))
+		s.physicalGenerations[source] = hex.EncodeToString(h[:])
+	}
+	return s.physicalGenerations[source]
 }
 
 func (s *fsTestImageService) ImageProcess(string) (*imageconfig.Process, error) {
@@ -60,6 +89,7 @@ func (s *fsTestImageService) ImageProcess(string) (*imageconfig.Process, error) 
 
 func (s *fsTestImageService) UmountOCI(req *imageapi.OCIUmountRequest) error {
 	s.mu.Lock()
+	s.unmountedGenerations = append(s.unmountedGenerations, req.PhysicalGeneration)
 	s.ociUmountCalls[req.ImageURL]++
 	s.mu.Unlock()
 	return nil

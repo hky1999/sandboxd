@@ -113,6 +113,9 @@ func validateFSJournal(j storedSandboxFSStates) error {
 		if len(state.S3) != len(state.S3Phases) || len(state.OCI) != len(state.OCIPhases) {
 			return fmt.Errorf("incomplete filesystem ownership stages")
 		}
+		if err := validateFSMountBindings(state); err != nil {
+			return err
+		}
 		phases := append([]fsLeasePhase{state.RootfsPhase}, state.S3Phases...)
 		phases = append(phases, state.OCIPhases...)
 		for _, phase := range phases {
@@ -130,6 +133,67 @@ func validateFSJournal(j storedSandboxFSStates) error {
 		}
 		if active, exists := j.Items[r.SandboxID]; exists && active.Generation == r.Generation {
 			return fmt.Errorf("filesystem generation is both active and completed")
+		}
+	}
+	return nil
+}
+
+func validateFSMountBindings(s sandboxFSState) error {
+	if len(s.S3) != len(s.S3MountGenerations) || len(s.OCI) != len(s.OCIMountGenerations) {
+		return fmt.Errorf("incomplete original filesystem mount bindings")
+	}
+	var root runtime.RootfsConfig
+	if err := proto.Unmarshal(s.Rootfs, &root); err != nil {
+		return err
+	}
+	validate := func(g string, phase fsLeasePhase, remote bool) error {
+		if g != "" && (!remote || !validFSPhysicalGeneration(g) || phase == fsReserved) {
+			return fmt.Errorf("invalid original filesystem mount generation")
+		}
+		if s.Generation != "" && remote && (phase == fsAcquired || phase == fsReleasePending) && g == "" {
+			return fmt.Errorf("original filesystem mount generation is missing")
+		}
+		return nil
+	}
+	if err := validate(s.RootfsMountGeneration, s.RootfsPhase, root.Type != runtime.RootfsSrcType_LOCAL); err != nil {
+		return err
+	}
+	for i, g := range s.S3MountGenerations {
+		if err := validate(g, s.S3Phases[i], true); err != nil {
+			return err
+		}
+	}
+	for i, g := range s.OCIMountGenerations {
+		if err := validate(g, s.OCIPhases[i], true); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateFSRecoveryBindings(s sandboxFSState) error {
+	if err := validateFSMountBindings(s); err != nil {
+		return err
+	}
+	if s.Generation == "" {
+		return nil
+	}
+	var root runtime.RootfsConfig
+	if err := proto.Unmarshal(s.Rootfs, &root); err != nil {
+		return err
+	}
+	unknown := func(g string, phase fsLeasePhase) bool { return needsFSReference(phase) && g == "" }
+	if root.Type != runtime.RootfsSrcType_LOCAL && unknown(s.RootfsMountGeneration, s.RootfsPhase) {
+		return fmt.Errorf("original rootfs acquisition is unresolved")
+	}
+	for i, g := range s.S3MountGenerations {
+		if unknown(g, s.S3Phases[i]) {
+			return fmt.Errorf("original S3 acquisition is unresolved")
+		}
+	}
+	for i, g := range s.OCIMountGenerations {
+		if unknown(g, s.OCIPhases[i]) {
+			return fmt.Errorf("original image acquisition is unresolved")
 		}
 	}
 	return nil
@@ -189,7 +253,7 @@ func decodeFSJournal(data []byte) (storedSandboxFSStates, error) {
 			if err := validateFSS3JSONFields(fields); err != nil {
 				return j, err
 			}
-			state := sandboxFSState{Rootfs: item.Rootfs, S3: item.S3, OCI: item.OCI, RootfsPhase: fsAcquired, S3Phases: make([]fsLeasePhase, len(item.S3)), OCIPhases: make([]fsLeasePhase, len(item.OCI))}
+			state := sandboxFSState{Rootfs: item.Rootfs, S3: item.S3, OCI: item.OCI, RootfsPhase: fsAcquired, S3Phases: make([]fsLeasePhase, len(item.S3)), OCIPhases: make([]fsLeasePhase, len(item.OCI)), S3MountGenerations: make([]string, len(item.S3)), OCIMountGenerations: make([]string, len(item.OCI))}
 			for i := range state.S3Phases {
 				state.S3Phases[i] = fsAcquired
 			}
@@ -212,6 +276,21 @@ func decodeFSJournal(data []byte) (storedSandboxFSStates, error) {
 		}
 		if j.Items == nil || len(j.Items)+len(j.Completed) != 0 {
 			return j, fmt.Errorf("nonempty schema 2 requires independent ownership migration")
+		}
+		j.SchemaVersion = fsJournalSchema
+	case 3:
+		if err := exactFSJSONFields(header, "schema_version", "items", "completed", "integrity_sha256"); err != nil {
+			return j, err
+		}
+		if err := decodeStrictFSJSON(data, &j); err != nil {
+			return j, err
+		}
+		if j.Items == nil || len(j.Items)+len(j.Completed) != 0 {
+			return j, fmt.Errorf("nonempty schema 3 requires independent physical ownership migration")
+		}
+		integrity, err := fsJournalIntegrity(j)
+		if err != nil || j.IntegritySHA256 != integrity {
+			return j, fmt.Errorf("filesystem journal integrity changed")
 		}
 		j.SchemaVersion = fsJournalSchema
 	case fsJournalSchema:
@@ -279,7 +358,7 @@ func validateFSJSONOwnerFields(header map[string]json.RawMessage) error {
 			}
 			allowed := []string{"sandbox_id", "generation", "source_fingerprint"}
 			if section == "items" {
-				allowed = []string{"generation", "source_fingerprint", "rootfs", "s3", "oci", "rootfs_phase", "s3_phases", "oci_phases"}
+				allowed = []string{"generation", "source_fingerprint", "rootfs", "s3", "oci", "rootfs_phase", "s3_phases", "oci_phases", "rootfs_mount_generation", "s3_mount_generations", "oci_mount_generations"}
 			}
 			if err := exactFSJSONFields(fields, allowed...); err != nil {
 				return err

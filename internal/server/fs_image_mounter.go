@@ -19,29 +19,29 @@ type fsImageMounter struct {
 }
 
 func (m *fsImageMounter) Mount(cfg langrtmanager.RootfsConfig) (string, []string, *imageconfig.Process, error) {
+	path, env, process, _, err := m.MountWithPhysicalGeneration(cfg)
+	return path, env, process, err
+}
+
+func (m *fsImageMounter) MountWithPhysicalGeneration(cfg langrtmanager.RootfsConfig) (string, []string, *imageconfig.Process, string, error) {
 	var entry imageMountEntry
+	var err error
 	switch cfg.SrcType {
 	case runtime.RootfsSrcType_LOCAL:
-		return m.local.Mount(cfg)
+		path, env, process, err := m.local.Mount(cfg)
+		return path, env, process, "", err
 	case runtime.RootfsSrcType_IMAGE:
-		if _, err := m.manager.oci.mountOCI(cfg.ImageUrl); err != nil {
-			return "", nil, nil, err
-		}
-		m.manager.oci.mu.Lock()
-		entry = *m.manager.oci.entries[cfg.ImageUrl]
-		m.manager.oci.mu.Unlock()
+		entry, err = m.manager.oci.mountOCIGeneration(cfg.ImageUrl, cfg.PhysicalGeneration, cfg.RequirePhysicalGeneration, cfg.AllowReleasedMount)
 	case runtime.RootfsSrcType_S3:
 		source := fsS3Source(cfg)
-		if _, err := m.manager.s3.mountS3(source); err != nil {
-			return "", nil, nil, err
-		}
-		m.manager.s3.mu.Lock()
-		entry = *m.manager.s3.entries[s3MountKey(source)]
-		m.manager.s3.mu.Unlock()
+		entry, err = m.manager.s3.mountS3Generation(source, cfg.PhysicalGeneration, cfg.RequirePhysicalGeneration, cfg.AllowReleasedMount)
 	default:
-		return "", nil, nil, fmt.Errorf("unsupported rootfs type")
+		return "", nil, nil, "", fmt.Errorf("unsupported rootfs type")
 	}
-	return entry.path, append([]string(nil), entry.env...), imageconfig.Clone(entry.imageProcess), nil
+	if err != nil {
+		return "", nil, nil, "", err
+	}
+	return entry.path, append([]string(nil), entry.env...), imageconfig.Clone(entry.imageProcess), entry.physicalGeneration, nil
 }
 
 func (m *fsImageMounter) ImageProcess(cfg langrtmanager.RootfsConfig) (*imageconfig.Process, error) {
@@ -49,13 +49,20 @@ func (m *fsImageMounter) ImageProcess(cfg langrtmanager.RootfsConfig) (*imagecon
 }
 
 func (m *fsImageMounter) Umount(cfg langrtmanager.RootfsConfig) error {
+	return m.UmountIfPhysicalGeneration(cfg, cfg.PhysicalGeneration)
+}
+
+func (m *fsImageMounter) UmountIfPhysicalGeneration(cfg langrtmanager.RootfsConfig, generation string) error {
+	if cfg.SrcType != runtime.RootfsSrcType_LOCAL && cfg.RequirePhysicalGeneration && !validFSPhysicalGeneration(generation) {
+		return fmt.Errorf("original rootfs mount generation is unknown")
+	}
 	switch cfg.SrcType {
 	case runtime.RootfsSrcType_LOCAL:
 		return m.local.Umount(cfg)
 	case runtime.RootfsSrcType_IMAGE:
-		return m.manager.oci.unmountOCI(cfg.ImageUrl)
+		return m.manager.oci.unmountOCIGeneration(cfg.ImageUrl, generation)
 	case runtime.RootfsSrcType_S3:
-		return m.manager.s3.unmountS3(fsS3Source(cfg))
+		return m.manager.s3.unmountS3Generation(fsS3Source(cfg), generation)
 	default:
 		return fmt.Errorf("unsupported rootfs type")
 	}
