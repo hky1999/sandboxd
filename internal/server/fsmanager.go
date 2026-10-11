@@ -760,7 +760,7 @@ func (m *fsManager) checkSourceAdmissionLocked(state sandboxFSState) error {
 	}
 	m.oci.mu.Lock()
 	for _, source := range oci {
-		if entry := m.oci.entries[source]; entry != nil && entry.releaseUnconfirmed {
+		if imageMountSourceBlocked(m.oci.entries, m.oci.generations, source) {
 			m.oci.mu.Unlock()
 			return fmt.Errorf("OCI source release is unconfirmed")
 		}
@@ -772,7 +772,7 @@ func (m *fsManager) checkSourceAdmissionLocked(state sandboxFSState) error {
 		if source == nil {
 			return fmt.Errorf("S3 source is missing")
 		}
-		if entry := m.s3.entries[s3MountKey(source)]; entry != nil && entry.releaseUnconfirmed {
+		if imageMountSourceBlocked(m.s3.entries, m.s3.generations, s3MountKey(source)) {
 			return fmt.Errorf("S3 source release is unconfirmed")
 		}
 	}

@@ -29,12 +29,14 @@ import (
 // imageMountEntry tracks a shared image mount with reference counting.
 // Multiple sandboxes using the same image share one mount point.
 type imageMountEntry struct {
-	refcount           int
-	path               string // local mount path
-	env                []string
-	imageProcess       *imageconfig.Process
-	releaseUnconfirmed bool
-	physicalGeneration string
+	refcount            int
+	path                string // local mount path
+	mountPoint          string // producer target, distinct from an S3 regular file
+	env                 []string
+	imageProcess        *imageconfig.Process
+	releaseUnconfirmed  bool
+	retirementConfirmed bool
+	physicalGeneration  string
 }
 
 // requireReadOnlyMount enforces that S3/OCI-image mounts carry the "ro" option.
@@ -69,10 +71,11 @@ type ociUnmountFunc func(imageURL string) error
 // its UnmountOSS kills the daemon directly without ref counting. This manager
 // ensures the daemon is only unmounted when no sandbox references it.
 type s3MountManager struct {
-	mu       sync.Mutex
-	entries  map[string]*imageMountEntry // key: endpoint+bucket+object
-	svc      imgApi.Service              // in-process image manager
-	unmountF s3UnmountFunc               // test seam
+	mu          sync.Mutex
+	entries     map[string]*imageMountEntry // current source for new owners
+	generations map[imageMountIdentity]*imageMountEntry
+	svc         imgApi.Service // in-process image manager
+	unmountF    s3UnmountFunc  // test seam
 }
 
 func newS3MountManager(svc imgApi.Service) *s3MountManager {
@@ -81,8 +84,9 @@ func newS3MountManager(svc imgApi.Service) *s3MountManager {
 		panic("server: newS3MountManager called without an image-manager Service")
 	}
 	return &s3MountManager{
-		entries: make(map[string]*imageMountEntry),
-		svc:     svc,
+		entries:     make(map[string]*imageMountEntry),
+		generations: make(map[imageMountIdentity]*imageMountEntry),
+		svc:         svc,
 		unmountF: func(endpoint, bucket, object string) error {
 			return svc.UmountOSS(&imgApi.OSSUmountRequest{
 				Endpoint: endpoint,
@@ -144,8 +148,15 @@ func (m *s3MountManager) mountS3Operation(cfg *runtime.S3Config, expected string
 			return imageMountEntry{}, err
 		}
 	}
+	if m.generations == nil {
+		m.generations = make(map[imageMountIdentity]*imageMountEntry)
+	}
 	req := &imgApi.OSSMountRequest{OperationID: operationID, PhysicalGeneration: expected, Endpoint: cfg.Endpoint, Bucket: cfg.Bucket, Object: cfg.Object, AccessKeyID: cfg.AccessKeyID, AccessKeySecret: cfg.AccessKeySecret}
-	if entry, ok := m.entries[key]; ok {
+	entry, err := findImageMountEntry(m.entries, m.generations, key, expected)
+	if err != nil {
+		return imageMountEntry{}, err
+	}
+	if entry != nil {
 		if err := validateMountEntry(*entry, expected, required, allowReleased); err != nil {
 			return imageMountEntry{}, err
 		}
@@ -158,7 +169,11 @@ func (m *s3MountManager) mountS3Operation(cfg *runtime.S3Config, expected string
 			if mi == nil || mi.FilePath != entry.path || mi.PhysicalGeneration != entry.physicalGeneration {
 				return imageMountEntry{}, fmt.Errorf("shared S3 original operation binding changed")
 			}
-			if err := verifyFSOperationReply(m.svc, req, operationID, "oss", mi.PhysicalGeneration, mi.MountPoint, allowReleased); err != nil {
+			result, err := verifyFSOperationReply(m.svc, req, operationID, "oss", mi.PhysicalGeneration, mi.MountPoint, allowReleased)
+			if err != nil {
+				return imageMountEntry{}, err
+			}
+			if err := observeImageMountResult(m.entries, m.generations, key, result); err != nil {
 				return imageMountEntry{}, err
 			}
 			if (mi.Released || mi.ReleasePending) && (!allowReleased || expected == "") {
@@ -179,19 +194,25 @@ func (m *s3MountManager) mountS3Operation(cfg *runtime.S3Config, expected string
 	if mi == nil || mi.FilePath == "" {
 		return imageMountEntry{}, fmt.Errorf("S3 mount returned no path")
 	}
+	var result *imgApi.MountOperationResult
 	if operationID != "" {
-		if err := verifyFSOperationReply(m.svc, req, operationID, "oss", mi.PhysicalGeneration, mi.MountPoint, allowReleased); err != nil {
+		result, err = verifyFSOperationReply(m.svc, req, operationID, "oss", mi.PhysicalGeneration, mi.MountPoint, allowReleased)
+		if err != nil {
 			return imageMountEntry{}, err
 		}
 	}
-	entry := imageMountEntry{refcount: 1, path: mi.FilePath,
-		physicalGeneration: mi.PhysicalGeneration, releaseUnconfirmed: mi.Released || mi.ReleasePending,
+	created := imageMountEntry{refcount: 1, path: mi.FilePath, mountPoint: mi.MountPoint,
+		retirementConfirmed: result != nil && result.State == "released",
+		physicalGeneration:  mi.PhysicalGeneration, releaseUnconfirmed: mi.Released || mi.ReleasePending,
 		env: append([]string(nil), mi.Env...), imageProcess: imageconfig.Clone(mi.ImageProcess)}
-	if err := validateMountEntry(entry, expected, required, allowReleased); err != nil {
+	created.releaseUnconfirmed = created.releaseUnconfirmed || result != nil && result.State != "ready"
+	if err := validateMountEntry(created, expected, required, allowReleased); err != nil {
 		return imageMountEntry{}, err
 	}
-	m.entries[key] = &entry
-	return entry, nil
+	if err := rememberImageMountEntry(m.entries, m.generations, key, &created); err != nil {
+		return imageMountEntry{}, err
+	}
+	return created, nil
 }
 
 // unmountS3 releases a reference to a shared S3 mount.
@@ -208,8 +229,15 @@ func (m *s3MountManager) unmountS3Generation(cfg *runtime.S3Config, expected str
 	key := s3MountKey(cfg)
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	entry, ok := m.entries[key]
-	if !ok || entry.refcount <= 0 {
+	entry := m.entries[key]
+	if expected != "" {
+		var err error
+		entry, err = findImageMountEntry(m.entries, m.generations, key, expected)
+		if err != nil {
+			return err
+		}
+	}
+	if entry == nil || entry.refcount <= 0 {
 		return fmt.Errorf("S3 mount reference is not owned")
 	}
 	if expected != "" && (!validFSPhysicalGeneration(expected) || entry.physicalGeneration != expected) {
@@ -226,34 +254,34 @@ func (m *s3MountManager) unmountS3Generation(cfg *runtime.S3Config, expected str
 			entry.releaseUnconfirmed = true
 			return err
 		}
-		delete(m.entries, key)
+		forgetImageMountEntry(m.entries, m.generations, key, entry)
 	} else {
 		entry.refcount--
 	}
 	return nil
 }
 
-// cleanupAllS3Unmounts unmounts all remaining S3 mounts.
-// Called during shutdown.
+// cleanupAllS3Unmounts cleans legacy entries only. Managed generations remain
+// owned until their filesystem journal authorizes conditional release.
 func (m *s3MountManager) cleanupAllS3Unmounts() {
 	m.mu.Lock()
-	entries := make(map[string]*imageMountEntry, len(m.entries))
-	for k, v := range m.entries {
-		entries[k] = v
-	}
-	m.entries = make(map[string]*imageMountEntry)
-	m.mu.Unlock()
-
-	for key, entry := range entries {
-		parts := strings.Split(key, "\x00")
-		if len(parts) != 3 {
-			logrus.Warnf("s3mount: invalid key format, skipping: %q", key)
+	defer m.mu.Unlock()
+	for key, entry := range m.entries {
+		if entry.physicalGeneration != "" {
 			continue
 		}
-		logrus.Infof("s3mount: cleanup remaining mount refcount=%d at %s", entry.refcount, entry.path)
-		if err := m.unmountF(parts[0], parts[1], parts[2]); err != nil {
-			logrus.Warnf("s3mount: cleanup failed for %s: %v", key, err)
+		parts := strings.Split(key, "\x00")
+		if len(parts) != 3 {
+			logrus.Warnf("s3mount: invalid legacy key format, skipping: %q", key)
+			delete(m.entries, key)
+			continue
 		}
+		if err := m.unmountF(parts[0], parts[1], parts[2]); err != nil {
+			entry.releaseUnconfirmed = true
+			logrus.Warnf("s3mount: legacy cleanup failed for %s: %v", key, err)
+			continue
+		}
+		delete(m.entries, key)
 	}
 }
 
@@ -261,10 +289,11 @@ func (m *s3MountManager) cleanupAllS3Unmounts() {
 // Similar to s3MountManager, it ensures OCI images are only unmounted when
 // no sandbox references them.
 type ociMountManager struct {
-	mu       sync.Mutex
-	entries  map[string]*imageMountEntry // key: image URL
-	svc      imgApi.Service              // in-process image-manager (nil falls back to HttpClient)
-	unmountF ociUnmountFunc              // for testing injection
+	mu          sync.Mutex
+	entries     map[string]*imageMountEntry // current source for new owners
+	generations map[imageMountIdentity]*imageMountEntry
+	svc         imgApi.Service // in-process image-manager (nil falls back to HttpClient)
+	unmountF    ociUnmountFunc // for testing injection
 }
 
 func newOciMountManager(svc imgApi.Service) *ociMountManager {
@@ -272,8 +301,9 @@ func newOciMountManager(svc imgApi.Service) *ociMountManager {
 		panic("server: newOciMountManager called without an image-manager Service")
 	}
 	return &ociMountManager{
-		entries: make(map[string]*imageMountEntry),
-		svc:     svc,
+		entries:     make(map[string]*imageMountEntry),
+		generations: make(map[imageMountIdentity]*imageMountEntry),
+		svc:         svc,
 		unmountF: func(imageURL string) error {
 			return svc.UmountOCI(&imgApi.OCIUmountRequest{
 				ImageURL: imageURL,
@@ -305,8 +335,15 @@ func (m *ociMountManager) mountOCIOperation(imageURL, expected string, required,
 			return imageMountEntry{}, err
 		}
 	}
+	if m.generations == nil {
+		m.generations = make(map[imageMountIdentity]*imageMountEntry)
+	}
 	req := &imgApi.OCIMountRequest{OperationID: operationID, ImageURL: imageURL, PhysicalGeneration: expected, RequirePhysicalGeneration: required}
-	if entry, ok := m.entries[imageURL]; ok {
+	entry, err := findImageMountEntry(m.entries, m.generations, imageURL, expected)
+	if err != nil {
+		return imageMountEntry{}, err
+	}
+	if entry != nil {
 		if err := validateMountEntry(*entry, expected, required, allowReleased); err != nil {
 			return imageMountEntry{}, err
 		}
@@ -319,7 +356,11 @@ func (m *ociMountManager) mountOCIOperation(imageURL, expected string, required,
 			if resp == nil || resp.MountPath != entry.path || resp.PhysicalGeneration != entry.physicalGeneration {
 				return imageMountEntry{}, fmt.Errorf("shared image original operation binding changed")
 			}
-			if err := verifyFSOperationReply(m.svc, req, operationID, "oci", resp.PhysicalGeneration, resp.MountPath, allowReleased); err != nil {
+			result, err := verifyFSOperationReply(m.svc, req, operationID, "oci", resp.PhysicalGeneration, resp.MountPath, allowReleased)
+			if err != nil {
+				return imageMountEntry{}, err
+			}
+			if err := observeImageMountResult(m.entries, m.generations, imageURL, result); err != nil {
 				return imageMountEntry{}, err
 			}
 			if (resp.Released || resp.ReleasePending) && (!allowReleased || expected == "") {
@@ -340,19 +381,25 @@ func (m *ociMountManager) mountOCIOperation(imageURL, expected string, required,
 	if resp == nil || resp.MountPath == "" {
 		return imageMountEntry{}, fmt.Errorf("OCI mount returned no path")
 	}
+	var result *imgApi.MountOperationResult
 	if operationID != "" {
-		if err := verifyFSOperationReply(m.svc, req, operationID, "oci", resp.PhysicalGeneration, resp.MountPath, allowReleased); err != nil {
+		result, err = verifyFSOperationReply(m.svc, req, operationID, "oci", resp.PhysicalGeneration, resp.MountPath, allowReleased)
+		if err != nil {
 			return imageMountEntry{}, err
 		}
 	}
-	entry := imageMountEntry{refcount: 1, path: resp.MountPath,
-		physicalGeneration: resp.PhysicalGeneration, releaseUnconfirmed: resp.Released || resp.ReleasePending,
+	created := imageMountEntry{refcount: 1, path: resp.MountPath, mountPoint: resp.MountPath,
+		retirementConfirmed: result != nil && result.State == "released",
+		physicalGeneration:  resp.PhysicalGeneration, releaseUnconfirmed: resp.Released || resp.ReleasePending,
 		env: append([]string(nil), resp.Env...), imageProcess: imageconfig.Clone(resp.ImageProcess)}
-	if err := validateMountEntry(entry, expected, required, allowReleased); err != nil {
+	created.releaseUnconfirmed = created.releaseUnconfirmed || result != nil && result.State != "ready"
+	if err := validateMountEntry(created, expected, required, allowReleased); err != nil {
 		return imageMountEntry{}, err
 	}
-	m.entries[imageURL] = &entry
-	return entry, nil
+	if err := rememberImageMountEntry(m.entries, m.generations, imageURL, &created); err != nil {
+		return imageMountEntry{}, err
+	}
+	return created, nil
 }
 
 // unmountOCI releases a reference to a shared OCI image mount.
@@ -368,8 +415,15 @@ func (m *ociMountManager) unmountOCIGeneration(imageURL, expected string) error 
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	entry, ok := m.entries[imageURL]
-	if !ok || entry.refcount <= 0 {
+	entry := m.entries[imageURL]
+	if expected != "" {
+		var err error
+		entry, err = findImageMountEntry(m.entries, m.generations, imageURL, expected)
+		if err != nil {
+			return err
+		}
+	}
+	if entry == nil || entry.refcount <= 0 {
 		return fmt.Errorf("OCI mount reference is not owned")
 	}
 	if expected != "" && (!validFSPhysicalGeneration(expected) || entry.physicalGeneration != expected) {
@@ -386,28 +440,27 @@ func (m *ociMountManager) unmountOCIGeneration(imageURL, expected string) error 
 			entry.releaseUnconfirmed = true
 			return err
 		}
-		delete(m.entries, imageURL)
+		forgetImageMountEntry(m.entries, m.generations, imageURL, entry)
 	} else {
 		entry.refcount--
 	}
 	return nil
 }
 
-// cleanupAllOciUnmounts unmounts all remaining OCI image mounts.
-// Called during shutdown.
+// cleanupAllOciUnmounts preserves managed ownership for journal-authorized
+// conditional cleanup, including original generations without a source alias.
 func (m *ociMountManager) cleanupAllOciUnmounts() {
 	m.mu.Lock()
-	entries := make(map[string]*imageMountEntry, len(m.entries))
-	for k, v := range m.entries {
-		entries[k] = v
-	}
-	m.entries = make(map[string]*imageMountEntry)
-	m.mu.Unlock()
-
-	for key, entry := range entries {
-		logrus.Infof("ocimount: cleanup remaining mount refcount=%d at %s", entry.refcount, entry.path)
-		if err := m.unmountF(key); err != nil {
-			logrus.Warnf("ocimount: cleanup failed for %s: %v", key, err)
+	defer m.mu.Unlock()
+	for key, entry := range m.entries {
+		if entry.physicalGeneration != "" {
+			continue
 		}
+		if err := m.unmountF(key); err != nil {
+			entry.releaseUnconfirmed = true
+			logrus.Warnf("ocimount: legacy cleanup failed for %s: %v", key, err)
+			continue
+		}
+		delete(m.entries, key)
 	}
 }

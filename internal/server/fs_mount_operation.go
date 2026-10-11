@@ -40,15 +40,15 @@ func requireFSMountOperationService(svc imageapi.Service, id string) error {
 	return imageapi.RequireMountOperationService(svc, id)
 }
 
-func verifyFSOperationReply(svc imageapi.Service, request any, id, kind, generation, target string, allowReleased bool) error {
+func verifyFSOperationReply(svc imageapi.Service, request any, id, kind, generation, target string, allowReleased bool) (*imageapi.MountOperationResult, error) {
 	r, err := imageapi.QueryOriginalMountOperation(svc, request, id, kind, allowReleased)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if r.PhysicalGeneration != generation || r.MountPoint != target {
-		return fmt.Errorf("original mount reply differs from its independent operation result")
+		return nil, fmt.Errorf("original mount reply differs from its independent operation result")
 	}
-	return nil
+	return r, nil
 }
 
 func fsOSSMountRequest(s *runtime.S3Config) *imageapi.OSSMountRequest {
@@ -75,7 +75,14 @@ func (m *fsManager) resolveFSOriginalOperationsLocked(state sandboxFSState) (san
 			return fmt.Errorf("original filesystem operation generation changed")
 		}
 		*generation = result.PhysicalGeneration
-		return nil
+		switch req := request.(type) {
+		case *imageapi.OCIMountRequest:
+			return m.oci.observeOriginalResult(req.ImageURL, result)
+		case *imageapi.OSSMountRequest:
+			return m.s3.observeOriginalResult(req.Endpoint+"\x00"+req.Bucket+"\x00"+req.Object, result)
+		default:
+			return fmt.Errorf("original filesystem source kind is unsupported")
+		}
 	}
 	var root runtime.RootfsConfig
 	if err := proto.Unmarshal(state.Rootfs, &root); err != nil {
