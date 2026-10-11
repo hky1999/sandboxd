@@ -871,6 +871,7 @@ func (d *Daemon) initializeDaemonWithBinding(ctx context.Context, timing *TimedO
 		timing.Fail(err)
 		return err
 	}
+	original := d.originalPhysicalIdentity()
 	if err := d.bindOriginalMount(bind); err != nil {
 		timing.Fail(err)
 		return err
@@ -882,14 +883,8 @@ func (d *Daemon) initializeDaemonWithBinding(ctx context.Context, timing *TimedO
 	// Apply cgroup settings before starting (v2: CgroupFD for clone3)
 	d.cgroupCtrl.Apply(c)
 
-	err := c.Start()
+	err := d.startOriginalDaemonCommand(c, original)
 	if err != nil {
-		if p := d.originalPhysicalIdentity(); p != nil {
-			p.Phase = "not_started"
-			if persistErr := d.publishPhysicalIdentity(p); persistErr != nil {
-				return persistErr
-			}
-		}
 		logrus.WithFields(d.daemonLogFields()).WithError(err).Error("failed to start distill daemon")
 		timing.Fail(err)
 		return err
@@ -1073,12 +1068,15 @@ func (d *Daemon) unmountLocked() (retErr error) {
 		return fmt.Errorf("loaded daemon has no original physical identity")
 	}
 	if physical != nil {
-		if physical.Phase == "launching" && physical.Process == nil {
-			return fmt.Errorf("original process dispatch is still unresolved")
-		}
+		dispatchUnresolved := physical.Process == nil && (physical.Phase == "launching" || physical.Phase == "releasing") && !physical.NoDispatchConfirmed
 		physical.Phase = "releasing"
 		if err := d.publishPhysicalIdentity(physical); err != nil {
 			return err
+		}
+		if dispatchUnresolved {
+			// Fence an original launch before returning unknown. The background
+			// initializer must not continue to exec after this cleanup intent.
+			return fmt.Errorf("original process dispatch is still unresolved")
 		}
 	}
 	defer func() {

@@ -11,6 +11,8 @@ directory and starting a new sandbox from that checkpoint.
 
 镜像挂载路由读写、daemon 清理及 OCI／Nydus／S3 卸载后的挂载回读错误会保留原登记，并阻止未完成来源的新挂载复用，见 [镜像挂载释放边界](scheduler-image-mount-release.md)。Nydus／S3 底层另持久保存启动意图、原进程与内核挂载身份及释放阶段，迟到事实不取消清理，完成发布失败不会回放成功。镜像入口与上层日志保存并传递原底层代际，已知绑定恢复只查询原记录；OCI 接口的 Nydus 路由完成历史可在重开及来源替换后回放。schema 5 每个原步骤的派发前挂载操作和独立查询已接通，共享缓存按原物理代际保存引用；确认原完成后可以恢复旧清理引用与活动替代代际，旧清理不减少新引用。未知取得不按 URL 重新挂载，释放待定继续阻止来源准入。普通 OCI 原身份、部分启动对账、旧登记迁移、有界调用和其他完成历史仍未完成；完整沙箱清理和预算结算须独立完成。
 
+Nydus／S3 释放先保存原清理意图，并与最终进程启动共用状态锁，防止后台初始化在清理之后迟到执行。实际 `Start` 失败的未派发事实在释放失败和重开后保留；缺少出生确认仍为未知。原 `not_started` 通过镜像 API 返回 `release_pending`，只用于已经授权的原清理恢复；待清理或已释放的回复不会写挂载成功确认或激活来源引用。这些事实不表示源沙箱已经完整退役，也不授权预算归还或恢复新的执行；未绑定意图、独立部分启动对账与完整物理故障仍须单独验收。
+
 The API has three operations:
 
 1. `SandboxService.Checkpoint` checkpoints an existing sandbox.

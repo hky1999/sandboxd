@@ -47,17 +47,18 @@ type physicalMountIdentity struct {
 }
 
 type physicalIdentity struct {
-	Generation       string                   `json:"generation"`
-	Scope            physicalScope            `json:"scope"`
-	Target           string                   `json:"target"`
-	PIDFile          string                   `json:"pid_file"`
-	ExecutableSHA256 string                   `json:"executable_sha256"`
-	ArgumentsSHA256  string                   `json:"arguments_sha256"`
-	SourceSHA256     string                   `json:"source_sha256"`
-	Phase            string                   `json:"phase"`
-	Process          *physicalProcessIdentity `json:"process,omitempty"`
-	Mount            *physicalMountIdentity   `json:"mount,omitempty"`
-	UnmountSucceeded bool                     `json:"unmount_succeeded"`
+	Generation          string                   `json:"generation"`
+	Scope               physicalScope            `json:"scope"`
+	Target              string                   `json:"target"`
+	PIDFile             string                   `json:"pid_file"`
+	ExecutableSHA256    string                   `json:"executable_sha256"`
+	ArgumentsSHA256     string                   `json:"arguments_sha256"`
+	SourceSHA256        string                   `json:"source_sha256"`
+	Phase               string                   `json:"phase"`
+	Process             *physicalProcessIdentity `json:"process,omitempty"`
+	Mount               *physicalMountIdentity   `json:"mount,omitempty"`
+	UnmountSucceeded    bool                     `json:"unmount_succeeded"`
+	NoDispatchConfirmed bool                     `json:"no_dispatch_confirmed,omitempty"`
 }
 
 func clonePhysicalIdentity(p *physicalIdentity) *physicalIdentity {
@@ -85,6 +86,11 @@ func (d *Daemon) originalPhysicalIdentity() *physicalIdentity {
 func (d *Daemon) publishPhysicalIdentity(p *physicalIdentity) error {
 	d.physicalMu.Lock()
 	defer d.physicalMu.Unlock()
+	return d.publishPhysicalIdentityLocked(p)
+}
+
+// Caller holds physicalMu, shared with the final original process dispatch.
+func (d *Daemon) publishPhysicalIdentityLocked(p *physicalIdentity) error {
 	if p == nil {
 		return fmt.Errorf("original physical identity cannot be removed")
 	}
@@ -115,6 +121,10 @@ func (d *Daemon) publishPhysicalIdentity(p *physicalIdentity) error {
 				next.Mount = clonePhysicalIdentity(current).Mount
 			}
 			next.UnmountSucceeded = next.UnmountSucceeded || current.UnmountSucceeded
+			if next.NoDispatchConfirmed && !current.NoDispatchConfirmed && current.Phase != "not_started" && next.Phase != "not_started" {
+				return fmt.Errorf("original unstarted proof cannot be invented")
+			}
+			next.NoDispatchConfirmed = next.NoDispatchConfirmed || current.NoDispatchConfirmed || current.Phase == "not_started"
 			switch current.Phase {
 			case "released":
 				if next.Phase != "released" || (current.Process == nil && next.Process != nil) || (current.Mount == nil && next.Mount != nil) || next.UnmountSucceeded != current.UnmountSucceeded {
@@ -552,6 +562,9 @@ func validatePhysicalMetadata(meta DaemonMeta) error {
 	}
 	if p.UnmountSucceeded && p.Mount == nil {
 		return fmt.Errorf("physical unmount result lacks original mount identity")
+	}
+	if p.NoDispatchConfirmed && (p.Process != nil || p.Mount != nil || p.UnmountSucceeded || p.Phase != "not_started" && p.Phase != "releasing" && p.Phase != "released") {
+		return fmt.Errorf("unstarted physical proof contains dispatch effects")
 	}
 	return nil
 }

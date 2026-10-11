@@ -24,7 +24,7 @@ func (w *HttpWorker) recoverDaemonMountBound(id, nydusURL, generation string, os
 	if err != nil {
 		return nil, err
 	}
-	info := &MountInfo{PhysicalGeneration: generation, MountPoint: d.MountPoint(), Env: d.Env(), ImageProcess: d.ImageProcess(), Released: phase == "released", ReleasePending: phase == "releasing"}
+	info := &MountInfo{PhysicalGeneration: generation, MountPoint: d.MountPoint(), Env: d.Env(), ImageProcess: d.ImageProcess(), Released: phase == "released", ReleasePending: phase == "releasing" || phase == "not_started"}
 	if oss {
 		info.FilePath = filepath.Join(d.MountPoint(), d.Name())
 	}

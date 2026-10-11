@@ -56,7 +56,7 @@ func (d *Daemon) InspectPhysicalGeneration(generation string) (string, error) {
 		return "", err
 	}
 	switch p.Phase {
-	case "released", "releasing":
+	case "released", "releasing", "not_started":
 		return p.Phase, nil
 	case "running":
 		if !d.IsAlive() {

@@ -137,8 +137,10 @@ func (w *HttpWorker) executeMountOperation(id, kind, imageURL, expected string, 
 		return nil, fmt.Errorf("original mount reply is missing")
 	}
 	query := &MountOperationQuery{id, fingerprint}
-	if err := w.mountStore.confirmMountOperation(query, info.PhysicalGeneration, info.MountPoint); err != nil {
-		return nil, err
+	if !info.Released && !info.ReleasePending {
+		if err := w.mountStore.confirmMountOperation(query, info.PhysicalGeneration, info.MountPoint); err != nil {
+			return nil, err
+		}
 	}
 	return info, nil
 }
@@ -195,7 +197,7 @@ func (w *HttpWorker) inspectMountOperation(r *mountOperationRecord) (*MountOpera
 	switch phase {
 	case "running":
 		result.State = "ready"
-	case "releasing":
+	case "releasing", "not_started":
 		result.State = "release_pending"
 	case "released":
 		result.State = "released"
@@ -233,8 +235,10 @@ func (w *HttpWorker) recoverBoundMountOperation(r *mountOperationRecord) (*Mount
 	if info.MountPoint != r.MountPoint {
 		return nil, fmt.Errorf("original mount target changed")
 	}
-	if err := w.mountStore.confirmMountOperation(&MountOperationQuery{r.OperationID, r.RequestFingerprint}, info.PhysicalGeneration, info.MountPoint); err != nil {
-		return nil, err
+	if !info.Released && !info.ReleasePending {
+		if err := w.mountStore.confirmMountOperation(&MountOperationQuery{r.OperationID, r.RequestFingerprint}, info.PhysicalGeneration, info.MountPoint); err != nil {
+			return nil, err
+		}
 	}
 	return info, nil
 }
