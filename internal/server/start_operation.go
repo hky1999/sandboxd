@@ -19,7 +19,10 @@ import (
 
 	"github.com/google/uuid"
 	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
+	"github.com/inclusionAI/sandboxd/config"
 	"github.com/inclusionAI/sandboxd/pkg/errord"
+	"github.com/inclusionAI/sandboxd/pkg/networkmanager"
+	svc "github.com/inclusionAI/sandboxd/pkg/runtime"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
 	"google.golang.org/grpc/codes"
@@ -397,15 +400,123 @@ func (h *sandboxService) startOperationResult(ctx context.Context, record *start
 	if err != nil {
 		return nil, status.Error(codes.Unavailable, "cannot inspect original start retirement")
 	}
-	defer unlock()
 	receipt, err := h.readRetirement(record.SandboxID, record.Generation)
 	if err != nil {
+		unlock()
 		return nil, status.Error(codes.Unavailable, "cannot read original start retirement")
 	}
 	if receipt != nil && receipt.Complete {
+		unlock()
 		response.State = runtime.StartOperationState_START_OPERATION_STATE_RETIRED
+		return response, nil
 	}
-	return response, nil
+	var recovered *runtime.StartResponse
+	if record.State == runtime.StartOperationState_START_OPERATION_STATE_PENDING && !record.SealedMissing {
+		recovered, err = h.observeCommittedStartResult(ctx, record)
+	}
+	// Never acquire the admission mutex under the physical lock: missing
+	// admission sealing takes them in the opposite order. The result below
+	// is a historical creation observation, not a lease or liveness promise.
+	unlock()
+	if err != nil {
+		return nil, status.Error(codes.Unavailable, "original physical start observation is unavailable")
+	}
+	if recovered == nil {
+		return response, nil
+	}
+	h.startOperationMu.Lock()
+	defer h.startOperationMu.Unlock()
+	j, err := h.openStartOperationJournal()
+	if err != nil {
+		return nil, status.Error(codes.Unavailable, "start recovery journal is unavailable")
+	}
+	current, err := j.read(record.OperationID)
+	if err != nil || current == nil || !current.sameIdentity(record) ||
+		current.State == runtime.StartOperationState_START_OPERATION_STATE_NOT_CREATED {
+		return nil, status.Error(codes.Unavailable, "start recovery identity or outcome changed")
+	}
+	if current.State == runtime.StartOperationState_START_OPERATION_STATE_PENDING {
+		current.State = runtime.StartOperationState_START_OPERATION_STATE_STARTED
+		current.Result = recovered
+		if err := j.writeFile(current.OperationID+".json", current, false); err != nil {
+			return nil, status.Error(codes.Unavailable, "recovered start result publication failed")
+		}
+	}
+	return current.response(), nil
+}
+
+// Caller holds the original sandbox's physical lock. A cached RUNNING status
+// is insufficient; require matching committed identity and a fresh runtime
+// observation, then reconstruct only daemon-owned original network facts.
+func (h *sandboxService) observeCommittedStartResult(ctx context.Context, record *startOperationRecord) (*runtime.StartResponse, error) {
+	if !h.recoveryReady.Load() {
+		return nil, nil
+	}
+	current, err := h.sandboxManager.Get(record.SandboxID)
+	if errors.Is(err, errord.ErrNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if current == nil || current.Metadata == nil {
+		return nil, nil
+	}
+	metadata := proto.Clone(current.Metadata).(*runtime.SandboxMetadata)
+	if metadata.ID != record.SandboxID || metadata.PhysicalPhase != runtime.SandboxPhysicalPhase_SANDBOX_PHYSICAL_PHASE_COMMITTED ||
+		metadata.Labels[startOperationLabel] != record.OperationID || metadata.Labels[resourceGenerationLabel] != record.Generation {
+		return nil, nil
+	}
+	handler, ok := h.serviceHandler.Get(metadata.RuntimeHandler)
+	if !ok || handler == nil {
+		return nil, fmt.Errorf("original runtime handler is unavailable")
+	}
+	checkCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	states, err := handler.List(checkCtx)
+	if err != nil {
+		return nil, err
+	}
+	count, running := 0, false
+	for _, state := range states {
+		if state == nil {
+			return nil, fmt.Errorf("runtime observation is incomplete")
+		}
+		if state.ID == record.SandboxID {
+			count++
+			running = state.Status == svc.SandboxStatusRunning
+		}
+	}
+	if count != 1 || !running {
+		return nil, nil
+	}
+	resources, err := h.physicalResources(metadata)
+	if err != nil {
+		return nil, err
+	}
+	encoded, ok := resources.Resources[config.ResourceNameInterface]
+	if !ok {
+		return nil, nil
+	}
+	network, err := networkmanager.NewNetResource(encoded)
+	if err != nil || network.Ip.To4() == nil || network.Ip.IsUnspecified() {
+		return nil, fmt.Errorf("original start network facts are incomplete")
+	}
+	// Even a fresh runtime query cannot authorize facts from a replacement
+	// metadata record. Recheck the complete captured original under this
+	// physical lock before publishing the historical creation result.
+	confirmed, err := h.sandboxManager.Get(record.SandboxID)
+	if err != nil {
+		return nil, err
+	}
+	if confirmed == nil || confirmed.Metadata == nil || !proto.Equal(confirmed.Metadata, metadata) {
+		return nil, fmt.Errorf("original start metadata changed during observation")
+	}
+	if err := checkCtx.Err(); err != nil {
+		return nil, err
+	}
+	return &runtime.StartResponse{ID: record.SandboxID, ResourceGeneration: record.Generation,
+		SandboxIp: network.Ip.String(), Ports: clonePorts(metadata.Ports)}, nil
 }
 
 func (h *sandboxService) GetStartOperation(ctx context.Context, request *runtime.GetStartOperationRequest) (*runtime.StartOperationResponse, error) {
