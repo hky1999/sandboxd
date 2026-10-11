@@ -234,6 +234,7 @@ type Daemon struct {
 	metaPersistMu                 sync.Mutex
 	savedMetaSHA256               string
 	metadataDirectorySyncFunc     func(*os.File) error
+	birthDirectorySyncFunc        func(*os.File) error
 	stopChan                      chan struct{}
 	kickStop                      *Stopper
 	state                         atomic.Int32 // DaemonState
@@ -1132,11 +1133,15 @@ func (d *Daemon) unmountLocked() (retErr error) {
 		return fmt.Errorf("loaded daemon has no original physical identity")
 	}
 	if physical != nil {
-		dispatchUnresolved := physical.Process == nil && (physical.Phase == "launching" || physical.Phase == "releasing") && !physical.NoDispatchConfirmed
 		physical.Phase = "releasing"
 		if err := d.publishPhysicalIdentity(physical); err != nil {
 			return err
 		}
+		if err := d.reconcilePhysicalBirthForRetirement(); err != nil {
+			return err
+		}
+		physical = d.originalPhysicalIdentity()
+		dispatchUnresolved := physical.Process == nil && !physical.NoDispatchConfirmed
 		if dispatchUnresolved {
 			// Fence an original launch before returning unknown. The background
 			// initializer must not continue to exec after this cleanup intent.

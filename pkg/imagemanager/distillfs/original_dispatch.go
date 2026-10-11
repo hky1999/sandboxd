@@ -27,7 +27,7 @@ func (d *Daemon) startOriginalDaemonCommand(command *exec.Cmd, expected *physica
 	if expected == nil || current == nil || current.Generation != expected.Generation || current.Phase != "launching" || current.Process != nil || current.Mount != nil || current.NoDispatchConfirmed || d.physicalPublicationPending {
 		return fmt.Errorf("original daemon dispatch is fenced or unresolved")
 	}
-	if current.Scope != expected.Scope || current.Target != expected.Target || current.PIDFile != expected.PIDFile || current.ExecutableSHA256 != expected.ExecutableSHA256 || current.ArgumentsSHA256 != expected.ArgumentsSHA256 || current.SourceSHA256 != expected.SourceSHA256 || d.meta.PidFilePath != expected.PIDFile {
+	if !samePhysicalLaunch(current, expected) || d.meta.PidFilePath != expected.PIDFile {
 		return fmt.Errorf("original daemon dispatch identity changed")
 	}
 	if command == nil || command.Path != d.binPath || metadataSHA([]byte(strings.Join(command.Args, "\x00")+"\x00")) != expected.ArgumentsSHA256 {
@@ -44,6 +44,13 @@ func (d *Daemon) startOriginalDaemonCommand(command *exec.Cmd, expected *physica
 	executable, err := readPhysicalFile(command.Path, 256<<20)
 	if err != nil || metadataSHA(executable) != expected.ExecutableSHA256 {
 		return fmt.Errorf("original daemon dispatch executable changed")
+	}
+	if current.BirthProtocol == 1 {
+		directory, err := d.openPhysicalBirthDirectory(current)
+		if err != nil {
+			return err
+		}
+		directory.Close()
 	}
 	dispatched, err := d.ownership.dispatch(command.Start)
 	if err != nil {

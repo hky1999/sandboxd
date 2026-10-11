@@ -59,6 +59,8 @@ type physicalIdentity struct {
 	Mount               *physicalMountIdentity   `json:"mount,omitempty"`
 	UnmountSucceeded    bool                     `json:"unmount_succeeded"`
 	NoDispatchConfirmed bool                     `json:"no_dispatch_confirmed,omitempty"`
+	BirthProtocol       uint8                    `json:"birth_protocol,omitempty"`
+	BirthDirectory      *directoryBirth          `json:"birth_directory,omitempty"`
 }
 
 func clonePhysicalIdentity(p *physicalIdentity) *physicalIdentity {
@@ -66,6 +68,10 @@ func clonePhysicalIdentity(p *physicalIdentity) *physicalIdentity {
 		return nil
 	}
 	out := *p
+	if p.BirthDirectory != nil {
+		birth := *p.BirthDirectory
+		out.BirthDirectory = &birth
+	}
 	if p.Process != nil {
 		process := *p.Process
 		out.Process = &process
@@ -110,7 +116,7 @@ func (d *Daemon) publishPhysicalIdentityLocked(p *physicalIdentity) error {
 				return fmt.Errorf("original physical generation is not durably settled")
 			}
 		} else {
-			if next.Scope != current.Scope || next.Target != current.Target || next.PIDFile != current.PIDFile || next.ExecutableSHA256 != current.ExecutableSHA256 || next.ArgumentsSHA256 != current.ArgumentsSHA256 || next.SourceSHA256 != current.SourceSHA256 || d.meta.PidFilePath != current.PIDFile {
+			if !samePhysicalLaunch(next, current) || d.meta.PidFilePath != current.PIDFile {
 				return fmt.Errorf("original physical launch identity changed")
 			}
 			if current.Process != nil {
@@ -406,8 +412,12 @@ func (d *Daemon) preparePhysicalLaunch() error {
 		generation = preparation.Generation
 	}
 	pidFile := filepath.Join(d.meta.DaemonDir, "pid-"+generation)
+	birth, err := readDirectoryBirth(d.meta.DaemonDir)
+	if err != nil {
+		return fmt.Errorf("record original daemon directory identity: %w", err)
+	}
 	args := append([]string{d.binPath}, d.buildMountArgsForPIDFile(pidFile)...)
-	p := &physicalIdentity{Generation: generation, Scope: scope, Target: d.meta.MountPoint, PIDFile: pidFile, ExecutableSHA256: metadataSHA(exe), ArgumentsSHA256: metadataSHA([]byte(strings.Join(args, "\x00") + "\x00")), SourceSHA256: source, Phase: "launching"}
+	p := &physicalIdentity{Generation: generation, Scope: scope, Target: d.meta.MountPoint, PIDFile: pidFile, ExecutableSHA256: metadataSHA(exe), ArgumentsSHA256: metadataSHA([]byte(strings.Join(args, "\x00") + "\x00")), SourceSHA256: source, Phase: "launching", BirthProtocol: 1, BirthDirectory: birth}
 	return d.publishPhysicalIdentity(p) // Durable before process dispatch.
 }
 
@@ -429,7 +439,12 @@ func (d *Daemon) captureOriginalProcess() error {
 		return fmt.Errorf("original daemon birth identity cannot be confirmed")
 	}
 	p.Process = current
-	return d.publishPhysicalIdentity(p)
+	d.physicalMu.Lock()
+	defer d.physicalMu.Unlock()
+	if err := d.persistPhysicalBirthLocked(p, "process"); err != nil {
+		return err
+	}
+	return d.publishPhysicalIdentityLocked(p)
 }
 
 func (d *Daemon) captureOriginalMount() error {
@@ -455,7 +470,12 @@ func (d *Daemon) captureOriginalMount() error {
 	}
 	p.Mount = mount
 	p.Phase = "running"
-	return d.publishPhysicalIdentity(p)
+	d.physicalMu.Lock()
+	defer d.physicalMu.Unlock()
+	if err := d.persistPhysicalBirthLocked(p, "mount"); err != nil {
+		return err
+	}
+	return d.publishPhysicalIdentityLocked(p)
 }
 
 func signalPhysicalProcess(expected *physicalProcessIdentity, sig syscall.Signal) error {
@@ -552,11 +572,17 @@ func validatePhysicalMetadata(meta DaemonMeta) error {
 	if len(p.Scope.BootID) != 36 || p.Scope.MountNSInode == 0 || p.Scope.PIDNSInode == 0 {
 		return fmt.Errorf("original physical namespace identity is incomplete")
 	}
+	if p.BirthProtocol > 1 || p.BirthProtocol == 0 && p.BirthDirectory != nil || p.BirthProtocol == 1 && (p.BirthDirectory == nil || p.BirthDirectory.Inode == 0) {
+		return fmt.Errorf("original physical birth protocol or directory is invalid")
+	}
 	if p.Process != nil && (p.Process.PID <= 0 || p.Process.StartTicks == 0 || p.Process.ExecutableSHA256 != p.ExecutableSHA256 || p.Process.ArgumentsSHA256 != p.ArgumentsSHA256) {
 		return fmt.Errorf("original process birth identity is invalid")
 	}
 	if p.Mount != nil && (p.Mount.MountID <= 0 || p.Mount.UniqueMountID == 0 || !strings.HasPrefix(p.Mount.Filesystem, "fuse")) {
 		return fmt.Errorf("original kernel mount birth identity is invalid")
+	}
+	if p.BirthProtocol == 1 && p.Mount != nil && (p.Mount.Major < 0 || p.Mount.Minor < 0 || !filepath.IsAbs(p.Mount.Root) || filepath.Clean(p.Mount.Root) != p.Mount.Root || p.Mount.Source == "" || p.Mount.Filesystem != "fuse" && !strings.HasPrefix(p.Mount.Filesystem, "fuse.")) {
+		return fmt.Errorf("independent original mount birth identity is incomplete")
 	}
 	switch p.Phase {
 	case "launching", "releasing", "released":

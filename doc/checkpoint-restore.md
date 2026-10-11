@@ -17,6 +17,8 @@ directory and starting a new sandbox from that checkpoint.
 
 Nydus／S3 释放先保存原清理意图，并与最终进程启动共用状态锁，防止后台初始化在清理之后迟到执行。实际 `Start` 失败的未派发事实在释放失败和重开后保留；缺少出生确认仍为未知。原 `not_started` 通过镜像 API 返回 `release_pending`，只用于已经授权的原清理恢复；待清理或已释放的回复不会写挂载成功确认或激活来源引用。这些事实不表示源沙箱已经完整退役，也不授权预算归还或恢复新的执行；未绑定意图、独立部分启动对账与完整物理故障仍须单独验收。
 
+新 Nydus／S3 启动身份保存 `birth_protocol=1` 和原 daemon 目录的设备号及 inode。观测到原进程或原内核挂载之后，先发布独立不可替换的身份文件，再提交主元数据；主元数据发布失败且旧有效快照存续时，显式原代际清理可以读取这些身份，先保存 releasing 屏障，再持久补交原身份后继续清理。读取不采用当前 PID 或当前挂载补造归属，不启动程序，不将清理改回运行。旧协议、缺失或损坏记录、目录替换、来源改变、PID 复用及挂载替换继续保持未知。它只覆盖首次身份已经观测并保存之后的主元数据失败窗口；成功 Start 到首次独立身份保存之间仍需要启动确认协议，不证明完整沙箱退役或授权预算归还。具体记录、兼容及持久边界见 [镜像挂载释放契约](scheduler-image-mount-release.md#独立原进程及挂载身份记录)。
+
 The API has three operations:
 
 1. `SandboxService.Checkpoint` checkpoints an existing sandbox.
