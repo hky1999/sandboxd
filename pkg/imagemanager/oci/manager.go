@@ -128,15 +128,16 @@ type imageLockEntry struct {
 
 // ContainerInfo stores mount-related information.
 type ContainerInfo struct {
-	MountID       string
-	ImageURL      string
-	MountPath     string
-	LayerDigests  []string
-	ChainIDs      []string
-	LowerDirs     []string
-	Env           []string
-	ImageProcess  *imageconfig.Process
-	CreatedAtUnix int64
+	UnmountSucceeded bool // protected by the image lock; never repeats a successful syscall
+	MountID          string
+	ImageURL         string
+	MountPath        string
+	LayerDigests     []string
+	ChainIDs         []string
+	LowerDirs        []string
+	Env              []string
+	ImageProcess     *imageconfig.Process
+	CreatedAtUnix    int64
 }
 
 // NewManager creates a new OCI manager.
@@ -341,6 +342,9 @@ func (m *Manager) MountImageConfigWithContext(ctx context.Context, imageURL stri
 
 	stageStart = time.Now()
 	if info := m.getContainer(imageURL); info != nil {
+		if info.UnmountSucceeded {
+			return "", nil, nil, fmt.Errorf("OCI mount release is unconfirmed")
+		}
 		timing.Stage("reuse_in_memory_mount", time.Since(stageStart))
 		logrus.Infof("OCI mount reuse in-memory: image=%s mount_path=%s cost=%s", imageURL, info.MountPath, time.Since(opStart))
 		return info.MountPath, info.Env, imageconfig.Clone(info.ImageProcess), nil
@@ -787,10 +791,25 @@ func (m *Manager) UnmountImageWithContext(ctx context.Context, imageURL string) 
 	timing.Stage("lookup_mount", time.Since(stageStart))
 
 	stageStart = time.Now()
-	if err := m.unmountFn(info.MountPath); err != nil && !isNotMountedError(err) {
-		err = fmt.Errorf("failed to unmount overlay at %s: %w", info.MountPath, err)
-		timing.RecordError(err)
-		return err
+	if !info.UnmountSucceeded {
+		if err := m.unmountFn(info.MountPath); err != nil && !isNotMountedError(err) {
+			return fmt.Errorf("unmount original OCI overlay: %w", err)
+		}
+		info.UnmountSucceeded = true
+		m.setContainer(imageURL, info)
+	}
+	if m.readMnts == nil {
+		return fmt.Errorf("OCI mount readback is unavailable")
+	}
+	mounted, known, err := m.readMnts()
+	if err != nil {
+		return fmt.Errorf("read back OCI mount removal: %w", err)
+	}
+	if !known {
+		return fmt.Errorf("OCI mount removal is unknown")
+	}
+	if _, exists := mounted[info.MountPath]; exists {
+		return fmt.Errorf("OCI target remains mounted after unmount")
 	}
 	timing.Stage("overlay_unmount", time.Since(stageStart))
 
@@ -2042,12 +2061,16 @@ func (m *Manager) getContainer(imageURL string) *ContainerInfo {
 		return nil
 	}
 	return &ContainerInfo{
-		MountID:      info.MountID,
-		ImageURL:     info.ImageURL,
-		MountPath:    info.MountPath,
-		LayerDigests: append([]string(nil), info.LayerDigests...),
-		ChainIDs:     append([]string(nil), info.ChainIDs...),
-		LowerDirs:    append([]string(nil), info.LowerDirs...),
+		UnmountSucceeded: info.UnmountSucceeded,
+		Env:              append([]string(nil), info.Env...),
+		ImageProcess:     imageconfig.Clone(info.ImageProcess),
+		CreatedAtUnix:    info.CreatedAtUnix,
+		MountID:          info.MountID,
+		ImageURL:         info.ImageURL,
+		MountPath:        info.MountPath,
+		LayerDigests:     append([]string(nil), info.LayerDigests...),
+		ChainIDs:         append([]string(nil), info.ChainIDs...),
+		LowerDirs:        append([]string(nil), info.LowerDirs...),
 	}
 }
 

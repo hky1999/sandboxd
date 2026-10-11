@@ -559,12 +559,17 @@ func (mgr *manager) GetDaemon(id string) *Daemon {
 
 // cleanupDaemonResources removes all daemon resources from disk
 // Caller must hold mgr.mu lock
-func (mgr *manager) cleanupDaemonResources(d *Daemon) {
+func (mgr *manager) cleanupDaemonResources(d *Daemon) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.releasePending || d.getState() != DaemonStateStopped || d.IsAlive() {
+		return fmt.Errorf("daemon cleanup is not confirmed stopped")
+	}
 	logrus.WithFields(d.daemonLogFields()).Info("cleaning daemon resources")
 
 	// Clean mount point to ensure FUSE filesystem is unmounted
 	if err := d.cleanMountPoint(); err != nil {
-		logrus.WithFields(d.daemonLogFields()).WithError(err).Warn("failed to clean mount point")
+		return fmt.Errorf("confirm daemon mount cleanup: %w", err)
 	}
 
 	// Remove mount point directory if it's using the default path
@@ -572,7 +577,7 @@ func (mgr *manager) cleanupDaemonResources(d *Daemon) {
 		defaultMountPath := filepath.Join(mgr.root, "mnt", d.meta.ID)
 		if d.meta.MountPoint == defaultMountPath {
 			if err := os.Remove(d.meta.MountPoint); err != nil && !os.IsNotExist(err) {
-				logrus.Warnf("failed to remove mount point directory %s: %v", d.meta.MountPoint, err)
+				return fmt.Errorf("remove daemon mount directory: %w", err)
 			}
 		}
 	}
@@ -583,23 +588,24 @@ func (mgr *manager) cleanupDaemonResources(d *Daemon) {
 	// Clean daemon working directory
 	if d.meta.DaemonDir != "" {
 		if err := os.RemoveAll(d.meta.DaemonDir); err != nil {
-			logrus.WithFields(d.daemonLogFields()).WithError(err).Warn("failed to remove daemon dir")
+			return fmt.Errorf("remove daemon working directory: %w", err)
 		}
 	}
 
 	// Clean image metadata directory
 	if d.meta.ImageMetaDir != "" {
 		if err := os.RemoveAll(d.meta.ImageMetaDir); err != nil {
-			logrus.WithFields(d.daemonLogFields()).WithError(err).Warn("failed to remove image meta dir")
+			return fmt.Errorf("remove daemon image metadata: %w", err)
 		}
 	}
 
 	// Clean daemon config file
 	if d.savedPath != "" {
 		if err := os.Remove(d.savedPath); err != nil && !os.IsNotExist(err) {
-			logrus.WithFields(d.daemonLogFields()).WithError(err).Warn("failed to remove daemon config")
+			return fmt.Errorf("remove daemon ownership record: %w", err)
 		}
 	}
+	return nil
 }
 
 // getDiskUsage returns the disk usage percentage for the given path
@@ -625,10 +631,7 @@ func (mgr *manager) gcDaemons() {
 	if len(failedDaemons) > 0 {
 		mgr.mu.Unlock()
 		for _, d := range failedDaemons {
-			if d.IsAlive() {
-				logrus.WithFields(d.daemonLogFields()).Warn("gc: unmounting daemon with failed mount but running process")
-				d.unmountForGC()
-			}
+			d.unmountForGC()
 		}
 		mgr.mu.Lock()
 
@@ -638,7 +641,10 @@ func (mgr *manager) gcDaemons() {
 				continue
 			}
 			logrus.WithFields(d.daemonLogFields()).Info("gc: cleaning daemon with failed mount")
-			mgr.cleanupDaemonResources(d)
+			if err := mgr.cleanupDaemonResources(d); err != nil {
+				logrus.WithFields(d.daemonLogFields()).WithError(err).Warn("retain failed daemon garbage collection")
+				continue
+			}
 			delete(mgr.daemons, d.meta.ID)
 		}
 	}
@@ -651,7 +657,10 @@ func (mgr *manager) gcDaemons() {
 		}
 		logrus.WithFields(d.daemonLogFields()).Info("delete daemon")
 
-		mgr.cleanupDaemonResources(d)
+		if err := mgr.cleanupDaemonResources(d); err != nil {
+			logrus.WithFields(d.daemonLogFields()).WithError(err).Warn("retain failed daemon garbage collection")
+			continue
+		}
 		delete(mgr.daemons, d.meta.ID)
 
 		nrToDelete--
@@ -715,7 +724,10 @@ func (mgr *manager) gcDaemonsByDiskPressure() {
 		d := item.daemon
 		logrus.WithFields(d.daemonLogFields()).WithField("expired_at", d.expiredAt).Info("cleaning up inactive daemon due to disk pressure")
 
-		mgr.cleanupDaemonResources(d)
+		if err := mgr.cleanupDaemonResources(d); err != nil {
+			logrus.WithFields(d.daemonLogFields()).WithError(err).Warn("retain failed daemon garbage collection")
+			continue
+		}
 		delete(mgr.daemons, d.meta.ID)
 		cleaned++
 
@@ -777,7 +789,9 @@ func (mgr *manager) CleanupDaemon(daemonID string) error {
 		return fmt.Errorf("daemon %s is not stopped (state=%d), unmount it first", daemonID, state)
 	}
 
-	mgr.cleanupDaemonResources(d)
+	if err := mgr.cleanupDaemonResources(d); err != nil {
+		return err
+	}
 	delete(mgr.daemons, d.meta.ID)
 	delete(mgr.recovered, daemonID)
 	logrus.WithFields(d.daemonLogFields()).Info("successfully cleaned daemon")

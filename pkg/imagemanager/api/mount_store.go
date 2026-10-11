@@ -85,6 +85,29 @@ func (s *MountStore) Delete(imageURL string) error {
 	})
 }
 
+// DeleteIfRecord never removes a changed replacement record. Missing state is
+// unknown here; only the original caller's durable completion can prove replay.
+func (s *MountStore) DeleteIfRecord(imageURL string, expected *MountRecord) error {
+	if expected == nil || expected.ImageURL != imageURL {
+		return fmt.Errorf("original mount route is required")
+	}
+	return s.db.Update(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket(mountRecordsBucket)
+		raw := bucket.Get([]byte(imageURL))
+		if raw == nil {
+			return fmt.Errorf("original mount route is missing")
+		}
+		var current MountRecord
+		if err := json.Unmarshal(raw, &current); err != nil {
+			return fmt.Errorf("original mount route is unreadable")
+		}
+		if current != *expected {
+			return fmt.Errorf("original mount route changed")
+		}
+		return bucket.Delete([]byte(imageURL))
+	})
+}
+
 // Close closes the underlying BoltDB.
 func (s *MountStore) Close() error {
 	return s.db.Close()

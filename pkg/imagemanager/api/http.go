@@ -28,6 +28,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/sirupsen/logrus"
@@ -95,6 +96,8 @@ type HttpWorker struct {
 	mountStore  *MountStore
 
 	nydusDetectSF singleflight.Group
+	routeLocksMu  sync.Mutex
+	routeLocks    map[string]*mountRouteLock
 }
 
 // Close releases resources held by the HttpWorker (e.g., mount store DB).
@@ -234,7 +237,6 @@ func (w *HttpWorker) UnmountOSS(req *OSSUmountRequest) (*MountInfo, error) {
 		timing.Fail(err)
 		return nil, err
 	}
-	defer w.mgr.SetDaemonReferenced(id, false)
 	timing.Stage("get_daemon", time.Since(stageStart))
 
 	// Stage 2: Unmount daemon (this will have its own detailed timing)
@@ -249,6 +251,7 @@ func (w *HttpWorker) UnmountOSS(req *OSSUmountRequest) (*MountInfo, error) {
 		timing.Fail(err)
 		return nil, fmt.Errorf("failed to umount daemon %s: %w", id, err)
 	}
+	w.mgr.SetDaemonReferenced(id, false)
 	logrus.WithFields(logrus.Fields{
 		"daemon_id":   id,
 		"mount_point": d.MountPoint(),
@@ -400,7 +403,6 @@ func (w *HttpWorker) UnmountNydus(req *NydusUmountRequest) (*MountInfo, error) {
 		timing.Fail(err)
 		return nil, err
 	}
-	defer w.mgr.SetDaemonReferenced(id, false)
 	timing.Stage("get_daemon", time.Since(stageStart))
 
 	// Stage 3: Unmount daemon
@@ -416,6 +418,7 @@ func (w *HttpWorker) UnmountNydus(req *NydusUmountRequest) (*MountInfo, error) {
 		timing.Fail(err)
 		return nil, fmt.Errorf("failed to umount daemon %s: %w", id, err)
 	}
+	w.mgr.SetDaemonReferenced(id, false)
 	logrus.WithFields(logrus.Fields{
 		"daemon_id":   id,
 		"mount_point": d.MountPoint(),
@@ -512,6 +515,11 @@ func (w *HttpWorker) mountNydusOnce(imageURL string, fn func() (nydusMountAttemp
 }
 
 func (w *HttpWorker) MountOCI(req *OCIMountRequest) (*OCIMountResponse, error) {
+	if req == nil || req.ImageURL == "" {
+		return nil, fmt.Errorf("image_url is required")
+	}
+	unlock := w.acquireMountRouteLock(req.ImageURL)
+	defer unlock()
 	if w.ociMgr == nil {
 		return nil, fmt.Errorf("oci manager is not initialized")
 	}
@@ -523,7 +531,9 @@ func (w *HttpWorker) MountOCI(req *OCIMountRequest) (*OCIMountResponse, error) {
 	if w.nydusClient != nil {
 		// Try original URL
 		if attempt, err := w.tryMountNydus(req.ImageURL); err == nil {
-			w.recordMount(req.ImageURL, "nydus", req.ImageURL, attempt.mountPoint)
+			if err := w.recordMount(req.ImageURL, "nydus", req.ImageURL, attempt.mountPoint); err != nil {
+				return nil, err
+			}
 			return &OCIMountResponse{MountPath: attempt.mountPoint, Env: attempt.env, ImageProcess: attempt.imageProcess}, nil
 		} else if attempt.detected {
 			logrus.WithError(err).Warnf("detected Nydus image for %s but Nydus mount failed, skip OCI fallback", req.ImageURL)
@@ -535,7 +545,9 @@ func (w *HttpWorker) MountOCI(req *OCIMountRequest) (*OCIMountResponse, error) {
 			imageWithSuffix := req.ImageURL + w.nydusSuffix
 			logrus.Infof("trying Nydus detection with suffix: %s", imageWithSuffix)
 			if attempt, err := w.tryMountNydus(imageWithSuffix); err == nil {
-				w.recordMount(req.ImageURL, "nydus", imageWithSuffix, attempt.mountPoint)
+				if err := w.recordMount(req.ImageURL, "nydus", imageWithSuffix, attempt.mountPoint); err != nil {
+					return nil, err
+				}
 				return &OCIMountResponse{MountPath: attempt.mountPoint, Env: attempt.env, ImageProcess: attempt.imageProcess}, nil
 			} else if attempt.detected {
 				logrus.WithError(err).Warnf("detected Nydus image for %s via suffix %s but Nydus mount failed, skip OCI fallback", req.ImageURL, imageWithSuffix)
@@ -550,7 +562,9 @@ func (w *HttpWorker) MountOCI(req *OCIMountRequest) (*OCIMountResponse, error) {
 	if err != nil {
 		return nil, err
 	}
-	w.recordMount(req.ImageURL, "oci", "", mountPoint)
+	if err := w.recordMount(req.ImageURL, "oci", "", mountPoint); err != nil {
+		return nil, err
+	}
 	return &OCIMountResponse{MountPath: mountPoint, Env: envVars, ImageProcess: imageProcess}, nil
 }
 
@@ -606,56 +620,121 @@ func (w *HttpWorker) ImageProcess(imageURL string) (*imageconfig.Process, error)
 	return w.ociMgr.ImageProcessWithContext(w.ctx, imageURL)
 }
 
-// recordMount persists a mount record. Errors are logged but not propagated.
-func (w *HttpWorker) recordMount(imageURL, mountType, nydusImageURL, mountPoint string) {
+// Preserve the original routing record until both backend cleanup and the
+// conditional durable removal succeed. This is not a mount-generation proof.
+func (w *HttpWorker) recordMount(imageURL, mountType, nydusImageURL, mountPoint string) error {
 	if w.mountStore == nil {
-		return
+		return nil
 	}
-	record := &MountRecord{
-		ImageURL:      imageURL,
-		MountType:     mountType,
-		NydusImageURL: nydusImageURL,
-		MountPoint:    mountPoint,
+	record := &MountRecord{ImageURL: imageURL, MountType: mountType, NydusImageURL: nydusImageURL, MountPoint: mountPoint}
+	if err := validateMountRoute(imageURL, record); err != nil {
+		return err
+	}
+	existing, err := w.mountStore.Get(imageURL)
+	if err != nil {
+		return fmt.Errorf("read original image mount route: %w", err)
+	}
+	if existing != nil {
+		if *existing != *record {
+			return fmt.Errorf("image mount route changed before publication")
+		}
+		return nil
 	}
 	if err := w.mountStore.Put(imageURL, record); err != nil {
-		logrus.Errorf("failed to record mount for %s: %v", imageURL, err)
+		return fmt.Errorf("persist image mount route: %w", err)
 	}
+	return nil
+}
+
+func validateMountRoute(imageURL string, r *MountRecord) error {
+	if r == nil || r.ImageURL != imageURL || r.MountPoint == "" {
+		return fmt.Errorf("image mount route is incomplete or changed")
+	}
+	switch r.MountType {
+	case "nydus":
+		if r.NydusImageURL == "" {
+			return fmt.Errorf("Nydus mount route is incomplete")
+		}
+	case "oci":
+		if r.NydusImageURL != "" {
+			return fmt.Errorf("OCI mount route contains a foreign backend")
+		}
+	default:
+		return fmt.Errorf("unknown image mount route")
+	}
+	return nil
 }
 
 func (w *HttpWorker) UnmountOCI(req *OCIUmountRequest) error {
-	if w.ociMgr == nil {
-		return fmt.Errorf("oci manager is not initialized")
-	}
-	if req.ImageURL == "" {
+	if req == nil || req.ImageURL == "" {
 		return fmt.Errorf("image_url is required")
 	}
-
-	// Try mount store first for accurate routing
+	unlock := w.acquireMountRouteLock(req.ImageURL)
+	defer unlock()
 	if w.mountStore != nil {
 		record, err := w.mountStore.Get(req.ImageURL)
 		if err != nil {
-			logrus.Warnf("failed to query mount store for %s: %v, falling back to legacy", req.ImageURL, err)
-		} else if record != nil {
-			defer func() {
-				if delErr := w.mountStore.Delete(req.ImageURL); delErr != nil {
-					logrus.Errorf("failed to delete mount record for %s: %v", req.ImageURL, delErr)
-				}
-			}()
-
-			switch record.MountType {
-			case "nydus":
-				logrus.Infof("mount store: image %s was mounted as Nydus (url=%s), unmounting via Nydus", req.ImageURL, record.NydusImageURL)
-				_, err := w.UnmountNydus(&NydusUmountRequest{ImageURL: record.NydusImageURL})
-				return err
-			default:
-				logrus.Infof("mount store: image %s was mounted as OCI, unmounting via OCI manager", req.ImageURL)
-				return w.ociMgr.UnmountImageWithContext(w.ctx, req.ImageURL)
-			}
+			return fmt.Errorf("read original image mount route: %w", err)
 		}
+		if err := validateMountRoute(req.ImageURL, record); err != nil {
+			return err
+		}
+		switch record.MountType {
+		case "nydus":
+			if w.mgr == nil {
+				return fmt.Errorf("distillfs manager is not initialized")
+			}
+			_, err = w.UnmountNydus(&NydusUmountRequest{ImageURL: record.NydusImageURL})
+		case "oci":
+			if w.ociMgr == nil {
+				return fmt.Errorf("oci manager is not initialized")
+			}
+			err = w.ociMgr.UnmountImageWithContext(w.ctx, req.ImageURL)
+		}
+		if err != nil {
+			return err
+		}
+		if err := w.mountStore.DeleteIfRecord(req.ImageURL, record); err != nil {
+			return fmt.Errorf("confirm original image mount route removal: %w", err)
+		}
+		return nil
 	}
-
-	// Legacy fallback: no record found, use daemon lookup
+	if w.ociMgr == nil {
+		return fmt.Errorf("oci manager is not initialized")
+	}
+	// Explicit legacy mode without a routing database retains its old API.
 	return w.unmountOCILegacy(req)
+}
+
+// Serializes publication and removal for the same facade source. Backend GC,
+// mount identity, deadlines and cross-process ownership are separate contracts.
+type mountRouteLock struct {
+	mu   sync.Mutex
+	refs int
+}
+
+func (w *HttpWorker) acquireMountRouteLock(source string) func() {
+	w.routeLocksMu.Lock()
+	if w.routeLocks == nil {
+		w.routeLocks = make(map[string]*mountRouteLock)
+	}
+	entry := w.routeLocks[source]
+	if entry == nil {
+		entry = &mountRouteLock{}
+		w.routeLocks[source] = entry
+	}
+	entry.refs++
+	w.routeLocksMu.Unlock()
+	entry.mu.Lock()
+	return func() {
+		entry.mu.Unlock()
+		w.routeLocksMu.Lock()
+		entry.refs--
+		if entry.refs == 0 {
+			delete(w.routeLocks, source)
+		}
+		w.routeLocksMu.Unlock()
+	}
 }
 
 // unmountOCILegacy is the original UnmountOCI logic, used when no mount store record exists.
@@ -666,8 +745,11 @@ func (w *HttpWorker) unmountOCILegacy(req *OCIUmountRequest) error {
 		nydusID := generateNydusID(req.ImageURL)
 		if d := w.mgr.GetDaemon(nydusID); d != nil {
 			logrus.Infof("legacy: image %s was mounted as Nydus, unmounting via Nydus", req.ImageURL)
-			defer w.mgr.SetDaemonReferenced(nydusID, false)
-			return d.Unmount()
+			if err := d.Unmount(); err != nil {
+				return err
+			}
+			w.mgr.SetDaemonReferenced(nydusID, false)
+			return nil
 		}
 
 		// Check with suffix if configured
@@ -676,8 +758,11 @@ func (w *HttpWorker) unmountOCILegacy(req *OCIUmountRequest) error {
 			nydusIDWithSuffix := generateNydusID(imageWithSuffix)
 			if d := w.mgr.GetDaemon(nydusIDWithSuffix); d != nil {
 				logrus.Infof("legacy: image %s (with suffix) was mounted as Nydus, unmounting via Nydus", imageWithSuffix)
-				defer w.mgr.SetDaemonReferenced(nydusIDWithSuffix, false)
-				return d.Unmount()
+				if err := d.Unmount(); err != nil {
+					return err
+				}
+				w.mgr.SetDaemonReferenced(nydusIDWithSuffix, false)
+				return nil
 			}
 		}
 	}

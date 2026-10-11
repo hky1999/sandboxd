@@ -9,6 +9,8 @@ directory and starting a new sandbox from that checkpoint.
 
 共享 Start 或 Restore 从第一次尝试发布物理元数据起，失败保留原身份、预留 ID、现有文件和已记录资源。运行时调用错误、运行时成功后提交或发布失败，以及初始元数据 rename 后目录同步失败，都不授权内联删除运行时或释放租约。磁盘已提交的记录保留原状态，供原创建结果查询核对。部分资源准备失败也返回并登记已知租约，成功准备的文件系统来源继续保留。cgroup 条件租约和池化网络的独立租用身份保护旧清理重试，见 [资源租约契约](scheduler-resource-leases.md)。意图对账使用物理锁、完整磁盘元数据和运行时清理后的回读；确认运行时不存在后先断开已知网络租约并移除 ACL，错误会阻止资源回收。文件系统准备／提交错误保留调用前的来源登记，卸载错误不删除引用，并持久记录每项释放；schema 3 核验原来源及整个日志的摘要，损坏或不明确的旧格式在任何重建前拒绝，见 [文件系统归属](scheduler-filesystem-ownership.md)。一般分配窗口、原挂载物理身份与卸载回读、其他资源的逐步清理、完成沙箱退役证明和真实故障验收仍待完成，不能依据资源池完成记录或意图清理日志归还调度器预算。
 
+镜像挂载路由读写、daemon 清理及 OCI／Nydus／S3 卸载后的挂载回读错误会保留原登记，并阻止未完成来源的新挂载复用，见 [镜像挂载释放边界](scheduler-image-mount-release.md)。这些条件及当前进程的成功标记不能证明原挂载身份或跨重启物理退役；完整沙箱清理和预算结算仍须独立完成。
+
 The API has three operations:
 
 1. `SandboxService.Checkpoint` checkpoints an existing sandbox.

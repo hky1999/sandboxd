@@ -31,12 +31,14 @@ func newTestManager(daemons map[string]*Daemon) *manager {
 	}
 }
 
-func newTestDaemon(id string) *Daemon {
+func newTestDaemon(t *testing.T, id string) *Daemon {
+	t.Helper()
 	d := &Daemon{
 		ctx: context.Background(),
 		meta: DaemonMeta{
-			ID:   id,
-			Name: id,
+			ID:         id,
+			Name:       id,
+			MountPoint: t.TempDir(),
 		},
 		config: &BackendConfig{},
 	}
@@ -144,7 +146,7 @@ func TestDaemon_UnmountForGC_AbortsWhenMountFailedCleared(t *testing.T) {
 // --- Manager-level GC tests ---
 
 func TestGCDaemons_CleansUpFailedDaemon(t *testing.T) {
-	d := newTestDaemon("failed-1")
+	d := newTestDaemon(t, "failed-1")
 	d.mountFailed.Store(true)
 	// IsAlive returns false (no real process), so GC won't call unmountForGC
 	// but the re-check will still delete it.
@@ -165,7 +167,7 @@ func TestGCDaemons_CleansUpFailedDaemon(t *testing.T) {
 }
 
 func TestGCDaemons_SkipsFailedDaemonWhenMountFailedCleared(t *testing.T) {
-	d := newTestDaemon("recovered-1")
+	d := newTestDaemon(t, "recovered-1")
 	d.mountFailed.Store(true)
 
 	mgr := newTestManager(map[string]*Daemon{
@@ -197,11 +199,11 @@ func TestGCDaemons_SkipsFailedDaemonWhenMountFailedCleared(t *testing.T) {
 }
 
 func TestGCDaemons_DoesNotAffectHealthyDaemons(t *testing.T) {
-	healthy := newTestDaemon("healthy-1")
+	healthy := newTestDaemon(t, "healthy-1")
 	healthy.mountFailed.Store(false)
 	healthy.updateExpired() // Not expired
 
-	failed := newTestDaemon("failed-1")
+	failed := newTestDaemon(t, "failed-1")
 	failed.mountFailed.Store(true)
 
 	mgr := newTestManager(map[string]*Daemon{
@@ -224,8 +226,8 @@ func TestGCDaemons_DoesNotAffectHealthyDaemons(t *testing.T) {
 	}
 }
 
-func TestGCDaemons_UnmountsAliveFailed(t *testing.T) {
-	d := newTestDaemon("alive-failed")
+func TestGCDaemons_RetainsAliveFailedWithUnknownPID(t *testing.T) {
+	d := newTestDaemon(t, "alive-failed")
 	d.mountFailed.Store(true)
 	d.isAliveFunc = func() bool { return true }
 	// Set up stopChan so unmountLocked doesn't panic
@@ -248,19 +250,21 @@ func TestGCDaemons_UnmountsAliveFailed(t *testing.T) {
 	_, exists := mgr.daemons[d.meta.ID]
 	mgr.mu.RUnlock()
 
-	if exists {
-		t.Error("gcDaemons should have cleaned up the alive-but-failed daemon")
+	if !exists {
+		t.Error("gcDaemons must retain an alive daemon whose original PID is unknown")
 	}
-
-	if d.getState() != DaemonStateStopped {
-		t.Errorf("daemon state = %v, want Stopped after GC unmount", d.getState())
+	if !d.releasePending {
+		t.Error("unresolved daemon release must remain pending")
+	}
+	if d.getState() == DaemonStateStopped {
+		t.Error("failed unmount cannot publish Stopped")
 	}
 }
 
 // --- Race protection tests (GetDaemon / CreateDaemon clear mountFailed) ---
 
 func TestGetDaemon_ClearsMountFailed(t *testing.T) {
-	d := newTestDaemon("get-clear")
+	d := newTestDaemon(t, "get-clear")
 	d.mountFailed.Store(true)
 
 	mgr := newTestManager(map[string]*Daemon{
@@ -331,7 +335,7 @@ func TestCreateDaemon_ExistingDaemon_ClearsMountFailed(t *testing.T) {
 func TestGCDaemons_RaceWithGetDaemon(t *testing.T) {
 	// Simulate: mount goroutine calls GetDaemon (clears mountFailed),
 	// then GC runs. GC should NOT delete the daemon.
-	d := newTestDaemon("race-1")
+	d := newTestDaemon(t, "race-1")
 	d.mountFailed.Store(true)
 
 	mgr := newTestManager(map[string]*Daemon{
@@ -359,7 +363,7 @@ func TestGCDaemons_RaceWithGetDaemon(t *testing.T) {
 func TestGCDaemons_ConcurrentMountAndGC(t *testing.T) {
 	// Run GC and Mount concurrently many times to detect races via -race flag.
 	for i := 0; i < 50; i++ {
-		d := newTestDaemon("concurrent")
+		d := newTestDaemon(t, "concurrent")
 		d.mountFailed.Store(true)
 		// Make daemon appear running so mount() returns via fast path
 		d.setState(DaemonStateRunning)
@@ -414,14 +418,14 @@ func TestDaemon_RemountAfterFailure_ClearsFlag(t *testing.T) {
 // --- Verify GC expiry-based pass still works alongside failed-daemon pass ---
 
 func TestGCDaemons_ExpiryStillWorksWithFailedPass(t *testing.T) {
-	expired := newTestDaemon("expired-1")
+	expired := newTestDaemon(t, "expired-1")
 	expired.expiredAt = time.Now().Add(-1 * time.Hour).UnixNano() // Already expired
 	expired.isAliveFunc = func() bool { return false }
 
-	failed := newTestDaemon("failed-1")
+	failed := newTestDaemon(t, "failed-1")
 	failed.mountFailed.Store(true)
 
-	healthy := newTestDaemon("healthy-1")
+	healthy := newTestDaemon(t, "healthy-1")
 	healthy.updateExpired()
 	healthy.isAliveFunc = func() bool { return true }
 
@@ -460,11 +464,11 @@ func TestGCDaemons_NoDaemonsNoPanic(t *testing.T) {
 }
 
 func TestGCDaemons_AllHealthyNoDeletion(t *testing.T) {
-	d1 := newTestDaemon("healthy-1")
+	d1 := newTestDaemon(t, "healthy-1")
 	d1.updateExpired()
 	d1.isAliveFunc = func() bool { return true }
 
-	d2 := newTestDaemon("healthy-2")
+	d2 := newTestDaemon(t, "healthy-2")
 	d2.updateExpired()
 	d2.isAliveFunc = func() bool { return true }
 
@@ -488,7 +492,7 @@ func TestGCDaemons_MultipleFailedDaemons(t *testing.T) {
 	daemons := make(map[string]*Daemon)
 	for i := 0; i < 5; i++ {
 		id := filepath.Base(t.TempDir()) // unique id
-		d := newTestDaemon(id)
+		d := newTestDaemon(t, id)
 		d.mountFailed.Store(true)
 		daemons[id] = d
 	}

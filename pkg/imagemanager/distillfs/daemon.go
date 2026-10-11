@@ -17,7 +17,6 @@ package distillfs
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -29,6 +28,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/moby/sys/mountinfo"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
 
@@ -234,6 +234,13 @@ type Daemon struct {
 	// mountFailed indicates a mount attempt timed out without success.
 	// GC uses this to detect and clean up orphaned daemon processes.
 	mountFailed atomic.Bool
+
+	// Protected by mu; unresolved cleanup cannot be reused by Mount.
+	releasePending         bool
+	targetUnmountSucceeded bool
+	mountPresentFunc       func(string) (bool, error)
+	unmountTargetFunc      func(string, int) error
+	unmountTimeout         time.Duration
 
 	// isAliveFunc allows mocking IsAlive() for testing
 	isAliveFunc func() bool
@@ -483,7 +490,6 @@ func (d *Daemon) remount() {
 		return
 	}
 	logrus.WithFields(d.daemonLogFields()).Info("try remount daemon")
-	os.Remove(d.meta.PidFilePath)
 	if err := d.mount(false); err != nil {
 		logrus.WithFields(d.daemonLogFields()).WithError(err).Error("failed to remount daemon")
 	}
@@ -567,6 +573,9 @@ func (d *Daemon) mount(userInitiated bool) error {
 
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	if d.releasePending {
+		return fmt.Errorf("daemon mount release is unconfirmed")
+	}
 
 	// Clear mountFailed: a new mount attempt supersedes any prior timeout.
 	// GC's unmountForGC checks this flag under d.mu, so they serialize correctly.
@@ -593,8 +602,15 @@ func (d *Daemon) mount(userInitiated bool) error {
 		return nil
 	}
 
+	if !userInitiated && !isAlive {
+		if err := os.Remove(d.meta.PidFilePath); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("prepare original daemon remount: %w", err)
+		}
+	}
+
 	// If already mounting, skip starting new process but wait for it to complete
 	if state != DaemonStateMounting {
+		d.targetUnmountSucceeded = false
 		// Set state to Mounting at the beginning
 		d.setState(DaemonStateMounting)
 
@@ -839,56 +855,67 @@ func (d *Daemon) initializeDaemon(ctx context.Context, timing *TimedOperation) e
 	return nil
 }
 
-func isMountPoint(path string) (bool, error) {
-	info, err := os.Lstat(path)
+func isMountPoint(target string) (bool, error) {
+	if !filepath.IsAbs(target) || filepath.Clean(target) != target {
+		return false, fmt.Errorf("mount point must be an absolute clean path")
+	}
+	mounts, err := mountinfo.GetMounts(nil)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return false, nil
+		return false, fmt.Errorf("read mount table: %w", err)
+	}
+	for _, mount := range mounts {
+		if mount.Mountpoint == target {
+			return true, nil
 		}
-		return false, fmt.Errorf("failed to stat path %s: %w", path, err)
 	}
-	stat, ok := info.Sys().(*syscall.Stat_t)
-	if !ok {
-		return false, fmt.Errorf("could not get syscall.Stat_t for %s", path)
+	// No mount-table entry is known. Still reject unreadable or aliased paths,
+	// rather than treating an invalid path as proof of successful cleanup.
+	info, err := os.Lstat(target)
+	if os.IsNotExist(err) {
+		return false, nil
 	}
-	parentPath := filepath.Dir(path)
-	parentInfo, err := os.Lstat(parentPath)
 	if err != nil {
-		return false, fmt.Errorf("failed to stat parent path %s: %w", parentPath, err)
+		return false, fmt.Errorf("inspect mount point: %w", err)
 	}
-
-	parentStat, ok := parentInfo.Sys().(*syscall.Stat_t)
-	if !ok {
-		return false, fmt.Errorf("could not get syscall.Stat_t for parent %s", parentPath)
-	}
-	if stat.Dev != parentStat.Dev {
-		return true, nil
-	}
-	if path == parentPath {
-		return true, nil
+	if info.Mode()&os.ModeSymlink != 0 {
+		return false, fmt.Errorf("mount point is a symbolic link")
 	}
 	return false, nil
 }
 
-func (d *Daemon) cleanMountPoint() error {
-	isMount, err := isMountPoint(d.meta.MountPoint)
-	if err != nil {
-		return fmt.Errorf("could not determine if '%s' is a mount point: %w", d.meta.MountPoint, err)
+func (d *Daemon) mountPresent(target string) (bool, error) {
+	if d.mountPresentFunc != nil {
+		return d.mountPresentFunc(target)
 	}
-	if !isMount {
+	return isMountPoint(target)
+}
+
+func (d *Daemon) cleanMountPoint() error {
+	mounted, err := d.mountPresent(d.meta.MountPoint)
+	if err != nil {
+		return fmt.Errorf("inspect original mount point: %w", err)
+	}
+	if !mounted {
 		return nil
 	}
-	if err := syscall.Unmount(d.meta.MountPoint, 0); err != nil {
-		if errors.Is(err, syscall.EPERM) {
-			return fmt.Errorf("failed to unmount '%s' due to permission denied. Did you run as root? Error: %w",
-				d.meta.MountPoint, err)
-		}
-		if errors.Is(err, syscall.EBUSY) {
-			return fmt.Errorf("failed to unmount '%s' because it is busy. Error: %w", d.meta.MountPoint, err)
-		}
-		return fmt.Errorf("unmount syscall failed for '%s': %w", d.meta.MountPoint, err)
+	if d.targetUnmountSucceeded {
+		return fmt.Errorf("mount point appeared after a confirmed unmount")
 	}
-	logrus.WithFields(d.daemonLogFields()).Info("successfully unmount using syscall")
+	unmount := d.unmountTargetFunc
+	if unmount == nil {
+		unmount = syscall.Unmount
+	}
+	if err := unmount(d.meta.MountPoint, 0); err != nil {
+		return fmt.Errorf("unmount original target: %w", err)
+	}
+	d.targetUnmountSucceeded = true
+	mounted, err = d.mountPresent(d.meta.MountPoint)
+	if err != nil {
+		return fmt.Errorf("read back original mount point: %w", err)
+	}
+	if mounted {
+		return fmt.Errorf("mount point remains mounted after unmount")
+	}
 	return nil
 }
 
@@ -909,34 +936,53 @@ func (d *Daemon) unmountForGC() bool {
 		logrus.WithFields(d.daemonLogFields()).Info("gc: abort unmount, new mount cleared mountFailed")
 		return false
 	}
-	d.unmountLocked()
+	if err := d.unmountLocked(); err != nil {
+		logrus.WithFields(d.daemonLogFields()).WithError(err).Warn("preserve failed daemon cleanup during garbage collection")
+		return false
+	}
 	return true
 }
 
 // unmountLocked performs the actual unmount. Caller must hold d.mu.
-func (d *Daemon) unmountLocked() error {
+func (d *Daemon) unmountLocked() (retErr error) {
 	// Start timing operation
 	timing, _ := StartTimedOperation(d.ctx, "daemon.Unmount", d.meta.ID)
 	defer timing.End()
 	logrus.WithFields(d.daemonLogFields()).Info("daemon unmount path started")
 
-	timeout := time.NewTimer(daemonUnmountTimeout)
+	duration := d.unmountTimeout
+	if duration <= 0 {
+		duration = daemonUnmountTimeout
+	}
+	timeout := time.NewTimer(duration)
 	defer timeout.Stop()
+	d.releasePending = true
 	defer func() {
+		if retErr != nil {
+			return
+		}
 		stageStart := time.Now()
-		err := d.cleanMountPoint()
-		if err != nil {
-			logrus.WithFields(d.daemonLogFields()).WithError(err).Warn("failed to clean mount point")
+		if err := d.cleanMountPoint(); err != nil {
+			timing.Fail(err)
+			retErr = err
+			return
 		}
 		timing.Stage("clean_mount_point", time.Since(stageStart))
-
-		// clean pid file
-		if err = os.Remove(d.meta.PidFilePath); err != nil {
-			logrus.WithFields(d.daemonLogFields()).WithError(err).Warn("failed to clean daemon pid file")
+		if err := os.Remove(d.meta.PidFilePath); err != nil && !os.IsNotExist(err) {
+			retErr = fmt.Errorf("remove original daemon PID record: %w", err)
+			timing.Fail(retErr)
+			return
 		}
 		d.setState(DaemonStateStopped)
 		d.updateExpired()
+		d.releasePending = false
 	}()
+	// Initialization can still publish a process or mount. Do not claim
+	// cleanup or clear the PID record while that original attempt is unresolved.
+	if d.getState() == DaemonStateMounting {
+		d.userStopped.Store(true)
+		return fmt.Errorf("daemon initialization is still unresolved")
+	}
 
 	// Mark as explicitly stopped to prevent automatic remount
 	d.userStopped.Store(true)
@@ -962,7 +1008,7 @@ func (d *Daemon) unmountLocked() error {
 			case <-d.stopChan:
 				logrus.WithFields(d.daemonLogFields()).Info("daemon watch goroutine exited")
 			case <-timeout.C:
-				logrus.WithFields(d.daemonLogFields()).Warn("wait daemon watch goroutine timeout")
+				return fmt.Errorf("daemon stop observation is still unresolved")
 			}
 		}
 		logrus.WithFields(d.daemonLogFields()).Info("daemon unmount path completed")
@@ -971,7 +1017,7 @@ func (d *Daemon) unmountLocked() error {
 
 	pid := d.getPid()
 	if pid <= 0 {
-		return nil
+		return fmt.Errorf("daemon reported alive but original PID is unknown")
 	}
 
 	// Stage 2: Send SIGTERM
