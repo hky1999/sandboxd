@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 
 	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
@@ -33,7 +34,7 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-const fsJournalSchema = 2
+const fsJournalSchema = 3
 const fsJournalLimit = 65536
 
 type fsLeasePhase string
@@ -73,13 +74,14 @@ type preparedFS struct {
 }
 
 type sandboxFSState struct {
-	Generation  string              `json:"generation,omitempty"`
-	Rootfs      []byte              `json:"rootfs,omitempty"`
-	S3          []*runtime.S3Config `json:"s3,omitempty"`
-	OCI         []string            `json:"oci,omitempty"`
-	RootfsPhase fsLeasePhase        `json:"rootfs_phase"`
-	S3Phases    []fsLeasePhase      `json:"s3_phases,omitempty"`
-	OCIPhases   []fsLeasePhase      `json:"oci_phases,omitempty"`
+	SourceFingerprint string              `json:"source_fingerprint"`
+	Generation        string              `json:"generation,omitempty"`
+	Rootfs            []byte              `json:"rootfs,omitempty"`
+	S3                []*runtime.S3Config `json:"s3,omitempty"`
+	OCI               []string            `json:"oci,omitempty"`
+	RootfsPhase       fsLeasePhase        `json:"rootfs_phase"`
+	S3Phases          []fsLeasePhase      `json:"s3_phases,omitempty"`
+	OCIPhases         []fsLeasePhase      `json:"oci_phases,omitempty"`
 }
 
 type fsCompletion struct {
@@ -89,9 +91,10 @@ type fsCompletion struct {
 }
 
 type storedSandboxFSStates struct {
-	SchemaVersion int                       `json:"schema_version,omitempty"`
-	Items         map[string]sandboxFSState `json:"items"`
-	Completed     map[string]fsCompletion   `json:"completed,omitempty"`
+	IntegritySHA256 string                    `json:"integrity_sha256,omitempty"`
+	SchemaVersion   int                       `json:"schema_version,omitempty"`
+	Items           map[string]sandboxFSState `json:"items"`
+	Completed       map[string]fsCompletion   `json:"completed,omitempty"`
 }
 
 func newFSManager(imgSvc imageapi.Service, stores ...store.DbStore) *fsManager {
@@ -137,6 +140,9 @@ func (m *fsManager) Prepare(request *runtime.StartRequest) (*preparedFS, error) 
 		return nil, err
 	}
 	state := sandboxFSState{Generation: p.generation, Rootfs: rootfs, RootfsPhase: fsReserved}
+	if p.sandboxID == "" || strings.ContainsRune(p.sandboxID, 0) || strings.ContainsRune(p.generation, 0) {
+		return nil, fmt.Errorf("invalid filesystem owner identity")
+	}
 	for _, mount := range p.mounts {
 		if mount == nil {
 			continue
@@ -161,6 +167,13 @@ func (m *fsManager) Prepare(request *runtime.StartRequest) (*preparedFS, error) 
 			state.OCI = append(state.OCI, source.ImageUrl)
 			state.OCIPhases = append(state.OCIPhases, fsReserved)
 		}
+	}
+	if err := validateFSSources(state); err != nil {
+		return nil, err
+	}
+	state.SourceFingerprint, err = fsSourceFingerprint(p.sandboxID, state)
+	if err != nil {
+		return nil, err
 	}
 	m.persistMu.Lock()
 	defer m.persistMu.Unlock()
@@ -400,20 +413,9 @@ func (m *fsManager) releaseLocked(id, generation string, conditional bool) error
 			return err
 		}
 	}
-	source, err := json.Marshal(struct {
-		Generation string
-		Rootfs     []byte
-		S3         []*runtime.S3Config
-		OCI        []string
-	}{
-		state.Generation, state.Rootfs, state.S3, state.OCI})
-	if err != nil {
-		return err
-	}
-	sum := sha256.Sum256(source)
 	m.mu.Lock()
 	previousReceipt, previousExists := m.completed[key]
-	m.completed[key] = fsCompletion{SandboxID: id, Generation: generation, SourceFingerprint: hex.EncodeToString(sum[:])}
+	m.completed[key] = fsCompletion{SandboxID: id, Generation: generation, SourceFingerprint: state.SourceFingerprint}
 	delete(m.sandboxState, id)
 	m.mu.Unlock()
 	if err := m.persistCurrentState(); err != nil {
@@ -498,6 +500,14 @@ func (m *fsManager) persistCurrentState() error {
 		stored.Completed[key] = receipt
 	}
 	m.mu.Unlock()
+	if err := validateFSJournal(stored); err != nil {
+		return err
+	}
+	integrity, err := fsJournalIntegrity(stored)
+	if err != nil {
+		return err
+	}
+	stored.IntegritySHA256 = integrity
 	data, err := json.Marshal(stored)
 	if err != nil {
 		return err
@@ -524,53 +534,9 @@ func (m *fsManager) loadLocked() error {
 	if err != nil {
 		return err
 	}
-	var stored storedSandboxFSStates
-	if err := json.Unmarshal(data, &stored); err != nil {
+	stored, err := decodeFSJournal(data)
+	if err != nil {
 		return err
-	}
-	if stored.SchemaVersion != 0 && stored.SchemaVersion != fsJournalSchema {
-		return fmt.Errorf("unsupported filesystem ownership schema")
-	}
-	if len(stored.Items)+len(stored.Completed) > fsJournalLimit {
-		return fmt.Errorf("filesystem journal limit exceeded")
-	}
-	for id, state := range stored.Items {
-		if id == "" || len(state.Rootfs) == 0 {
-			return fmt.Errorf("invalid filesystem owner")
-		}
-		if stored.SchemaVersion == 0 {
-			state.RootfsPhase = fsAcquired
-			state.S3Phases = make([]fsLeasePhase, len(state.S3))
-			for i := range state.S3Phases {
-				state.S3Phases[i] = fsAcquired
-			}
-			state.OCIPhases = make([]fsLeasePhase, len(state.OCI))
-			for i := range state.OCIPhases {
-				state.OCIPhases[i] = fsAcquired
-			}
-		}
-		if len(state.S3) != len(state.S3Phases) || len(state.OCI) != len(state.OCIPhases) {
-			return fmt.Errorf("incomplete filesystem ownership stages")
-		}
-		phases := append([]fsLeasePhase{state.RootfsPhase}, state.S3Phases...)
-		phases = append(phases, state.OCIPhases...)
-		for _, phase := range phases {
-			switch phase {
-			case fsReserved, fsAcquiring, fsAcquired, fsReleasePending, fsReleased:
-			default:
-				return fmt.Errorf("invalid filesystem ownership stage")
-			}
-		}
-		stored.Items[id] = cloneFSState(state)
-	}
-	for key, r := range stored.Completed {
-		fingerprint, err := hex.DecodeString(r.SourceFingerprint)
-		if err != nil || len(fingerprint) != sha256.Size || r.SandboxID == "" || key != fsCompletionKey(r.SandboxID, r.Generation) {
-			return fmt.Errorf("invalid filesystem completion")
-		}
-		if active, exists := stored.Items[r.SandboxID]; exists && active.Generation == r.Generation {
-			return fmt.Errorf("filesystem generation is both active and completed")
-		}
 	}
 	m.mu.Lock()
 	for id, state := range stored.Items {
