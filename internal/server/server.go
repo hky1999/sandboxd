@@ -1680,95 +1680,23 @@ func (h *sandboxService) createSandbox(
 	var preparedFilesystem *preparedFS
 	var preparedResources *preparedStartResources
 	var sandboxFiles *preparedSandboxFiles
-	var filesystemCommitted bool
-	var runtimeStarted bool
-	var dnatConfigured bool
 	var portsReserved bool
-	var metadataPersisted bool
-	var aclAttempted bool
-	var aclRegistered bool
-	var xpuAcquired bool
+	var metadataPersistenceAttempted bool
 	defer func() {
 		if startSucceeded {
 			return
 		}
-		if errors.Is(retErr, svc.ErrRestoreCleanupIncomplete) || errors.Is(retErr, svc.ErrRuntimeCreationUnconfirmed) ||
-			errors.Is(retErr, errPhysicalPreparationIncomplete) {
-			logrus.Warnf(
-				"retain physical intent and prepared resources for sandbox %s after unconfirmed preparation or runtime creation",
-				sandboxID,
-			)
+		// PersistMetadata can rename before its durability confirmation fails.
+		// From the first attempted publication onward, every failure belongs to
+		// this physical generation. Keep its ID, files and all prepared leases
+		// for authoritative reconciliation; inline rollback cannot prove their
+		// complete retirement and must not erase the durable ownership first.
+		if metadataPersistenceAttempted {
+			logrus.Warnf("retain original physical ownership for sandbox %s after creation failure", sandboxID)
 			return
-		}
-		if runtimeStarted {
-			cleanupCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-			if handler, ok := h.serviceHandler.Get(startReq.Runtime); ok {
-				if err := handler.Delete(cleanupCtx, sandboxID); err != nil {
-					logrus.Warnf("rollback runtime for sandbox %s: %v", sandboxID, err)
-					// Keep the durable INTENT and its resource ownership hidden from
-					// List. Restart reconciliation resolves the uncertain runtime fact.
-					cancel()
-					return
-				} else {
-					h.sandboxManager.CleanSandboxRoot(sandboxID)
-				}
-			}
-			cancel()
-		} else if metadataPersisted {
-			h.sandboxManager.CleanSandboxRoot(sandboxID)
-		}
-		if dnatConfigured {
-			h.networkMgr.cleanupDnatRules(sandboxID)
-		}
-		if preparedResources != nil {
-			if err := h.deactivateStartNetwork(preparedResources.OccupiedResource); err != nil {
-				logrus.Warnf("deactivate network endpoint while rolling back sandbox %s: %v", sandboxID, err)
-			}
 		}
 		if portsReserved {
 			h.networkMgr.releaseDnatPorts(sandboxID)
-		}
-		aclCleanupFailed := aclAttempted && !aclRegistered
-		if aclAttempted && h.aclMgr != nil {
-			h.aclMu.Lock()
-			if err := h.aclMgr.Remove(sandboxID); err != nil {
-				logrus.Warnf("rollback network ACL for sandbox %s: %v", sandboxID, err)
-				aclCleanupFailed = true
-			}
-			h.aclMu.Unlock()
-		}
-		if aclCleanupFailed && preparedResources != nil {
-			resource := preparedResources.Resources[config.ResourceNameInterface]
-			// Never return an endpoint whose ACL registration or cleanup failed
-			// to the idle pool. A successful discard destroys its TC
-			// attachments; a failed discard leaves the lease quarantined in
-			// the interface manager for restart recovery.
-			if discardErr := h.networkMgr.Discard(resource); discardErr != nil {
-				logrus.Warnf(
-					"quarantine interface after ACL rollback failure for sandbox %s: %v",
-					sandboxID,
-					discardErr,
-				)
-			}
-			delete(preparedResources.Resources, config.ResourceNameInterface)
-		}
-		if filesystemCommitted {
-			if err := h.fsMgr.Release(sandboxID); err != nil {
-				logrus.Warnf("rollback filesystem state for sandbox %s: %v", sandboxID, err)
-			}
-		} else if preparedFilesystem != nil {
-			preparedFilesystem.Rollback()
-		}
-		if preparedResources != nil {
-			if err := h.releaseStartResources(preparedResources.OccupiedResource); err != nil {
-				logrus.Warnf("rollback resources for sandbox %s: %v", sandboxID, err)
-			}
-		}
-		if xpuAcquired && h.xpuMgr != nil {
-			h.xpuMgr.Release(sandboxID)
-		}
-		if sandboxFiles != nil {
-			sandboxFiles.Rollback()
 		}
 		h.sandboxManager.ReleaseID(sandboxID)
 	}()
@@ -1797,12 +1725,12 @@ func (h *sandboxService) createSandbox(
 	if options.restoreIdentity != nil {
 		metadata.RestoreIdentity = proto.Clone(options.restoreIdentity).(*runtime.RestoreIdentity)
 	}
+	metadataPersistenceAttempted = true
 	if err := h.sandboxManager.PersistMetadata(sandboxID, metadata); err != nil {
 		return &runtime.StartResponse{
 			Code: -1, Message: fmt.Sprintf("Failed to persist sandbox physical identity: %v", err),
 		}, err
 	}
-	metadataPersisted = true
 	if options.onReserved != nil {
 		if err := options.onReserved(startReq, sandboxID); err != nil {
 			return &runtime.StartResponse{Code: -1, Message: err.Error()}, err
@@ -1841,8 +1769,6 @@ func (h *sandboxService) createSandbox(
 		if preparedFilesystem != nil {
 			if err := h.fsMgr.Commit(sandboxID, preparedFilesystem); err != nil {
 				preparationErr = errors.Join(preparationErr, err)
-			} else {
-				filesystemCommitted = true
 			}
 		}
 		return &runtime.StartResponse{
@@ -1857,7 +1783,6 @@ func (h *sandboxService) createSandbox(
 			Message: fmt.Sprintf("Failed to commit filesystem state: %v", err),
 		}, err
 	}
-	filesystemCommitted = true
 	runtimeRootfs := preparedFilesystem.RootfsPath()
 	var specUpdates *svc.SpecUpdates
 	if len(startReq.XpuAllocations) > 0 {
@@ -1873,7 +1798,6 @@ func (h *sandboxService) createSandbox(
 				Message: fmt.Sprintf("failed to allocate XPU devices: %v", err),
 			}, errord.ToGRPC(errord.ErrInvalidArgument)
 		}
-		xpuAcquired = specUpdates != nil
 	}
 
 	// Rootfs env (from image mount) goes first with lowest priority; request
@@ -1944,7 +1868,6 @@ func (h *sandboxService) createSandbox(
 			}, err
 		}
 		h.aclMu.Lock()
-		aclAttempted = true
 		err = h.aclMgr.Register(networkacl.Binding{
 			SandboxID: sandboxID,
 			IP:        preparedResources.network.Ip,
@@ -1956,7 +1879,6 @@ func (h *sandboxService) createSandbox(
 				Code: -1, Message: fmt.Sprintf("failed to install network ACL: %v", err),
 			}, err
 		}
-		aclRegistered = true
 	}
 	sandboxFiles, err = h.prepareSandboxFiles(
 		sandboxID,
@@ -2007,7 +1929,6 @@ func (h *sandboxService) createSandbox(
 			ID:      "",
 		}, err
 	}
-	runtimeStarted = true
 
 	// If Ports are specified, set up DNAT rules using sandbox IP from startSandboxRuntime.
 	if len(startReq.Ports) > 0 {
@@ -2023,7 +1944,6 @@ func (h *sandboxService) createSandbox(
 				Message: fmt.Sprintf("Failed to setup DNAT rules: %v", err),
 			}, err
 		}
-		dnatConfigured = true
 	}
 
 	metadata.PhysicalPhase = runtime.SandboxPhysicalPhase_SANDBOX_PHYSICAL_PHASE_COMMITTED

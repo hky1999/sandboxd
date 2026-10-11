@@ -170,6 +170,26 @@ func (h *sandboxService) reconcilePhysicalIntent(
 	if err := cleanupCtx.Err(); err != nil {
 		return err
 	}
+	resources, resourceErr := h.physicalResources(metadata)
+	if resourceErr != nil && !errors.Is(resourceErr, os.ErrNotExist) {
+		return fmt.Errorf("collect resources for physical intent %s: %w", metadata.ID, resourceErr)
+	}
+	// Failed creation retains any installed policy together with its endpoint.
+	// Disconnect the original lease before removing ACLs, and never allow a
+	// failed ACL cleanup to return that endpoint to the idle pool.
+	if resourceErr == nil {
+		if err := h.deactivateStartNetwork(resources); err != nil {
+			return fmt.Errorf("deactivate network for physical intent %s: %w", metadata.ID, err)
+		}
+	}
+	if h.aclMgr != nil {
+		h.aclMu.Lock()
+		aclErr := h.aclMgr.Remove(metadata.ID)
+		h.aclMu.Unlock()
+		if aclErr != nil {
+			return fmt.Errorf("remove network ACL for physical intent %s: %w", metadata.ID, aclErr)
+		}
+	}
 	if h.xpuMgr != nil {
 		h.xpuMgr.Release(metadata.ID)
 	}
@@ -179,17 +199,13 @@ func (h *sandboxService) reconcilePhysicalIntent(
 		}
 	}
 
-	resources, err := h.physicalResources(metadata)
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("collect resources for physical intent %s: %w", metadata.ID, err)
-	}
 	if cleanupErr := h.cleanupPhysicalDnatFacts(metadata, resources); cleanupErr != nil {
 		return cleanupErr
 	}
 	if h.networkMgr != nil {
 		h.networkMgr.releaseDnatPorts(metadata.ID)
 	}
-	if err == nil {
+	if resourceErr == nil {
 		if err := h.releaseStartResources(resources); err != nil {
 			return fmt.Errorf("release resources for physical intent %s: %w", metadata.ID, err)
 		}
