@@ -21,6 +21,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -180,23 +181,26 @@ func (cfg *BackendConfig) LoadTemplate(templatePath string) error {
 }
 
 type DaemonMeta struct {
-	ID            string               `json:"id"`
-	Name          string               `json:"name"`
-	CfgPath       string               `json:"cfg_path"`
-	MountPoint    string               `json:"mount_point"`
-	DaemonDir     string               `json:"daemon_dir"`
-	DaemonLogPath string               `json:"daemon_log_path"`
-	PidFilePath   string               `json:"pid_file_path"`
-	CachePath     string               `json:"cache_path"`
-	ImageMetaDir  string               `json:"image_meta_dir"`
-	ChunkDBDir    string               `json:"chunk_db_dir"`
-	SourceType    string               `json:"source_type,omitempty"`    // "oss" or "nydus"
-	BootstrapPath string               `json:"bootstrap_path,omitempty"` // For Nydus: path to bootstrap file
-	CacheDir      string               `json:"cache_dir,omitempty"`      // For Nydus: --cache-dir parameter
-	ImageURL      string               `json:"image_url,omitempty"`      // For Nydus: image URL for bootstrap download
-	Env           []string             `json:"env,omitempty"`            // Environment variables from image config
-	EnvResolved   bool                 `json:"env_resolved,omitempty"`   // True after env has been extracted (distinguishes nil env from unresolved)
-	ImageProcess  *imageconfig.Process `json:"image_process,omitempty"`
+	PhysicalIdentity *physicalIdentity    `json:"physical_identity,omitempty"`
+	SchemaVersion    int                  `json:"schema_version,omitempty"`
+	IntegritySHA256  string               `json:"integrity_sha256,omitempty"`
+	ID               string               `json:"id"`
+	Name             string               `json:"name"`
+	CfgPath          string               `json:"cfg_path"`
+	MountPoint       string               `json:"mount_point"`
+	DaemonDir        string               `json:"daemon_dir"`
+	DaemonLogPath    string               `json:"daemon_log_path"`
+	PidFilePath      string               `json:"pid_file_path"`
+	CachePath        string               `json:"cache_path"`
+	ImageMetaDir     string               `json:"image_meta_dir"`
+	ChunkDBDir       string               `json:"chunk_db_dir"`
+	SourceType       string               `json:"source_type,omitempty"`    // "oss" or "nydus"
+	BootstrapPath    string               `json:"bootstrap_path,omitempty"` // For Nydus: path to bootstrap file
+	CacheDir         string               `json:"cache_dir,omitempty"`      // For Nydus: --cache-dir parameter
+	ImageURL         string               `json:"image_url,omitempty"`      // For Nydus: image URL for bootstrap download
+	Env              []string             `json:"env,omitempty"`            // Environment variables from image config
+	EnvResolved      bool                 `json:"env_resolved,omitempty"`   // True after env has been extracted (distinguishes nil env from unresolved)
+	ImageProcess     *imageconfig.Process `json:"image_process,omitempty"`
 }
 
 // DaemonInfo contains basic information about a daemon
@@ -209,20 +213,30 @@ type DaemonInfo struct {
 }
 
 type Daemon struct {
-	chunkDBSize string // Node configuration, also injected when recovering saved daemons.
-	mu          sync.Mutex
-	ctx         context.Context
-	meta        DaemonMeta
-	binPath     string
-	config      *BackendConfig // Backend configuration (OSS, Nydus/Registry, etc.)
-	savedPath   string
-	stopChan    chan struct{}
-	kickStop    *Stopper
-	state       atomic.Int32 // DaemonState
-	expiredAt   int64
-	nydusClient NydusClient           // For Nydus: client to fetch bootstrap
-	proxyURL    string                // For Nydus: proxy URL for bootstrap download
-	cgroupCtrl  *imgcgroup.Controller // Memory cgroup controller (nil = disabled)
+	physicalMu                 sync.Mutex
+	physicalPublicationPending bool
+	physicalScopeFunc          func() (physicalScope, error)
+	physicalMountFunc          func(string) (*physicalMountIdentity, error)
+	physicalProcessFunc        func(int) (*physicalProcessIdentity, error)
+	physicalSignalFunc         func(*physicalProcessIdentity, syscall.Signal) error
+	metadataLoaded             bool
+	chunkDBSize                string // Node configuration, also injected when recovering saved daemons.
+	mu                         sync.Mutex
+	ctx                        context.Context
+	meta                       DaemonMeta
+	binPath                    string
+	config                     *BackendConfig // Backend configuration (OSS, Nydus/Registry, etc.)
+	savedPath                  string
+	metaPersistMu              sync.Mutex
+	savedMetaSHA256            string
+	metadataDirectorySyncFunc  func(*os.File) error
+	stopChan                   chan struct{}
+	kickStop                   *Stopper
+	state                      atomic.Int32 // DaemonState
+	expiredAt                  int64
+	nydusClient                NydusClient           // For Nydus: client to fetch bootstrap
+	proxyURL                   string                // For Nydus: proxy URL for bootstrap download
+	cgroupCtrl                 *imgcgroup.Controller // Memory cgroup controller (nil = disabled)
 
 	// watcherActive indicates if watcher goroutine is active
 	watcherActive atomic.Bool
@@ -265,15 +279,13 @@ func (d *Daemon) daemonLogFields() logrus.Fields {
 }
 
 func (d *Daemon) saveMeta() error {
-	file, err := os.OpenFile(d.savedPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
-	if err != nil {
-		return fmt.Errorf("failed to open file %s: %w", d.savedPath, err)
+	d.physicalMu.Lock()
+	defer d.physicalMu.Unlock()
+	err := d.persistDaemonMetadata()
+	if d.meta.PhysicalIdentity != nil {
+		d.physicalPublicationPending = err != nil
 	}
-	defer file.Close()
-	if err = json.NewEncoder(file).Encode(&d.meta); err != nil {
-		return fmt.Errorf("failed to dump json format: %w", err)
-	}
-	return nil
+	return err
 }
 
 func (d *Daemon) loadBackendConfig() error {
@@ -378,6 +390,17 @@ func (d *Daemon) IsAlive() bool {
 	if d.isAliveFunc != nil {
 		return d.isAliveFunc()
 	}
+	if p := d.originalPhysicalIdentity(); p != nil {
+		if p.Process == nil || p.Phase == "released" || p.Phase == "not_started" {
+			return false
+		}
+		scope, err := d.observeOriginalScope()
+		if err != nil || scope != p.Scope {
+			return false
+		}
+		current, err := d.observeOriginalProcess(p.Process.PID)
+		return err == nil && current != nil && *current == *p.Process
+	}
 
 	pid := d.getPid()
 	if pid <= 0 {
@@ -391,26 +414,20 @@ func (d *Daemon) IsAlive() bool {
 }
 
 func (d *Daemon) LoadExisted(metaFilePath string) error {
-	file, err := os.Open(metaFilePath)
-	if err != nil {
-		return fmt.Errorf("failed to load from meta file, %w", err)
-	}
-	defer file.Close()
-	if err = json.NewDecoder(file).Decode(&d.meta); err != nil {
-		return fmt.Errorf("invalid json format, %w", err)
-	}
-
-	// Backward compatibility: default to "oss" if SourceType is not set
-	if d.meta.SourceType == "" {
-		d.meta.SourceType = "oss"
-	}
-
-	// Load backend config (works for both OSS and Nydus)
-	d.config = &BackendConfig{}
-	if err = d.loadBackendConfig(); err != nil {
+	if err := d.loadDaemonMetadata(metaFilePath); err != nil {
 		return err
 	}
+	d.activateRecoveredDaemon()
+	return nil
+}
 
+func (d *Daemon) activateRecoveredDaemon() {
+	if p := d.originalPhysicalIdentity(); p == nil || p.Phase == "launching" || p.Phase == "releasing" {
+		d.releasePending = true
+		d.userStopped.Store(true)
+		d.setState(DaemonStateStopped)
+		return
+	}
 	if d.IsAlive() {
 		d.kickStop = NewStopper()
 		d.stopChan = make(chan struct{})
@@ -421,7 +438,6 @@ func (d *Daemon) LoadExisted(metaFilePath string) error {
 		d.setState(DaemonStateStopped)
 		logrus.WithFields(d.daemonLogFields()).Info("load non-active daemon")
 	}
-	return nil
 }
 
 func (d *Daemon) updateExpired() {
@@ -511,12 +527,16 @@ func (d *Daemon) applyConfig() error {
 
 // buildMountArgs generates CLI arguments for distill_fs based on source type
 func (d *Daemon) buildMountArgs() []string {
+	return d.buildMountArgsForPIDFile(d.meta.PidFilePath)
+}
+
+func (d *Daemon) buildMountArgsForPIDFile(pidFile string) []string {
 	// Common arguments for both OSS and Nydus
 	args := []string{
 		"mount",
 		"--daemon",
 		"--log-file", d.meta.DaemonLogPath,
-		"--pid-file", d.meta.PidFilePath,
+		"--pid-file", pidFile,
 		"--name", d.meta.Name,
 		"--mountpoint", d.meta.MountPoint,
 	}
@@ -576,6 +596,9 @@ func (d *Daemon) mount(userInitiated bool) error {
 	if d.releasePending {
 		return fmt.Errorf("daemon mount release is unconfirmed")
 	}
+	if p := d.originalPhysicalIdentity(); p != nil && p.Phase != "released" && p.Phase != "not_started" && d.getState() != DaemonStateRunning {
+		return fmt.Errorf("original physical daemon lifecycle must be reconciled before remount")
+	}
 
 	// Clear mountFailed: a new mount attempt supersedes any prior timeout.
 	// GC's unmountForGC checks this flag under d.mu, so they serialize correctly.
@@ -598,6 +621,11 @@ func (d *Daemon) mount(userInitiated bool) error {
 
 	// Fast path: if already running and alive, return immediately
 	if state == DaemonStateRunning && isAlive {
+		if d.originalPhysicalIdentity() != nil {
+			if err := d.verifyOriginalMountForRemoval(); err != nil {
+				return err
+			}
+		}
 		logrus.WithFields(d.daemonLogFields()).Info("daemon already mounted")
 		return nil
 	}
@@ -693,6 +721,10 @@ func (d *Daemon) startDaemonProcess() {
 				continue
 			}
 			if isMountReady {
+				if err := d.captureOriginalMount(); err != nil {
+					timing.Fail(err)
+					return
+				}
 				elapsed := time.Since(stageStart)
 				d.setState(DaemonStateRunning)
 				timing.Stage("wait_mount_ready", elapsed)
@@ -811,6 +843,10 @@ func (d *Daemon) initializeDaemon(ctx context.Context, timing *TimedOperation) e
 
 	// Stage 3: Build args and start process
 	stageStart = time.Now()
+	if err := d.preparePhysicalLaunch(); err != nil {
+		timing.Fail(err)
+		return err
+	}
 	args := d.buildMountArgs()
 	c := exec.CommandContext(ctx, d.binPath, args...)
 	logrus.WithFields(d.daemonLogFields()).WithField("command", fmt.Sprintf("%s %s", d.binPath, strings.Join(args, " "))).Info("mounting daemon")
@@ -820,12 +856,22 @@ func (d *Daemon) initializeDaemon(ctx context.Context, timing *TimedOperation) e
 
 	err := c.Start()
 	if err != nil {
+		if p := d.originalPhysicalIdentity(); p != nil {
+			p.Phase = "not_started"
+			if persistErr := d.publishPhysicalIdentity(p); persistErr != nil {
+				return persistErr
+			}
+		}
 		logrus.WithFields(d.daemonLogFields()).WithError(err).Error("failed to start distill daemon")
 		timing.Fail(err)
 		return err
 	}
 	if err = c.Wait(); err != nil {
 		logrus.WithFields(d.daemonLogFields()).WithError(err).Error("distill daemon exited abnormal")
+		timing.Fail(err)
+		return err
+	}
+	if err := d.captureOriginalProcess(); err != nil {
 		timing.Fail(err)
 		return err
 	}
@@ -887,16 +933,29 @@ func (d *Daemon) mountPresent(target string) (bool, error) {
 	if d.mountPresentFunc != nil {
 		return d.mountPresentFunc(target)
 	}
+	if d.physicalMountFunc != nil {
+		mount, err := d.physicalMountFunc(target)
+		return mount != nil, err
+	}
 	return isMountPoint(target)
 }
 
 func (d *Daemon) cleanMountPoint() error {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	mounted, err := d.mountPresent(d.meta.MountPoint)
 	if err != nil {
 		return fmt.Errorf("inspect original mount point: %w", err)
 	}
 	if !mounted {
 		return nil
+	}
+	// Test-only backend seams retain their existing boolean observation model.
+	// Native cleanup always requires the recorded original kernel identity.
+	if d.mountPresentFunc == nil {
+		if err := d.verifyOriginalMountForRemoval(); err != nil {
+			return err
+		}
 	}
 	if d.targetUnmountSucceeded {
 		return fmt.Errorf("mount point appeared after a confirmed unmount")
@@ -909,6 +968,12 @@ func (d *Daemon) cleanMountPoint() error {
 		return fmt.Errorf("unmount original target: %w", err)
 	}
 	d.targetUnmountSucceeded = true
+	if p := d.originalPhysicalIdentity(); p != nil {
+		p.UnmountSucceeded = true
+		if err := d.publishPhysicalIdentity(p); err != nil {
+			return err
+		}
+	}
 	mounted, err = d.mountPresent(d.meta.MountPoint)
 	if err != nil {
 		return fmt.Errorf("read back original mount point: %w", err)
@@ -922,6 +987,17 @@ func (d *Daemon) cleanMountPoint() error {
 func (d *Daemon) Unmount() error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	return d.unmountLocked()
+}
+
+// Original generation comes from the acquisition, never a later lookup.
+func (d *Daemon) UnmountIfPhysicalGeneration(generation string) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	p := d.originalPhysicalIdentity()
+	if generation == "" || p == nil || p.Generation != generation {
+		return fmt.Errorf("original physical generation is missing or changed")
+	}
 	return d.unmountLocked()
 }
 
@@ -957,9 +1033,41 @@ func (d *Daemon) unmountLocked() (retErr error) {
 	timeout := time.NewTimer(duration)
 	defer timeout.Stop()
 	d.releasePending = true
+	physical := d.originalPhysicalIdentity()
+	if physical != nil && physical.Phase == "released" {
+		if err := d.ensurePhysicalPublication(); err != nil {
+			return err
+		}
+		d.releasePending = false
+		return nil // Replay original completion without reading or touching a new target.
+	}
+	if physical == nil && d.metadataLoaded {
+		return fmt.Errorf("loaded daemon has no original physical identity")
+	}
+	if physical != nil {
+		if physical.Phase == "launching" && physical.Process == nil {
+			return fmt.Errorf("original process dispatch is still unresolved")
+		}
+		physical.Phase = "releasing"
+		if err := d.publishPhysicalIdentity(physical); err != nil {
+			return err
+		}
+	}
 	defer func() {
 		if retErr != nil {
 			return
+		}
+		if p := d.originalPhysicalIdentity(); p != nil && p.Process != nil {
+			scope, err := d.observeOriginalScope()
+			if err != nil || scope != p.Scope {
+				retErr = fmt.Errorf("original process scope is unconfirmed after stop")
+				return
+			}
+			current, err := d.observeOriginalProcess(p.Process.PID)
+			if err != nil || current != nil {
+				retErr = fmt.Errorf("original process exit is unconfirmed after stop")
+				return
+			}
 		}
 		stageStart := time.Now()
 		if err := d.cleanMountPoint(); err != nil {
@@ -975,6 +1083,13 @@ func (d *Daemon) unmountLocked() (retErr error) {
 		}
 		d.setState(DaemonStateStopped)
 		d.updateExpired()
+		if p := d.originalPhysicalIdentity(); p != nil {
+			p.Phase = "released"
+			if err := d.publishPhysicalIdentity(p); err != nil {
+				retErr = err
+				return
+			}
+		}
 		d.releasePending = false
 	}()
 	// Initialization can still publish a process or mount. Do not claim
@@ -997,8 +1112,23 @@ func (d *Daemon) unmountLocked() (retErr error) {
 	}
 	timing.Stage("signal_stop", time.Since(stageStart))
 
-	// Check if process is alive
-	if !d.IsAlive() {
+	// Unknown original process observations cannot authorize mount/PID cleanup.
+	alive := d.IsAlive()
+	if physical != nil && physical.Process != nil {
+		scope, err := d.observeOriginalScope()
+		if err != nil || scope != physical.Scope {
+			return fmt.Errorf("original process scope is unknown during retirement")
+		}
+		current, err := d.observeOriginalProcess(physical.Process.PID)
+		if err != nil {
+			return fmt.Errorf("original process stop observation is unknown: %w", err)
+		}
+		if current != nil && *current != *physical.Process {
+			return fmt.Errorf("original PID now belongs to a different process")
+		}
+		alive = current != nil
+	}
+	if !alive {
 		logrus.WithFields(d.daemonLogFields()).Info("daemon is not alive, skip signal and wait for watch goroutine")
 		// Wait for watch goroutine to exit only if it was started
 		// The watch goroutine is started only when stopChan is created in startDaemonProcess()
@@ -1016,6 +1146,9 @@ func (d *Daemon) unmountLocked() (retErr error) {
 	}
 
 	pid := d.getPid()
+	if physical != nil && physical.Process != nil {
+		pid = physical.Process.PID
+	}
 	if pid <= 0 {
 		return fmt.Errorf("daemon reported alive but original PID is unknown")
 	}
@@ -1024,7 +1157,14 @@ func (d *Daemon) unmountLocked() (retErr error) {
 	stageStart = time.Now()
 	p, _ := os.FindProcess(pid)
 	logrus.WithFields(d.daemonLogFields()).WithField("pid", p.Pid).Info("send termination signal to daemon")
-	err := p.Signal(syscall.SIGTERM)
+	var err error
+	if physical != nil {
+		err = d.signalOriginalProcess(syscall.SIGTERM)
+	} else if d.isAliveFunc != nil {
+		err = p.Signal(syscall.SIGTERM) // Existing controlled process test seam.
+	} else {
+		err = fmt.Errorf("original process birth is missing before signal")
+	}
 	if err != nil {
 		logrus.WithFields(d.daemonLogFields()).WithError(err).Error("daemon unmount path failed")
 		timing.Fail(err)
@@ -1045,7 +1185,13 @@ func (d *Daemon) unmountLocked() (retErr error) {
 
 		// Stage 4: Force kill
 		stageStart = time.Now()
-		err = p.Kill()
+		if physical != nil {
+			err = d.signalOriginalProcess(syscall.SIGKILL)
+		} else if d.isAliveFunc != nil {
+			err = p.Kill()
+		} else {
+			err = fmt.Errorf("original process birth is missing before kill")
+		}
 		if err != nil {
 			logrus.WithFields(d.daemonLogFields()).WithError(err).Warn("failed to send kill signal to daemon")
 		}

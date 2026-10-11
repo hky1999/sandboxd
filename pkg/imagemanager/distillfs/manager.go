@@ -24,6 +24,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -206,19 +207,29 @@ func (mgr *manager) loadExistedDaemons() error {
 	if err != nil {
 		return fmt.Errorf("failed to read daemon configs: %w", err)
 	}
+	loaded := make(map[string]*Daemon)
 	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".daemon-metadata-") {
+			continue // Interrupted pre-publication temporary file; not an owner.
+		}
 		if !entry.Type().IsRegular() {
-			continue
+			return fmt.Errorf("daemon ownership record is not a regular file")
 		}
 		d := &Daemon{ctx: mgr.ctx, binPath: mgr.binPath, cgroupCtrl: mgr.cgroupCtrl, chunkDBSize: mgr.chunkDBSize}
 		metaFilePath := filepath.Join(daemonConfigDir, entry.Name())
-		if err = d.LoadExisted(metaFilePath); err != nil {
-			logrus.Errorf("failed to load daemon from meta file %s: %v", metaFilePath, err)
-			continue
+		if err = d.loadDaemonMetadata(metaFilePath); err != nil {
+			return fmt.Errorf("preserve unresolved daemon ownership: %w", err)
 		}
-		d.savedPath = filepath.Join(daemonConfigDir, d.meta.ID+".json")
+		if _, exists := loaded[d.meta.ID]; exists {
+			return fmt.Errorf("duplicate daemon ownership identity")
+		}
+		loaded[d.meta.ID] = d
+	}
+	// Validate the entire inventory before a watcher or remount can start.
+	for _, d := range loaded {
 		mgr.daemons[d.meta.ID] = d
 		mgr.recovered[d.meta.ID] = false
+		d.activateRecoveredDaemon()
 	}
 	return nil
 }
@@ -564,6 +575,12 @@ func (mgr *manager) cleanupDaemonResources(d *Daemon) error {
 	defer d.mu.Unlock()
 	if d.releasePending || d.getState() != DaemonStateStopped || d.IsAlive() {
 		return fmt.Errorf("daemon cleanup is not confirmed stopped")
+	}
+	if p := d.originalPhysicalIdentity(); p != nil && p.Phase != "released" {
+		return fmt.Errorf("original daemon release is not persistently confirmed")
+	}
+	if d.metadataLoaded && d.originalPhysicalIdentity() == nil {
+		return fmt.Errorf("original daemon physical ownership is unknown")
 	}
 	logrus.WithFields(d.daemonLogFields()).Info("cleaning daemon resources")
 

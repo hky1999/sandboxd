@@ -651,6 +651,7 @@ func TestCheckMountReady_StatfsErrorReturnsError(t *testing.T) {
 func TestDaemon_StartDaemonProcess_RequiresStatfsReady(t *testing.T) {
 	tmpDir := t.TempDir()
 	mock := newMockDaemon(tmpDir)
+	attachTestPhysicalBirth(t, mock.Daemon)
 
 	prevStatfs := statfsFunc
 	t.Cleanup(func() {
@@ -677,6 +678,7 @@ func TestDaemon_StartDaemonProcess_RequiresStatfsReady(t *testing.T) {
 func TestDaemon_StartDaemonProcess_NonZeroBlocksLogsProgressAndRecovers(t *testing.T) {
 	tmpDir := t.TempDir()
 	mock := newMockDaemon(tmpDir)
+	attachTestPhysicalBirth(t, mock.Daemon)
 
 	prevStatfs := statfsFunc
 	prevOutput := logrus.StandardLogger().Out
@@ -723,6 +725,7 @@ func TestDaemon_StartDaemonProcess_NonZeroBlocksLogsProgressAndRecovers(t *testi
 func TestDaemon_StartDaemonProcess_ZeroSizeRuns(t *testing.T) {
 	tmpDir := t.TempDir()
 	mock := newMockDaemon(tmpDir)
+	attachTestPhysicalBirth(t, mock.Daemon)
 
 	prevStatfs := statfsFunc
 	t.Cleanup(func() {
