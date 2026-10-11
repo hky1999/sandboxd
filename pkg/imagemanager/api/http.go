@@ -1043,6 +1043,7 @@ func (w *HttpWorker) ListMountedOCIDetails() ([]oci.OciMountRecord, error) {
 func (w *HttpWorker) prepareHttp() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/mount_operation_query", w.serveMountOperationQuery)
+	mux.HandleFunc("/mount_operation_retire", w.serveMountOperationRetirement)
 	mux.HandleFunc("/oss_mount", func(writer http.ResponseWriter, request *http.Request) {
 		if request.Method != http.MethodPost {
 			writer.WriteHeader(http.StatusBadRequest)

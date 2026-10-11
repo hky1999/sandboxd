@@ -160,6 +160,9 @@ func (w *HttpWorker) executeMountOperation(id, kind, imageURL, expected string, 
 	unlock := w.acquireMountOperationLock(id)
 	defer unlock()
 	intent := &mountOperationRecord{OperationID: id, RequestFingerprint: fingerprint, Kind: kind, Phase: "intent", ImageURL: imageURL}
+	if _, ok := w.mgr.(distillfs.PreparationRetirementManager); ok {
+		intent.PreparationProtocol = 1
+	}
 	r, fresh, err := w.mountStore.beginMountOperation(intent)
 	if err != nil {
 		return nil, err
@@ -218,6 +221,10 @@ func (w *HttpWorker) QueryMountOperation(query *MountOperationQuery) (*MountOper
 
 func (w *HttpWorker) inspectMountOperation(r *mountOperationRecord) (*MountOperationResult, error) {
 	result := &MountOperationResult{OperationID: r.OperationID, RequestFingerprint: r.RequestFingerprint, Kind: r.Kind, State: "unresolved", PhysicalGeneration: r.PhysicalGeneration, MountPoint: r.MountPoint}
+	if r.Phase == "not_allocated" {
+		result.State = "not_allocated"
+		return result, nil
+	}
 	if r.Phase == "intent" {
 		bound, err := w.findOriginalPreparation(r)
 		if err != nil {
@@ -270,6 +277,9 @@ func (w *HttpWorker) inspectMountOperation(r *mountOperationRecord) (*MountOpera
 // Replays bind to the journal's original backend even if a tag now resolves
 // elsewhere. Only Mount, not the independent query, may rebuild a missing route.
 func (w *HttpWorker) recoverBoundMountOperation(r *mountOperationRecord) (*MountInfo, error) {
+	if r.Phase == "not_allocated" {
+		return nil, fmt.Errorf("original mount operation is durably closed without allocation")
+	}
 	if r.Phase == "intent" {
 		bound, err := w.findOriginalPreparation(r)
 		if err != nil {
@@ -372,6 +382,10 @@ func (c *HttpClient) QueryMountOperation(query *MountOperationQuery) (*MountOper
 	if err != nil {
 		return nil, fmt.Errorf("mount operation query failed: %w", err)
 	}
+	return readMountOperationReply(resp, query)
+}
+
+func readMountOperationReply(resp *http.Response, query *MountOperationQuery) (*MountOperationResult, error) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("mount operation query failed with status %d", resp.StatusCode)
@@ -403,7 +417,7 @@ func (c *HttpClient) QueryMountOperation(query *MountOperationQuery) (*MountOper
 	if result.OperationID != query.OperationID || result.RequestFingerprint != query.RequestFingerprint {
 		return nil, fmt.Errorf("mount operation query reply identity changed")
 	}
-	if result.State != "absent" && result.State != "intent" && result.State != "unresolved" && result.State != "ready" && result.State != "release_pending" && result.State != "released" {
+	if result.State != "absent" && result.State != "intent" && result.State != "unresolved" && result.State != "ready" && result.State != "release_pending" && result.State != "released" && result.State != "not_allocated" {
 		return nil, fmt.Errorf("mount operation query reply state is invalid")
 	}
 	if result.State == "ready" || result.State == "release_pending" || result.State == "released" || result.State == "unresolved" {
@@ -419,7 +433,7 @@ func (c *HttpClient) QueryMountOperation(query *MountOperationQuery) (*MountOper
 		if result.Kind != "oss" && result.Kind != "nydus" && result.Kind != "oci" {
 			return nil, fmt.Errorf("mount operation query reply kind is invalid")
 		}
-		if result.State == "intent" && (result.PhysicalGeneration != "" || result.MountPoint != "") {
+		if (result.State == "intent" || result.State == "not_allocated") && (result.PhysicalGeneration != "" || result.MountPoint != "") {
 			return nil, fmt.Errorf("unbound mount operation reply contains physical claims")
 		}
 	}

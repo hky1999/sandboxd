@@ -2,6 +2,8 @@
 
 镜像管理模块关闭期间拒绝新的挂载、卸载、查询和元数据解析请求，已准入请求及后台维护退出前继续持有原根目录独占锁；关闭超时不能交出锁或声称物理清理完成，见 [镜像管理器所有权契约](scheduler-image-mount-release.md)。这只协调本地镜像管理器的生命周期，不证明检查点源执行已经退役，不改变恢复预算准入或未绑定操作的未知结果语义。
 
+已经持久请求清理、仍在取得中且没有底层代际的文件系统步骤，可以显式请求原挂载生产者保存未分配屏障，并通过独立查询确认 `not_allocated`，随后保存该步骤释放完成；不取得引用或调用卸载。原生产者仍在工作、已有准备、旧协议、库存或持久记录未知时继续保留原归属。完成记录跨管理器与数据库重开后拒绝迟到分配，见 [文件系统归属](scheduler-filesystem-ownership.md) 和 [原挂载完成契约](scheduler-image-mount-release.md)。这一局部证明不授权检查点源沙箱预算归还或新的恢复执行；完整沙箱退役与独立 Restore 的持久操作整合仍待完成。
+
 sandboxd supports checkpointing a running sandbox into a caller-owned
 directory and starting a new sandbox from that checkpoint.
 

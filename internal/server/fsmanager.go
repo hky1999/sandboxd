@@ -725,7 +725,7 @@ func (m *fsManager) recoverAllLocked() error {
 		if err != nil {
 			return fmt.Errorf("resolve original filesystem %s: %w", id, err)
 		}
-		if state.RootfsMountGeneration != next.RootfsMountGeneration || !slices.Equal(state.S3MountGenerations, next.S3MountGenerations) || !slices.Equal(state.OCIMountGenerations, next.OCIMountGenerations) {
+		if state.RootfsPhase != next.RootfsPhase || !slices.Equal(state.S3Phases, next.S3Phases) || !slices.Equal(state.OCIPhases, next.OCIPhases) || state.RootfsMountGeneration != next.RootfsMountGeneration || !slices.Equal(state.S3MountGenerations, next.S3MountGenerations) || !slices.Equal(state.OCIMountGenerations, next.OCIMountGenerations) {
 			resolved[id] = next
 		}
 	}

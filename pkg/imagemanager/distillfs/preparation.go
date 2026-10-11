@@ -7,8 +7,10 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"syscall"
 
@@ -27,6 +29,15 @@ type PreparationOwner struct {
 type PreparationManager interface {
 	PrepareDaemon(*DaemonCreateOpt, PreparationOwner, func(string, string) error) error
 	FindPreparation(PreparationOwner) (*PreparationInfo, error)
+}
+
+// The additional capability confirms that the original producer has no native
+// preparation, including unpublished in-memory intents and legacy inventory.
+// It does not itself authorize dropping an upper intent: that producer must
+// first be fenced by its durable operation journal under its operation lock.
+type PreparationRetirementManager interface {
+	PreparationManager
+	ConfirmNoPreparation(PreparationOwner) error
 }
 
 type PreparationInfo struct {
@@ -410,4 +421,107 @@ func (d *Daemon) cleanupPreparationResources() error {
 		return err
 	}
 	return syncPreparationDirectory(filepath.Dir(d.savedPath))
+}
+
+func (mgr *manager) ConfirmNoPreparation(owner PreparationOwner) error {
+	release, err := mgr.ownership.acquire()
+	if err != nil {
+		return err
+	}
+	defer release()
+	if !validPhysicalSHA(owner.OperationID) || !validPhysicalSHA(owner.RequestFingerprint) {
+		return fmt.Errorf("original preparation identity is invalid")
+	}
+	mgr.mu.RLock()
+	defer mgr.mu.RUnlock()
+	known := make(map[string]bool)
+	metadata := make(map[string]*daemonPreparation)
+	for _, d := range mgr.daemons {
+		if !d.physicalMu.TryLock() {
+			return fmt.Errorf("native preparation inventory is currently active")
+		}
+		p := clonePreparation(d.meta.Preparation)
+		d.physicalMu.Unlock()
+		if p == nil || p.Owner.OperationID == "" {
+			return fmt.Errorf("legacy native allocation has no original producer identity")
+		}
+		if p.Owner.OperationID == owner.OperationID {
+			return fmt.Errorf("original native preparation exists or is unresolved")
+		}
+		known[filepath.Base(p.Directory)] = true
+		metadata[d.meta.ID+".json"] = p
+	}
+	// Validate the disk inventory as well as the live map. An unindexed or
+	// changed owner cannot disappear from an absence proof merely because it
+	// was not loaded into memory. No temporary or damaged file is discarded.
+	metadataDir := filepath.Join(mgr.root, "daemon_configs")
+	if _, err := readDirectoryBirth(metadataDir); err != nil {
+		return fmt.Errorf("native metadata inventory is unreadable")
+	}
+	entries, err := os.ReadDir(metadataDir)
+	if err != nil {
+		return err
+	}
+	if len(entries) != len(metadata) {
+		return fmt.Errorf("native metadata inventory has an unindexed or missing owner")
+	}
+	for _, entry := range entries {
+		original, known := metadata[entry.Name()]
+		if !known || !entry.Type().IsRegular() {
+			return fmt.Errorf("native metadata inventory has an unindexed owner")
+		}
+		raw, err := readDaemonMetadataFile(filepath.Join(metadataDir, entry.Name()))
+		if err != nil {
+			return err
+		}
+		meta, err := decodeDaemonMetadata(raw)
+		if err != nil || meta.ID+".json" != entry.Name() || !reflect.DeepEqual(meta.Preparation, original) {
+			return fmt.Errorf("native preparation ownership changed or is unreadable")
+		}
+	}
+	// Legacy unindexed directories cannot become a no-allocation proof after
+	// losing an upper journal. Inspect a single entry: any legacy effect blocks.
+	for _, child := range []string{"daemons", "image_metas", "mnt"} {
+		path := filepath.Join(mgr.root, child)
+		_, err := readDirectoryBirth(path)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("legacy allocation inventory is unreadable")
+		}
+		f, err := os.Open(path)
+		if err != nil {
+			return fmt.Errorf("legacy allocation inventory is unreadable")
+		}
+		entries, readErr := f.ReadDir(1)
+		f.Close()
+		if len(entries) != 0 || readErr != io.EOF {
+			return fmt.Errorf("legacy allocation inventory remains unresolved")
+		}
+	}
+	allocationDir := filepath.Join(mgr.root, "allocations")
+	if _, err := readDirectoryBirth(allocationDir); err != nil {
+		return err
+	}
+	f, err := os.Open(allocationDir)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	for {
+		entries, err := f.ReadDir(128)
+		for _, entry := range entries {
+			if !entry.IsDir() || !known[entry.Name()] {
+				return fmt.Errorf("unindexed original allocation remains unresolved")
+			}
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }

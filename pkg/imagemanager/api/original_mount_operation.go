@@ -37,6 +37,13 @@ func QueryOriginalMountOperation(svc Service, request any, operationID, kind str
 	if r == nil || r.OperationID != operationID || r.RequestFingerprint != fingerprint || r.Kind != kind {
 		return nil, fmt.Errorf("original mount operation result identity changed or is unavailable")
 	}
+	if r.State == "not_allocated" {
+		if !allowReleased || r.PhysicalGeneration != "" || r.MountPoint != "" {
+			return nil, fmt.Errorf("original no-allocation proof cannot authorize acquisition or contain a physical binding")
+		}
+		copy := *r
+		return &copy, nil
+	}
 	if r.State != "ready" && !(allowReleased && (r.State == "released" || r.State == "release_pending")) {
 		return nil, fmt.Errorf("original mount operation result is unresolved or retired")
 	}
@@ -45,4 +52,36 @@ func QueryOriginalMountOperation(svc Service, request any, operationID, kind str
 	}
 	copy := *r
 	return &copy, nil
+}
+
+// Cleanup first requests a persistent fence, then independently reads back the
+// original result. The request fingerprint never serializes raw credentials.
+func RetireOriginalMountOperation(svc Service, request any, operationID, kind string) (*MountOperationResult, error) {
+	if err := RequireMountOperationService(svc, operationID); err != nil {
+		return nil, err
+	}
+	retirement, ok := svc.(MountOperationRetirementService)
+	if !ok {
+		return nil, fmt.Errorf("mount producer does not support persistent allocation retirement")
+	}
+	fp, err := MountRequestFingerprint(request)
+	if err != nil {
+		return nil, err
+	}
+	facade := ""
+	if req, ok := request.(*OCIMountRequest); ok {
+		facade = req.ImageURL
+	}
+	result, err := retirement.RetireMountOperation(&MountOperationRetirement{OperationID: operationID, RequestFingerprint: fp, Kind: kind, ImageURL: facade})
+	if err != nil {
+		return nil, err
+	}
+	confirmed, err := QueryOriginalMountOperation(svc, request, operationID, kind, true)
+	if err != nil {
+		return nil, err
+	}
+	if result == nil || *confirmed != *result {
+		return nil, fmt.Errorf("original mount retirement readback changed")
+	}
+	return confirmed, nil
 }

@@ -34,15 +34,16 @@ type MountOperationResult struct {
 }
 
 type mountOperationRecord struct {
-	OperationID        string `json:"operation_id"`
-	RequestFingerprint string `json:"request_fingerprint"`
-	Kind               string `json:"kind"`
-	Phase              string `json:"phase"`
-	PhysicalGeneration string `json:"physical_generation"`
-	DaemonID           string `json:"daemon_id"`
-	MountPoint         string `json:"mount_point"`
-	ImageURL           string `json:"image_url"`
-	NydusImageURL      string `json:"nydus_image_url"`
+	PreparationProtocol int    `json:"preparation_protocol,omitempty"`
+	OperationID         string `json:"operation_id"`
+	RequestFingerprint  string `json:"request_fingerprint"`
+	Kind                string `json:"kind"`
+	Phase               string `json:"phase"`
+	PhysicalGeneration  string `json:"physical_generation"`
+	DaemonID            string `json:"daemon_id"`
+	MountPoint          string `json:"mount_point"`
+	ImageURL            string `json:"image_url"`
+	NydusImageURL       string `json:"nydus_image_url"`
 }
 
 type storedMountOperation struct {
@@ -104,7 +105,13 @@ func validateMountOperation(r *mountOperationRecord) error {
 	if (r.Kind == "oci") != (r.ImageURL != "") {
 		return fmt.Errorf("mount operation facade is invalid")
 	}
-	if r.Phase == "intent" {
+	if r.PreparationProtocol < 0 || r.PreparationProtocol > 1 {
+		return fmt.Errorf("unknown mount preparation protocol")
+	}
+	if r.Phase == "intent" || r.Phase == "not_allocated" {
+		if r.Phase == "not_allocated" && r.PreparationProtocol != 1 {
+			return fmt.Errorf("legacy mount operation cannot claim no allocation")
+		}
 		if r.PhysicalGeneration != "" || r.DaemonID != "" || r.MountPoint != "" || r.NydusImageURL != "" {
 			return fmt.Errorf("unbound mount operation contains physical claims")
 		}
@@ -163,11 +170,16 @@ func decodeMountOperation(raw []byte) (*mountOperationRecord, error) {
 		return nil, err
 	}
 	var fields map[string]json.RawMessage
-	if err := json.Unmarshal(envelope["record"], &fields); err != nil || len(fields) != 9 {
+	if err := json.Unmarshal(envelope["record"], &fields); err != nil || len(fields) < 9 || len(fields) > 10 {
 		return nil, fmt.Errorf("mount operation fields are incomplete")
 	}
-	if err := exactMountJSONFields(fields, "operation_id", "request_fingerprint", "kind", "phase", "physical_generation", "daemon_id", "mount_point", "image_url", "nydus_image_url"); err != nil {
+	if err := exactMountJSONFields(fields, "operation_id", "request_fingerprint", "kind", "phase", "physical_generation", "daemon_id", "mount_point", "image_url", "nydus_image_url", "preparation_protocol"); err != nil {
 		return nil, err
+	}
+	for _, required := range []string{"operation_id", "request_fingerprint", "kind", "phase", "physical_generation", "daemon_id", "mount_point", "image_url", "nydus_image_url"} {
+		if _, exists := fields[required]; !exists {
+			return nil, fmt.Errorf("mount operation fields are incomplete")
+		}
 	}
 	var stored storedMountOperation
 	d = json.NewDecoder(bytes.NewReader(raw))
@@ -253,8 +265,11 @@ func (s *MountStore) publishMountBinding(binding *mountOperationRecord) error {
 		if err != nil {
 			return err
 		}
-		if prior == nil || prior.RequestFingerprint != binding.RequestFingerprint || prior.Kind != binding.Kind || prior.ImageURL != binding.ImageURL {
+		if prior == nil || prior.RequestFingerprint != binding.RequestFingerprint || prior.Kind != binding.Kind || prior.ImageURL != binding.ImageURL || prior.PreparationProtocol != binding.PreparationProtocol {
 			return fmt.Errorf("original mount intent changed")
+		}
+		if prior.Phase == "not_allocated" {
+			return fmt.Errorf("original mount allocation has been durably fenced")
 		}
 		if prior.Phase != "intent" {
 			copy := *prior
@@ -296,7 +311,7 @@ func (s *MountStore) confirmMountOperation(query *MountOperationQuery, generatio
 		if err != nil {
 			return err
 		}
-		if r == nil || r.Phase == "intent" || r.RequestFingerprint != query.RequestFingerprint || r.PhysicalGeneration != generation || r.MountPoint != target {
+		if r == nil || (r.Phase != "bound" && r.Phase != "ready") || r.RequestFingerprint != query.RequestFingerprint || r.PhysicalGeneration != generation || r.MountPoint != target {
 			return fmt.Errorf("original mount confirmation changed")
 		}
 		r.Phase = "ready"

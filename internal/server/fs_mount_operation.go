@@ -62,14 +62,24 @@ func (m *fsManager) resolveFSOriginalOperationsLocked(state sandboxFSState) (san
 	if state.MountOperationProtocol != 1 {
 		return state, validateFSRecoveryBindings(state)
 	}
-	resolve := func(svc imageapi.Service, request any, purpose, kind string, index int, phase fsLeasePhase, generation *string) error {
-		if !needsFSReference(phase) {
+	resolve := func(svc imageapi.Service, request any, purpose, kind string, index int, phase *fsLeasePhase, generation *string) error {
+		if !needsFSReference(*phase) {
 			return nil
 		}
 		id := fsMountOperationID(state, purpose, index)
-		result, err := imageapi.QueryOriginalMountOperation(svc, request, id, kind, state.ReleaseRequested || phase == fsReleasePending)
+		result, err := imageapi.QueryOriginalMountOperation(svc, request, id, kind, state.ReleaseRequested || *phase == fsReleasePending)
+		if err != nil && state.ReleaseRequested && *phase == fsAcquiring && *generation == "" {
+			result, err = imageapi.RetireOriginalMountOperation(svc, request, id, kind)
+		}
 		if err != nil {
 			return err
+		}
+		if result.State == "not_allocated" {
+			if !state.ReleaseRequested || *phase != fsAcquiring || *generation != "" {
+				return fmt.Errorf("no-allocation proof cannot settle an acquired filesystem generation")
+			}
+			*phase = fsReleased
+			return nil
 		}
 		if *generation != "" && *generation != result.PhysicalGeneration {
 			return fmt.Errorf("original filesystem operation generation changed")
@@ -90,23 +100,23 @@ func (m *fsManager) resolveFSOriginalOperationsLocked(state sandboxFSState) (san
 	}
 	switch root.Type {
 	case runtime.RootfsSrcType_IMAGE:
-		err := resolve(m.oci.svc, &imageapi.OCIMountRequest{ImageURL: root.GetImageUrl(), RequirePhysicalGeneration: true}, "rootfs", "oci", 0, state.RootfsPhase, &state.RootfsMountGeneration)
+		err := resolve(m.oci.svc, &imageapi.OCIMountRequest{ImageURL: root.GetImageUrl(), RequirePhysicalGeneration: true}, "rootfs", "oci", 0, &state.RootfsPhase, &state.RootfsMountGeneration)
 		if err != nil {
 			return state, err
 		}
 	case runtime.RootfsSrcType_S3:
-		err := resolve(m.s3.svc, fsOSSMountRequest(root.GetS3Config()), "rootfs", "oss", 0, state.RootfsPhase, &state.RootfsMountGeneration)
+		err := resolve(m.s3.svc, fsOSSMountRequest(root.GetS3Config()), "rootfs", "oss", 0, &state.RootfsPhase, &state.RootfsMountGeneration)
 		if err != nil {
 			return state, err
 		}
 	}
 	for i, source := range state.S3 {
-		if err := resolve(m.s3.svc, fsOSSMountRequest(source), "s3", "oss", i, state.S3Phases[i], &state.S3MountGenerations[i]); err != nil {
+		if err := resolve(m.s3.svc, fsOSSMountRequest(source), "s3", "oss", i, &state.S3Phases[i], &state.S3MountGenerations[i]); err != nil {
 			return state, err
 		}
 	}
 	for i, source := range state.OCI {
-		if err := resolve(m.oci.svc, &imageapi.OCIMountRequest{ImageURL: source, RequirePhysicalGeneration: true}, "oci", "oci", i, state.OCIPhases[i], &state.OCIMountGenerations[i]); err != nil {
+		if err := resolve(m.oci.svc, &imageapi.OCIMountRequest{ImageURL: source, RequirePhysicalGeneration: true}, "oci", "oci", i, &state.OCIPhases[i], &state.OCIMountGenerations[i]); err != nil {
 			return state, err
 		}
 	}
