@@ -21,14 +21,18 @@ import (
 
 	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
 	imgApi "github.com/inclusionAI/sandboxd/pkg/imagemanager/api"
+	"github.com/inclusionAI/sandboxd/pkg/imagemanager/imageconfig"
 	"github.com/sirupsen/logrus"
 )
 
 // imageMountEntry tracks a shared image mount with reference counting.
 // Multiple sandboxes using the same image share one mount point.
 type imageMountEntry struct {
-	refcount int
-	path     string // local mount path
+	refcount           int
+	path               string // local mount path
+	env                []string
+	imageProcess       *imageconfig.Process
+	releaseUnconfirmed bool
 }
 
 // requireReadOnlyMount enforces that S3/OCI-image mounts carry the "ro" option.
@@ -102,43 +106,27 @@ func (m *s3MountManager) mountS3(cfg *runtime.S3Config) (string, error) {
 	}
 
 	key := s3MountKey(cfg)
-
 	m.mu.Lock()
+	defer m.mu.Unlock()
 	if entry, ok := m.entries[key]; ok {
+		if entry.releaseUnconfirmed {
+			return "", fmt.Errorf("S3 source release is unconfirmed")
+		}
 		entry.refcount++
-		m.mu.Unlock()
-		logrus.Debugf("s3mount: reuse existing mount for %s/%s, refcount=%d", cfg.Bucket, cfg.Object, entry.refcount)
 		return entry.path, nil
 	}
-	m.mu.Unlock()
-
-	// First caller: mount via in-process image-manager.
 	mi, err := m.svc.MountOSS(&imgApi.OSSMountRequest{
-		Endpoint:        cfg.Endpoint,
-		Bucket:          cfg.Bucket,
-		Object:          cfg.Object,
-		AccessKeyID:     cfg.AccessKeyID,
-		AccessKeySecret: cfg.AccessKeySecret,
+		Endpoint: cfg.Endpoint, Bucket: cfg.Bucket, Object: cfg.Object,
+		AccessKeyID: cfg.AccessKeyID, AccessKeySecret: cfg.AccessKeySecret,
 	})
 	if err != nil {
-		return "", fmt.Errorf("failed to mount S3 %s/%s: %w", cfg.Bucket, cfg.Object, err)
+		return "", fmt.Errorf("mount S3: %w", err)
 	}
-
-	m.mu.Lock()
-	// Double-check: another goroutine might have mounted while we were unlocked.
-	if existing, ok := m.entries[key]; ok {
-		existing.refcount++
-		m.mu.Unlock()
-		logrus.Debugf("s3mount: race detected for %s/%s, reusing existing", cfg.Bucket, cfg.Object)
-		return existing.path, nil
+	if mi == nil || mi.FilePath == "" {
+		return "", fmt.Errorf("S3 mount returned no path")
 	}
-	m.entries[key] = &imageMountEntry{
-		refcount: 1,
-		path:     mi.FilePath,
-	}
-	m.mu.Unlock()
-
-	logrus.Infof("s3mount: mounted %s/%s at %s", cfg.Bucket, cfg.Object, mi.FilePath)
+	m.entries[key] = &imageMountEntry{refcount: 1, path: mi.FilePath,
+		env: append([]string(nil), mi.Env...), imageProcess: imageconfig.Clone(mi.ImageProcess)}
 	return mi.FilePath, nil
 }
 
@@ -150,29 +138,20 @@ func (m *s3MountManager) unmountS3(cfg *runtime.S3Config) error {
 	}
 
 	key := s3MountKey(cfg)
-
 	m.mu.Lock()
+	defer m.mu.Unlock()
 	entry, ok := m.entries[key]
-	if !ok {
-		m.mu.Unlock()
-		logrus.Warnf("s3mount: unmount called for unknown key %s/%s", cfg.Bucket, cfg.Object)
-		return nil
+	if !ok || entry.refcount <= 0 {
+		return fmt.Errorf("S3 mount reference is not owned")
 	}
-
-	entry.refcount--
-	if entry.refcount > 0 {
-		m.mu.Unlock()
-		logrus.Debugf("s3mount: released one ref for %s/%s, refcount=%d", cfg.Bucket, cfg.Object, entry.refcount)
-		return nil
-	}
-
-	delete(m.entries, key)
-	m.mu.Unlock()
-
-	logrus.Infof("s3mount: last ref released for %s/%s, unmounting", cfg.Bucket, cfg.Object)
-	if err := m.unmountF(cfg.Endpoint, cfg.Bucket, cfg.Object); err != nil {
-		logrus.Warnf("s3mount: failed to unmount S3 %s/%s: %v", cfg.Bucket, cfg.Object, err)
-		return err
+	if entry.refcount == 1 {
+		if err := m.unmountF(cfg.Endpoint, cfg.Bucket, cfg.Object); err != nil {
+			entry.releaseUnconfirmed = true
+			return err
+		}
+		delete(m.entries, key)
+	} else {
+		entry.refcount--
 	}
 	return nil
 }
@@ -233,40 +212,24 @@ func (m *ociMountManager) mountOCI(imageURL string) (string, error) {
 		return "", fmt.Errorf("image_url is empty")
 	}
 
-	key := imageURL
-
 	m.mu.Lock()
-	if entry, ok := m.entries[key]; ok {
+	defer m.mu.Unlock()
+	if entry, ok := m.entries[imageURL]; ok {
+		if entry.releaseUnconfirmed {
+			return "", fmt.Errorf("OCI source release is unconfirmed")
+		}
 		entry.refcount++
-		m.mu.Unlock()
-		logrus.Debugf("ocimount: reuse existing mount for %s, refcount=%d", imageURL, entry.refcount)
 		return entry.path, nil
 	}
-	m.mu.Unlock()
-
-	// First caller: mount via in-process image-manager.
-	resp, err := m.svc.MountOCI(&imgApi.OCIMountRequest{
-		ImageURL: imageURL,
-	})
+	resp, err := m.svc.MountOCI(&imgApi.OCIMountRequest{ImageURL: imageURL})
 	if err != nil {
-		return "", fmt.Errorf("failed to mount OCI image %s: %w", imageURL, err)
+		return "", fmt.Errorf("mount OCI image: %w", err)
 	}
-
-	m.mu.Lock()
-	// Double-check: another goroutine might have mounted while we were unlocked.
-	if existing, ok := m.entries[key]; ok {
-		existing.refcount++
-		m.mu.Unlock()
-		logrus.Debugf("ocimount: race detected for %s, reusing existing", imageURL)
-		return existing.path, nil
+	if resp == nil || resp.MountPath == "" {
+		return "", fmt.Errorf("OCI mount returned no path")
 	}
-	m.entries[key] = &imageMountEntry{
-		refcount: 1,
-		path:     resp.MountPath,
-	}
-	m.mu.Unlock()
-
-	logrus.Infof("ocimount: mounted %s at %s", imageURL, resp.MountPath)
+	m.entries[imageURL] = &imageMountEntry{refcount: 1, path: resp.MountPath,
+		env: append([]string(nil), resp.Env...), imageProcess: imageconfig.Clone(resp.ImageProcess)}
 	return resp.MountPath, nil
 }
 
@@ -277,30 +240,20 @@ func (m *ociMountManager) unmountOCI(imageURL string) error {
 		return fmt.Errorf("image_url is empty")
 	}
 
-	key := imageURL
-
 	m.mu.Lock()
-	entry, ok := m.entries[key]
-	if !ok {
-		m.mu.Unlock()
-		logrus.Warnf("ocimount: unmount called for unknown image %s", imageURL)
-		return nil
+	defer m.mu.Unlock()
+	entry, ok := m.entries[imageURL]
+	if !ok || entry.refcount <= 0 {
+		return fmt.Errorf("OCI mount reference is not owned")
 	}
-
-	entry.refcount--
-	if entry.refcount > 0 {
-		m.mu.Unlock()
-		logrus.Debugf("ocimount: released one ref for %s, refcount=%d", imageURL, entry.refcount)
-		return nil
-	}
-
-	delete(m.entries, key)
-	m.mu.Unlock()
-
-	logrus.Infof("ocimount: last ref released for %s, unmounting", imageURL)
-	if err := m.unmountF(imageURL); err != nil {
-		logrus.Warnf("ocimount: failed to unmount OCI image %s: %v", imageURL, err)
-		return err
+	if entry.refcount == 1 {
+		if err := m.unmountF(imageURL); err != nil {
+			entry.releaseUnconfirmed = true
+			return err
+		}
+		delete(m.entries, imageURL)
+	} else {
+		entry.refcount--
 	}
 	return nil
 }

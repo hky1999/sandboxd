@@ -297,6 +297,7 @@ func TestRestoreCleansVerifiedParkedSourceWithCapturedGeneration(t *testing.T) {
 	const id = "sbox-park-verified"
 	const generation = "generation-parked"
 	stageParkedSource(t, s, id, generation)
+	stageFilesystemOwner(t, s, id, generation)
 	directory, fact := publishParkedArtifact(t, s, parkedSourceIdentity(id, generation, "case"))
 	request := restoreCleanupRequest(directory, fact, id, t.TempDir())
 

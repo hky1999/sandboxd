@@ -15,6 +15,8 @@
 package server
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -31,467 +33,790 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-type fsManager struct {
-	rootfs *langrtmanager.LangRTManager
-	s3     *s3MountManager
-	oci    *ociMountManager
+const fsJournalSchema = 2
+const fsJournalLimit = 65536
 
+type fsLeasePhase string
+
+const (
+	fsReserved       fsLeasePhase = "reserved"
+	fsAcquiring      fsLeasePhase = "acquiring"
+	fsAcquired       fsLeasePhase = "acquired"
+	fsReleasePending fsLeasePhase = "release_pending"
+	fsReleased       fsLeasePhase = "released"
+)
+
+type fsManager struct {
+	rootfs          *langrtmanager.LangRTManager
+	s3              *s3MountManager
+	oci             *ociMountManager
 	mu              sync.Mutex
 	sandboxRootfs   map[string]*langrtmanager.LanguageRuntime
 	sandboxS3Mount  map[string][]*runtime.S3Config
 	sandboxOCIMount map[string][]string
 	sandboxState    map[string]sandboxFSState
+	completed       map[string]fsCompletion
 	store           store.DbStore
-	persistMu       sync.Mutex
+	persistMu       sync.Mutex // serializes ownership, backend references and journal writes
+	loaded          bool
 }
 
 type preparedFS struct {
-	manager *fsManager
-	rootfs  *langrtmanager.LanguageRuntime
-	source  *runtime.RootfsConfig
-	mounts  []*runtime.Mount
-	s3      []*runtime.S3Config
-	oci     []string
+	manager    *fsManager
+	sandboxID  string
+	generation string
+	rootfs     *langrtmanager.LanguageRuntime
+	source     *runtime.RootfsConfig
+	mounts     []*runtime.Mount
+	s3         []*runtime.S3Config
+	oci        []string
 }
 
 type sandboxFSState struct {
-	Rootfs []byte              `json:"rootfs,omitempty"`
-	S3     []*runtime.S3Config `json:"s3,omitempty"`
-	OCI    []string            `json:"oci,omitempty"`
+	Generation  string              `json:"generation,omitempty"`
+	Rootfs      []byte              `json:"rootfs,omitempty"`
+	S3          []*runtime.S3Config `json:"s3,omitempty"`
+	OCI         []string            `json:"oci,omitempty"`
+	RootfsPhase fsLeasePhase        `json:"rootfs_phase"`
+	S3Phases    []fsLeasePhase      `json:"s3_phases,omitempty"`
+	OCIPhases   []fsLeasePhase      `json:"oci_phases,omitempty"`
+}
+
+type fsCompletion struct {
+	SandboxID         string `json:"sandbox_id"`
+	Generation        string `json:"generation"`
+	SourceFingerprint string `json:"source_fingerprint"`
 }
 
 type storedSandboxFSStates struct {
-	Items map[string]sandboxFSState `json:"items"`
+	SchemaVersion int                       `json:"schema_version,omitempty"`
+	Items         map[string]sandboxFSState `json:"items"`
+	Completed     map[string]fsCompletion   `json:"completed,omitempty"`
 }
 
 func newFSManager(imgSvc imageapi.Service, stores ...store.DbStore) *fsManager {
-	s3Mgr := newS3MountManagerForFS(imgSvc)
-	ociMgr := newOciMountManagerForFS(imgSvc)
-	var stateStore store.DbStore
-	if len(stores) > 0 {
-		stateStore = stores[0]
-	}
-	return &fsManager{
-		rootfs:          langrtmanager.NewLanguageRuntimeManager(langrtmanager.NewDefaultMounter(imgSvc)),
-		s3:              s3Mgr,
-		oci:             ociMgr,
+	m := &fsManager{
+		s3: newS3MountManagerForFS(imgSvc), oci: newOciMountManagerForFS(imgSvc),
 		sandboxRootfs:   make(map[string]*langrtmanager.LanguageRuntime),
 		sandboxS3Mount:  make(map[string][]*runtime.S3Config),
-		sandboxOCIMount: make(map[string][]string),
-		sandboxState:    make(map[string]sandboxFSState),
-		store:           stateStore,
+		sandboxOCIMount: make(map[string][]string), sandboxState: make(map[string]sandboxFSState),
+		completed: make(map[string]fsCompletion),
 	}
+	if len(stores) > 0 {
+		m.store = stores[0]
+	}
+	m.rootfs = langrtmanager.NewLanguageRuntimeManager(&fsImageMounter{
+		manager: m, local: langrtmanager.NewDefaultMounter(imgSvc),
+	})
+	return m
 }
 
 func newS3MountManagerForFS(imgSvc imageapi.Service) *s3MountManager {
 	if imgSvc != nil {
 		return newS3MountManager(imgSvc)
 	}
-	return &s3MountManager{
-		entries:  make(map[string]*imageMountEntry),
-		unmountF: func(_, _, _ string) error { return nil },
-	}
+	return &s3MountManager{entries: make(map[string]*imageMountEntry), unmountF: func(_, _, _ string) error { return nil }}
 }
-
 func newOciMountManagerForFS(imgSvc imageapi.Service) *ociMountManager {
 	if imgSvc != nil {
 		return newOciMountManager(imgSvc)
 	}
-	return &ociMountManager{
-		entries:  make(map[string]*imageMountEntry),
-		unmountF: func(string) error { return nil },
-	}
+	return &ociMountManager{entries: make(map[string]*imageMountEntry), unmountF: func(string) error { return nil }}
 }
 
-func (m *fsManager) Prepare(request *runtime.StartRequest) (_ *preparedFS, retErr error) {
-	rootfs, err := m.rootfs.AddLangRuntime(request, true)
+func (m *fsManager) Prepare(request *runtime.StartRequest) (*preparedFS, error) {
+	if request == nil || request.Rootfs == nil || request.SandboxID == "" {
+		return nil, fmt.Errorf("filesystem preparation requires an ID and rootfs source")
+	}
+	request = proto.Clone(request).(*runtime.StartRequest)
+	p := &preparedFS{manager: m, sandboxID: request.SandboxID,
+		generation: request.Labels[resourceGenerationLabel],
+		source:     proto.Clone(request.Rootfs).(*runtime.RootfsConfig), mounts: cloneMounts(request.Mounts)}
+	rootfs, err := proto.Marshal(p.source)
 	if err != nil {
 		return nil, err
 	}
-	rootfs.IncRef()
-
-	prepared := &preparedFS{
-		manager: m,
-		rootfs:  rootfs,
-		source:  proto.Clone(request.Rootfs).(*runtime.RootfsConfig),
-	}
-	defer func() {
-		if retErr != nil {
-			prepared.Rollback()
-		}
-	}()
-
-	prepared.mounts = cloneMounts(request.Mounts)
-	for _, mount := range prepared.mounts {
+	state := sandboxFSState{Generation: p.generation, Rootfs: rootfs, RootfsPhase: fsReserved}
+	for _, mount := range p.mounts {
 		if mount == nil {
 			continue
 		}
-		switch src := mount.GetSource().(type) {
-		case *runtime.Mount_HostPath:
+		switch source := mount.GetSource().(type) {
 		case *runtime.Mount_S3Config:
 			if err := requireReadOnlyMount(mount); err != nil {
-				return nil, fmt.Errorf("invalid S3 mount: %w", err)
+				return nil, err
 			}
-			path, err := m.s3.mountS3(src.S3Config)
-			if err != nil {
-				return nil, fmt.Errorf("failed to mount S3: %w", err)
+			if source.S3Config == nil {
+				return nil, fmt.Errorf("S3 source is missing")
 			}
-			mount.Source = &runtime.Mount_HostPath{HostPath: path}
-			prepared.s3 = append(prepared.s3, src.S3Config)
+			state.S3 = append(state.S3, proto.Clone(source.S3Config).(*runtime.S3Config))
+			state.S3Phases = append(state.S3Phases, fsReserved)
 		case *runtime.Mount_ImageUrl:
 			if err := requireReadOnlyMount(mount); err != nil {
-				return nil, fmt.Errorf("invalid image mount: %w", err)
+				return nil, err
 			}
-			path, err := m.oci.mountOCI(src.ImageUrl)
-			if err != nil {
-				return nil, fmt.Errorf("failed to mount OCI image: %w", err)
+			if source.ImageUrl == "" {
+				return nil, fmt.Errorf("OCI source is missing")
 			}
-			mount.Source = &runtime.Mount_HostPath{HostPath: path}
-			prepared.oci = append(prepared.oci, src.ImageUrl)
-		default:
-			if mount.GetHostPath() == "" {
-				logrus.Warnf("mount %s has no source, skipping", mount.GetTarget())
-			}
+			state.OCI = append(state.OCI, source.ImageUrl)
+			state.OCIPhases = append(state.OCIPhases, fsReserved)
 		}
 	}
-	return prepared, nil
+	m.persistMu.Lock()
+	defer m.persistMu.Unlock()
+	if err := m.loadLocked(); err != nil {
+		return nil, err
+	}
+	// Existing owners must be reconstructed before this source can be shared.
+	if err := m.recoverAllLocked(); err != nil {
+		return nil, err
+	}
+	m.mu.Lock()
+	_, exists := m.sandboxState[p.sandboxID]
+	_, retired := m.completed[fsCompletionKey(p.sandboxID, p.generation)]
+	if !exists && (p.generation == "" || !retired) && len(m.sandboxState)+len(m.completed) < fsJournalLimit {
+		if p.generation == "" {
+			delete(m.completed, fsCompletionKey(p.sandboxID, ""))
+		}
+		m.sandboxState[p.sandboxID] = cloneFSState(state)
+	} else {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("filesystem owner exists or journal is full")
+	}
+	m.mu.Unlock()
+	if err := m.persistCurrentState(); err != nil {
+		return p, err
+	}
+	if err := m.checkSourceAdmissionLocked(state); err != nil {
+		return p, err
+	}
+	state.RootfsPhase = fsAcquiring
+	if err := m.saveStateLocked(p.sandboxID, state); err != nil {
+		return p, err
+	}
+	lr, err := m.rootfs.AddLangRuntime(request, true)
+	if err != nil {
+		return p, err
+	}
+	lr.IncRef()
+	p.rootfs = lr
+	m.mu.Lock()
+	m.sandboxRootfs[p.sandboxID] = lr
+	m.mu.Unlock()
+	state.RootfsPhase = fsAcquired
+	if err := m.saveStateLocked(p.sandboxID, state); err != nil {
+		return p, err
+	}
+	si, oi := 0, 0
+	for _, mount := range p.mounts {
+		if mount == nil {
+			continue
+		}
+		switch source := mount.GetSource().(type) {
+		case *runtime.Mount_S3Config:
+			state.S3Phases[si] = fsAcquiring
+			if err := m.saveStateLocked(p.sandboxID, state); err != nil {
+				return p, err
+			}
+			path, err := m.s3.mountS3(source.S3Config)
+			if err != nil {
+				return p, err
+			}
+			m.setS3Handle(p.sandboxID, si, len(state.S3), state.S3[si])
+			p.s3 = append(p.s3, state.S3[si])
+			mount.Source = &runtime.Mount_HostPath{HostPath: path}
+			state.S3Phases[si] = fsAcquired
+			if err := m.saveStateLocked(p.sandboxID, state); err != nil {
+				return p, err
+			}
+			si++
+		case *runtime.Mount_ImageUrl:
+			state.OCIPhases[oi] = fsAcquiring
+			if err := m.saveStateLocked(p.sandboxID, state); err != nil {
+				return p, err
+			}
+			path, err := m.oci.mountOCI(source.ImageUrl)
+			if err != nil {
+				return p, err
+			}
+			m.setOCIHandle(p.sandboxID, oi, len(state.OCI), source.ImageUrl)
+			p.oci = append(p.oci, source.ImageUrl)
+			mount.Source = &runtime.Mount_HostPath{HostPath: path}
+			state.OCIPhases[oi] = fsAcquired
+			if err := m.saveStateLocked(p.sandboxID, state); err != nil {
+				return p, err
+			}
+			oi++
+		}
+	}
+	return p, nil
 }
 
 func (m *fsManager) Commit(sandboxID string, prepared *preparedFS) error {
-	if sandboxID == "" || prepared == nil {
-		return fmt.Errorf("sandbox filesystem commit requires an ID and prepared state")
+	if prepared == nil || prepared.manager != m || prepared.sandboxID != sandboxID {
+		return fmt.Errorf("filesystem commit does not own the prepared identity")
 	}
-	state, err := stateFromPrepared(prepared)
-	if err != nil {
-		return fmt.Errorf("encode filesystem state for sandbox %s: %w", sandboxID, err)
-	}
-
 	m.persistMu.Lock()
 	defer m.persistMu.Unlock()
 	m.mu.Lock()
-	if _, exists := m.sandboxState[sandboxID]; exists {
-		m.mu.Unlock()
-		return fmt.Errorf("filesystem state for sandbox %s already exists", sandboxID)
-	}
-	m.sandboxRootfs[sandboxID] = prepared.rootfs
-	if len(prepared.s3) > 0 {
-		m.sandboxS3Mount[sandboxID] = append([]*runtime.S3Config(nil), prepared.s3...)
-	}
-	if len(prepared.oci) > 0 {
-		m.sandboxOCIMount[sandboxID] = append([]string(nil), prepared.oci...)
-	}
-	m.sandboxState[sandboxID] = state
+	state, exists := m.sandboxState[sandboxID]
 	m.mu.Unlock()
-	if err := m.persistCurrentState(); err != nil {
-		m.mu.Lock()
-		delete(m.sandboxRootfs, sandboxID)
-		delete(m.sandboxS3Mount, sandboxID)
-		delete(m.sandboxOCIMount, sandboxID)
-		delete(m.sandboxState, sandboxID)
-		m.mu.Unlock()
-		return fmt.Errorf("persist filesystem state for sandbox %s: %w", sandboxID, err)
+	if !exists || state.Generation != prepared.generation {
+		return fmt.Errorf("filesystem owner changed")
 	}
-	return nil
+	// A failed write keeps the in-memory owner and the earlier durable intent.
+	return m.persistCurrentState()
 }
 
 func (m *fsManager) Release(sandboxID string) error {
-	return m.release(sandboxID, true)
+	m.persistMu.Lock()
+	defer m.persistMu.Unlock()
+	if err := m.loadLocked(); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	state, exists := m.sandboxState[sandboxID]
+	m.mu.Unlock()
+	if exists && state.Generation != "" {
+		return fmt.Errorf("filesystem release requires the original resource generation")
+	}
+	return m.releaseLocked(sandboxID, "", false)
 }
 
-func (m *fsManager) RootfsConfig(sandboxID string) (*runtime.RootfsConfig, error) {
+func (m *fsManager) ReleaseIfGeneration(sandboxID, generation string) error {
+	if sandboxID == "" || generation == "" {
+		return fmt.Errorf("filesystem release requires original identity")
+	}
+	m.persistMu.Lock()
+	defer m.persistMu.Unlock()
+	if err := m.loadLocked(); err != nil {
+		return err
+	}
+	return m.releaseLocked(sandboxID, generation, true)
+}
+
+func fsCompletionKey(id, generation string) string {
+	sum := sha256.Sum256([]byte(id + "\x00" + generation))
+	return hex.EncodeToString(sum[:])
+}
+
+func (m *fsManager) releaseLocked(id, generation string, conditional bool) error {
+	key := fsCompletionKey(id, generation)
 	m.mu.Lock()
-	state, ok := m.sandboxState[sandboxID]
+	receipt, completed := m.completed[key]
+	state, exists := m.sandboxState[id]
 	m.mu.Unlock()
-	if !ok || len(state.Rootfs) == 0 {
-		return nil, fmt.Errorf("rootfs source for sandbox %s: %w", sandboxID, errord.ErrNotFound)
+	if conditional && completed && receipt.SandboxID == id && receipt.Generation == generation {
+		return nil // original completion never touches a replacement owner
+	}
+	if !exists {
+		if conditional {
+			return fmt.Errorf("filesystem completion is unknown: %w", errord.ErrNotFound)
+		}
+		return nil
+	}
+	if state.Generation != generation {
+		return fmt.Errorf("filesystem generation changed")
+	}
+	// Flush any in-memory confirmation whose preceding write failed, BEFORE
+	// taking another reference or changing a backend. This prevents double release.
+	if err := m.persistCurrentState(); err != nil {
+		return err
+	}
+	if err := m.recoverAllLocked(); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	state = cloneFSState(m.sandboxState[id])
+	m.mu.Unlock()
+	releaseStep := func(phase *fsLeasePhase, release func() error) error {
+		if *phase == fsReleased {
+			return nil
+		}
+		if *phase == fsReserved {
+			*phase = fsReleased
+			return m.saveStateLocked(id, state)
+		}
+		*phase = fsReleasePending
+		if err := m.saveStateLocked(id, state); err != nil {
+			return err
+		}
+		if err := release(); err != nil {
+			return err
+		}
+		*phase = fsReleased
+		return m.saveStateLocked(id, state)
+	}
+	if err := releaseStep(&state.RootfsPhase, func() error {
+		m.mu.Lock()
+		lr := m.sandboxRootfs[id]
+		m.mu.Unlock()
+		if lr == nil {
+			return fmt.Errorf("rootfs reference is unknown")
+		}
+		if err := lr.DecRef(); err != nil {
+			return err
+		}
+		m.mu.Lock()
+		delete(m.sandboxRootfs, id)
+		m.mu.Unlock()
+		return nil
+	}); err != nil {
+		return err
+	}
+	for i := range state.S3 {
+		if err := releaseStep(&state.S3Phases[i], func() error {
+			m.mu.Lock()
+			handles := m.sandboxS3Mount[id]
+			known := i < len(handles) && handles[i] != nil
+			m.mu.Unlock()
+			if !known {
+				return fmt.Errorf("S3 reference is unknown")
+			}
+			if err := m.s3.unmountS3(state.S3[i]); err != nil {
+				return err
+			}
+			m.setS3Handle(id, i, len(state.S3), nil)
+			return nil
+		}); err != nil {
+			return err
+		}
+	}
+	for i := range state.OCI {
+		if err := releaseStep(&state.OCIPhases[i], func() error {
+			m.mu.Lock()
+			handles := m.sandboxOCIMount[id]
+			known := i < len(handles) && handles[i] != ""
+			m.mu.Unlock()
+			if !known {
+				return fmt.Errorf("OCI reference is unknown")
+			}
+			if err := m.oci.unmountOCI(state.OCI[i]); err != nil {
+				return err
+			}
+			m.setOCIHandle(id, i, len(state.OCI), "")
+			return nil
+		}); err != nil {
+			return err
+		}
+	}
+	source, err := json.Marshal(struct {
+		Generation string
+		Rootfs     []byte
+		S3         []*runtime.S3Config
+		OCI        []string
+	}{
+		state.Generation, state.Rootfs, state.S3, state.OCI})
+	if err != nil {
+		return err
+	}
+	sum := sha256.Sum256(source)
+	m.mu.Lock()
+	previousReceipt, previousExists := m.completed[key]
+	m.completed[key] = fsCompletion{SandboxID: id, Generation: generation, SourceFingerprint: hex.EncodeToString(sum[:])}
+	delete(m.sandboxState, id)
+	m.mu.Unlock()
+	if err := m.persistCurrentState(); err != nil {
+		m.mu.Lock()
+		m.sandboxState[id] = cloneFSState(state)
+		if previousExists {
+			m.completed[key] = previousReceipt
+		} else {
+			delete(m.completed, key)
+		}
+		m.mu.Unlock()
+		return err
+	}
+	m.mu.Lock()
+	delete(m.sandboxS3Mount, id)
+	delete(m.sandboxOCIMount, id)
+	m.mu.Unlock()
+	return nil
+}
+
+func (m *fsManager) RootfsConfig(id string) (*runtime.RootfsConfig, error) {
+	m.mu.Lock()
+	state, exists := m.sandboxState[id]
+	state = cloneFSState(state)
+	m.mu.Unlock()
+	if !exists || len(state.Rootfs) == 0 {
+		return nil, fmt.Errorf("rootfs source is unknown: %w", errord.ErrNotFound)
 	}
 	rootfs := &runtime.RootfsConfig{}
 	if err := proto.Unmarshal(state.Rootfs, rootfs); err != nil {
-		return nil, fmt.Errorf("decode rootfs source for sandbox %s: %w", sandboxID, err)
+		return nil, err
 	}
 	return rootfs, nil
 }
 
 func (m *fsManager) Shutdown() {
-	m.mu.Lock()
-	rootfsRefs := make([]*langrtmanager.LanguageRuntime, 0, len(m.sandboxRootfs))
-	for _, rootfs := range m.sandboxRootfs {
-		rootfsRefs = append(rootfsRefs, rootfs)
+	m.persistMu.Lock()
+	defer m.persistMu.Unlock()
+	if err := m.loadLocked(); err != nil {
+		logrus.Warnf("preserve unreadable filesystem journal during shutdown: %v", err)
+		return
 	}
-	m.sandboxRootfs = make(map[string]*langrtmanager.LanguageRuntime)
-	m.sandboxS3Mount = make(map[string][]*runtime.S3Config)
-	m.sandboxOCIMount = make(map[string][]string)
-	m.sandboxState = make(map[string]sandboxFSState)
-	m.mu.Unlock()
-
-	for _, rootfs := range rootfsRefs {
-		if rootfs != nil {
-			rootfs.DecRef()
-		}
-	}
-	m.s3.cleanupAllS3Unmounts()
-	m.oci.cleanupAllOciUnmounts()
-	if err := m.persistState(); err != nil {
+	// Daemon shutdown is not sandbox retirement. Preserve all owners and mounts.
+	if err := m.persistCurrentState(); err != nil {
 		logrus.Warnf("persist filesystem shutdown state: %v", err)
 	}
 }
 
-func stateFromPrepared(prepared *preparedFS) (sandboxFSState, error) {
-	if prepared == nil || prepared.source == nil {
-		return sandboxFSState{}, fmt.Errorf("rootfs source is missing")
-	}
-	rootfs, err := proto.Marshal(prepared.source)
-	if err != nil {
-		return sandboxFSState{}, fmt.Errorf("marshal rootfs source: %w", err)
-	}
-	return sandboxFSState{
-		Rootfs: rootfs,
-		S3:     cloneS3Configs(prepared.s3),
-		OCI:    append([]string(nil), prepared.oci...),
-	}, nil
-}
-
 func cloneS3Configs(configs []*runtime.S3Config) []*runtime.S3Config {
-	cloned := make([]*runtime.S3Config, 0, len(configs))
-	for _, cfg := range configs {
-		if cfg == nil {
-			cloned = append(cloned, nil)
-			continue
+	result := make([]*runtime.S3Config, len(configs))
+	for i, cfg := range configs {
+		if cfg != nil {
+			result[i] = proto.Clone(cfg).(*runtime.S3Config)
 		}
-		cloned = append(cloned, proto.Clone(cfg).(*runtime.S3Config))
 	}
-	return cloned
+	return result
 }
-
-func cloneFSState(state sandboxFSState) sandboxFSState {
-	return sandboxFSState{
-		Rootfs: append([]byte(nil), state.Rootfs...),
-		S3:     cloneS3Configs(state.S3),
-		OCI:    append([]string(nil), state.OCI...),
-	}
+func cloneFSState(s sandboxFSState) sandboxFSState {
+	s.Rootfs = append([]byte(nil), s.Rootfs...)
+	s.S3 = cloneS3Configs(s.S3)
+	s.OCI = append([]string(nil), s.OCI...)
+	s.S3Phases = append([]fsLeasePhase(nil), s.S3Phases...)
+	s.OCIPhases = append([]fsLeasePhase(nil), s.OCIPhases...)
+	return s
 }
-
-func (m *fsManager) persistState() error {
-	if m.store == nil {
-		return nil
-	}
-	m.persistMu.Lock()
-	defer m.persistMu.Unlock()
+func (m *fsManager) saveStateLocked(id string, state sandboxFSState) error {
+	m.mu.Lock()
+	m.sandboxState[id] = cloneFSState(state)
+	m.mu.Unlock()
 	return m.persistCurrentState()
 }
-
 func (m *fsManager) persistCurrentState() error {
 	if m.store == nil {
 		return nil
 	}
 	m.mu.Lock()
-	items := make(map[string]sandboxFSState, len(m.sandboxState))
-	for sandboxID, state := range m.sandboxState {
-		items[sandboxID] = cloneFSState(state)
+	stored := storedSandboxFSStates{SchemaVersion: fsJournalSchema, Items: make(map[string]sandboxFSState, len(m.sandboxState)), Completed: make(map[string]fsCompletion, len(m.completed))}
+	for id, state := range m.sandboxState {
+		stored.Items[id] = cloneFSState(state)
+	}
+	for key, receipt := range m.completed {
+		stored.Completed[key] = receipt
 	}
 	m.mu.Unlock()
-
-	data, err := json.Marshal(storedSandboxFSStates{Items: items})
+	data, err := json.Marshal(stored)
 	if err != nil {
-		return fmt.Errorf("encode sandbox filesystem state: %w", err)
+		return err
 	}
 	if err := m.store.StoreRaw(config.SandboxFSStateBucket, data); err != nil {
-		return fmt.Errorf("store sandbox filesystem state: %w", err)
+		return fmt.Errorf("persist filesystem ownership: %w", err)
 	}
 	return nil
 }
 
-// Restore rebuilds rootfs and additional-mount references after sandboxd
-// restarts in the same pod. State belonging to sandboxes that no longer exist
-// is re-acquired and immediately released so the underlying mount is cleaned.
-func (m *fsManager) Restore(sandboxExists func(string) bool) error {
+func (m *fsManager) loadLocked() error {
+	if m.loaded {
+		return nil
+	}
 	if m.store == nil {
+		m.loaded = true
 		return nil
 	}
 	data, err := m.store.LoadRaw(config.SandboxFSStateBucket)
-	if err != nil {
-		if errord.IsNotFound(err) {
-			return nil
-		}
-		return fmt.Errorf("load sandbox filesystem state: %w", err)
-	}
-
-	var stored storedSandboxFSStates
-	if err := json.Unmarshal(data, &stored); err != nil {
-		return fmt.Errorf("decode sandbox filesystem state: %w", err)
-	}
-	ids := make([]string, 0, len(stored.Items))
-	orphaned := make(map[string]bool, len(stored.Items))
-	for sandboxID := range stored.Items {
-		ids = append(ids, sandboxID)
-		orphaned[sandboxID] = sandboxExists != nil && !sandboxExists(sandboxID)
-	}
-	// Restore live sandboxes first so shared mount references exist before
-	// orphan state is reacquired and released. Otherwise an orphan sorted first
-	// could unmount a daemon that a recovered sandbox still uses.
-	sort.Slice(ids, func(i, j int) bool {
-		if orphaned[ids[i]] != orphaned[ids[j]] {
-			return !orphaned[ids[i]]
-		}
-		return ids[i] < ids[j]
-	})
-
-	var restoreErrors []error
-	for _, sandboxID := range ids {
-		state := cloneFSState(stored.Items[sandboxID])
-		if err := m.restoreSandbox(sandboxID, state); err != nil {
-			restoreErrors = append(restoreErrors, fmt.Errorf("sandbox %s: %w", sandboxID, err))
-			continue
-		}
-		if orphaned[sandboxID] {
-			_ = m.release(sandboxID, false)
-		}
-	}
-	if len(restoreErrors) > 0 {
-		return errors.Join(restoreErrors...)
-	}
-	return m.persistState()
-}
-
-func (m *fsManager) restoreSandbox(sandboxID string, state sandboxFSState) (retErr error) {
-	rootfs := &runtime.RootfsConfig{}
-	if len(state.Rootfs) == 0 {
-		return fmt.Errorf("rootfs source is missing")
-	}
-	if err := proto.Unmarshal(state.Rootfs, rootfs); err != nil {
-		return fmt.Errorf("unmarshal rootfs source: %w", err)
-	}
-	lrt, err := m.rootfs.AddLangRuntime(&runtime.StartRequest{
-		SandboxID: sandboxID,
-		Rootfs:    rootfs,
-	}, true)
-	if err != nil {
-		return fmt.Errorf("restore rootfs: %w", err)
-	}
-	lrt.IncRef()
-	prepared := &preparedFS{manager: m, rootfs: lrt, source: rootfs}
-	defer func() {
-		if retErr != nil {
-			prepared.Rollback()
-		}
-	}()
-
-	for _, cfg := range state.S3 {
-		if _, err := m.s3.mountS3(cfg); err != nil {
-			return fmt.Errorf("restore S3 mount: %w", err)
-		}
-		prepared.s3 = append(prepared.s3, cfg)
-	}
-	for _, imageURL := range state.OCI {
-		if _, err := m.oci.mountOCI(imageURL); err != nil {
-			return fmt.Errorf("restore OCI mount: %w", err)
-		}
-		prepared.oci = append(prepared.oci, imageURL)
-	}
-
-	m.mu.Lock()
-	m.sandboxRootfs[sandboxID] = prepared.rootfs
-	m.sandboxS3Mount[sandboxID] = cloneS3Configs(prepared.s3)
-	m.sandboxOCIMount[sandboxID] = append([]string(nil), prepared.oci...)
-	m.sandboxState[sandboxID] = cloneFSState(state)
-	m.mu.Unlock()
-	return nil
-}
-
-func (m *fsManager) release(sandboxID string, persist bool) error {
-	if sandboxID == "" {
+	if errord.IsNotFound(err) {
+		m.loaded = true
 		return nil
 	}
-
-	m.persistMu.Lock()
+	if err != nil {
+		return err
+	}
+	var stored storedSandboxFSStates
+	if err := json.Unmarshal(data, &stored); err != nil {
+		return err
+	}
+	if stored.SchemaVersion != 0 && stored.SchemaVersion != fsJournalSchema {
+		return fmt.Errorf("unsupported filesystem ownership schema")
+	}
+	if len(stored.Items)+len(stored.Completed) > fsJournalLimit {
+		return fmt.Errorf("filesystem journal limit exceeded")
+	}
+	for id, state := range stored.Items {
+		if id == "" || len(state.Rootfs) == 0 {
+			return fmt.Errorf("invalid filesystem owner")
+		}
+		if stored.SchemaVersion == 0 {
+			state.RootfsPhase = fsAcquired
+			state.S3Phases = make([]fsLeasePhase, len(state.S3))
+			for i := range state.S3Phases {
+				state.S3Phases[i] = fsAcquired
+			}
+			state.OCIPhases = make([]fsLeasePhase, len(state.OCI))
+			for i := range state.OCIPhases {
+				state.OCIPhases[i] = fsAcquired
+			}
+		}
+		if len(state.S3) != len(state.S3Phases) || len(state.OCI) != len(state.OCIPhases) {
+			return fmt.Errorf("incomplete filesystem ownership stages")
+		}
+		phases := append([]fsLeasePhase{state.RootfsPhase}, state.S3Phases...)
+		phases = append(phases, state.OCIPhases...)
+		for _, phase := range phases {
+			switch phase {
+			case fsReserved, fsAcquiring, fsAcquired, fsReleasePending, fsReleased:
+			default:
+				return fmt.Errorf("invalid filesystem ownership stage")
+			}
+		}
+		stored.Items[id] = cloneFSState(state)
+	}
+	for key, r := range stored.Completed {
+		fingerprint, err := hex.DecodeString(r.SourceFingerprint)
+		if err != nil || len(fingerprint) != sha256.Size || r.SandboxID == "" || key != fsCompletionKey(r.SandboxID, r.Generation) {
+			return fmt.Errorf("invalid filesystem completion")
+		}
+		if active, exists := stored.Items[r.SandboxID]; exists && active.Generation == r.Generation {
+			return fmt.Errorf("filesystem generation is both active and completed")
+		}
+	}
 	m.mu.Lock()
-	rootfs := m.sandboxRootfs[sandboxID]
-	s3Configs := append([]*runtime.S3Config(nil), m.sandboxS3Mount[sandboxID]...)
-	ociURLs := append([]string(nil), m.sandboxOCIMount[sandboxID]...)
-	state, stateExists := m.sandboxState[sandboxID]
-	delete(m.sandboxRootfs, sandboxID)
-	delete(m.sandboxS3Mount, sandboxID)
-	delete(m.sandboxOCIMount, sandboxID)
-	delete(m.sandboxState, sandboxID)
+	for id, state := range stored.Items {
+		m.sandboxState[id] = cloneFSState(state)
+	}
+	for key, receipt := range stored.Completed {
+		m.completed[key] = receipt
+	}
 	m.mu.Unlock()
-	if persist {
-		if err := m.persistCurrentState(); err != nil {
-			m.mu.Lock()
-			if rootfs != nil {
-				m.sandboxRootfs[sandboxID] = rootfs
-			}
-			if len(s3Configs) > 0 {
-				m.sandboxS3Mount[sandboxID] = s3Configs
-			}
-			if len(ociURLs) > 0 {
-				m.sandboxOCIMount[sandboxID] = ociURLs
-			}
-			if stateExists {
-				m.sandboxState[sandboxID] = state
-			}
-			m.mu.Unlock()
-			m.persistMu.Unlock()
-			return fmt.Errorf("persist released filesystem state for sandbox %s: %w", sandboxID, err)
-		}
-	}
-	m.persistMu.Unlock()
+	m.loaded = true
+	return nil
+}
 
-	if rootfs != nil {
-		rootfs.DecRef()
+// Validate before ANY reconstruction or orphan cleanup. Otherwise a missing
+// physical owner's journal could undercount a shared mount and release its
+// source as if an unrelated orphan held the final reference.
+func (m *fsManager) ValidatePhysicalOwners(owners []*runtime.SandboxMetadata) error {
+	m.persistMu.Lock()
+	defer m.persistMu.Unlock()
+	if err := m.loadLocked(); err != nil {
+		return err
 	}
-	for _, cfg := range s3Configs {
-		if err := m.s3.unmountS3(cfg); err != nil {
-			logrus.Warnf("failed to unmount S3 for sandbox %s: %v", sandboxID, err)
+	for _, metadata := range owners {
+		if metadata == nil || metadata.ID == "" {
+			return fmt.Errorf("physical owner is incomplete")
 		}
-	}
-	for _, imageURL := range ociURLs {
-		if err := m.oci.unmountOCI(imageURL); err != nil {
-			logrus.Warnf("failed to unmount OCI image for sandbox %s: %v", sandboxID, err)
+		generation := metadata.Labels[resourceGenerationLabel]
+		m.mu.Lock()
+		state, exists := m.sandboxState[metadata.ID]
+		receipt, completed := m.completed[fsCompletionKey(metadata.ID, generation)]
+		m.mu.Unlock()
+		if generation != "" && metadata.PhysicalPhase == runtime.SandboxPhysicalPhase_SANDBOX_PHYSICAL_PHASE_INTENT && completed && receipt.SandboxID == metadata.ID && receipt.Generation == generation {
+			continue
+		}
+		if !exists || state.Generation != generation {
+			return fmt.Errorf("filesystem owner %s is missing or changed", metadata.ID)
+		}
+		if metadata.PhysicalPhase != runtime.SandboxPhysicalPhase_SANDBOX_PHYSICAL_PHASE_INTENT {
+			phases := append([]fsLeasePhase{state.RootfsPhase}, state.S3Phases...)
+			phases = append(phases, state.OCIPhases...)
+			for _, phase := range phases {
+				if phase != fsAcquired {
+					return fmt.Errorf("published filesystem owner %s has unresolved cleanup", metadata.ID)
+				}
+			}
 		}
 	}
 	return nil
 }
 
+// Rebuild every surviving owner before allowing an orphan to release a shared
+// source. An interrupted acquire/release re-acquires its OWN reference; it never
+// decrements a neighbor's reconstructed reference or treats absence as success.
+func (m *fsManager) Restore(sandboxExists func(string) bool) error {
+	m.persistMu.Lock()
+	defer m.persistMu.Unlock()
+	if err := m.loadLocked(); err != nil {
+		return err
+	}
+	if err := m.persistCurrentState(); err != nil {
+		return err
+	}
+	if err := m.recoverAllLocked(); err != nil {
+		return err
+	}
+	ids := m.ownerIDs()
+	for _, id := range ids {
+		if sandboxExists != nil && !sandboxExists(id) {
+			m.mu.Lock()
+			generation := m.sandboxState[id].Generation
+			m.mu.Unlock()
+			if err := m.releaseLocked(id, generation, generation != ""); err != nil {
+				return fmt.Errorf("release orphan filesystem %s: %w", id, err)
+			}
+		}
+	}
+	return m.persistCurrentState()
+}
+func (m *fsManager) ownerIDs() []string {
+	m.mu.Lock()
+	ids := make([]string, 0, len(m.sandboxState))
+	for id := range m.sandboxState {
+		ids = append(ids, id)
+	}
+	m.mu.Unlock()
+	sort.Strings(ids)
+	return ids
+}
+func (m *fsManager) recoverAllLocked() error {
+	var failures []error
+	for _, id := range m.ownerIDs() {
+		if err := m.recoverSandboxLocked(id); err != nil {
+			failures = append(failures, fmt.Errorf("recover filesystem %s: %w", id, err))
+		}
+	}
+	return errors.Join(failures...)
+}
+
+func (m *fsManager) checkSourceAdmissionLocked(state sandboxFSState) error {
+	rootfs := &runtime.RootfsConfig{}
+	if err := proto.Unmarshal(state.Rootfs, rootfs); err != nil {
+		return err
+	}
+	oci := append([]string(nil), state.OCI...)
+	s3 := cloneS3Configs(state.S3)
+	if rootfs.Type == runtime.RootfsSrcType_IMAGE {
+		oci = append(oci, rootfs.GetImageUrl())
+	}
+	if rootfs.Type == runtime.RootfsSrcType_S3 {
+		s3 = append(s3, rootfs.GetS3Config())
+	}
+	m.oci.mu.Lock()
+	for _, source := range oci {
+		if entry := m.oci.entries[source]; entry != nil && entry.releaseUnconfirmed {
+			m.oci.mu.Unlock()
+			return fmt.Errorf("OCI source release is unconfirmed")
+		}
+	}
+	m.oci.mu.Unlock()
+	m.s3.mu.Lock()
+	defer m.s3.mu.Unlock()
+	for _, source := range s3 {
+		if source == nil {
+			return fmt.Errorf("S3 source is missing")
+		}
+		if entry := m.s3.entries[s3MountKey(source)]; entry != nil && entry.releaseUnconfirmed {
+			return fmt.Errorf("S3 source release is unconfirmed")
+		}
+	}
+	return nil
+}
+func needsFSReference(phase fsLeasePhase) bool { return phase != fsReserved && phase != fsReleased }
+func (m *fsManager) recoverSandboxLocked(id string) error {
+	m.mu.Lock()
+	state := cloneFSState(m.sandboxState[id])
+	lr := m.sandboxRootfs[id]
+	m.mu.Unlock()
+	if needsFSReference(state.RootfsPhase) && lr == nil {
+		rootfs := &runtime.RootfsConfig{}
+		if err := proto.Unmarshal(state.Rootfs, rootfs); err != nil {
+			return err
+		}
+		recovered, err := m.rootfs.AddLangRuntime(&runtime.StartRequest{SandboxID: id, Rootfs: rootfs}, true)
+		if err != nil {
+			return err
+		}
+		recovered.IncRef()
+		m.mu.Lock()
+		m.sandboxRootfs[id] = recovered
+		m.mu.Unlock()
+		if state.RootfsPhase == fsAcquiring {
+			state.RootfsPhase = fsAcquired
+		}
+		if err := m.saveStateLocked(id, state); err != nil {
+			return err
+		}
+	}
+	for i, source := range state.S3 {
+		if !needsFSReference(state.S3Phases[i]) {
+			continue
+		}
+		m.mu.Lock()
+		handles := m.sandboxS3Mount[id]
+		known := i < len(handles) && handles[i] != nil
+		m.mu.Unlock()
+		if known {
+			continue
+		}
+		if _, err := m.s3.mountS3(source); err != nil {
+			return err
+		}
+		m.setS3Handle(id, i, len(state.S3), source)
+		if state.S3Phases[i] == fsAcquiring {
+			state.S3Phases[i] = fsAcquired
+		}
+		if err := m.saveStateLocked(id, state); err != nil {
+			return err
+		}
+	}
+	for i, source := range state.OCI {
+		if !needsFSReference(state.OCIPhases[i]) {
+			continue
+		}
+		m.mu.Lock()
+		handles := m.sandboxOCIMount[id]
+		known := i < len(handles) && handles[i] != ""
+		m.mu.Unlock()
+		if known {
+			continue
+		}
+		if _, err := m.oci.mountOCI(source); err != nil {
+			return err
+		}
+		m.setOCIHandle(id, i, len(state.OCI), source)
+		if state.OCIPhases[i] == fsAcquiring {
+			state.OCIPhases[i] = fsAcquired
+		}
+		if err := m.saveStateLocked(id, state); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+func (m *fsManager) setS3Handle(id string, index, count int, source *runtime.S3Config) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.sandboxS3Mount[id] == nil {
+		m.sandboxS3Mount[id] = make([]*runtime.S3Config, count)
+	}
+	m.sandboxS3Mount[id][index] = source
+}
+func (m *fsManager) setOCIHandle(id string, index, count int, source string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.sandboxOCIMount[id] == nil {
+		m.sandboxOCIMount[id] = make([]string, count)
+	}
+	m.sandboxOCIMount[id][index] = source
+}
 func (p *preparedFS) RootfsPath() string {
 	if p == nil || p.rootfs == nil || p.rootfs.RootFS == nil {
 		return ""
 	}
 	return p.rootfs.RootFS.Path()
 }
-
 func (p *preparedFS) Mounts() []*runtime.Mount {
 	if p == nil {
 		return nil
 	}
 	return p.mounts
 }
-
-func (p *preparedFS) Rollback() {
+func (p *preparedFS) Rollback() error {
 	if p == nil {
-		return
+		return nil
 	}
-	if p.rootfs != nil {
-		p.rootfs.DecRef()
-		p.rootfs = nil
+	if p.generation != "" {
+		return p.manager.ReleaseIfGeneration(p.sandboxID, p.generation)
 	}
-	for _, cfg := range p.s3 {
-		_ = p.manager.s3.unmountS3(cfg)
-	}
-	for _, url := range p.oci {
-		_ = p.manager.oci.unmountOCI(url)
-	}
-	p.s3 = nil
-	p.oci = nil
+	return p.manager.Release(p.sandboxID)
 }
-
 func cloneMounts(mounts []*runtime.Mount) []*runtime.Mount {
-	cloned := make([]*runtime.Mount, 0, len(mounts))
-	for _, mount := range mounts {
-		if mount == nil {
-			cloned = append(cloned, nil)
-			continue
+	result := make([]*runtime.Mount, len(mounts))
+	for i, mount := range mounts {
+		if mount != nil {
+			result[i] = proto.Clone(mount).(*runtime.Mount)
 		}
-		cloned = append(cloned, proto.Clone(mount).(*runtime.Mount))
 	}
-	return cloned
+	return result
 }

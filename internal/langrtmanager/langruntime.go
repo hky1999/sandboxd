@@ -15,9 +15,8 @@
 package langrtmanager
 
 import (
+	"fmt"
 	"sync"
-
-	"github.com/sirupsen/logrus"
 )
 
 type LanguageRuntime struct {
@@ -47,18 +46,20 @@ func (lr *LanguageRuntime) IncRef() {
 	lr.refcnt += 1
 }
 
-func (lr *LanguageRuntime) DecRef() {
+func (lr *LanguageRuntime) DecRef() error {
 	lr.mu.Lock()
 	defer lr.mu.Unlock()
-
-	lr.refcnt -= 1
-
-	if lr.temporary && lr.refcnt == 0 {
-		logrus.Infof("Release language runtime %v.", lr.ID)
-		// release rootfs
-		lr.RootFS.DecRef()
-		lr.cleanupFunc()
-	} else if lr.refcnt < 0 {
-		logrus.Warningf("Refcount %v < 0, leak happens.", lr.refcnt)
+	if lr.refcnt <= 0 {
+		return fmt.Errorf("language runtime reference is not owned")
 	}
+	if lr.temporary && lr.refcnt == 1 {
+		if err := lr.RootFS.DecRef(); err != nil {
+			return err
+		}
+		if lr.cleanupFunc != nil {
+			lr.cleanupFunc()
+		}
+	}
+	lr.refcnt--
+	return nil
 }

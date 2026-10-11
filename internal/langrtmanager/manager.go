@@ -15,6 +15,7 @@
 package langrtmanager
 
 import (
+	"errors"
 	"fmt"
 	"sync"
 
@@ -60,7 +61,7 @@ func (lm *LangRTManager) GetRootfs(cfg RootfsConfig) (*RootFS, error) {
 	lm.rootfsMap[cfg] = entry
 	lm.rfMu.Unlock()
 
-	logrus.Infof("rootfs %v not exists, try to create it", cfg)
+	logrus.Infof("create rootfs for source type %s", cfg.SrcType.String())
 	rootfs, err := NewRootFS(cfg, lm.mounter, func() {
 		lm.rfMu.Lock()
 		// Only delete if it's still our entry (not replaced by a new one).
@@ -81,7 +82,7 @@ func (lm *LangRTManager) GetRootfs(cfg RootfsConfig) (*RootFS, error) {
 			delete(lm.rootfsMap, cfg)
 		}
 		lm.rfMu.Unlock()
-		return nil, fmt.Errorf("failed to create rootfs with config %v: %v", cfg, err)
+		return nil, fmt.Errorf("create rootfs: %w", err)
 	}
 
 	return rootfs, nil
@@ -188,7 +189,10 @@ func (lm *LangRTManager) AddLangRuntime(request *api.StartRequest, temporary boo
 
 		err = rootfs.IncRef()
 		if err != nil {
-			logrus.Warningf("Get reference of rootfs %v failed: %v, retry", rootfs.cfg, err)
+			if errors.Is(err, ErrRootfsReleaseUnconfirmed) {
+				return nil, err
+			}
+			logrus.Warningf("rootfs reference changed; retry")
 			continue
 		} else {
 			break // get rootfs succeed.
@@ -203,7 +207,9 @@ func (lm *LangRTManager) AddLangRuntime(request *api.StartRequest, temporary boo
 	if lr, ok := lm.lrtMap[id]; ok {
 		logrus.Debugf("Language runtime %v already exists (added concurrently)!", id)
 		lr.SetTemporary(temporary)
-		rootfs.DecRef()
+		if err := rootfs.DecRef(); err != nil {
+			return nil, fmt.Errorf("release duplicate rootfs reference: %w", err)
+		}
 		return lr, nil
 	}
 

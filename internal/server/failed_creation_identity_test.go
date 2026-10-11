@@ -85,7 +85,19 @@ func stageFailedCreationIntent(t *testing.T, s *sandboxService) *runtime.Sandbox
 		PhysicalPhase: runtime.SandboxPhysicalPhase_SANDBOX_PHYSICAL_PHASE_INTENT,
 		Labels:        map[string]string{resourceGenerationLabel: uuid.NewString(), startOperationLabel: uuid.NewString()}}
 	require.NoError(t, s.sandboxManager.PersistMetadata(id, metadata))
+	stageFilesystemOwner(t, s, id, metadata.Labels[resourceGenerationLabel])
 	return metadata
+}
+
+func stageFilesystemOwner(t *testing.T, s *sandboxService, id, generation string) {
+	t.Helper()
+	prepared, err := s.fsMgr.Prepare(&runtime.StartRequest{SandboxID: id,
+		Labels: map[string]string{resourceGenerationLabel: generation},
+		Rootfs: &runtime.RootfsConfig{Type: runtime.RootfsSrcType_LOCAL,
+			Source: &runtime.RootfsConfig_Path{Path: t.TempDir()}},
+	})
+	require.NoError(t, err)
+	require.NoError(t, s.fsMgr.Commit(id, prepared))
 }
 
 func TestFailedRuntimeCreationPreservesOriginalIntent(t *testing.T) {

@@ -488,8 +488,14 @@ func (h *sandboxService) deleteSandboxRuntime(ctx context.Context, sandboxID str
 		return err
 	}
 
-	if err := h.fsMgr.Release(sandboxID); err != nil {
-		return err
+	var fsReleaseErr error
+	if deleteGeneration != "" {
+		fsReleaseErr = h.fsMgr.ReleaseIfGeneration(sandboxID, deleteGeneration)
+	} else {
+		fsReleaseErr = h.fsMgr.Release(sandboxID)
+	}
+	if fsReleaseErr != nil {
+		return fsReleaseErr
 	}
 	if h.aclMgr != nil {
 		h.aclMu.Lock()
@@ -1762,10 +1768,10 @@ func (h *sandboxService) createSandbox(
 		}
 	}
 	if preparationErr != nil {
-		// A successful filesystem preparation is owned too. Register its
+		// A partial filesystem preparation is owned too. Confirm its
 		// original source so restart reconciliation can locate it even when
-		// another resource failed. Filesystem preparation/commit failure
-		// crash gaps remain a separate cleanup requirement.
+		// another resource failed. Its source intent was already written before
+		// filesystem allocation, and commit errors retain that original owner.
 		if preparedFilesystem != nil {
 			if err := h.fsMgr.Commit(sandboxID, preparedFilesystem); err != nil {
 				preparationErr = errors.Join(preparationErr, err)

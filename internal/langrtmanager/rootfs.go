@@ -15,6 +15,7 @@
 package langrtmanager
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"sync"
@@ -22,7 +23,6 @@ import (
 	runtime_api "github.com/inclusionAI/sandboxd/api/runtime/v1"
 	"github.com/inclusionAI/sandboxd/pkg/imagemanager/api"
 	"github.com/inclusionAI/sandboxd/pkg/imagemanager/imageconfig"
-	"github.com/sirupsen/logrus"
 )
 
 // ImageMounter abstracts rootfs mount/umount operations for testability.
@@ -33,16 +33,19 @@ type ImageMounter interface {
 }
 
 type RootFS struct {
-	cfg          RootfsConfig
-	path         string
-	env          []string
-	imageProcess *imageconfig.Process
-	mounter      ImageMounter
-	cleanupFunc  func()
-	mu           sync.Mutex // mu protects fields below
-	refcnt       int64
-	deleted      bool
+	cfg                RootfsConfig
+	path               string
+	env                []string
+	imageProcess       *imageconfig.Process
+	mounter            ImageMounter
+	cleanupFunc        func()
+	mu                 sync.Mutex // mu protects fields below
+	refcnt             int64
+	deleted            bool
+	releaseUnconfirmed bool
 }
+
+var ErrRootfsReleaseUnconfirmed = errors.New("rootfs release is unconfirmed")
 
 type RootfsConfig struct {
 	SrcType runtime_api.RootfsSrcType
@@ -217,25 +220,32 @@ func (rf *RootFS) IncRef() error {
 	if rf.deleted {
 		return fmt.Errorf("this rootfs has already been deleted")
 	}
+	if rf.releaseUnconfirmed {
+		return ErrRootfsReleaseUnconfirmed
+	}
 	rf.refcnt += 1
 	return nil
 }
 
-func (rf *RootFS) DecRef() {
+func (rf *RootFS) DecRef() error {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-
-	rf.refcnt -= 1
-	if rf.refcnt == 0 {
-		logrus.Infof("No one refers rootfs %v, try to release it", rf.cfg)
-		rf.deleted = true
-		if err := rf.UmountImage(); err != nil {
-			logrus.Warningf("Failed to umount image %v: %v, just ignore", rf.path, err)
-		}
-		rf.cleanupFunc()
-	} else if rf.refcnt < 0 {
-		logrus.Warningf("Refcount %v < 0, leak happens.", rf.refcnt)
+	if rf.deleted || rf.refcnt <= 0 {
+		return fmt.Errorf("rootfs reference is not owned")
 	}
+	if rf.refcnt == 1 {
+		if err := rf.UmountImage(); err != nil {
+			rf.releaseUnconfirmed = true
+			return fmt.Errorf("unmount rootfs: %w", err)
+		}
+		rf.deleted = true
+		rf.releaseUnconfirmed = false
+		if rf.cleanupFunc != nil {
+			rf.cleanupFunc()
+		}
+	}
+	rf.refcnt--
+	return nil
 }
 
 func NewRootFS(cfg RootfsConfig, mounter ImageMounter, cleanup func()) (*RootFS, error) {

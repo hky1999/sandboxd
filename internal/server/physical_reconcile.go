@@ -38,6 +38,16 @@ const physicalIntentCleanupTimeout = 20 * time.Second
 const physicalIntentMetadataLimit = 4 * 1024 * 1024
 
 func (h *sandboxService) recoverPhysicalState(ctx context.Context) error {
+	owners := h.sandboxManager.ListPhysicalIntents()
+	for _, c := range h.sandboxManager.List() {
+		if c == nil || c.Metadata == nil {
+			return fmt.Errorf("published physical ownership is incomplete")
+		}
+		owners = append(owners, proto.Clone(c.Metadata).(*runtime.SandboxMetadata))
+	}
+	if err := h.fsMgr.ValidatePhysicalOwners(owners); err != nil {
+		return fmt.Errorf("validate original filesystem owners: %w", err)
+	}
 	if err := h.fsMgr.Restore(h.sandboxManager.HasPhysicalRecord); err != nil {
 		return fmt.Errorf("restore sandbox filesystem state: %w", err)
 	}
@@ -194,8 +204,14 @@ func (h *sandboxService) reconcilePhysicalIntent(
 		h.xpuMgr.Release(metadata.ID)
 	}
 	if h.fsMgr != nil {
-		if err := h.fsMgr.Release(metadata.ID); err != nil {
-			return fmt.Errorf("release filesystem for physical intent %s: %w", metadata.ID, err)
+		var fsErr error
+		if generation := metadata.Labels[resourceGenerationLabel]; generation != "" {
+			fsErr = h.fsMgr.ReleaseIfGeneration(metadata.ID, generation)
+		} else {
+			fsErr = h.fsMgr.Release(metadata.ID)
+		}
+		if fsErr != nil {
+			return fmt.Errorf("release filesystem for physical intent %s: %w", metadata.ID, fsErr)
 		}
 	}
 
