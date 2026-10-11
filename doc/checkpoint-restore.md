@@ -5,6 +5,8 @@ directory and starting a new sandbox from that checkpoint.
 
 ## Design
 
+调度器的普通创建及通过 `checkpoint_info` 发起的创建可以使用 [持久创建操作](scheduler-start-operations.md) 的 `StartOperation`。它复用同一物理创建流程，并单独记录创建身份与结果；独立 `Restore` 的持久操作整合仍待完成。
+
 The API has three operations:
 
 1. `SandboxService.Checkpoint` checkpoints an existing sandbox.

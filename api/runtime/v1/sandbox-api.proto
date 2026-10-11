@@ -22,6 +22,12 @@ option go_package = "github.com/inclusionAI/sandboxd/api/runtime/v1;v1";
 service SandboxService {
   // Start creates and starts a sandbox.
   rpc Start(StartRequest) returns (StartResponse) {}
+  // Creates at most once under a durable operation identity. Never fall back
+  // to Start when this RPC is unsupported or its outcome is unknown.
+  rpc StartOperation(StartOperationRequest) returns (StartOperationResponse) {}
+  // Reads durable historical results. UNKNOWN is not proof of non-creation;
+  // STARTED is not a claim that the original incarnation is currently alive.
+  rpc GetStartOperation(GetStartOperationRequest) returns (StartOperationResponse) {}
   // Checkpoint saves a running sandbox and stops its source process.
   rpc Checkpoint(CheckpointRequest) returns (CheckpointResponse) {}
   // Checkpoints only the physical incarnation identified by the nested
@@ -61,6 +67,47 @@ service SandboxService {
   rpc ListAvailableRuntimes(ListAvailableRuntimesRequest) returns (ListAvailableRuntimesResponse) {}
   // SetNetworkPolicy atomically replaces the network policy of a running sandbox.
   rpc SetNetworkPolicy(SetNetworkPolicyRequest) returns (SetNetworkPolicyResponse) {}
+}
+
+message StartOperationRequest {
+  StartRequest start = 1;
+  string operation_id = 2;
+  // Opaque full-request SHA256 supplied by the caller. The daemon separately
+  // hashes the complete nested protobuf request to detect changed payloads.
+  string request_fingerprint = 3;
+  uint64 deadline_unix_millis = 4;
+}
+
+message GetStartOperationRequest {
+  string operation_id = 1;
+  string request_fingerprint = 2;
+  uint64 deadline_unix_millis = 3;
+  // Explicitly fence a never-admitted operation after its deadline. A healthy
+  // admission index and authoritative physical checks are required. Callers
+  // must not enable this for operations sent through legacy Start.
+  bool seal_missing = 4;
+}
+
+enum StartOperationState {
+  START_OPERATION_STATE_UNKNOWN = 0;
+  START_OPERATION_STATE_PENDING = 1;
+  START_OPERATION_STATE_STARTED = 2;
+  // Durable rejection before physical side effects; later identical requests
+  // replay this outcome and cannot dispatch a creation.
+  START_OPERATION_STATE_NOT_CREATED = 3;
+  // Only a matching completed generation-conditional retirement receipt
+  // authorizes this outcome. Absence alone never authorizes it.
+  START_OPERATION_STATE_RETIRED = 4;
+}
+
+message StartOperationResponse {
+  string operation_id = 1;
+  string request_fingerprint = 2;
+  uint64 deadline_unix_millis = 3;
+  StartOperationState state = 4;
+  // Original bound sandbox ID and generation, including for PENDING/RETIRED.
+  // A successful result also retains its original IP and ports.
+  StartResponse result = 5;
 }
 
 // NetworkPolicyAction is the action selected by a network policy rule.

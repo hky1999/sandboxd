@@ -130,6 +130,8 @@ type sandboxService struct {
 	deleteGroup                       singleflight.Group
 	resourceLocks                     physicalLocks
 	retirementMu                      sync.Mutex
+	startOperationMu                  sync.Mutex
+	startJournal                      *startOperationJournal
 	aclMu                             sync.Mutex
 	checkpointMu                      sync.Mutex
 	checkpointing                     map[string]struct{}
@@ -810,6 +812,7 @@ func (h *sandboxService) Shutdown() {
 		}
 	}
 	logrus.Info("sandbox service shutdown complete")
+	h.closeStartOperationJournal()
 }
 
 func (h *sandboxService) acquireCheckpointOperation() (func(), bool) {
@@ -1447,9 +1450,11 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 }
 
 type createOptions struct {
-	checkpointImage string
-	onReserved      func(*runtime.StartRequest, string) error
-	restoreIdentity *runtime.RestoreIdentity
+	checkpointImage    string
+	onReserved         func(*runtime.StartRequest, string) error
+	restoreIdentity    *runtime.RestoreIdentity
+	resourceGeneration string
+	beforeSideEffects  func() error
 }
 
 func (h *sandboxService) createSandbox(
@@ -1481,6 +1486,9 @@ func (h *sandboxService) createSandbox(
 		startReq.Labels = make(map[string]string)
 	}
 	startReq.Labels[resourceGenerationLabel] = uuid.NewString()
+	if options.resourceGeneration != "" {
+		startReq.Labels[resourceGenerationLabel] = options.resourceGeneration
+	}
 	// Birth-resource evidence is a fresh observation bound to the generation
 	// above: drop any caller-supplied or checkpoint-source-carried record
 	// before it can reach the metadata and annotations copies. A restored
@@ -1763,6 +1771,11 @@ func (h *sandboxService) createSandbox(
 		}
 		h.sandboxManager.ReleaseID(sandboxID)
 	}()
+	if options.beforeSideEffects != nil {
+		if err := options.beforeSideEffects(); err != nil {
+			return nil, err
+		}
+	}
 	resolvedPorts, err := h.networkMgr.resolveDnatPorts(sandboxID, startReq.Ports)
 	if err != nil {
 		return &runtime.StartResponse{Code: -1, Message: err.Error()},
