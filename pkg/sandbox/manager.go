@@ -866,8 +866,9 @@ func (or OccupiedResource) ToLabels() map[string]string {
 }
 
 type OccupiedResource struct {
-	ID        string
-	Resources map[string]string
+	ID         string
+	Generation string
+	Resources  map[string]string
 }
 
 func (m *Manager) CollectResourceByID(id string) (OccupiedResource, error) {
@@ -881,6 +882,7 @@ func (m *Manager) CollectResourceByID(id string) (OccupiedResource, error) {
 		return resource, err
 	}
 	resource.ID = id
+	resource.Generation = oci.Annotations[config.ResourceGenerationLabel]
 	resource.Resources = make(map[string]string)
 	for resourceName, key := range oci.Annotations {
 		if strings.HasPrefix(resourceName, config.ResourceAnnotationKeyPrefix) {
@@ -890,7 +892,7 @@ func (m *Manager) CollectResourceByID(id string) (OccupiedResource, error) {
 	}
 
 	if _, ok := resource.Resources[config.ResourceNameCgroup]; !ok {
-		if oci.Linux.CgroupsPath != "" {
+		if oci.Linux != nil && oci.Linux.CgroupsPath != "" {
 			resource.Resources[config.ResourceNameCgroup] = oci.Linux.CgroupsPath
 		}
 	}

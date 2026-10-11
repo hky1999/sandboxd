@@ -186,7 +186,9 @@ type failingCgroupMgr struct {
 	recycles   []string
 }
 
-func (f *failingCgroupMgr) Allocate() (string, error) { return "", nil }
+func (f *failingCgroupMgr) Allocate() (string, error)                    { return "", nil }
+func (f *failingCgroupMgr) AllocateForGeneration(string) (string, error) { return f.Allocate() }
+func (f *failingCgroupMgr) RecycleForGeneration(path, _ string) error    { return f.Recycle(path) }
 func (f *failingCgroupMgr) Recycle(name string) error {
 	f.recycles = append(f.recycles, name)
 	if f.recycleErr != nil {

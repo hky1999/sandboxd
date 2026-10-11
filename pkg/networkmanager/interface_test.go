@@ -391,7 +391,7 @@ func TestInterfaceShutdownWaitsForAllocationHandoff(t *testing.T) {
 
 	stored, err := db.LoadRaw(config.BridgeIpBucket)
 	require.NoError(t, err)
-	assert.JSONEq(t, `{"items":[]}`, string(stored))
+	assert.JSONEq(t, `{"schema_version":2,"items":[]}`, string(stored))
 
 	_, err = m.Allocate()
 	assert.ErrorIs(t, err, errord.ErrUnavailable)

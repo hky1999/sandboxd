@@ -58,10 +58,12 @@ type resizeCgroups struct {
 
 func (c *resizeCgroups) ReadMemoryLimit(string) (int64, error) { return 0, nil }
 
-func (*resizeCgroups) Allocate() (string, error)    { return "/sandbox/lease", nil }
-func (*resizeCgroups) Recycle(string) error         { return nil }
-func (*resizeCgroups) ShutDown() error              { return nil }
-func (c *resizeCgroups) SupportsMemoryShrink() bool { return c.shrinkSupported }
+func (*resizeCgroups) Allocate() (string, error)                      { return "/sandbox/lease", nil }
+func (*resizeCgroups) Recycle(string) error                           { return nil }
+func (c *resizeCgroups) AllocateForGeneration(string) (string, error) { return c.Allocate() }
+func (c *resizeCgroups) RecycleForGeneration(path, _ string) error    { return c.Recycle(path) }
+func (*resizeCgroups) ShutDown() error                                { return nil }
+func (c *resizeCgroups) SupportsMemoryShrink() bool                   { return c.shrinkSupported }
 
 func (c *resizeCgroups) Stats(name string) (cgroupmanager.Stats, error) {
 	if c.onStats != nil {

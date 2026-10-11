@@ -37,7 +37,8 @@ const (
 const (
 	UnknownVersion = "unknown"
 
-	SandboxServiceName = "sandbox"
+	SandboxServiceName      = "sandbox"
+	ResourceGenerationLabel = "akernel.scheduler/resource-generation"
 )
 
 const (

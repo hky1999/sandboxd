@@ -80,6 +80,8 @@ type xpuLeaseManager interface {
 type sandboxCgroups interface {
 	Allocate() (string, error)
 	Recycle(string) error
+	AllocateForGeneration(string) (string, error)
+	RecycleForGeneration(string, string) error
 	Prepare(string, *runtime.LinuxSandboxResources) error
 	Stats(string) (cgroupmanager.Stats, error)
 	CgroupIdentity(string) (cgroupmanager.CgroupIdentity, error)
@@ -1690,9 +1692,10 @@ func (h *sandboxService) createSandbox(
 		if startSucceeded {
 			return
 		}
-		if errors.Is(retErr, svc.ErrRestoreCleanupIncomplete) || errors.Is(retErr, svc.ErrRuntimeCreationUnconfirmed) {
+		if errors.Is(retErr, svc.ErrRestoreCleanupIncomplete) || errors.Is(retErr, svc.ErrRuntimeCreationUnconfirmed) ||
+			errors.Is(retErr, errPhysicalPreparationIncomplete) {
 			logrus.Warnf(
-				"retain physical intent and prepared resources for sandbox %s after unconfirmed runtime creation",
+				"retain physical intent and prepared resources for sandbox %s after unconfirmed preparation or runtime creation",
 				sandboxID,
 			)
 			return
@@ -1813,7 +1816,7 @@ func (h *sandboxService) createSandbox(
 		fsCh <- fsPrepareResult{fs: preparedFS, err: err}
 	}()
 	go func() {
-		resources, err := h.prepareStartResources(startReq.Runtime, sandboxID)
+		resources, err := h.prepareStartResources(startReq.Runtime, sandboxID, metadata.Labels[resourceGenerationLabel])
 		resourceCh <- resourcePrepareResult{resources: resources, err: err}
 	}()
 
@@ -1821,19 +1824,32 @@ func (h *sandboxService) createSandbox(
 	resourceResult := <-resourceCh
 	preparedFilesystem = fsResult.fs
 	preparedResources = resourceResult.resources
-	if fsResult.err != nil || resourceResult.err != nil {
-		err := errors.Join(fsResult.err, resourceResult.err)
-		return &runtime.StartResponse{
-			Code:    -1,
-			Message: fmt.Sprintf("failed to prepare sandbox: %v", err),
-			ID:      "",
-		}, err
+	preparationErr := errors.Join(fsResult.err, resourceResult.err)
+	// Persist every returned lease before reporting a preparation failure.
+	// The allocation worker never releases a partial set on its own.
+	if preparedResources != nil {
+		if err := h.persistPhysicalResourceFacts(metadata, preparedResources.Resources); err != nil {
+			return &runtime.StartResponse{Code: -1, Message: err.Error()},
+				errors.Join(preparationErr, err, errPhysicalPreparationIncomplete)
+		}
 	}
-	if err := h.persistPhysicalResourceFacts(metadata, preparedResources.Resources); err != nil {
+	if preparationErr != nil {
+		// A successful filesystem preparation is owned too. Register its
+		// original source so restart reconciliation can locate it even when
+		// another resource failed. Filesystem preparation/commit failure
+		// crash gaps remain a separate cleanup requirement.
+		if preparedFilesystem != nil {
+			if err := h.fsMgr.Commit(sandboxID, preparedFilesystem); err != nil {
+				preparationErr = errors.Join(preparationErr, err)
+			} else {
+				filesystemCommitted = true
+			}
+		}
 		return &runtime.StartResponse{
 			Code:    -1,
-			Message: fmt.Sprintf("failed to persist sandbox resource facts: %v", err),
-		}, err
+			Message: fmt.Sprintf("failed to prepare sandbox: %v", preparationErr),
+			ID:      "",
+		}, errors.Join(preparationErr, errPhysicalPreparationIncomplete)
 	}
 	if err := h.fsMgr.Commit(sandboxID, preparedFilesystem); err != nil {
 		return &runtime.StartResponse{

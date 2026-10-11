@@ -27,6 +27,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/google/uuid"
 	cmap "github.com/orcaman/concurrent-map/v2"
 
 	"github.com/inclusionAI/sandboxd/config"
@@ -86,6 +87,9 @@ type InterfaceManager struct {
 	// store resource string.
 	db      store.DbStore
 	storeMu sync.Mutex
+	// Protected by storeMu; a completed pooled lease binds its ID to the
+	// original serialized facts, independently of later endpoint reuse.
+	completedPooledLeases map[string]string
 
 	// storeMark is used to mark whether the cgroup id need to be stored.
 	// If it's true, manager should not exit.
@@ -207,7 +211,9 @@ type deviceIPNet struct {
 }
 
 type storedInterfaceIDs struct {
-	Items []string `json:"items"`
+	SchemaVersion         int               `json:"schema_version,omitempty"`
+	Items                 []string          `json:"items"`
+	CompletedPooledLeases map[string]string `json:"completed_pooled_leases,omitempty"`
 }
 
 // CacheSizeLimit exposes the configured cache target for metrics reporting.
@@ -482,6 +488,12 @@ func (m *InterfaceManager) Allocate() (string, error) {
 // re-store the same set once, which is harmless, while clearing it could drop
 // a concurrent Recycle's removal from the next flush.
 func (m *InterfaceManager) markUsingPooled(netResourceStr string) (string, error) {
+	m.leaseMu.Lock()
+	defer m.leaseMu.Unlock()
+	if m.db == nil {
+		m.interfaces.Push(netResourceStr)
+		return "", fmt.Errorf("network lease store is unavailable: %w", errord.ErrUnavailable)
+	}
 	marked, err := m.markUsing(netResourceStr)
 	if err != nil {
 		return "", err
@@ -619,6 +631,14 @@ func (m *InterfaceManager) markUsing(netResourceStr string) (string, error) {
 	if netResource.Interface == nil {
 		return "", fmt.Errorf("interface is nil for resource %s, this indicates a creation failure", netResourceStr)
 	}
+	leaseID, err := uuid.NewRandom()
+	if err != nil {
+		return "", fmt.Errorf("create network lease identity: %w", err)
+	}
+	// Device/IP/ifindex can all stay unchanged when a pooled endpoint is
+	// reassigned. A fresh lease ID makes the durable active key specific to
+	// this handout; an old cleanup cannot match the new owner's key.
+	netResource.LeaseID = leaseID.String()
 	if err := m.setTapState(netResource, true); err != nil {
 		// Keep a malformed or externally modified endpoint quarantined and
 		// counted. It must never go back to the reusable queue.
@@ -641,7 +661,7 @@ func (m *InterfaceManager) Recycle(id string) error {
 	defer m.leaseMu.Unlock()
 
 	if !m.usingInterfaces.Has(id) {
-		return nil
+		return m.inactivePooledLeaseResult(id)
 	}
 	netResource, err := NewNetResource(id)
 	if err != nil {
@@ -650,11 +670,16 @@ func (m *InterfaceManager) Recycle(id string) error {
 	if err := m.setTapState(netResource, false); err != nil {
 		return err
 	}
-	m.usingInterfaces.Pop(id)
+	// Persist removal before cache admission. Keep the original active lease
+	// on any error, and do not expose a tentative removal to keepStoring.
+	if err := m.persistAndRemoveLease(id); err != nil {
+		return err
+	}
 	logrus.Infof("parse interface when recycle: %s ", netResource.ToString())
 	// using -> idle, total unchanged. Queue the serialization refreshed by
 	// setTapState rather than the caller's copy, so the idle lease carries
 	// current bookkeeping (ifindex).
+	netResource.LeaseID = ""
 	m.interfaces.Push(netResource.ToString())
 	m.storeMark.Store(true)
 
@@ -674,7 +699,7 @@ func (m *InterfaceManager) Deactivate(id string) error {
 	defer m.leaseMu.Unlock()
 
 	if !m.usingInterfaces.Has(id) {
-		return nil
+		return m.inactivePooledLeaseResult(id)
 	}
 	resource, err := NewNetResource(id)
 	if err != nil {
@@ -745,7 +770,7 @@ func (m *InterfaceManager) Discard(id string) error {
 	defer m.leaseMu.Unlock()
 
 	if _, active := m.usingInterfaces.Pop(id); !active {
-		return nil
+		return m.inactivePooledLeaseResult(id)
 	}
 	if err := m.doDestroy(id); err != nil {
 		m.usingInterfaces.Set(id, struct{}{})
@@ -797,11 +822,17 @@ func (m *InterfaceManager) keepStoring() {
 }
 
 func (m *InterfaceManager) store() error {
+	m.storeMu.Lock()
+	defer m.storeMu.Unlock()
+	return m.storeActiveInterfaces("")
+}
+
+// Caller holds storeMu. Both periodic snapshots and release publication use
+// this lock so a release cannot be followed by a stale active snapshot.
+func (m *InterfaceManager) storeActiveInterfaces(exclude string) error {
 	if m.db == nil {
 		return nil
 	}
-	m.storeMu.Lock()
-	defer m.storeMu.Unlock()
 	start := time.Now()
 	defer func() {
 		logrus.Debugf("store network interface %v using id cost: %v ms", m.usingInterfaces.Count(), time.Since(start).Milliseconds())
@@ -809,15 +840,42 @@ func (m *InterfaceManager) store() error {
 	dm := m.usingInterfaces.Keys()
 	dmToStr := make([]string, 0, len(dm))
 	for idx := range dm {
+		if dm[idx] == exclude {
+			continue
+		}
 		dmToStr = append(dmToStr, dm[idx])
 	}
-	dataToStore, err := json.Marshal(storedInterfaceIDs{Items: dmToStr})
+	completed, err := m.proposedPooledCompletions(exclude)
+	if err != nil {
+		return err
+	}
+	state := storedInterfaceIDs{SchemaVersion: 2, Items: dmToStr, CompletedPooledLeases: completed}
+	if err := validatePooledLeaseState(state); err != nil {
+		return err
+	}
+	dataToStore, err := json.Marshal(state)
 	if err != nil {
 		return fmt.Errorf("encode network interface using id: %w", err)
 	}
 	if err := m.db.StoreRaw(config.BridgeIpBucket, dataToStore); err != nil {
 		return fmt.Errorf("store network interface using id: %w", err)
 	}
+	return nil
+}
+
+func (m *InterfaceManager) persistAndRemoveLease(id string) error {
+	m.storeMu.Lock()
+	defer m.storeMu.Unlock()
+	completed, err := m.proposedPooledCompletions(id)
+	if err != nil {
+		return err
+	}
+	if err := m.storeActiveInterfaces(id); err != nil {
+		return err
+	}
+	m.completedPooledLeases = completed
+	m.usingInterfaces.Pop(id)
+	m.storeMark.Store(true)
 	return nil
 }
 
@@ -918,6 +976,9 @@ func NewInterfaceManager(
 	natBackend string,
 	sandboxRoots ...string,
 ) (*InterfaceManager, error) {
+	if db == nil {
+		return nil, fmt.Errorf("network lease store is unavailable: %w", errord.ErrUnavailable)
+	}
 	// load using id from db
 	idData, err := db.LoadRaw(config.BridgeIpBucket)
 	if err != nil && !errord.IsNotFound(err) {
@@ -930,6 +991,9 @@ func NewInterfaceManager(
 		} else {
 			logrus.Infof("load network interface using id num: %v", len(usingID.Items))
 		}
+	}
+	if err := validatePooledLeaseState(usingID); err != nil {
+		return nil, err
 	}
 
 	usingInterfaces := cmap.New[struct{}]()
@@ -975,23 +1039,24 @@ func NewInterfaceManager(
 		sandboxRoot = sandboxRoots[0]
 	}
 	manager := &InterfaceManager{
-		db:              db,
-		cacheSize:       cacheSize,
-		idleIp:          util.New(""),
-		size:            size,
-		createReqs:      make(chan *createRequest, size),
-		IpRange:         ipRange,
-		BridgeIp:        gatewayIp,
-		interfaces:      util.New(""),
-		usingInterfaces: usingInterfaces,
-		bridgeLink:      bridgeLink,
-		natBackend:      natBackend,
-		sandboxRoot:     sandboxRoot,
-		mask:            mask,
-		storeMark:       atomic.Bool{},
-		stopCh:          make(chan struct{}),
-		runDoneCh:       make(chan struct{}),
-		storeDoneCh:     make(chan struct{}),
+		db:                    db,
+		completedPooledLeases: usingID.CompletedPooledLeases,
+		cacheSize:             cacheSize,
+		idleIp:                util.New(""),
+		size:                  size,
+		createReqs:            make(chan *createRequest, size),
+		IpRange:               ipRange,
+		BridgeIp:              gatewayIp,
+		interfaces:            util.New(""),
+		usingInterfaces:       usingInterfaces,
+		bridgeLink:            bridgeLink,
+		natBackend:            natBackend,
+		sandboxRoot:           sandboxRoot,
+		mask:                  mask,
+		storeMark:             atomic.Bool{},
+		stopCh:                make(chan struct{}),
+		runDoneCh:             make(chan struct{}),
+		storeDoneCh:           make(chan struct{}),
 	}
 
 	if err = manager.load(ips); err != nil {
@@ -1267,6 +1332,9 @@ func (m *InterfaceManager) destroyDevice(dev net.Interface) error {
 }
 
 type NetResource struct {
+	// LeaseID identifies one pooled handout independently of physical device
+	// identity. Recovery preserves active IDs; idle entries have no owner.
+	LeaseID       string           `json:"leaseID,omitempty" protobuf:"bytes,10,opt,name=leaseID"`
 	SchemaVersion int              `json:"schemaVersion,omitempty" protobuf:"varint,7,opt,name=schemaVersion"`
 	EndpointType  string           `json:"endpointType,omitempty" protobuf:"bytes,8,opt,name=endpointType"`
 	GuestMAC      net.HardwareAddr `json:"guestMAC,omitempty" protobuf:"bytes,9,opt,name=guestMAC"`

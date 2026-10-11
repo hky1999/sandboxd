@@ -15,17 +15,92 @@
 package server
 
 import (
+	"context"
 	"errors"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 
+	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
 	"github.com/inclusionAI/sandboxd/config"
 	"github.com/inclusionAI/sandboxd/pkg/networkmanager"
+	svc "github.com/inclusionAI/sandboxd/pkg/runtime"
 	"github.com/inclusionAI/sandboxd/pkg/sandbox"
+	"github.com/inclusionAI/sandboxd/pkg/store"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestPrepareRequiredStartResourcesPreservesPartialOwnership(t *testing.T) {
+	allocationErr := errors.New("allocation reply lost")
+	resources, err := prepareRequiredStartResources("sbox-partial",
+		[]string{"successful", "uncertain"},
+		func(name string) (string, *networkmanager.NetResource, error) {
+			if name == "uncertain" {
+				return "uncertain-lease", nil, allocationErr
+			}
+			return "original-lease", nil, nil
+		})
+	require.ErrorIs(t, err, allocationErr)
+	require.NotNil(t, resources, "an allocation error must not discard known ownership")
+	require.Equal(t, map[string]string{"successful": "original-lease", "uncertain": "uncertain-lease"}, resources.Resources)
+}
+
+type partialPreparationCgroups struct {
+	*resizeCgroups
+	releases            int
+	allocatedGeneration string
+}
+
+func (*partialPreparationCgroups) Allocate() (string, error) { return "/sandbox/partial-lease", nil }
+func (m *partialPreparationCgroups) AllocateForGeneration(generation string) (string, error) {
+	m.allocatedGeneration = generation
+	return m.Allocate()
+}
+func (m *partialPreparationCgroups) RecycleForGeneration(path, _ string) error {
+	return m.Recycle(path)
+}
+func (m *partialPreparationCgroups) Recycle(string) error {
+	m.releases++
+	return errors.New("cgroup cleanup failed")
+}
+
+func TestCreateSandboxPersistsPartialResourcesAfterPreparationFailure(t *testing.T) {
+	handler := svc.NewFakeRuntimeHandler()
+	s := newTestService(t, map[string]svc.Handler{"runsc": handler})
+	s.fsMgr = newFSManager(nil, store.NewStoreImp(filepath.Join(s.config.RootDir, "fs.db")))
+	cgroups := &partialPreparationCgroups{resizeCgroups: &resizeCgroups{}}
+	s.cgroupMgr = cgroups
+	id := "sbox-partial-preparation"
+	_, err := s.createSandbox(context.Background(), &runtime.StartRequest{
+		SandboxID: id, Runtime: "runsc",
+		Rootfs: &runtime.RootfsConfig{Type: runtime.RootfsSrcType_LOCAL, Source: &runtime.RootfsConfig_Path{Path: t.TempDir()}},
+	}, createOptions{})
+	require.ErrorContains(t, err, "interface manager not configured")
+	require.Zero(t, cgroups.releases, "preparation failure must preserve resources for durable reconciliation")
+	intents := s.sandboxManager.ListPhysicalIntents()
+	require.Len(t, intents, 1)
+	require.Equal(t, map[string]string{config.ResourceNameCgroup: "/sandbox/partial-lease"}, intents[0].ResourceFacts)
+	require.NotEmpty(t, intents[0].Labels[resourceGenerationLabel])
+	require.Equal(t, intents[0].Labels[resourceGenerationLabel], cgroups.allocatedGeneration)
+	require.FileExists(t, filepath.Join(s.config.RootDir, "containers", id, config.SandboxMetaFile))
+	_, reserveErr := s.sandboxManager.ReserveID(id)
+	require.Error(t, reserveErr)
+
+	// Reopening the real manager must recover the same ownership without
+	// depending on the failed request's stack or a log message.
+	reopened, openErr := sandbox.NewManager(s.config.RootDir, s.serviceHandler, make(chan bool, 10), nil, 1000)
+	require.NoError(t, openErr)
+	recovered := reopened.ListPhysicalIntents()
+	require.Len(t, recovered, 1)
+	require.Equal(t, intents[0].ResourceFacts, recovered[0].ResourceFacts)
+	require.Equal(t, intents[0].Labels[resourceGenerationLabel], recovered[0].Labels[resourceGenerationLabel])
+	reopenedFS := newFSManager(nil, store.NewStoreImp(filepath.Join(s.config.RootDir, "fs.db")))
+	require.NoError(t, reopenedFS.Restore(reopened.HasPhysicalRecord))
+	_, fsErr := reopenedFS.RootfsConfig(id)
+	require.NoError(t, fsErr, "successful filesystem ownership must survive a peer allocation failure")
+}
 
 func TestRequiredStartResourcesWithoutCgroup(t *testing.T) {
 	resources, err := requiredStartResources(config.RuntimeNameRunsc, true)
@@ -64,7 +139,6 @@ func TestPrepareRequiredStartResourcesReturnsErrorInDeclaredOrder(t *testing.T) 
 				close(secondFinished)
 				return "", nil, errors.New("second error")
 			},
-			func(sandbox.OccupiedResource) error { return nil },
 		)
 		resultCh <- err
 	}()
@@ -77,10 +151,9 @@ func TestPrepareRequiredStartResourcesReturnsErrorInDeclaredOrder(t *testing.T) 
 	}
 }
 
-func TestPrepareRequiredStartResourcesRollsBackSuccessfulAllocations(t *testing.T) {
+func TestPrepareRequiredStartResourcesReturnsSuccessfulAllocationsToOwner(t *testing.T) {
 	var mu sync.Mutex
 	allocated := make(map[string]struct{})
-	var released sandbox.OccupiedResource
 
 	resources, err := prepareRequiredStartResources(
 		"sandbox-id",
@@ -94,18 +167,14 @@ func TestPrepareRequiredStartResourcesRollsBackSuccessfulAllocations(t *testing.
 			}
 			return "resource-value", nil, nil
 		},
-		func(resources sandbox.OccupiedResource) error {
-			released = resources
-			return nil
-		},
 	)
 
 	require.ErrorContains(t, err, "allocate resource broken failed: allocation failed")
-	assert.Nil(t, resources)
+	require.NotNil(t, resources)
 	assert.Equal(t, map[string]struct{}{
 		"successful": {},
 		"broken":     {},
 	}, allocated)
-	assert.Equal(t, "sandbox-id", released.ID)
-	assert.Equal(t, map[string]string{"successful": "resource-value"}, released.Resources)
+	assert.Equal(t, "sandbox-id", resources.ID)
+	assert.Equal(t, map[string]string{"successful": "resource-value"}, resources.Resources)
 }

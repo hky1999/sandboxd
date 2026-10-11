@@ -31,26 +31,31 @@ type preparedStartResources struct {
 	network   *networkmanager.NetResource
 }
 
-func (h *sandboxService) prepareStartResources(runtimeName, sandboxID string) (*preparedStartResources, error) {
+// A preparation error after allocation cannot authorize an implicit rollback.
+// The creation owner retains the intent and leases until durable reconciliation
+// can confirm every cleanup step for the original physical generation.
+var errPhysicalPreparationIncomplete = errors.New("physical preparation requires reconciliation")
+
+func (h *sandboxService) prepareStartResources(runtimeName, sandboxID, generation string) (*preparedStartResources, error) {
 	required, err := requiredStartResources(runtimeName, h.config.DisableCgroup)
 	if err != nil {
 		return nil, err
 	}
-	return prepareRequiredStartResources(
+	resources, err := prepareRequiredStartResources(
 		sandboxID,
 		required,
 		func(name string) (string, *networkmanager.NetResource, error) {
-			return h.allocateStartResource(runtimeName, sandboxID, name)
+			return h.allocateStartResource(runtimeName, sandboxID, generation, name)
 		},
-		h.releaseStartResources,
 	)
+	resources.Generation = generation
+	return resources, err
 }
 
 func prepareRequiredStartResources(
 	sandboxID string,
 	required []string,
 	allocate func(string) (string, *networkmanager.NetResource, error),
-	release func(sandbox.OccupiedResource) error,
 ) (*preparedStartResources, error) {
 	results := make([]resourceResult, len(required))
 	var wg sync.WaitGroup
@@ -69,27 +74,22 @@ func prepareRequiredStartResources(
 		},
 	}
 
-	var firstErr error
+	var allocationErrs []error
 	for _, result := range results {
 		if result.err != nil {
-			if firstErr == nil {
-				firstErr = fmt.Errorf("allocate resource %s failed: %w", result.name, result.err)
-			}
-			continue
+			allocationErrs = append(allocationErrs, fmt.Errorf("allocate resource %s failed: %w", result.name, result.err))
 		}
-		resources.Resources[result.name] = result.value
+		// A nonempty lease with an error is still owned. An allocator may
+		// have applied the allocation before its final confirmation failed.
+		if result.value != "" {
+			resources.Resources[result.name] = result.value
+		}
 		if result.network != nil {
 			resources.network = result.network
 			resources.sandboxIP = result.network.Ip.String()
 		}
 	}
-	if firstErr != nil {
-		if err := release(resources.OccupiedResource); err != nil {
-			logrus.Warnf("rollback start resources for %s failed after allocation error: %v", sandboxID, err)
-		}
-		return nil, firstErr
-	}
-	return resources, nil
+	return resources, errors.Join(allocationErrs...)
 }
 
 func requiredStartResources(runtimeName string, disableCgroup bool) ([]string, error) {
@@ -120,6 +120,7 @@ type resourceResult struct {
 func (h *sandboxService) allocateStartResource(
 	runtimeName,
 	sandboxID,
+	generation,
 	name string,
 ) (string, *networkmanager.NetResource, error) {
 	switch name {
@@ -127,17 +128,17 @@ func (h *sandboxService) allocateStartResource(
 		if h.cgroupMgr == nil {
 			return "", nil, fmt.Errorf("cgroup manager not configured")
 		}
-		value, err := h.cgroupMgr.Allocate()
+		value, err := h.cgroupMgr.AllocateForGeneration(generation)
 		return value, nil, err
 	case config.ResourceNameInterface:
 		if h.networkMgr == nil {
 			return "", nil, fmt.Errorf("network manager not configured")
 		}
 		network, err := h.networkMgr.Prepare(runtimeName, sandboxID)
-		if err != nil {
+		if network == nil {
 			return "", nil, err
 		}
-		return network.resource, network.config, nil
+		return network.resource, network.config, err
 	default:
 		return "", nil, fmt.Errorf("resource %s is not registered", name)
 	}
@@ -162,7 +163,7 @@ func (h *sandboxService) deactivateStartNetwork(resources sandbox.OccupiedResour
 func (h *sandboxService) releaseStartResources(resources sandbox.OccupiedResource) error {
 	var errs []error
 	for name, value := range resources.Resources {
-		if err := h.releaseStartResource(name, value); err != nil {
+		if err := h.releaseStartResource(name, value, resources.Generation); err != nil {
 			errs = append(errs, fmt.Errorf("release resource %s[%s] failed: %w", name, value, err))
 			continue
 		}
@@ -171,11 +172,14 @@ func (h *sandboxService) releaseStartResources(resources sandbox.OccupiedResourc
 	return errors.Join(errs...)
 }
 
-func (h *sandboxService) releaseStartResource(name, value string) error {
+func (h *sandboxService) releaseStartResource(name, value, generation string) error {
 	switch name {
 	case config.ResourceNameCgroup:
 		if h.cgroupMgr == nil {
 			return fmt.Errorf("cgroup manager not configured")
+		}
+		if generation != "" {
+			return h.cgroupMgr.RecycleForGeneration(value, generation)
 		}
 		return h.cgroupMgr.Recycle(value)
 	case config.ResourceNameInterface:

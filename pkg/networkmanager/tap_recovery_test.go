@@ -12,6 +12,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/sets"
 
 	"github.com/inclusionAI/sandboxd/internal/util"
+	"github.com/inclusionAI/sandboxd/pkg/store"
 )
 
 // tapRecoveryFixture builds a manager around one host TAP whose exact state
@@ -28,6 +29,7 @@ func newTapRecoveryFixture(t *testing.T, tap *netlink.Tuntap) *tapRecoveryFixtur
 	bridge := &netlink.Bridge{LinkAttrs: netlink.LinkAttrs{Name: BridgeName, Index: 42}}
 	linkOps := &fakeLinkOperations{link: tap}
 	m := &InterfaceManager{
+		db:         store.NewMockStore(),
 		IpRange:    "10.88.0.1/16",
 		BridgeIp:   net.ParseIP("10.88.0.1"),
 		mask:       net.CIDRMask(16, 32),

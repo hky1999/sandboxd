@@ -40,9 +40,11 @@ type retirementCgroups struct {
 
 func (c *retirementCgroups) ReadMemoryLimit(string) (int64, error) { return 0, nil }
 
-func (*retirementCgroups) Allocate() (string, error)  { return "/sandbox/lease", nil }
-func (*retirementCgroups) ShutDown() error            { return nil }
-func (*retirementCgroups) SupportsMemoryShrink() bool { return false }
+func (*retirementCgroups) Allocate() (string, error)                      { return "/sandbox/lease", nil }
+func (c *retirementCgroups) AllocateForGeneration(string) (string, error) { return c.Allocate() }
+func (c *retirementCgroups) RecycleForGeneration(path, _ string) error    { return c.Recycle(path) }
+func (*retirementCgroups) ShutDown() error                                { return nil }
+func (*retirementCgroups) SupportsMemoryShrink() bool                     { return false }
 
 func (*retirementCgroups) Prepare(string, *runtime.LinuxSandboxResources) error {
 	return nil

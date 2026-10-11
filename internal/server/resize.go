@@ -14,7 +14,7 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-const resourceGenerationLabel = "akernel.scheduler/resource-generation"
+const resourceGenerationLabel = config.ResourceGenerationLabel
 
 // limitsMatch requires proven observations: an unknown memory limit is a
 // legacy fallback number that must not pass as the enforced hard limit.

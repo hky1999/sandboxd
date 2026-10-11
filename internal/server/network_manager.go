@@ -293,10 +293,7 @@ func (m *networkManager) Prepare(runtimeName, sandboxID string) (*preparedNetwor
 	}
 	netResource := &networkmanager.NetResource{}
 	if err := netResource.FromString(resource); err != nil {
-		if recycleErr := m.iface.Recycle(resource); recycleErr != nil {
-			logrus.Warnf("recycle malformed network resource %q failed: %v", resource, recycleErr)
-		}
-		return nil, fmt.Errorf("parse net device(%s) failed, err: %v", resource, err)
+		return &preparedNetwork{resource: resource}, fmt.Errorf("parse net device failed: %w", err)
 	}
 	return &preparedNetwork{
 		resource: resource,

@@ -50,6 +50,10 @@ type CgroupManager struct {
 
 	usingID cmap.ConcurrentMap[string, struct{}]
 	idleID  *util.Queue[string]
+	// leaseMu serializes ownership, durable handout/release and pool reuse.
+	leaseMu              sync.Mutex
+	leaseOwners          map[string]string
+	completedGenerations map[string]string
 
 	// cgroups contains every physical child owned by this manager, including
 	// active and cached cgroups.
@@ -90,7 +94,10 @@ type createResult struct {
 }
 
 type storedCgroupIDs struct {
-	Items []string `json:"items"`
+	SchemaVersion        int               `json:"schema_version,omitempty"`
+	Items                []string          `json:"items"`
+	LeaseOwners          map[string]string `json:"lease_owners,omitempty"`
+	CompletedGenerations map[string]string `json:"completed_generations,omitempty"`
 }
 
 // CacheSizeLimit exposes the configured cache target for metrics reporting.
@@ -191,6 +198,17 @@ func (c *CgroupManager) Status() ([]string, []string) {
 // Runtime teardown has already run, so draining and restoring the small set of
 // controls managed by sandboxd belongs on this release path, not Start.
 func (c *CgroupManager) Recycle(id string) error {
+	c.leaseMu.Lock()
+	defer c.leaseMu.Unlock()
+	if c.leaseOwners[id] != "" {
+		return fmt.Errorf("cgroup %s has a generation-owned lease: %w", id, errord.ErrFailedPrecondition)
+	}
+	return c.recycle(id, "")
+}
+
+// Caller holds leaseMu and has verified the current ownership or a legacy
+// unowned lease. Owned release persists completion before any idle admission.
+func (c *CgroupManager) recycle(id, generation string) error {
 	if !c.usingID.Has(id) {
 		// Unleased: never leased, cleanly recycled into the idle cache, or a
 		// confirmed release already completed. Duplicate releases are
@@ -201,8 +219,9 @@ func (c *CgroupManager) Recycle(id string) error {
 	if !c.cgroups.Has(id) {
 		// Leased but no physical cgroup (a create that never landed): the
 		// release confirms — drop the lease and return the capacity.
-		c.usingID.Pop(id)
-		c.storeDirty.Store(true)
+		if err := c.completeLeaseRelease(id, generation); err != nil {
+			return err
+		}
 		c.mu.Lock()
 		c.total--
 		c.mu.Unlock()
@@ -223,8 +242,9 @@ func (c *CgroupManager) Recycle(id string) error {
 	// Verified clean: the release confirms. Admission to the idle cache
 	// keeps the directory by design; beyond the cache size the existing
 	// destroy path (GC) applies, unchanged.
-	c.usingID.Pop(id)
-	c.storeDirty.Store(true)
+	if err := c.completeLeaseRelease(id, generation); err != nil {
+		return err
+	}
 	c.mu.Lock()
 	if c.idleID.Length() < c.cacheSize {
 		c.idleID.Push(id)
@@ -253,6 +273,12 @@ func (c *CgroupManager) cleanForReuse(name string) error {
 // Allocate hands out an idle cgroup name (e.g. "/sandbox/<id>"). On a cache
 // miss, creation remains serialized by the maintenance goroutine.
 func (c *CgroupManager) Allocate() (string, error) {
+	c.leaseMu.Lock()
+	defer c.leaseMu.Unlock()
+	return c.allocate()
+}
+
+func (c *CgroupManager) allocate() (string, error) {
 	if c.stopped.Load() {
 		return "", errCgroupManagerStopped
 	}
@@ -465,7 +491,7 @@ func NewCgroupManager(
 	usingIDs := cmap.New[struct{}]()
 	recoveryDirty := false
 	for _, id := range persisted.Items {
-		if !belongsToRoot(id, rootName) || !cgroups.Has(id) {
+		if !belongsToRoot(id, rootName) || (!cgroups.Has(id) && persisted.LeaseOwners[id] == "") {
 			logrus.Warnf("drop stale persisted cgroup id %s during recovery", id)
 			recoveryDirty = true
 			continue
@@ -489,6 +515,9 @@ func NewCgroupManager(
 		ops:        ops,
 		oom:        oom,
 		stopCh:     make(chan struct{}),
+	}
+	if err := c.restoreGenerationLeases(persisted); err != nil {
+		return nil, err
 	}
 
 	for id := range cgroups.Items() {
@@ -550,6 +579,14 @@ func (c *CgroupManager) keepStoring() {
 }
 
 func (c *CgroupManager) store() error {
+	c.leaseMu.Lock()
+	defer c.leaseMu.Unlock()
+	return c.storeLeaseState("", "")
+}
+
+// Caller holds leaseMu. A proposed release is encoded without exposing its
+// removal in memory until StoreRaw confirms the entire state transaction.
+func (c *CgroupManager) storeLeaseState(releasedPath, releasedGeneration string) error {
 	start := time.Now()
 	defer func() {
 		logrus.Debugf(
@@ -558,7 +595,23 @@ func (c *CgroupManager) store() error {
 			time.Since(start).Milliseconds(),
 		)
 	}()
-	data, err := json.Marshal(storedCgroupIDs{Items: c.usingID.Keys()})
+	state := storedCgroupIDs{SchemaVersion: 2, LeaseOwners: make(map[string]string), CompletedGenerations: make(map[string]string)}
+	for _, id := range c.usingID.Keys() {
+		if id == releasedPath {
+			continue
+		}
+		state.Items = append(state.Items, id)
+		if owner := c.leaseOwners[id]; owner != "" {
+			state.LeaseOwners[id] = owner
+		}
+	}
+	for generation, path := range c.completedGenerations {
+		state.CompletedGenerations[generation] = path
+	}
+	if releasedGeneration != "" {
+		state.CompletedGenerations[releasedGeneration] = releasedPath
+	}
+	data, err := json.Marshal(state)
 	if err != nil {
 		return fmt.Errorf("encode cgroup using IDs: %w", err)
 	}

@@ -241,17 +241,30 @@ func (h *sandboxService) verifyOriginalPhysicalIntent(metadata *runtime.SandboxM
 func (h *sandboxService) physicalResources(
 	metadata *runtime.SandboxMetadata,
 ) (sandbox.OccupiedResource, error) {
+	if metadata == nil || metadata.ID == "" {
+		return sandbox.OccupiedResource{}, fmt.Errorf("physical resource identity is missing: %w", errord.ErrFailedPrecondition)
+	}
 	if metadata != nil && len(metadata.ResourceFacts) > 0 {
 		resources := sandbox.OccupiedResource{
-			ID:        metadata.ID,
-			Resources: make(map[string]string, len(metadata.ResourceFacts)),
+			ID:         metadata.ID,
+			Generation: metadata.Labels[resourceGenerationLabel],
+			Resources:  make(map[string]string, len(metadata.ResourceFacts)),
 		}
 		for name, value := range metadata.ResourceFacts {
 			resources.Resources[name] = value
 		}
 		return resources, nil
 	}
-	return h.sandboxManager.CollectResourceByID(metadata.ID)
+	resources, err := h.sandboxManager.CollectResourceByID(metadata.ID)
+	if err != nil {
+		return resources, err
+	}
+	generation := metadata.Labels[resourceGenerationLabel]
+	if resources.Generation != "" && resources.Generation != generation {
+		return resources, fmt.Errorf("physical resource spec generation changed: %w", errord.ErrFailedPrecondition)
+	}
+	resources.Generation = generation
+	return resources, nil
 }
 
 func (h *sandboxService) cleanupPhysicalDnatFacts(
