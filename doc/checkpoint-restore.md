@@ -445,4 +445,4 @@ The destination host must support the saved I/O engine. In particular, direct en
 
 generation 条件删除及检查点 RPC、持久资源 revision、operation ID、deadline 和结果未知语义继续作为独立扩展保留。CheckpointResponse 的附加产物事实可由上游客户端忽略。`api/runtime/v1/testdata/` 中从固定上游原件独立生成的 descriptor 检查每个公共消息字段及 RPC。协议匹配不等于运行时或重启验收通过。
 
-镜像服务另提供挂载操作的派发前登记、进程启动前原代际绑定及独立结果查询，见 [镜像挂载操作契约](scheduler-image-mount-release.md)。该接口不改变 protobuf，也不证明整个源沙箱已经退役。文件系统管理器已接通 schema 5 每个原步骤的稳定操作身份、共享所有者登记和原结果查询，能够在上层确认缺失时读取原绑定，见 [文件系统归属契约](scheduler-filesystem-ownership.md)。未绑定意图、部分启动对账、完整沙箱清理、独立 Restore 和节点最终预算结算仍未完成，不能据局部挂载确认宣称恢复故障已验收。
+镜像服务另提供挂载操作的派发前登记、进程启动前原代际绑定及独立结果查询，见 [镜像挂载操作契约](scheduler-image-mount-release.md)。该接口不改变 protobuf，也不证明整个源沙箱已经退役。文件系统管理器已接通 schema 5 每个原步骤的稳定操作身份、共享所有者登记和原结果查询，能够在上层确认缺失时读取原绑定，见 [文件系统归属契约](scheduler-filesystem-ownership.md)。新建 S3／Nydus 镜像的准备阶段先保存原操作、请求指纹、物理代际及私有目录计划，再完成上层绑定，随后分配工作目录。未绑定原意图可以只读查询该准备记录，显式重试只恢复原清理归属；准备过程没有发布物理启动意图时，按原目录出生身份清理。相关契约见 [镜像挂载操作契约](scheduler-image-mount-release.md)。旧未绑定意图、明确未分配的持久结算、完整部分启动出生对账、完成历史、完整沙箱清理、独立 Restore 和节点最终预算结算仍未完成，不能据局部挂载确认宣称恢复故障已验收。

@@ -75,7 +75,7 @@ func TestMountOperationLostReplyReopensOriginalBindingWithoutRedispatch(t *testi
 	dispatches := 0
 	_, err := w.executeMountOperation(request.OperationID, "oci", request.ImageURL, "", request, func(bind mountBinding) (*MountInfo, error) {
 		dispatches++
-		require.NoError(t, bind(record.DaemonID, record.NydusImageURL, record.PhysicalGeneration, record.MountPoint))
+		require.NoError(t, bind.Bind(record.DaemonID, record.NydusImageURL, record.PhysicalGeneration, record.MountPoint))
 		return nil, errors.New("success reply was lost")
 	})
 	require.Error(t, err)
@@ -108,7 +108,7 @@ func TestMountOperationConfirmationFailureKeepsQueryableOriginalBinding(t *testi
 	w, request, record := mountOperationFixture(t)
 	path := w.mountStore.db.Path()
 	_, err := w.executeMountOperation(request.OperationID, "oci", request.ImageURL, "", request, func(bind mountBinding) (*MountInfo, error) {
-		require.NoError(t, bind(record.DaemonID, record.NydusImageURL, record.PhysicalGeneration, record.MountPoint))
+		require.NoError(t, bind.Bind(record.DaemonID, record.NydusImageURL, record.PhysicalGeneration, record.MountPoint))
 		require.NoError(t, w.mountStore.Close()) // Producer succeeded; confirmation cannot be written.
 		return &MountInfo{MountPoint: record.MountPoint, PhysicalGeneration: record.PhysicalGeneration}, nil
 	})
@@ -252,7 +252,7 @@ func TestMountOperationIndependentQueryDuringDispatchAndDuplicateSerialization(t
 		dispatches.Add(1)
 		close(entered)
 		<-finish
-		if err := bind(record.DaemonID, record.NydusImageURL, record.PhysicalGeneration, record.MountPoint); err != nil {
+		if err := bind.Bind(record.DaemonID, record.NydusImageURL, record.PhysicalGeneration, record.MountPoint); err != nil {
 			return nil, err
 		}
 		return &MountInfo{MountPoint: record.MountPoint, PhysicalGeneration: record.PhysicalGeneration}, nil

@@ -256,6 +256,9 @@ func (mgr *manager) loadExistedDaemons() error {
 		if err = d.loadDaemonMetadata(metaFilePath); err != nil {
 			return fmt.Errorf("preserve unresolved daemon ownership: %w", err)
 		}
+		if p := d.originalPreparation(); p != nil && (p.Directory != filepath.Join(mgr.root, "allocations", p.Generation) || metaFilePath != filepath.Join(mgr.root, "daemon_configs", d.meta.ID+".json")) {
+			return fmt.Errorf("recovered preparation is outside the original manager root")
+		}
 		if _, exists := loaded[d.meta.ID]; exists {
 			return fmt.Errorf("duplicate daemon ownership identity")
 		}
@@ -292,6 +295,15 @@ func (mgr *manager) addExistingDaemonsToCgroup() {
 }
 
 func (mgr *manager) prepare(ossCfgPath string, nydusCfgPath string, ossAuthsPath string, registryAuthsPath string) error {
+	if err := os.MkdirAll(filepath.Join(mgr.root, "allocations"), 0700); err != nil {
+		return fmt.Errorf("prepare private allocation parent: %w", err)
+	}
+	if _, err := readDirectoryBirth(filepath.Join(mgr.root, "allocations")); err != nil {
+		return err
+	}
+	if err := syncPreparationDirectory(mgr.root); err != nil {
+		return err
+	}
 	// chunk db
 	err := os.MkdirAll(filepath.Join(mgr.root, "chunk_db"), 0755)
 	if err != nil {
@@ -415,13 +427,6 @@ func (mgr *manager) setupOSSDaemon(opts *DaemonCreateOpt) (*Daemon, error) {
 	d.meta.ID = opts.ID
 	d.meta.SourceType = "oss"
 
-	if opts.MountPoint == "" {
-		opts.MountPoint = filepath.Join(mgr.root, "mnt", d.meta.ID)
-	}
-	if err := os.MkdirAll(opts.MountPoint, 0755); err != nil {
-		return nil, fmt.Errorf("failed to create mountpoint dir: %w", err)
-	}
-	d.meta.MountPoint = opts.MountPoint
 	*d.config = mgr.ossCfgTemplate.DeepCopy()
 
 	// Override OSS config if provided
@@ -457,23 +462,9 @@ func (mgr *manager) setupOSSDaemon(opts *DaemonCreateOpt) (*Daemon, error) {
 	}
 
 	d.binPath = mgr.binPath
-	err := os.MkdirAll(filepath.Join(mgr.root, "image_metas", d.meta.ID), 0755)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create image meta dir: %w", err)
+	if err := mgr.planPreparation(d, opts); err != nil {
+		return nil, err
 	}
-	daemonDir := filepath.Join(mgr.root, "daemons", d.meta.ID)
-	if err = os.MkdirAll(daemonDir, 0755); err != nil {
-		return nil, fmt.Errorf("failed to create daemon dir: %w", err)
-	}
-	d.meta.DaemonDir = daemonDir
-	d.meta.ImageMetaDir = filepath.Join(mgr.root, "image_metas", d.meta.ID)
-	d.meta.DaemonLogPath = filepath.Join(daemonDir, "daemon.log")
-	d.meta.PidFilePath = filepath.Join(daemonDir, "pid")
-	d.meta.ChunkDBDir = filepath.Join(mgr.root, "chunk_db")
-	d.meta.CachePath = filepath.Join(daemonDir, "cache")
-	d.meta.CfgPath = filepath.Join(daemonDir, "backend.cfg")
-	d.savedPath = filepath.Join(mgr.root, "daemon_configs", d.meta.ID+".json")
-	d.updateExpired()
 
 	return d, nil
 }
@@ -492,14 +483,6 @@ func (mgr *manager) setupNydusDaemon(opts *DaemonCreateOpt) (*Daemon, error) {
 	d.meta.ID = opts.ID
 	d.meta.SourceType = "nydus"
 	d.meta.ImageURL = opts.ImageURL
-
-	if opts.MountPoint == "" {
-		opts.MountPoint = filepath.Join(mgr.root, "mnt", d.meta.ID)
-	}
-	if err := os.MkdirAll(opts.MountPoint, 0755); err != nil {
-		return nil, fmt.Errorf("failed to create mountpoint dir: %w", err)
-	}
-	d.meta.MountPoint = opts.MountPoint
 
 	// Use Nydus config template (which should be a Nydus backend config with backend_type set)
 	*d.config = mgr.nydusCfgTemplate.DeepCopy()
@@ -540,62 +523,85 @@ func (mgr *manager) setupNydusDaemon(opts *DaemonCreateOpt) (*Daemon, error) {
 		}
 	}
 
-	// Create necessary directories
-	err := os.MkdirAll(filepath.Join(mgr.root, "image_metas", d.meta.ID), 0755)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create image meta dir: %w", err)
+	if err := mgr.planPreparation(d, opts); err != nil {
+		return nil, err
 	}
-
-	daemonDir := filepath.Join(mgr.root, "daemons", d.meta.ID)
-	if err = os.MkdirAll(daemonDir, 0755); err != nil {
-		return nil, fmt.Errorf("failed to create daemon dir: %w", err)
-	}
-
-	// Setup cache directory for Nydus
-	cacheDir := filepath.Join(daemonDir, "cache_dir")
-	if err = os.MkdirAll(cacheDir, 0755); err != nil {
-		return nil, fmt.Errorf("failed to create cache dir: %w", err)
-	}
-
-	d.meta.DaemonDir = daemonDir
-	d.meta.ImageMetaDir = filepath.Join(mgr.root, "image_metas", d.meta.ID)
-	d.meta.DaemonLogPath = filepath.Join(daemonDir, "daemon.log")
-	d.meta.PidFilePath = filepath.Join(daemonDir, "pid")
-	d.meta.ChunkDBDir = filepath.Join(mgr.root, "chunk_db")
-	d.meta.CacheDir = cacheDir
-	d.meta.CfgPath = filepath.Join(daemonDir, "backend.cfg")
-	// BootstrapPath will be set during Mount() when bootstrap is downloaded
-	d.savedPath = filepath.Join(mgr.root, "daemon_configs", d.meta.ID+".json")
-	d.updateExpired()
 
 	return d, nil
 }
 
 func (mgr *manager) CreateDaemon(opts *DaemonCreateOpt) error {
+	return mgr.createPreparedDaemon(opts, PreparationOwner{}, nil)
+}
+
+func (mgr *manager) PrepareDaemon(opts *DaemonCreateOpt, owner PreparationOwner, bind func(string, string) error) error {
+	if !validPhysicalSHA(owner.OperationID) || !validPhysicalSHA(owner.RequestFingerprint) || bind == nil {
+		return fmt.Errorf("managed preparation requires its original producer and binding")
+	}
+	return mgr.createPreparedDaemon(opts, owner, bind)
+}
+
+func (mgr *manager) createPreparedDaemon(opts *DaemonCreateOpt, owner PreparationOwner, bind func(string, string) error) error {
 	release, err := mgr.ownership.acquire()
 	if err != nil {
 		return err
 	}
 	defer release()
-	if opts == nil {
-		return fmt.Errorf("daemon creation options are required")
+	if opts == nil || opts.ID == "" || opts.ID == "." || opts.ID == ".." || strings.ContainsAny(opts.ID, "/\\\x00") {
+		return fmt.Errorf("valid daemon creation options are required")
 	}
 	mgr.mu.Lock()
-	defer mgr.mu.Unlock()
-
 	if d, ok := mgr.daemons[opts.ID]; ok {
+		mgr.mu.Unlock()
+		if bind != nil {
+			d.mu.Lock()
+			defer d.mu.Unlock()
+			if err := d.bindOriginalMount(bind); err != nil {
+				return err
+			}
+			if p := d.originalPhysicalIdentity(); p == nil || p.Phase != "running" {
+				return fmt.Errorf("existing original preparation cannot be dispatched again")
+			}
+		}
 		d.updateExpired()
-		// Clear mountFailed: a new CreateDaemon call means the caller intends
-		// to use this daemon, so GC should not clean it up.
 		d.mountFailed.Store(false)
 		return nil
 	}
 	d, err := mgr.newDaemon(opts)
 	if err != nil {
+		mgr.mu.Unlock()
 		return err
 	}
+	// Keep the original planned owner even when publication/allocation fails.
 	mgr.daemons[d.meta.ID] = d
-	return nil
+	mgr.mu.Unlock()
+	return d.allocatePreparation(owner, bind)
+}
+
+func (mgr *manager) FindPreparation(owner PreparationOwner) (*PreparationInfo, error) {
+	release, err := mgr.ownership.acquire()
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	if !validPhysicalSHA(owner.OperationID) || !validPhysicalSHA(owner.RequestFingerprint) {
+		return nil, fmt.Errorf("original preparation producer is invalid")
+	}
+	mgr.mu.RLock()
+	defer mgr.mu.RUnlock()
+	var original *PreparationInfo
+	for _, d := range mgr.daemons {
+		p := d.preparationObservation.Load()
+		if p == nil || p.Owner.OperationID != owner.OperationID {
+			continue
+		}
+		if p.Owner != owner || original != nil {
+			return nil, fmt.Errorf("original preparation producer changed or is ambiguous")
+		}
+		copy := *p
+		original = &copy
+	}
+	return original, nil // Absence is not evidence that allocation never occurred.
 }
 
 func (mgr *manager) GetDaemon(id string) *Daemon {
@@ -629,6 +635,13 @@ func (mgr *manager) cleanupDaemonResources(d *Daemon) error {
 	}
 	if p := d.originalPhysicalIdentity(); p != nil && p.Phase != "released" {
 		return fmt.Errorf("original daemon release is not persistently confirmed")
+	}
+	if p := d.originalPreparation(); p != nil {
+		if d.originalPhysicalIdentity() == nil && p.Phase != "released" {
+			return fmt.Errorf("original preparation retirement is not confirmed")
+		}
+		rescueDaemonLog(mgr.root, d)
+		return d.cleanupPreparationResources()
 	}
 	if d.metadataLoaded && d.originalPhysicalIdentity() == nil {
 		return fmt.Errorf("original daemon physical ownership is unknown")

@@ -56,10 +56,30 @@ func (d *Daemon) InspectPhysicalGeneration(generation string) (string, error) {
 		return "", err
 	}
 	defer release()
-	d.mu.Lock()
+	if !d.mu.TryLock() {
+		return "", fmt.Errorf("original mount lifecycle is currently active")
+	}
 	defer d.mu.Unlock()
-	p := d.originalPhysicalIdentity()
-	if generation == "" || p == nil || p.Generation != generation {
+	if !d.physicalMu.TryLock() {
+		return "", fmt.Errorf("original mount publication is currently active")
+	}
+	p := clonePhysicalIdentity(d.meta.PhysicalIdentity)
+	preparation := clonePreparation(d.meta.Preparation)
+	pending := d.preparationPublicationPending
+	d.physicalMu.Unlock()
+	if p == nil {
+		if generation == "" || preparation == nil || preparation.Generation != generation {
+			return "", fmt.Errorf("original mount generation is missing or changed")
+		}
+		if pending {
+			return "", fmt.Errorf("original preparation publication is unresolved")
+		}
+		if preparation.Phase == "released" {
+			return "released", nil
+		}
+		return "releasing", nil // Prepared is a cleanup-only acquisition, never ready.
+	}
+	if generation == "" || p.Generation != generation {
 		return "", fmt.Errorf("original mount generation is missing or changed")
 	}
 	if err := d.ensurePhysicalPublication(); err != nil {

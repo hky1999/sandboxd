@@ -99,6 +99,11 @@ func (d *Daemon) publishPhysicalIdentityLocked(p *physicalIdentity) error {
 	if current == nil && d.metadataLoaded {
 		return fmt.Errorf("loaded daemon cannot adopt a new physical identity")
 	}
+	if preparation := d.meta.Preparation; preparation != nil {
+		if next.Generation != preparation.Generation || preparation.Phase != "prepared" && (next.Phase == "launching" || next.Phase == "running") {
+			return fmt.Errorf("original preparation generation or phase changed")
+		}
+	}
 	if current != nil {
 		if next.Generation != current.Generation {
 			if d.physicalPublicationPending || (current.Phase != "released" && current.Phase != "not_started") || next.Phase != "launching" || next.Process != nil || next.Mount != nil || next.UnmountSucceeded {
@@ -394,6 +399,12 @@ func (d *Daemon) preparePhysicalLaunch() error {
 		return fmt.Errorf("allocate original physical generation")
 	}
 	generation := hex.EncodeToString(nonce[:])
+	if preparation := d.originalPreparation(); preparation != nil {
+		if err := d.verifyPreparationForLaunch(); err != nil {
+			return err
+		}
+		generation = preparation.Generation
+	}
 	pidFile := filepath.Join(d.meta.DaemonDir, "pid-"+generation)
 	args := append([]string{d.binPath}, d.buildMountArgsForPIDFile(pidFile)...)
 	p := &physicalIdentity{Generation: generation, Scope: scope, Target: d.meta.MountPoint, PIDFile: pidFile, ExecutableSHA256: metadataSHA(exe), ArgumentsSHA256: metadataSHA([]byte(strings.Join(args, "\x00") + "\x00")), SourceSHA256: source, Phase: "launching"}

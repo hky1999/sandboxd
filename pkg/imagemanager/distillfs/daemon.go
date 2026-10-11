@@ -181,6 +181,7 @@ func (cfg *BackendConfig) LoadTemplate(templatePath string) error {
 }
 
 type DaemonMeta struct {
+	Preparation      *daemonPreparation   `json:"preparation,omitempty"`
 	PhysicalIdentity *physicalIdentity    `json:"physical_identity,omitempty"`
 	SchemaVersion    int                  `json:"schema_version,omitempty"`
 	IntegritySHA256  string               `json:"integrity_sha256,omitempty"`
@@ -213,31 +214,33 @@ type DaemonInfo struct {
 }
 
 type Daemon struct {
-	ownership                  *managerOwnership
-	physicalMu                 sync.Mutex
-	physicalPublicationPending bool
-	physicalScopeFunc          func() (physicalScope, error)
-	physicalMountFunc          func(string) (*physicalMountIdentity, error)
-	physicalProcessFunc        func(int) (*physicalProcessIdentity, error)
-	physicalSignalFunc         func(*physicalProcessIdentity, syscall.Signal) error
-	metadataLoaded             bool
-	chunkDBSize                string // Node configuration, also injected when recovering saved daemons.
-	mu                         sync.Mutex
-	ctx                        context.Context
-	meta                       DaemonMeta
-	binPath                    string
-	config                     *BackendConfig // Backend configuration (OSS, Nydus/Registry, etc.)
-	savedPath                  string
-	metaPersistMu              sync.Mutex
-	savedMetaSHA256            string
-	metadataDirectorySyncFunc  func(*os.File) error
-	stopChan                   chan struct{}
-	kickStop                   *Stopper
-	state                      atomic.Int32 // DaemonState
-	expiredAt                  int64
-	nydusClient                NydusClient           // For Nydus: client to fetch bootstrap
-	proxyURL                   string                // For Nydus: proxy URL for bootstrap download
-	cgroupCtrl                 *imgcgroup.Controller // Memory cgroup controller (nil = disabled)
+	ownership                     *managerOwnership
+	physicalMu                    sync.Mutex
+	physicalPublicationPending    bool
+	preparationPublicationPending bool
+	preparationObservation        atomic.Pointer[PreparationInfo]
+	physicalScopeFunc             func() (physicalScope, error)
+	physicalMountFunc             func(string) (*physicalMountIdentity, error)
+	physicalProcessFunc           func(int) (*physicalProcessIdentity, error)
+	physicalSignalFunc            func(*physicalProcessIdentity, syscall.Signal) error
+	metadataLoaded                bool
+	chunkDBSize                   string // Node configuration, also injected when recovering saved daemons.
+	mu                            sync.Mutex
+	ctx                           context.Context
+	meta                          DaemonMeta
+	binPath                       string
+	config                        *BackendConfig // Backend configuration (OSS, Nydus/Registry, etc.)
+	savedPath                     string
+	metaPersistMu                 sync.Mutex
+	savedMetaSHA256               string
+	metadataDirectorySyncFunc     func(*os.File) error
+	stopChan                      chan struct{}
+	kickStop                      *Stopper
+	state                         atomic.Int32 // DaemonState
+	expiredAt                     int64
+	nydusClient                   NydusClient           // For Nydus: client to fetch bootstrap
+	proxyURL                      string                // For Nydus: proxy URL for bootstrap download
+	cgroupCtrl                    *imgcgroup.Controller // Memory cgroup controller (nil = disabled)
 
 	// watcherActive indicates if watcher goroutine is active
 	watcherActive atomic.Bool
@@ -834,6 +837,9 @@ func (d *Daemon) initializeDaemonWithBinding(ctx context.Context, timing *TimedO
 		return err
 	}
 	defer release()
+	if err := d.verifyPreparationForLaunch(); err != nil {
+		return err
+	}
 	// For Nydus: download bootstrap if not exists
 	if d.meta.SourceType == "nydus" && d.meta.BootstrapPath == "" {
 		if d.meta.ImageURL == "" || d.nydusClient == nil {
@@ -1065,7 +1071,8 @@ func (d *Daemon) UnmountIfPhysicalGeneration(generation string) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	p := d.originalPhysicalIdentity()
-	if generation == "" || p == nil || p.Generation != generation {
+	preparation := d.originalPreparation()
+	if generation == "" || (p == nil && (preparation == nil || preparation.Generation != generation)) || (p != nil && p.Generation != generation) {
 		return fmt.Errorf("original physical generation is missing or changed")
 	}
 	return d.unmountLocked()
@@ -1115,6 +1122,11 @@ func (d *Daemon) unmountLocked() (retErr error) {
 		}
 		d.releasePending = false
 		return nil // Replay original completion without reading or touching a new target.
+	}
+	if physical == nil && d.originalPreparation() != nil {
+		d.physicalMu.Lock()
+		defer d.physicalMu.Unlock()
+		return d.retirePreparationLocked()
 	}
 	if physical == nil && d.metadataLoaded {
 		return fmt.Errorf("loaded daemon has no original physical identity")

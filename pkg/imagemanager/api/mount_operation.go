@@ -10,6 +10,8 @@ import (
 	"io"
 	"net/http"
 	"path/filepath"
+
+	"github.com/inclusionAI/sandboxd/pkg/imagemanager/distillfs"
 )
 
 // Kept separate from legacy Service: managed callers must require this
@@ -21,7 +23,16 @@ type MountOperationService interface {
 var _ MountOperationService = (*HttpWorker)(nil)
 var _ MountOperationService = (*HttpClient)(nil)
 
-type mountBinding func(daemonID, nydusURL, generation, target string) error
+type mountOperationBinding struct {
+	owner   distillfs.PreparationOwner
+	publish func(daemonID, nydusURL, generation, target string) error
+}
+
+type mountBinding = *mountOperationBinding
+
+func (b *mountOperationBinding) Bind(daemonID, nydusURL, generation, target string) error {
+	return b.publish(daemonID, nydusURL, generation, target)
+}
 
 func decodeMountDispatch(body io.Reader, request any) error {
 	raw, err := io.ReadAll(io.LimitReader(body, mountRecordLimit+1))
@@ -66,7 +77,46 @@ func nativeMountBinding(bind mountBinding, daemonID, nydusURL string) func(strin
 	if bind == nil {
 		return nil
 	}
-	return func(generation, target string) error { return bind(daemonID, nydusURL, generation, target) }
+	return func(generation, target string) error { return bind.Bind(daemonID, nydusURL, generation, target) }
+}
+
+func (w *HttpWorker) prepareDaemonForMount(opts *distillfs.DaemonCreateOpt, bind mountBinding) error {
+	if bind == nil {
+		return w.mgr.CreateDaemon(opts)
+	}
+	manager, ok := w.mgr.(distillfs.PreparationManager)
+	if !ok {
+		return fmt.Errorf("managed mount requires durable pre-allocation ownership")
+	}
+	nydusURL := ""
+	if opts.SourceType == "nydus" {
+		nydusURL = opts.ImageURL
+	}
+	return manager.PrepareDaemon(opts, bind.owner, nativeMountBinding(bind, opts.ID, nydusURL))
+}
+
+// An independent lookup only reads the original preparation. It never aborts
+// an active producer, allocates directories, or adopts the source's current
+// generation. Absence still means unknown, including for legacy producers.
+func (w *HttpWorker) findOriginalPreparation(r *mountOperationRecord) (*mountOperationRecord, error) {
+	manager, ok := w.mgr.(distillfs.PreparationManager)
+	if !ok {
+		return nil, nil
+	}
+	p, err := manager.FindPreparation(distillfs.PreparationOwner{OperationID: r.OperationID, RequestFingerprint: r.RequestFingerprint})
+	if err != nil || p == nil {
+		return nil, err
+	}
+	bound := *r
+	bound.Phase, bound.DaemonID = "bound", p.DaemonID
+	bound.PhysicalGeneration, bound.MountPoint = p.Generation, p.Target
+	if p.SourceType == "nydus" {
+		bound.NydusImageURL = p.ImageURL
+	}
+	if err := validateMountOperation(&bound); err != nil {
+		return nil, err
+	}
+	return &bound, nil
 }
 
 func (w *HttpWorker) acquireMountOperationLock(id string) func() {
@@ -129,7 +179,7 @@ func (w *HttpWorker) executeMountOperation(id, kind, imageURL, expected string, 
 		binding.PhysicalGeneration, binding.MountPoint = generation, target
 		return w.mountStore.publishMountBinding(&binding)
 	}
-	info, err := mount(bind)
+	info, err := mount(&mountOperationBinding{owner: distillfs.PreparationOwner{OperationID: id, RequestFingerprint: fingerprint}, publish: bind})
 	if err != nil {
 		return nil, err
 	} // Preserve intent/binding; no blind retry.
@@ -169,8 +219,15 @@ func (w *HttpWorker) QueryMountOperation(query *MountOperationQuery) (*MountOper
 func (w *HttpWorker) inspectMountOperation(r *mountOperationRecord) (*MountOperationResult, error) {
 	result := &MountOperationResult{OperationID: r.OperationID, RequestFingerprint: r.RequestFingerprint, Kind: r.Kind, State: "unresolved", PhysicalGeneration: r.PhysicalGeneration, MountPoint: r.MountPoint}
 	if r.Phase == "intent" {
-		result.State = "intent"
-		return result, nil
+		bound, err := w.findOriginalPreparation(r)
+		if err != nil {
+			return nil, err
+		}
+		if bound == nil {
+			result.State = "intent"
+			return result, nil
+		}
+		return w.inspectMountOperation(bound)
 	}
 	if r.Kind == "oci" {
 		completed, err := w.mountStore.Completed(r.ImageURL, r.PhysicalGeneration)
@@ -214,7 +271,19 @@ func (w *HttpWorker) inspectMountOperation(r *mountOperationRecord) (*MountOpera
 // elsewhere. Only Mount, not the independent query, may rebuild a missing route.
 func (w *HttpWorker) recoverBoundMountOperation(r *mountOperationRecord) (*MountInfo, error) {
 	if r.Phase == "intent" {
-		return nil, fmt.Errorf("original mount dispatch is unresolved")
+		bound, err := w.findOriginalPreparation(r)
+		if err != nil {
+			return nil, err
+		}
+		if bound == nil {
+			return nil, fmt.Errorf("original mount dispatch is unresolved")
+		}
+		// Only the explicit retry publishes the recovered original binding;
+		// the independent query remains read-only.
+		if err := w.mountStore.publishMountBinding(bound); err != nil {
+			return nil, err
+		}
+		r = bound
 	}
 	if r.Kind == "oci" {
 		unlock := w.acquireMountRouteLock(r.ImageURL)

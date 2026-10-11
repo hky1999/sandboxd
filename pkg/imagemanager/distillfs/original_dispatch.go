@@ -20,6 +20,9 @@ func (d *Daemon) startOriginalDaemonCommand(command *exec.Cmd, expected *physica
 	defer release()
 	d.physicalMu.Lock()
 	defer d.physicalMu.Unlock()
+	if err := d.verifyPreparationForLaunchLocked(); err != nil {
+		return err
+	}
 	current := d.meta.PhysicalIdentity
 	if expected == nil || current == nil || current.Generation != expected.Generation || current.Phase != "launching" || current.Process != nil || current.Mount != nil || current.NoDispatchConfirmed || d.physicalPublicationPending {
 		return fmt.Errorf("original daemon dispatch is fenced or unresolved")

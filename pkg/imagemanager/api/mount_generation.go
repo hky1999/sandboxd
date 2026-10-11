@@ -29,7 +29,7 @@ func (w *HttpWorker) recoverDaemonMountBound(id, nydusURL, generation string, os
 		info.FilePath = filepath.Join(d.MountPoint(), d.Name())
 	}
 	if bind != nil {
-		if err := bind(id, nydusURL, generation, info.MountPoint); err != nil {
+		if err := bind.Bind(id, nydusURL, generation, info.MountPoint); err != nil {
 			return nil, err
 		}
 	}
@@ -56,7 +56,7 @@ func (w *HttpWorker) recoverOCIMountBound(req *OCIMountRequest, bind mountBindin
 	}
 	if completed != nil {
 		if bind != nil {
-			if err := bind(generateNydusID(completed.NydusImageURL), completed.NydusImageURL, completed.PhysicalGeneration, completed.MountPoint); err != nil {
+			if err := bind.Bind(generateNydusID(completed.NydusImageURL), completed.NydusImageURL, completed.PhysicalGeneration, completed.MountPoint); err != nil {
 				return nil, err
 			}
 		}

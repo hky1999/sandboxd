@@ -41,6 +41,7 @@ func (d *Daemon) persistDaemonMetadata() error {
 	defer d.metaPersistMu.Unlock()
 	meta := d.meta
 	meta.PhysicalIdentity = clonePhysicalIdentity(meta.PhysicalIdentity)
+	meta.Preparation = clonePreparation(meta.Preparation)
 	meta.Env = append([]string(nil), meta.Env...)
 	meta.ImageProcess = imageconfig.Clone(meta.ImageProcess)
 	meta.SchemaVersion = 1
@@ -146,7 +147,7 @@ func decodeDaemonMetadata(data []byte) (DaemonMeta, error) {
 	}
 	switch meta.SchemaVersion {
 	case 0:
-		if meta.IntegritySHA256 != "" || meta.PhysicalIdentity != nil {
+		if meta.IntegritySHA256 != "" || meta.PhysicalIdentity != nil || meta.Preparation != nil {
 			return meta, fmt.Errorf("legacy daemon metadata contains unproven integrity")
 		}
 	case 1:
@@ -156,6 +157,9 @@ func decodeDaemonMetadata(data []byte) (DaemonMeta, error) {
 		}
 	default:
 		return meta, fmt.Errorf("unknown daemon metadata schema")
+	}
+	if err := validatePreparationMetadata(meta); err != nil {
+		return meta, err
 	}
 	if err := validatePhysicalMetadata(meta); err != nil {
 		return meta, err
@@ -224,6 +228,10 @@ func (d *Daemon) loadDaemonMetadata(path string) error {
 		d.targetUnmountSucceeded = p.UnmountSucceeded
 	}
 	d.config = &BackendConfig{}
+	d.publishPreparationObservationLocked() // Loading precedes admission and all goroutines.
+	if meta.Preparation != nil && meta.PhysicalIdentity == nil {
+		return nil // Preparation can precede any backend configuration file.
+	}
 	if p := meta.PhysicalIdentity; p != nil && p.Phase == "released" {
 		return nil // Original release was persisted before removal of backend files.
 	}

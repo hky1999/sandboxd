@@ -268,7 +268,7 @@ func (w *HttpWorker) mountOSS(req *OSSMountRequest, bind mountBinding) (*MountIn
 
 	// Stage 3: Create daemon
 	stageStart = time.Now()
-	err = w.mgr.CreateDaemon(opts)
+	err = w.prepareDaemonForMount(opts, bind)
 	if err != nil {
 		timing.Fail(err)
 		return nil, fmt.Errorf("failed to create daemon: %w", err)
@@ -413,6 +413,11 @@ func (w *HttpWorker) mountNydus(req *NydusMountRequest, bind mountBinding) (*Mou
 	stageStart = time.Now()
 	d := w.mgr.GetDaemon(id)
 	if d != nil {
+		if bind != nil {
+			if err := w.prepareDaemonForMount(&distillfs.DaemonCreateOpt{ID: id, SourceType: "nydus", ImageURL: req.ImageURL}, bind); err != nil {
+				return nil, err
+			}
+		}
 		logrus.Infof("daemon %s for image %s already exists, reusing it", id, req.ImageURL)
 
 		info := &MountInfo{
@@ -459,7 +464,7 @@ func (w *HttpWorker) mountNydus(req *NydusMountRequest, bind mountBinding) (*Mou
 
 	// Stage 4: Create daemon (bootstrap download happens here)
 	stageStart = time.Now()
-	if err := w.mgr.CreateDaemon(opts); err != nil {
+	if err := w.prepareDaemonForMount(opts, bind); err != nil {
 		timing.Fail(err)
 		return nil, fmt.Errorf("failed to create daemon: %w", err)
 	}
