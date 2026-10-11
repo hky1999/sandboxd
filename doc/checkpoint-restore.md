@@ -440,3 +440,5 @@ The destination host must support the saved I/O engine. In particular, direct en
 `scheduler/agent-dx-protocol-20261010` 分支采用上游 sandboxd 提交 `31d0749a85e269396cfc1c469c948345f9610906` 的公共 protobuf 字段，与 agent-dx 固定协议一致。StartResponse 的 `sandbox_ip`、`resource_generation`、调度器端口映射分别位于 4、5、6。CheckpointRequest 保留上游 1–6 号字段；调度器检查点身份、文件系统快照开关、trace 身份及内部 timeout 别名分别占用 7–10。该分支有意停止兼容旧 YuanRong 调度器的字段编号，不得部署到旧环境。
 
 generation 条件删除及检查点 RPC、持久资源 revision、operation ID、deadline 和结果未知语义继续作为独立扩展保留。CheckpointResponse 的附加产物事实可由上游客户端忽略。`api/runtime/v1/testdata/` 中从固定上游原件独立生成的 descriptor 检查每个公共消息字段及 RPC。协议匹配不等于运行时或重启验收通过。
+
+镜像服务另提供挂载操作的派发前登记、进程启动前原代际绑定及独立结果查询，见 [镜像挂载操作契约](scheduler-image-mount-release.md)。该接口不改变 protobuf，也不证明整个源沙箱已经退役。文件系统管理器的逐步骤操作身份及查询接线、部分启动对账、独立 Restore 和节点最终预算结算仍未完成，不能据局部挂载确认宣称恢复故障已验收。

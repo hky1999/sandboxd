@@ -21,6 +21,7 @@ import (
 )
 
 type OSSMountRequest struct {
+	OperationID        string `json:"operation_id,omitempty"`
 	PhysicalGeneration string `json:"physical_generation,omitempty"`
 	MountPoint         string `json:"mount_point,omitempty"`
 	Endpoint           string `json:"endpoint"`
@@ -67,6 +68,7 @@ type OCIMountResponse struct {
 
 // OCIMountRequest is used to request mounting an OCI image
 type OCIMountRequest struct {
+	OperationID               string `json:"operation_id,omitempty"`
 	RequirePhysicalGeneration bool   `json:"require_physical_generation,omitempty"`
 	PhysicalGeneration        string `json:"physical_generation,omitempty"`
 	ImageURL                  string `json:"image_url"` // Image URL, e.g., "library/alpine:latest"
@@ -88,6 +90,7 @@ func (req *OCIUmountRequest) String() string {
 
 // NydusMountRequest is used to request mounting a Nydus image
 type NydusMountRequest struct {
+	OperationID        string `json:"operation_id,omitempty"`
 	PhysicalGeneration string `json:"physical_generation,omitempty"`
 	ImageURL           string `json:"image_url"`
 	MountPoint         string `json:"mount_point,omitempty"`

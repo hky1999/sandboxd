@@ -9,6 +9,10 @@ import (
 )
 
 func (w *HttpWorker) recoverDaemonMount(id, generation string, oss bool) (*MountInfo, error) {
+	return w.recoverDaemonMountBound(id, "", generation, oss, nil)
+}
+
+func (w *HttpWorker) recoverDaemonMountBound(id, nydusURL, generation string, oss bool, bind mountBinding) (*MountInfo, error) {
 	if !validMountGeneration(generation) || w.mgr == nil {
 		return nil, fmt.Errorf("original daemon mount identity is required")
 	}
@@ -24,6 +28,11 @@ func (w *HttpWorker) recoverDaemonMount(id, generation string, oss bool) (*Mount
 	if oss {
 		info.FilePath = filepath.Join(d.MountPoint(), d.Name())
 	}
+	if bind != nil {
+		if err := bind(id, nydusURL, generation, info.MountPoint); err != nil {
+			return nil, err
+		}
+	}
 	if phase == "running" {
 		if err := w.mgr.SetDaemonReferencedIfPhysicalGeneration(id, generation, true); err != nil {
 			return nil, err
@@ -34,6 +43,10 @@ func (w *HttpWorker) recoverDaemonMount(id, generation string, oss bool) (*Mount
 
 // Caller owns the source route lock. Completed replay precedes current lookup.
 func (w *HttpWorker) recoverOCIMount(req *OCIMountRequest) (*OCIMountResponse, error) {
+	return w.recoverOCIMountBound(req, nil)
+}
+
+func (w *HttpWorker) recoverOCIMountBound(req *OCIMountRequest, bind mountBinding) (*OCIMountResponse, error) {
 	if w.mountStore == nil {
 		return nil, fmt.Errorf("original image mount requires its persistent route")
 	}
@@ -42,6 +55,11 @@ func (w *HttpWorker) recoverOCIMount(req *OCIMountRequest) (*OCIMountResponse, e
 		return nil, err
 	}
 	if completed != nil {
+		if bind != nil {
+			if err := bind(generateNydusID(completed.NydusImageURL), completed.NydusImageURL, completed.PhysicalGeneration, completed.MountPoint); err != nil {
+				return nil, err
+			}
+		}
 		return &OCIMountResponse{MountPath: completed.MountPoint, PhysicalGeneration: completed.PhysicalGeneration, Released: true}, nil
 	}
 	route, err := w.mountStore.Get(req.ImageURL)
@@ -57,7 +75,7 @@ func (w *HttpWorker) recoverOCIMount(req *OCIMountRequest) (*OCIMountResponse, e
 	if route.MountType != "nydus" {
 		return nil, fmt.Errorf("OCI physical mount recovery is not supported yet")
 	}
-	info, err := w.recoverDaemonMount(generateNydusID(route.NydusImageURL), req.PhysicalGeneration, false)
+	info, err := w.recoverDaemonMountBound(generateNydusID(route.NydusImageURL), route.NydusImageURL, req.PhysicalGeneration, false, bind)
 	if err != nil {
 		return nil, err
 	}

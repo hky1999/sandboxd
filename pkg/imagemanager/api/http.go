@@ -95,9 +95,11 @@ type HttpWorker struct {
 	nydusCache  *NydusImageCache
 	mountStore  *MountStore
 
-	nydusDetectSF singleflight.Group
-	routeLocksMu  sync.Mutex
-	routeLocks    map[string]*mountRouteLock
+	nydusDetectSF    singleflight.Group
+	routeLocksMu     sync.Mutex
+	routeLocks       map[string]*mountRouteLock
+	operationLocksMu sync.Mutex
+	operationLocks   map[string]*mountRouteLock
 }
 
 // Close releases resources held by the HttpWorker (e.g., mount store DB).
@@ -135,11 +137,18 @@ func splitObject(object string) (string, string, error) {
 }
 
 func (w *HttpWorker) MountOSS(req *OSSMountRequest) (*MountInfo, error) {
+	if req != nil && req.OperationID != "" {
+		return w.executeMountOperation(req.OperationID, "oss", "", req.PhysicalGeneration, req, func(bind mountBinding) (*MountInfo, error) { return w.mountOSS(req, bind) })
+	}
+	return w.mountOSS(req, nil)
+}
+
+func (w *HttpWorker) mountOSS(req *OSSMountRequest, bind mountBinding) (*MountInfo, error) {
 	if req == nil {
 		return nil, fmt.Errorf("mount source is required")
 	}
 	if req.PhysicalGeneration != "" {
-		return w.recoverDaemonMount(generateOSSID(req.Endpoint, req.Bucket, req.Object), req.PhysicalGeneration, true)
+		return w.recoverDaemonMountBound(generateOSSID(req.Endpoint, req.Bucket, req.Object), "", req.PhysicalGeneration, true, bind)
 	}
 	// Generate daemon ID first for tracing
 	daemonID := generateOSSID(req.Endpoint, req.Bucket, req.Object)
@@ -211,7 +220,7 @@ func (w *HttpWorker) MountOSS(req *OSSMountRequest) (*MountInfo, error) {
 		"mount_point": d.MountPoint(),
 		"source_type": "oss",
 	}).Info("mount path begin daemon mount")
-	generation, mountErr := d.MountWithPhysicalGeneration()
+	generation, mountErr := d.MountWithPhysicalBinding(nativeMountBinding(bind, daemonID, ""))
 	if mountErr != nil {
 		err = mountErr
 		timing.Fail(err)
@@ -279,11 +288,18 @@ func (w *HttpWorker) UnmountOSS(req *OSSUmountRequest) (*MountInfo, error) {
 }
 
 func (w *HttpWorker) MountNydus(req *NydusMountRequest) (*MountInfo, error) {
+	if req != nil && req.OperationID != "" {
+		return w.executeMountOperation(req.OperationID, "nydus", "", req.PhysicalGeneration, req, func(bind mountBinding) (*MountInfo, error) { return w.mountNydus(req, bind) })
+	}
+	return w.mountNydus(req, nil)
+}
+
+func (w *HttpWorker) mountNydus(req *NydusMountRequest, bind mountBinding) (*MountInfo, error) {
 	if req == nil {
 		return nil, fmt.Errorf("mount source is required")
 	}
 	if req.PhysicalGeneration != "" {
-		return w.recoverDaemonMount(generateNydusID(req.ImageURL), req.PhysicalGeneration, false)
+		return w.recoverDaemonMountBound(generateNydusID(req.ImageURL), req.ImageURL, req.PhysicalGeneration, false, bind)
 	}
 	// Generate daemon ID
 	id := generateNydusID(req.ImageURL)
@@ -322,7 +338,7 @@ func (w *HttpWorker) MountNydus(req *NydusMountRequest) (*MountInfo, error) {
 
 		// Mount if not already mounted
 		stageStart = time.Now()
-		generation, err := d.MountWithPhysicalGeneration()
+		generation, err := d.MountWithPhysicalBinding(nativeMountBinding(bind, id, req.ImageURL))
 		if err != nil {
 			timing.Fail(err)
 			return nil, fmt.Errorf("failed to mount existing daemon %s: %w", id, err)
@@ -386,7 +402,7 @@ func (w *HttpWorker) MountNydus(req *NydusMountRequest) (*MountInfo, error) {
 		"source_type": "nydus",
 		"image_url":   req.ImageURL,
 	}).Info("mount path begin daemon mount")
-	generation, err := d.MountWithPhysicalGeneration()
+	generation, err := d.MountWithPhysicalBinding(nativeMountBinding(bind, id, req.ImageURL))
 	if err != nil {
 		timing.Fail(err)
 		return nil, fmt.Errorf("failed to mount %s: %w", opts.ID, err)
@@ -476,11 +492,15 @@ type nydusMountAttempt struct {
 // tryMountNydus attempts to mount an image as Nydus format.
 // Returns mount point on success, or error if image is not Nydus or mount fails.
 func (w *HttpWorker) tryMountNydus(imageURL string) (nydusMountAttempt, error) {
+	return w.tryMountNydusWithBinding(imageURL, nil)
+}
+
+func (w *HttpWorker) tryMountNydusWithBinding(imageURL string, bind mountBinding) (nydusMountAttempt, error) {
 	// Check cache first
 	if isNydus, found := w.nydusCache.Get(imageURL); found {
 		if isNydus {
 			logrus.Infof("cache hit: %s is a Nydus image, routing to Nydus mount", imageURL)
-			info, err := w.MountNydus(&NydusMountRequest{ImageURL: imageURL})
+			info, err := w.mountNydus(&NydusMountRequest{ImageURL: imageURL}, bind)
 			if err != nil {
 				return nydusMountAttempt{detected: true}, fmt.Errorf("failed to mount Nydus image: %w", err)
 			}
@@ -491,13 +511,13 @@ func (w *HttpWorker) tryMountNydus(imageURL string) (nydusMountAttempt, error) {
 		}
 	}
 
-	return w.mountNydusOnce(imageURL, func() (nydusMountAttempt, error) {
+	attempt := func() (nydusMountAttempt, error) {
 		// Double-check cache inside singleflight.
 		if isNydus, found := w.nydusCache.Get(imageURL); found {
 			if !isNydus {
 				return nydusMountAttempt{}, fmt.Errorf("not a Nydus image (cached)")
 			}
-			info, err := w.MountNydus(&NydusMountRequest{ImageURL: imageURL})
+			info, err := w.mountNydus(&NydusMountRequest{ImageURL: imageURL}, bind)
 			if err != nil {
 				return nydusMountAttempt{detected: true}, fmt.Errorf("failed to mount Nydus image: %w", err)
 			}
@@ -522,12 +542,16 @@ func (w *HttpWorker) tryMountNydus(imageURL string) (nydusMountAttempt, error) {
 		}
 
 		logrus.Infof("detected Nydus image at %s, routing to Nydus mount", imageURL)
-		info, err := w.MountNydus(&NydusMountRequest{ImageURL: imageURL})
+		info, err := w.mountNydus(&NydusMountRequest{ImageURL: imageURL}, bind)
 		if err != nil {
 			return nydusMountAttempt{detected: true}, fmt.Errorf("failed to mount Nydus image: %w", err)
 		}
 		return nydusMountAttempt{physicalGeneration: info.PhysicalGeneration, mountPoint: info.MountPoint, env: info.Env, imageProcess: info.ImageProcess, detected: true}, nil
-	})
+	}
+	if bind != nil {
+		return attempt()
+	} // Every owner must execute its own binding.
+	return w.mountNydusOnce(imageURL, attempt)
 }
 
 func (w *HttpWorker) mountNydusOnce(imageURL string, fn func() (nydusMountAttempt, error)) (nydusMountAttempt, error) {
@@ -551,13 +575,33 @@ func (w *HttpWorker) mountNydusOnce(imageURL string, fn func() (nydusMountAttemp
 }
 
 func (w *HttpWorker) MountOCI(req *OCIMountRequest) (*OCIMountResponse, error) {
+	if req != nil && req.OperationID != "" {
+		if !req.RequirePhysicalGeneration {
+			return nil, fmt.Errorf("mount operation requires physical ownership")
+		}
+		info, err := w.executeMountOperation(req.OperationID, "oci", req.ImageURL, req.PhysicalGeneration, req, func(bind mountBinding) (*MountInfo, error) {
+			response, err := w.mountOCI(req, bind)
+			if err != nil {
+				return nil, err
+			}
+			return &MountInfo{MountPoint: response.MountPath, Env: response.Env, ImageProcess: response.ImageProcess, PhysicalGeneration: response.PhysicalGeneration, Released: response.Released, ReleasePending: response.ReleasePending}, nil
+		})
+		if err != nil {
+			return nil, err
+		}
+		return &OCIMountResponse{MountPath: info.MountPoint, Env: info.Env, ImageProcess: info.ImageProcess, PhysicalGeneration: info.PhysicalGeneration, Released: info.Released, ReleasePending: info.ReleasePending}, nil
+	}
+	return w.mountOCI(req, nil)
+}
+
+func (w *HttpWorker) mountOCI(req *OCIMountRequest, bind mountBinding) (*OCIMountResponse, error) {
 	if req == nil || req.ImageURL == "" {
 		return nil, fmt.Errorf("image_url is required")
 	}
 	unlock := w.acquireMountRouteLock(req.ImageURL)
 	defer unlock()
 	if req.PhysicalGeneration != "" {
-		return w.recoverOCIMount(req)
+		return w.recoverOCIMountBound(req, bind)
 	}
 	if req.RequirePhysicalGeneration && w.mountStore == nil {
 		return nil, fmt.Errorf("original image mount requires its persistent route")
@@ -572,7 +616,7 @@ func (w *HttpWorker) MountOCI(req *OCIMountRequest) (*OCIMountResponse, error) {
 	// Try to detect Nydus image if nydusClient is available
 	if w.nydusClient != nil {
 		// Try original URL
-		if attempt, err := w.tryMountNydus(req.ImageURL); err == nil {
+		if attempt, err := w.tryMountNydusWithBinding(req.ImageURL, bind); err == nil {
 			if err := w.recordMountGeneration(req.ImageURL, "nydus", req.ImageURL, attempt.mountPoint, attempt.physicalGeneration); err != nil {
 				return nil, err
 			}
@@ -586,7 +630,7 @@ func (w *HttpWorker) MountOCI(req *OCIMountRequest) (*OCIMountResponse, error) {
 		if w.nydusSuffix != "" {
 			imageWithSuffix := req.ImageURL + w.nydusSuffix
 			logrus.Infof("trying Nydus detection with suffix: %s", imageWithSuffix)
-			if attempt, err := w.tryMountNydus(imageWithSuffix); err == nil {
+			if attempt, err := w.tryMountNydusWithBinding(imageWithSuffix, bind); err == nil {
 				if err := w.recordMountGeneration(req.ImageURL, "nydus", imageWithSuffix, attempt.mountPoint, attempt.physicalGeneration); err != nil {
 					return nil, err
 				}
@@ -866,6 +910,7 @@ func (w *HttpWorker) ListMountedOCIDetails() ([]oci.OciMountRecord, error) {
 
 func (w *HttpWorker) prepareHttp() *http.ServeMux {
 	mux := http.NewServeMux()
+	mux.HandleFunc("/mount_operation_query", w.serveMountOperationQuery)
 	mux.HandleFunc("/oss_mount", func(writer http.ResponseWriter, request *http.Request) {
 		if request.Method != http.MethodPost {
 			writer.WriteHeader(http.StatusBadRequest)
@@ -873,7 +918,7 @@ func (w *HttpWorker) prepareHttp() *http.ServeMux {
 			return
 		}
 		var req OSSMountRequest
-		if err := json.NewDecoder(request.Body).Decode(&req); err != nil {
+		if err := decodeMountDispatch(request.Body, &req); err != nil {
 			writer.WriteHeader(http.StatusBadRequest)
 			writer.Write([]byte("invalid oss mount request format"))
 			return
@@ -923,7 +968,7 @@ func (w *HttpWorker) prepareHttp() *http.ServeMux {
 			return
 		}
 		var req NydusMountRequest
-		if err := json.NewDecoder(request.Body).Decode(&req); err != nil {
+		if err := decodeMountDispatch(request.Body, &req); err != nil {
 			writer.WriteHeader(http.StatusBadRequest)
 			writer.Write([]byte("invalid nydus mount request format"))
 			return
@@ -973,7 +1018,7 @@ func (w *HttpWorker) prepareHttp() *http.ServeMux {
 			return
 		}
 		var req OCIMountRequest
-		if err := json.NewDecoder(request.Body).Decode(&req); err != nil {
+		if err := decodeMountDispatch(request.Body, &req); err != nil {
 			writer.WriteHeader(http.StatusBadRequest)
 			writer.Write([]byte("invalid oci mount request format"))
 			return

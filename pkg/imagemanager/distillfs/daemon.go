@@ -593,6 +593,10 @@ func (d *Daemon) mount(userInitiated bool) error {
 
 // Caller holds the lifecycle lock through result capture.
 func (d *Daemon) mountLocked(userInitiated bool) error {
+	return d.mountLockedWithBinding(userInitiated, nil)
+}
+
+func (d *Daemon) mountLockedWithBinding(userInitiated bool, bind func(generation, target string) error) error {
 	// Start timing operation
 	timing, _ := StartTimedOperation(d.ctx, "daemon.Mount", d.meta.ID)
 	defer timing.End()
@@ -632,7 +636,7 @@ func (d *Daemon) mountLocked(userInitiated bool) error {
 			}
 		}
 		logrus.WithFields(d.daemonLogFields()).Info("daemon already mounted")
-		return nil
+		return d.bindOriginalMount(bind)
 	}
 
 	if !userInitiated && !isAlive {
@@ -648,7 +652,11 @@ func (d *Daemon) mountLocked(userInitiated bool) error {
 		d.setState(DaemonStateMounting)
 
 		// Start daemon process in background
-		go d.startDaemonProcess()
+		go d.startDaemonProcessWithBinding(bind)
+	} else if bind != nil {
+		// Do not silently share another caller's in-flight launch without a
+		// durable binding for this caller. The current intent stays unresolved.
+		return fmt.Errorf("original mount dispatch is already in flight")
 	}
 
 	// Wait for daemon to become running
@@ -684,6 +692,10 @@ func (d *Daemon) mountLocked(userInitiated bool) error {
 
 // startDaemonProcess starts the daemon process in background
 func (d *Daemon) startDaemonProcess() {
+	d.startDaemonProcessWithBinding(nil)
+}
+
+func (d *Daemon) startDaemonProcessWithBinding(bind func(generation, target string) error) {
 	timing, ctx := StartTimedOperation(d.ctx, "daemon.startDaemonProcess", d.meta.ID)
 	defer timing.End()
 
@@ -695,9 +707,12 @@ func (d *Daemon) startDaemonProcess() {
 	}()
 
 	if !d.watcherActive.Load() {
-		if err := d.initializeDaemon(ctx, timing); err != nil {
+		if err := d.initializeDaemonWithBinding(ctx, timing, bind); err != nil {
 			return
 		}
+	} else if err := d.bindOriginalMount(bind); err != nil {
+		timing.Fail(err)
+		return
 	}
 
 	// Stage 6: Wait for mount ready
@@ -778,6 +793,10 @@ func shouldLogMountReadiness(now, lastLog time.Time) bool {
 // - Saves metadata
 // - Initializes channels and starts watcher
 func (d *Daemon) initializeDaemon(ctx context.Context, timing *TimedOperation) error {
+	return d.initializeDaemonWithBinding(ctx, timing, nil)
+}
+
+func (d *Daemon) initializeDaemonWithBinding(ctx context.Context, timing *TimedOperation, bind func(generation, target string) error) error {
 	// For Nydus: download bootstrap if not exists
 	if d.meta.SourceType == "nydus" && d.meta.BootstrapPath == "" {
 		if d.meta.ImageURL == "" || d.nydusClient == nil {
@@ -849,6 +868,10 @@ func (d *Daemon) initializeDaemon(ctx context.Context, timing *TimedOperation) e
 	// Stage 3: Build args and start process
 	stageStart = time.Now()
 	if err := d.preparePhysicalLaunch(); err != nil {
+		timing.Fail(err)
+		return err
+	}
+	if err := d.bindOriginalMount(bind); err != nil {
 		timing.Fail(err)
 		return err
 	}

@@ -70,7 +70,10 @@ func OpenMountStore(dbPath string) (*MountStore, error) {
 		if _, err := tx.CreateBucketIfNotExists(mountRecordsBucket); err != nil {
 			return err
 		}
-		_, err := tx.CreateBucketIfNotExists(mountCompletionsBucket)
+		if _, err := tx.CreateBucketIfNotExists(mountCompletionsBucket); err != nil {
+			return err
+		}
+		_, err := tx.CreateBucketIfNotExists(mountOperationsBucket)
 		return err
 	})
 	if err != nil {
@@ -123,7 +126,7 @@ func (s *MountStore) writeMountRecord(imageURL string, record *MountRecord, pres
 				return nil
 			}
 		}
-		if tx.Bucket(mountRecordsBucket).Get([]byte(imageURL)) == nil && tx.Bucket(mountRecordsBucket).Stats().KeyN+tx.Bucket(mountCompletionsBucket).Stats().KeyN >= mountJournalLimit {
+		if tx.Bucket(mountRecordsBucket).Get([]byte(imageURL)) == nil && mountJournalEntries(tx) >= mountJournalLimit {
 			return fmt.Errorf("image mount journal is full")
 		}
 		return tx.Bucket(mountRecordsBucket).Put([]byte(imageURL), data)
