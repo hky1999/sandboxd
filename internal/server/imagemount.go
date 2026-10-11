@@ -125,6 +125,10 @@ func validateMountEntry(entry imageMountEntry, expected string, required, allowR
 // A nonempty expected generation queries the original lease and never creates
 // a mount. A retiring lease may be reconstructed only for its pending cleanup.
 func (m *s3MountManager) mountS3Generation(cfg *runtime.S3Config, expected string, required, allowReleased bool) (imageMountEntry, error) {
+	return m.mountS3Operation(cfg, expected, required, allowReleased, "")
+}
+
+func (m *s3MountManager) mountS3Operation(cfg *runtime.S3Config, expected string, required, allowReleased bool, operationID string) (imageMountEntry, error) {
 	if cfg == nil {
 		return imageMountEntry{}, fmt.Errorf("s3_config is nil")
 	}
@@ -135,9 +139,32 @@ func (m *s3MountManager) mountS3Generation(cfg *runtime.S3Config, expected strin
 	key := s3MountKey(cfg)
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if operationID != "" {
+		if err := requireFSMountOperationService(m.svc, operationID); err != nil {
+			return imageMountEntry{}, err
+		}
+	}
+	req := &imgApi.OSSMountRequest{OperationID: operationID, PhysicalGeneration: expected, Endpoint: cfg.Endpoint, Bucket: cfg.Bucket, Object: cfg.Object, AccessKeyID: cfg.AccessKeyID, AccessKeySecret: cfg.AccessKeySecret}
 	if entry, ok := m.entries[key]; ok {
 		if err := validateMountEntry(*entry, expected, required, allowReleased); err != nil {
 			return imageMountEntry{}, err
+		}
+		if operationID != "" {
+			req.PhysicalGeneration = entry.physicalGeneration
+			mi, err := m.svc.MountOSS(req)
+			if err != nil {
+				return imageMountEntry{}, err
+			}
+			if mi == nil || mi.FilePath != entry.path || mi.PhysicalGeneration != entry.physicalGeneration {
+				return imageMountEntry{}, fmt.Errorf("shared S3 original operation binding changed")
+			}
+			if err := verifyFSOperationReply(m.svc, req, operationID, "oss", mi.PhysicalGeneration, mi.MountPoint, allowReleased); err != nil {
+				return imageMountEntry{}, err
+			}
+			if (mi.Released || mi.ReleasePending) && (!allowReleased || expected == "") {
+				return imageMountEntry{}, fmt.Errorf("original shared S3 operation is retired")
+			}
+			entry.releaseUnconfirmed = entry.releaseUnconfirmed || mi.Released || mi.ReleasePending
 		}
 		entry.refcount++
 		return *entry, nil
@@ -145,16 +172,17 @@ func (m *s3MountManager) mountS3Generation(cfg *runtime.S3Config, expected strin
 	if m.svc == nil || expected != "" && !validFSPhysicalGeneration(expected) {
 		return imageMountEntry{}, fmt.Errorf("original S3 mount service or identity is unavailable")
 	}
-	mi, err := m.svc.MountOSS(&imgApi.OSSMountRequest{
-		PhysicalGeneration: expected,
-		Endpoint:           cfg.Endpoint, Bucket: cfg.Bucket, Object: cfg.Object,
-		AccessKeyID: cfg.AccessKeyID, AccessKeySecret: cfg.AccessKeySecret,
-	})
+	mi, err := m.svc.MountOSS(req)
 	if err != nil {
 		return imageMountEntry{}, fmt.Errorf("mount S3: %w", err)
 	}
 	if mi == nil || mi.FilePath == "" {
 		return imageMountEntry{}, fmt.Errorf("S3 mount returned no path")
+	}
+	if operationID != "" {
+		if err := verifyFSOperationReply(m.svc, req, operationID, "oss", mi.PhysicalGeneration, mi.MountPoint, allowReleased); err != nil {
+			return imageMountEntry{}, err
+		}
 	}
 	entry := imageMountEntry{refcount: 1, path: mi.FilePath,
 		physicalGeneration: mi.PhysicalGeneration, releaseUnconfirmed: mi.Released || mi.ReleasePending,
@@ -262,15 +290,42 @@ func (m *ociMountManager) mountOCI(imageURL string) (string, error) {
 }
 
 func (m *ociMountManager) mountOCIGeneration(imageURL, expected string, required, allowReleased bool) (imageMountEntry, error) {
+	return m.mountOCIOperation(imageURL, expected, required, allowReleased, "")
+}
+
+func (m *ociMountManager) mountOCIOperation(imageURL, expected string, required, allowReleased bool, operationID string) (imageMountEntry, error) {
 	if imageURL == "" {
 		return imageMountEntry{}, fmt.Errorf("image_url is empty")
 	}
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if operationID != "" {
+		if err := requireFSMountOperationService(m.svc, operationID); err != nil {
+			return imageMountEntry{}, err
+		}
+	}
+	req := &imgApi.OCIMountRequest{OperationID: operationID, ImageURL: imageURL, PhysicalGeneration: expected, RequirePhysicalGeneration: required}
 	if entry, ok := m.entries[imageURL]; ok {
 		if err := validateMountEntry(*entry, expected, required, allowReleased); err != nil {
 			return imageMountEntry{}, err
+		}
+		if operationID != "" {
+			req.PhysicalGeneration = entry.physicalGeneration
+			resp, err := m.svc.MountOCI(req)
+			if err != nil {
+				return imageMountEntry{}, err
+			}
+			if resp == nil || resp.MountPath != entry.path || resp.PhysicalGeneration != entry.physicalGeneration {
+				return imageMountEntry{}, fmt.Errorf("shared image original operation binding changed")
+			}
+			if err := verifyFSOperationReply(m.svc, req, operationID, "oci", resp.PhysicalGeneration, resp.MountPath, allowReleased); err != nil {
+				return imageMountEntry{}, err
+			}
+			if (resp.Released || resp.ReleasePending) && (!allowReleased || expected == "") {
+				return imageMountEntry{}, fmt.Errorf("original shared image operation is retired")
+			}
+			entry.releaseUnconfirmed = entry.releaseUnconfirmed || resp.Released || resp.ReleasePending
 		}
 		entry.refcount++
 		return *entry, nil
@@ -278,12 +333,17 @@ func (m *ociMountManager) mountOCIGeneration(imageURL, expected string, required
 	if m.svc == nil || expected != "" && !validFSPhysicalGeneration(expected) {
 		return imageMountEntry{}, fmt.Errorf("original image mount service or identity is unavailable")
 	}
-	resp, err := m.svc.MountOCI(&imgApi.OCIMountRequest{ImageURL: imageURL, PhysicalGeneration: expected, RequirePhysicalGeneration: required})
+	resp, err := m.svc.MountOCI(req)
 	if err != nil {
 		return imageMountEntry{}, fmt.Errorf("mount OCI image: %w", err)
 	}
 	if resp == nil || resp.MountPath == "" {
 		return imageMountEntry{}, fmt.Errorf("OCI mount returned no path")
+	}
+	if operationID != "" {
+		if err := verifyFSOperationReply(m.svc, req, operationID, "oci", resp.PhysicalGeneration, resp.MountPath, allowReleased); err != nil {
+			return imageMountEntry{}, err
+		}
 	}
 	entry := imageMountEntry{refcount: 1, path: resp.MountPath,
 		physicalGeneration: resp.PhysicalGeneration, releaseUnconfirmed: resp.Released || resp.ReleasePending,

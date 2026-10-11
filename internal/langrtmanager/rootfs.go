@@ -73,12 +73,13 @@ type RootfsConfig struct {
 	Path string
 
 	PhysicalGeneration        string
+	MountOperationID          string
 	RequirePhysicalGeneration bool
 	AllowReleasedMount        bool
 }
 
 func (cfg RootfsConfig) key() string {
-	return fmt.Sprintf("%d:%s:%s:%s:%s:%s:%s:%s:%s:%t:%t",
+	return fmt.Sprintf("%d:%s:%s:%s:%s:%s:%s:%s:%s:%t:%t:%s",
 		cfg.SrcType,
 		cfg.Endpoint,
 		cfg.Bucket,
@@ -88,6 +89,7 @@ func (cfg RootfsConfig) key() string {
 		cfg.ImageUrl,
 		cfg.Path,
 		cfg.PhysicalGeneration, cfg.RequirePhysicalGeneration, cfg.AllowReleasedMount,
+		cfg.MountOperationID,
 	)
 }
 
@@ -136,7 +138,7 @@ func (rf *RootFS) MountImage() error {
 	var err error
 	if mounter, ok := rf.mounter.(PhysicalImageMounter); ok {
 		path, env, imageProcess, generation, err = mounter.MountWithPhysicalGeneration(rf.cfg)
-	} else if rf.cfg.RequirePhysicalGeneration || rf.cfg.PhysicalGeneration != "" {
+	} else if rf.cfg.RequirePhysicalGeneration || rf.cfg.PhysicalGeneration != "" || rf.cfg.MountOperationID != "" {
 		return fmt.Errorf("rootfs mounter cannot preserve the original physical generation")
 	} else {
 		path, env, imageProcess, err = rf.mounter.Mount(rf.cfg)
@@ -144,7 +146,7 @@ func (rf *RootFS) MountImage() error {
 	if err != nil {
 		return err
 	}
-	if rf.cfg.SrcType != runtime_api.RootfsSrcType_LOCAL && (rf.cfg.RequirePhysicalGeneration || rf.cfg.PhysicalGeneration != "") {
+	if rf.cfg.SrcType != runtime_api.RootfsSrcType_LOCAL && (rf.cfg.RequirePhysicalGeneration || rf.cfg.PhysicalGeneration != "" || rf.cfg.MountOperationID != "") {
 		decoded, err := hex.DecodeString(generation)
 		if err != nil || len(decoded) != 32 || hex.EncodeToString(decoded) != generation || rf.cfg.PhysicalGeneration != "" && generation != rf.cfg.PhysicalGeneration {
 			return fmt.Errorf("original rootfs physical generation is missing or changed")
@@ -192,34 +194,62 @@ func (d *defaultMounter) Mount(cfg RootfsConfig) (string, []string, *imageconfig
 }
 
 func (d *defaultMounter) MountWithPhysicalGeneration(cfg RootfsConfig) (string, []string, *imageconfig.Process, string, error) {
+	if cfg.SrcType != runtime_api.RootfsSrcType_LOCAL && cfg.MountOperationID != "" {
+		if err := api.RequireMountOperationService(d.svc, cfg.MountOperationID); err != nil {
+			return "", nil, nil, "", err
+		}
+	}
+	verify := func(request any, kind, generation, target string) error {
+		if cfg.MountOperationID == "" {
+			return nil
+		}
+		result, err := api.QueryOriginalMountOperation(d.svc, request, cfg.MountOperationID, kind, cfg.AllowReleasedMount)
+		if err != nil {
+			return err
+		}
+		if result.PhysicalGeneration != generation || result.MountPoint != target {
+			return fmt.Errorf("original rootfs mount reply binding changed")
+		}
+		return nil
+	}
 	switch cfg.SrcType {
 	case runtime_api.RootfsSrcType_S3:
-		mi, err := d.client().MountOSS(&api.OSSMountRequest{
+		request := &api.OSSMountRequest{
+			OperationID:        cfg.MountOperationID,
 			PhysicalGeneration: cfg.PhysicalGeneration,
 			Endpoint:           cfg.Endpoint,
 			Bucket:             cfg.Bucket,
 			Object:             cfg.Object,
 			AccessKeyID:        cfg.AccessKeyID,
 			AccessKeySecret:    cfg.AccessKeySecret,
-		})
+		}
+		mi, err := d.client().MountOSS(request)
 		if err != nil {
 			return "", nil, nil, "", err
 		}
 		if mi == nil || mi.FilePath == "" || (mi.Released || mi.ReleasePending) && (!cfg.AllowReleasedMount || cfg.PhysicalGeneration == "") {
 			return "", nil, nil, "", fmt.Errorf("original S3 mount is unavailable")
 		}
+		if err := verify(request, "oss", mi.PhysicalGeneration, mi.MountPoint); err != nil {
+			return "", nil, nil, "", err
+		}
 		return mi.FilePath, mi.Env, mi.ImageProcess, mi.PhysicalGeneration, nil
 
 	case runtime_api.RootfsSrcType_IMAGE:
-		resp, err := d.client().MountOCI(&api.OCIMountRequest{
+		request := &api.OCIMountRequest{
+			OperationID:        cfg.MountOperationID,
 			ImageURL:           cfg.ImageUrl,
 			PhysicalGeneration: cfg.PhysicalGeneration, RequirePhysicalGeneration: cfg.RequirePhysicalGeneration,
-		})
+		}
+		resp, err := d.client().MountOCI(request)
 		if err != nil {
 			return "", nil, nil, "", err
 		}
 		if resp == nil || resp.MountPath == "" || (resp.Released || resp.ReleasePending) && (!cfg.AllowReleasedMount || cfg.PhysicalGeneration == "") {
 			return "", nil, nil, "", fmt.Errorf("original image mount is unavailable")
+		}
+		if err := verify(request, "oci", resp.PhysicalGeneration, resp.MountPath); err != nil {
+			return "", nil, nil, "", err
 		}
 		return resp.MountPath, resp.Env, resp.ImageProcess, resp.PhysicalGeneration, nil
 

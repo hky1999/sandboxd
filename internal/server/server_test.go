@@ -75,7 +75,7 @@ func newTestService(t *testing.T, handlers map[string]svc.Handler) *sandboxServi
 		sandboxManager:                    cm,
 		store:                             store.NewMockStore(),
 		UnimplementedSandboxServiceServer: runtime.UnimplementedSandboxServiceServer{},
-		fsMgr:                             newFSManager(nil),
+		fsMgr:                             newFSManager(nil, store.NewStoreImp(filepath.Join(tmpDir, "filesystem.db"))),
 		networkMgr:                        newNetworkManager(nil, "", false),
 	}
 	s.ready.Store(true)

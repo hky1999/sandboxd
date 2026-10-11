@@ -120,6 +120,10 @@ func (lm *LangRTManager) AddLangRuntime(request *api.StartRequest, temporary boo
 }
 
 func (lm *LangRTManager) AddLangRuntimeWithMountGeneration(request *api.StartRequest, temporary bool, generation string, required, allowReleased bool) (*LanguageRuntime, error) {
+	return lm.AddLangRuntimeWithMountOperation(request, temporary, generation, required, allowReleased, "")
+}
+
+func (lm *LangRTManager) AddLangRuntimeWithMountOperation(request *api.StartRequest, temporary bool, generation string, required, allowReleased bool, operationID string) (*LanguageRuntime, error) {
 	if request == nil {
 		return nil, fmt.Errorf("start request is nil")
 	}
@@ -168,13 +172,14 @@ func (lm *LangRTManager) AddLangRuntimeWithMountGeneration(request *api.StartReq
 		return nil, fmt.Errorf("Rootfs Type not supported: %v", request.Rootfs.Type.String())
 	}
 	cfg.PhysicalGeneration = generation
+	cfg.MountOperationID = operationID
 	cfg.RequirePhysicalGeneration = required && cfg.SrcType != api.RootfsSrcType_LOCAL
 	cfg.AllowReleasedMount = allowReleased
 	if id == "" {
 		id = cfg.key()
 	}
 	validateExisting := func(lr *LanguageRuntime) error {
-		if !cfg.RequirePhysicalGeneration && generation == "" {
+		if !cfg.RequirePhysicalGeneration && generation == "" && operationID == "" {
 			return nil
 		}
 		old, next := lr.RootFS.Config(), cfg

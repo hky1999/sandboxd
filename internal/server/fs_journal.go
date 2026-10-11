@@ -97,6 +97,9 @@ func validateFSJournal(j storedSandboxFSStates) error {
 		return fmt.Errorf("invalid filesystem ownership inventory")
 	}
 	for id, state := range j.Items {
+		if state.MountOperationProtocol > 1 || state.MountOperationProtocol == 1 && state.Generation == "" {
+			return fmt.Errorf("invalid filesystem mount operation protocol")
+		}
 		if id == "" || strings.ContainsRune(id, 0) || strings.ContainsRune(state.Generation, 0) {
 			return fmt.Errorf("invalid filesystem owner identity")
 		}
@@ -293,14 +296,14 @@ func decodeFSJournal(data []byte) (storedSandboxFSStates, error) {
 			return j, fmt.Errorf("filesystem journal integrity changed")
 		}
 		j.SchemaVersion = fsJournalSchema
-	case fsJournalSchema:
+	case 4, fsJournalSchema:
 		if err := exactFSJSONFields(header, "schema_version", "items", "completed", "integrity_sha256"); err != nil {
 			return j, err
 		}
 		if err := decodeStrictFSJSON(data, &j); err != nil {
 			return j, err
 		}
-		if err := validateFSJSONOwnerFields(header); err != nil {
+		if err := validateFSJSONOwnerFields(header, version); err != nil {
 			return j, err
 		}
 		integrity, err := fsJournalIntegrity(j)
@@ -310,6 +313,7 @@ func decodeFSJournal(data []byte) (storedSandboxFSStates, error) {
 		if j.IntegritySHA256 != integrity {
 			return j, fmt.Errorf("filesystem journal integrity changed")
 		}
+		j.SchemaVersion = fsJournalSchema
 	default:
 		return j, fmt.Errorf("unsupported filesystem ownership schema")
 	}
@@ -341,7 +345,7 @@ func exactFSJSONFields(fields map[string]json.RawMessage, allowed ...string) err
 	return nil
 }
 
-func validateFSJSONOwnerFields(header map[string]json.RawMessage) error {
+func validateFSJSONOwnerFields(header map[string]json.RawMessage, version int) error {
 	for _, section := range []string{"items", "completed"} {
 		raw, exists := header[section]
 		if !exists {
@@ -359,6 +363,9 @@ func validateFSJSONOwnerFields(header map[string]json.RawMessage) error {
 			allowed := []string{"sandbox_id", "generation", "source_fingerprint"}
 			if section == "items" {
 				allowed = []string{"generation", "source_fingerprint", "rootfs", "s3", "oci", "rootfs_phase", "s3_phases", "oci_phases", "rootfs_mount_generation", "s3_mount_generations", "oci_mount_generations"}
+				if version == fsJournalSchema {
+					allowed = append(allowed, "mount_operation_protocol", "release_requested")
+				}
 			}
 			if err := exactFSJSONFields(fields, allowed...); err != nil {
 				return err

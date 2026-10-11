@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -34,7 +35,7 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-const fsJournalSchema = 4
+const fsJournalSchema = 5
 const fsJournalLimit = 65536
 
 type fsLeasePhase string
@@ -74,17 +75,19 @@ type preparedFS struct {
 }
 
 type sandboxFSState struct {
-	RootfsMountGeneration string              `json:"rootfs_mount_generation,omitempty"`
-	S3MountGenerations    []string            `json:"s3_mount_generations,omitempty"`
-	OCIMountGenerations   []string            `json:"oci_mount_generations,omitempty"`
-	SourceFingerprint     string              `json:"source_fingerprint"`
-	Generation            string              `json:"generation,omitempty"`
-	Rootfs                []byte              `json:"rootfs,omitempty"`
-	S3                    []*runtime.S3Config `json:"s3,omitempty"`
-	OCI                   []string            `json:"oci,omitempty"`
-	RootfsPhase           fsLeasePhase        `json:"rootfs_phase"`
-	S3Phases              []fsLeasePhase      `json:"s3_phases,omitempty"`
-	OCIPhases             []fsLeasePhase      `json:"oci_phases,omitempty"`
+	MountOperationProtocol uint8               `json:"mount_operation_protocol,omitempty"`
+	ReleaseRequested       bool                `json:"release_requested,omitempty"`
+	RootfsMountGeneration  string              `json:"rootfs_mount_generation,omitempty"`
+	S3MountGenerations     []string            `json:"s3_mount_generations,omitempty"`
+	OCIMountGenerations    []string            `json:"oci_mount_generations,omitempty"`
+	SourceFingerprint      string              `json:"source_fingerprint"`
+	Generation             string              `json:"generation,omitempty"`
+	Rootfs                 []byte              `json:"rootfs,omitempty"`
+	S3                     []*runtime.S3Config `json:"s3,omitempty"`
+	OCI                    []string            `json:"oci,omitempty"`
+	RootfsPhase            fsLeasePhase        `json:"rootfs_phase"`
+	S3Phases               []fsLeasePhase      `json:"s3_phases,omitempty"`
+	OCIPhases              []fsLeasePhase      `json:"oci_phases,omitempty"`
 }
 
 type fsCompletion struct {
@@ -143,6 +146,9 @@ func (m *fsManager) Prepare(request *runtime.StartRequest) (*preparedFS, error) 
 		return nil, err
 	}
 	state := sandboxFSState{Generation: p.generation, Rootfs: rootfs, RootfsPhase: fsReserved}
+	if p.generation != "" {
+		state.MountOperationProtocol = 1
+	}
 	if p.sandboxID == "" || strings.ContainsRune(p.sandboxID, 0) || strings.ContainsRune(p.generation, 0) {
 		return nil, fmt.Errorf("invalid filesystem owner identity")
 	}
@@ -180,6 +186,30 @@ func (m *fsManager) Prepare(request *runtime.StartRequest) (*preparedFS, error) 
 	if err != nil {
 		return nil, err
 	}
+	if state.MountOperationProtocol == 1 {
+		if m.store == nil {
+			return nil, fmt.Errorf("managed filesystem operations require a persistent ownership journal")
+		}
+		if id := fsMountOperationID(state, "rootfs", 0); id != "" {
+			svc := m.oci.svc
+			if p.source.Type == runtime.RootfsSrcType_S3 {
+				svc = m.s3.svc
+			}
+			if err := requireFSMountOperationService(svc, id); err != nil {
+				return nil, err
+			}
+		}
+		if len(state.S3) > 0 {
+			if err := requireFSMountOperationService(m.s3.svc, fsMountOperationID(state, "s3", 0)); err != nil {
+				return nil, err
+			}
+		}
+		if len(state.OCI) > 0 {
+			if err := requireFSMountOperationService(m.oci.svc, fsMountOperationID(state, "oci", 0)); err != nil {
+				return nil, err
+			}
+		}
+	}
 	m.persistMu.Lock()
 	defer m.persistMu.Unlock()
 	if err := m.loadLocked(); err != nil {
@@ -212,7 +242,7 @@ func (m *fsManager) Prepare(request *runtime.StartRequest) (*preparedFS, error) 
 	if err := m.saveStateLocked(p.sandboxID, state); err != nil {
 		return p, err
 	}
-	lr, err := m.rootfs.AddLangRuntimeWithMountGeneration(request, true, "", p.generation != "", false)
+	lr, err := m.rootfs.AddLangRuntimeWithMountOperation(request, true, "", p.generation != "", false, fsMountOperationID(state, "rootfs", 0))
 	if err != nil {
 		return p, err
 	}
@@ -237,7 +267,7 @@ func (m *fsManager) Prepare(request *runtime.StartRequest) (*preparedFS, error) 
 			if err := m.saveStateLocked(p.sandboxID, state); err != nil {
 				return p, err
 			}
-			entry, err := m.s3.mountS3Generation(source.S3Config, "", p.generation != "", false)
+			entry, err := m.s3.mountS3Operation(source.S3Config, "", p.generation != "", false, fsMountOperationID(state, "s3", si))
 			if err != nil {
 				return p, err
 			}
@@ -255,7 +285,7 @@ func (m *fsManager) Prepare(request *runtime.StartRequest) (*preparedFS, error) 
 			if err := m.saveStateLocked(p.sandboxID, state); err != nil {
 				return p, err
 			}
-			entry, err := m.oci.mountOCIGeneration(source.ImageUrl, "", p.generation != "", false)
+			entry, err := m.oci.mountOCIOperation(source.ImageUrl, "", p.generation != "", false, fsMountOperationID(state, "oci", oi))
 			if err != nil {
 				return p, err
 			}
@@ -342,6 +372,11 @@ func (m *fsManager) releaseLocked(id, generation string, conditional bool) error
 	// Flush any in-memory confirmation whose preceding write failed, BEFORE
 	// taking another reference or changing a backend. This prevents double release.
 	if err := m.persistCurrentState(); err != nil {
+		return err
+	}
+	state = cloneFSState(state)
+	state.ReleaseRequested = true
+	if err := m.saveStateLocked(id, state); err != nil {
 		return err
 	}
 	if err := m.recoverAllLocked(); err != nil {
@@ -497,7 +532,7 @@ func cloneFSState(s sandboxFSState) sandboxFSState {
 func (m *fsManager) saveStateLocked(id string, state sandboxFSState) error {
 	m.mu.Lock()
 	original, exists := m.sandboxState[id]
-	if !exists || original.Generation != state.Generation || original.SourceFingerprint != state.SourceFingerprint || changedKnownMountGeneration(original.RootfsMountGeneration, state.RootfsMountGeneration) || changedKnownMountGenerations(original.S3MountGenerations, state.S3MountGenerations) || changedKnownMountGenerations(original.OCIMountGenerations, state.OCIMountGenerations) {
+	if !exists || original.Generation != state.Generation || original.SourceFingerprint != state.SourceFingerprint || original.MountOperationProtocol != state.MountOperationProtocol || original.ReleaseRequested && !state.ReleaseRequested || changedKnownMountGeneration(original.RootfsMountGeneration, state.RootfsMountGeneration) || changedKnownMountGenerations(original.S3MountGenerations, state.S3MountGenerations) || changedKnownMountGenerations(original.OCIMountGenerations, state.OCIMountGenerations) {
 		m.mu.Unlock()
 		return fmt.Errorf("original filesystem owner or mount identity changed")
 	}
@@ -609,6 +644,9 @@ func (m *fsManager) ValidatePhysicalOwners(owners []*runtime.SandboxMetadata) er
 			return fmt.Errorf("filesystem owner %s is missing or changed", metadata.ID)
 		}
 		if metadata.PhysicalPhase != runtime.SandboxPhysicalPhase_SANDBOX_PHYSICAL_PHASE_INTENT {
+			if state.ReleaseRequested {
+				return fmt.Errorf("published filesystem owner %s has unresolved cleanup", metadata.ID)
+			}
 			phases := append([]fsLeasePhase{state.RootfsPhase}, state.S3Phases...)
 			phases = append(phases, state.OCIPhases...)
 			for _, phase := range phases {
@@ -633,12 +671,25 @@ func (m *fsManager) Restore(sandboxExists func(string) bool) error {
 	if err := m.persistCurrentState(); err != nil {
 		return err
 	}
+	orphans := make(map[string]bool)
+	for _, id := range m.ownerIDs() {
+		if sandboxExists != nil && !sandboxExists(id) {
+			orphans[id] = true
+			m.mu.Lock()
+			state := cloneFSState(m.sandboxState[id])
+			m.mu.Unlock()
+			state.ReleaseRequested = true
+			if err := m.saveStateLocked(id, state); err != nil {
+				return err
+			}
+		}
+	}
 	if err := m.recoverAllLocked(); err != nil {
 		return err
 	}
 	ids := m.ownerIDs()
 	for _, id := range ids {
-		if sandboxExists != nil && !sandboxExists(id) {
+		if orphans[id] {
 			m.mu.Lock()
 			generation := m.sandboxState[id].Generation
 			m.mu.Unlock()
@@ -662,14 +713,29 @@ func (m *fsManager) ownerIDs() []string {
 func (m *fsManager) recoverAllLocked() error {
 	// An unknown managed acquisition cannot be turned into a new mount by URL.
 	// Check the entire inventory before reconstructing any shared reference.
-	m.mu.Lock()
-	for _, state := range m.sandboxState {
-		if err := validateFSRecoveryBindings(state); err != nil {
-			m.mu.Unlock()
-			return err
+	if err := m.persistCurrentState(); err != nil {
+		return err
+	}
+	resolved := make(map[string]sandboxFSState)
+	for _, id := range m.ownerIDs() {
+		m.mu.Lock()
+		state := cloneFSState(m.sandboxState[id])
+		m.mu.Unlock()
+		next, err := m.resolveFSOriginalOperationsLocked(state)
+		if err != nil {
+			return fmt.Errorf("resolve original filesystem %s: %w", id, err)
+		}
+		if state.RootfsMountGeneration != next.RootfsMountGeneration || !slices.Equal(state.S3MountGenerations, next.S3MountGenerations) || !slices.Equal(state.OCIMountGenerations, next.OCIMountGenerations) {
+			resolved[id] = next
 		}
 	}
-	m.mu.Unlock()
+	for _, id := range m.ownerIDs() {
+		if next, changed := resolved[id]; changed {
+			if err := m.saveStateLocked(id, next); err != nil {
+				return err
+			}
+		}
+	}
 	var failures []error
 	for _, id := range m.ownerIDs() {
 		if err := m.recoverSandboxLocked(id); err != nil {
@@ -723,7 +789,7 @@ func (m *fsManager) recoverSandboxLocked(id string) error {
 		if err := proto.Unmarshal(state.Rootfs, rootfs); err != nil {
 			return err
 		}
-		recovered, err := m.rootfs.AddLangRuntimeWithMountGeneration(&runtime.StartRequest{SandboxID: id, Rootfs: rootfs}, true, state.RootfsMountGeneration, state.Generation != "", state.RootfsPhase == fsReleasePending)
+		recovered, err := m.rootfs.AddLangRuntimeWithMountOperation(&runtime.StartRequest{SandboxID: id, Rootfs: rootfs}, true, state.RootfsMountGeneration, state.Generation != "", state.ReleaseRequested || state.RootfsPhase == fsReleasePending, fsMountOperationID(state, "rootfs", 0))
 		if err != nil {
 			return err
 		}
@@ -750,7 +816,7 @@ func (m *fsManager) recoverSandboxLocked(id string) error {
 		if known {
 			continue
 		}
-		entry, err := m.s3.mountS3Generation(source, state.S3MountGenerations[i], state.Generation != "", state.S3Phases[i] == fsReleasePending)
+		entry, err := m.s3.mountS3Operation(source, state.S3MountGenerations[i], state.Generation != "", state.ReleaseRequested || state.S3Phases[i] == fsReleasePending, fsMountOperationID(state, "s3", i))
 		if err != nil {
 			return err
 		}
@@ -774,7 +840,7 @@ func (m *fsManager) recoverSandboxLocked(id string) error {
 		if known {
 			continue
 		}
-		entry, err := m.oci.mountOCIGeneration(source, state.OCIMountGenerations[i], state.Generation != "", state.OCIPhases[i] == fsReleasePending)
+		entry, err := m.oci.mountOCIOperation(source, state.OCIMountGenerations[i], state.Generation != "", state.ReleaseRequested || state.OCIPhases[i] == fsReleasePending, fsMountOperationID(state, "oci", i))
 		if err != nil {
 			return err
 		}

@@ -32,6 +32,7 @@ import (
 )
 
 type fsTestImageService struct {
+	operations           map[string]fsOperationProducerRecord
 	physicalGenerations  map[string]string
 	unmountedGenerations []string
 	mu                   sync.Mutex
@@ -53,7 +54,11 @@ func (s *fsTestImageService) MountOSS(req *imageapi.OSSMountRequest) (*imageapi.
 	if req.PhysicalGeneration != "" && req.PhysicalGeneration != g {
 		return nil, fmt.Errorf("original test mount generation changed")
 	}
-	return &imageapi.MountInfo{FilePath: "/mnt/s3/" + req.Object, PhysicalGeneration: g}, nil
+	path := "/mnt/s3/" + req.Object
+	if err := s.recordOperationLocked(req, req.OperationID, req.Endpoint+"\x00"+req.Bucket+"\x00"+req.Object, "oss", g, path); err != nil {
+		return nil, err
+	}
+	return &imageapi.MountInfo{FilePath: path, MountPoint: path, PhysicalGeneration: g}, nil
 }
 
 func (s *fsTestImageService) UmountOSS(*imageapi.OSSUmountRequest) error { return nil }
@@ -62,6 +67,9 @@ func (s *fsTestImageService) MountOCI(req *imageapi.OCIMountRequest) (*imageapi.
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	g := s.physicalGenerationLocked(req.ImageURL)
+	if err := s.recordOperationLocked(req, req.OperationID, req.ImageURL, "oci", g, "/mnt/oci/"+req.ImageURL); err != nil {
+		return nil, err
+	}
 	if req.PhysicalGeneration != "" {
 		if req.PhysicalGeneration != g {
 			return nil, fmt.Errorf("original test mount generation changed")
@@ -70,6 +78,42 @@ func (s *fsTestImageService) MountOCI(req *imageapi.OCIMountRequest) (*imageapi.
 	}
 	s.ociMountCalls[req.ImageURL]++
 	return &imageapi.OCIMountResponse{MountPath: "/mnt/oci/" + req.ImageURL, PhysicalGeneration: g}, nil
+}
+
+func (s *fsTestImageService) recordOperationLocked(request any, id, source, kind, generation, path string) error {
+	if id == "" {
+		return nil
+	}
+	fingerprint, err := imageapi.MountRequestFingerprint(request)
+	if err != nil {
+		return err
+	}
+	if s.operations == nil {
+		s.operations = make(map[string]fsOperationProducerRecord)
+	}
+	record := fsOperationProducerRecord{Source: source, Result: imageapi.MountOperationResult{OperationID: id, RequestFingerprint: fingerprint, Kind: kind, State: "ready", PhysicalGeneration: generation, MountPoint: path}}
+	if old, ok := s.operations[id]; ok && old != record {
+		return fmt.Errorf("original controlled producer operation changed")
+	}
+	s.operations[id] = record
+	return nil
+}
+
+func (s *fsTestImageService) QueryMountOperation(query *imageapi.MountOperationQuery) (*imageapi.MountOperationResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	record, ok := s.operations[query.OperationID]
+	if !ok {
+		return &imageapi.MountOperationResult{OperationID: query.OperationID, RequestFingerprint: query.RequestFingerprint, State: "absent"}, nil
+	}
+	if record.Result.RequestFingerprint != query.RequestFingerprint {
+		return nil, fmt.Errorf("original controlled operation request changed")
+	}
+	result := record.Result
+	if s.physicalGenerations[record.Source] != result.PhysicalGeneration {
+		result.State = "unresolved"
+	}
+	return &result, nil
 }
 
 func (s *fsTestImageService) physicalGenerationLocked(source string) string {

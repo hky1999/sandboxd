@@ -195,7 +195,7 @@ type fsCompletedMountService struct {
 
 func (s *fsCompletedMountService) MountOCI(r *imageapi.OCIMountRequest) (*imageapi.OCIMountResponse, error) {
 	if r.PhysicalGeneration != "" && s.completed[r.ImageURL+"\x00"+r.PhysicalGeneration] {
-		return &imageapi.OCIMountResponse{MountPath: "/original/mount", PhysicalGeneration: r.PhysicalGeneration, Released: true}, nil
+		return &imageapi.OCIMountResponse{MountPath: "/mnt/oci/" + r.ImageURL, PhysicalGeneration: r.PhysicalGeneration, Released: true}, nil
 	}
 	return s.ownershipImageService.MountOCI(r)
 }
@@ -210,6 +210,21 @@ func (s *fsCompletedMountService) UmountOCI(r *imageapi.OCIUmountRequest) error 
 	}
 	s.completed[key] = true
 	return nil
+}
+
+func (s *fsCompletedMountService) QueryMountOperation(query *imageapi.MountOperationQuery) (*imageapi.MountOperationResult, error) {
+	s.fsTestImageService.mu.Lock()
+	record, exists := s.operations[query.OperationID]
+	s.fsTestImageService.mu.Unlock()
+	if exists && s.completed[record.Source+"\x00"+record.Result.PhysicalGeneration] {
+		if record.Result.RequestFingerprint != query.RequestFingerprint {
+			return nil, fmt.Errorf("original completion request changed")
+		}
+		result := record.Result
+		result.State = "released"
+		return &result, nil
+	}
+	return s.fsTestImageService.QueryMountOperation(query)
 }
 
 func TestFSMountGenerationCompletedProducerResumesPendingCleanupAfterReplacement(t *testing.T) {
@@ -267,8 +282,9 @@ func TestFSMountGenerationLostAcquisitionConfirmationNeverRemounts(t *testing.T)
 	_, err := m.Prepare(r)
 	require.Error(t, err)
 	reopened := newFSManager(service, st)
-	require.Error(t, reopened.Restore(func(string) bool { return true }))
-	require.Empty(t, reopened.sandboxRootfs)
+	require.NoError(t, reopened.Restore(func(string) bool { return true }))
+	require.NotEmpty(t, reopened.sandboxRootfs)
+	require.Equal(t, service.physicalGenerations[r.Rootfs.GetImageUrl()], reopened.sandboxState[r.SandboxID].RootfsMountGeneration)
 	require.Equal(t, 1, service.mountCalls(r.Rootfs.GetImageUrl()))
 	require.Zero(t, service.umountCalls(r.Rootfs.GetImageUrl()))
 }

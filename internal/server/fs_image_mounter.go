@@ -31,10 +31,10 @@ func (m *fsImageMounter) MountWithPhysicalGeneration(cfg langrtmanager.RootfsCon
 		path, env, process, err := m.local.Mount(cfg)
 		return path, env, process, "", err
 	case runtime.RootfsSrcType_IMAGE:
-		entry, err = m.manager.oci.mountOCIGeneration(cfg.ImageUrl, cfg.PhysicalGeneration, cfg.RequirePhysicalGeneration, cfg.AllowReleasedMount)
+		entry, err = m.manager.oci.mountOCIOperation(cfg.ImageUrl, cfg.PhysicalGeneration, cfg.RequirePhysicalGeneration, cfg.AllowReleasedMount, cfg.MountOperationID)
 	case runtime.RootfsSrcType_S3:
 		source := fsS3Source(cfg)
-		entry, err = m.manager.s3.mountS3Generation(source, cfg.PhysicalGeneration, cfg.RequirePhysicalGeneration, cfg.AllowReleasedMount)
+		entry, err = m.manager.s3.mountS3Operation(source, cfg.PhysicalGeneration, cfg.RequirePhysicalGeneration, cfg.AllowReleasedMount, cfg.MountOperationID)
 	default:
 		return "", nil, nil, "", fmt.Errorf("unsupported rootfs type")
 	}
