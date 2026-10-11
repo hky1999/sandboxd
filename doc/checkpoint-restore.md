@@ -7,6 +7,8 @@ directory and starting a new sandbox from that checkpoint.
 
 调度器的普通创建及通过 `checkpoint_info` 发起的创建可以使用 [持久创建操作](scheduler-start-operations.md) 的 `StartOperation`。它复用同一物理创建流程，并单独记录创建身份与结果；独立 `Restore` 的持久操作整合仍待完成。
 
+Start 或 Restore 的运行时调用返回错误而物理结果未确认时，共享创建流程保留原物理意图和资源，不再依据调用错误删除身份记录。意图对账使用物理锁、完整磁盘元数据和运行时清理后的回读；失败创建的完成退役证明和真实故障验收仍待完成，不能依据意图清理日志归还调度器预算。
+
 The API has three operations:
 
 1. `SandboxService.Checkpoint` checkpoints an existing sandbox.

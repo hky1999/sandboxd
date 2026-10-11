@@ -301,8 +301,7 @@ func (h *sandboxService) startSandboxRuntime(
 	}
 	if err != nil {
 		logrus.WithField(trace.ContextKeyTraceId, traceID).Errorf("runtime handler create sandbox failed: %v", err)
-		h.sandboxManager.CleanSandboxRoot(startConfig.ID)
-		return errord.ToGRPC(err)
+		return errors.Join(errord.ToGRPC(err), svc.ErrRuntimeCreationUnconfirmed)
 	}
 
 	logrus.WithField(trace.ContextKeyTraceId, traceID).Infof("StartSandbox %s success, traceID: %v, spanId: %v, cost: %v", startConfig.ID, traceID, spanID, time.Since(start).String())
@@ -349,8 +348,7 @@ func (h *sandboxService) restoreSandboxRuntime(
 		if errors.Is(err, svc.ErrRestoreCleanupIncomplete) {
 			return err
 		}
-		h.sandboxManager.CleanSandboxRoot(startConfig.ID)
-		return errord.ToGRPC(err)
+		return errors.Join(errord.ToGRPC(err), svc.ErrRuntimeCreationUnconfirmed)
 	}
 	return nil
 }
@@ -1692,9 +1690,9 @@ func (h *sandboxService) createSandbox(
 		if startSucceeded {
 			return
 		}
-		if errors.Is(retErr, svc.ErrRestoreCleanupIncomplete) {
+		if errors.Is(retErr, svc.ErrRestoreCleanupIncomplete) || errors.Is(retErr, svc.ErrRuntimeCreationUnconfirmed) {
 			logrus.Warnf(
-				"retain physical intent and prepared resources for sandbox %s after incomplete restore cleanup",
+				"retain physical intent and prepared resources for sandbox %s after unconfirmed runtime creation",
 				sandboxID,
 			)
 			return

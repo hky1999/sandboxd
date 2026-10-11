@@ -18,7 +18,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
+	"path/filepath"
 	"sort"
 	"time"
 
@@ -28,10 +30,12 @@ import (
 	"github.com/inclusionAI/sandboxd/pkg/networkmanager"
 	svc "github.com/inclusionAI/sandboxd/pkg/runtime"
 	"github.com/inclusionAI/sandboxd/pkg/sandbox"
+	"golang.org/x/sys/unix"
 	"google.golang.org/protobuf/proto"
 )
 
 const physicalIntentCleanupTimeout = 20 * time.Second
+const physicalIntentMetadataLimit = 4 * 1024 * 1024
 
 func (h *sandboxService) recoverPhysicalState(ctx context.Context) error {
 	if err := h.fsMgr.Restore(h.sandboxManager.HasPhysicalRecord); err != nil {
@@ -96,29 +100,50 @@ func (h *sandboxService) reconcilePhysicalIntent(
 	ctx context.Context,
 	metadata *runtime.SandboxMetadata,
 ) error {
-	if metadata == nil || metadata.ID == "" || metadata.RuntimeHandler == "" {
+	if metadata == nil || !config.IsValidSandboxID(metadata.ID) || metadata.RuntimeHandler == "" ||
+		metadata.PhysicalPhase != runtime.SandboxPhysicalPhase_SANDBOX_PHYSICAL_PHASE_INTENT {
 		return fmt.Errorf("physical intent metadata is incomplete: %w", errord.ErrFailedPrecondition)
 	}
+	metadata = proto.Clone(metadata).(*runtime.SandboxMetadata)
+	cleanupCtx, cancel := context.WithTimeout(ctx, physicalIntentCleanupTimeout)
+	defer cancel()
+	unlock, err := h.resourceLocks.acquire(cleanupCtx, metadata.ID)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	if err := h.verifyOriginalPhysicalIntent(metadata); err != nil {
+		return err
+	}
 	handler, ok := h.serviceHandler.Get(metadata.RuntimeHandler)
-	if !ok {
+	if !ok || handler == nil {
 		return fmt.Errorf("runtime handler %q for intent %s is unavailable: %w",
 			metadata.RuntimeHandler, metadata.ID, errord.ErrUnavailable)
 	}
 
-	cleanupCtx, cancel := context.WithTimeout(ctx, physicalIntentCleanupTimeout)
-	defer cancel()
 	states, err := handler.List(cleanupCtx)
 	if err != nil {
 		return fmt.Errorf("list runtime facts for physical intent %s: %w", metadata.ID, err)
 	}
-	runtimeExists := false
+	runtimeCount := 0
 	for _, state := range states {
-		if state != nil && state.ID == metadata.ID {
-			runtimeExists = true
-			break
+		if state == nil {
+			return fmt.Errorf("physical intent runtime inventory is incomplete: %w", errord.ErrUnavailable)
+		}
+		if state.ID == metadata.ID {
+			runtimeCount++
 		}
 	}
-	if runtimeExists {
+	if runtimeCount > 1 {
+		return fmt.Errorf("physical intent runtime inventory is ambiguous: %w", errord.ErrUnavailable)
+	}
+	if err := h.verifyOriginalPhysicalIntent(metadata); err != nil {
+		return err
+	}
+	if err := cleanupCtx.Err(); err != nil {
+		return err
+	}
+	if runtimeCount == 1 {
 		if err := handler.Delete(cleanupCtx, metadata.ID); err != nil &&
 			!errors.Is(err, errord.ErrNotFound) {
 			return fmt.Errorf("delete runtime for physical intent %s: %w", metadata.ID, err)
@@ -127,6 +152,23 @@ func (h *sandboxService) reconcilePhysicalIntent(
 		if err := cleaner.CleanupPreparedState(cleanupCtx, metadata.ID); err != nil {
 			return fmt.Errorf("cleanup prepared runtime state for physical intent %s: %w", metadata.ID, err)
 		}
+	}
+	// A returned Delete/cleanup alone does not prove physical absence. Check
+	// fresh inventory and the original durable identity before any recycling.
+	states, err = handler.List(cleanupCtx)
+	if err != nil {
+		return fmt.Errorf("verify runtime absence for physical intent %s: %w", metadata.ID, err)
+	}
+	for _, state := range states {
+		if state == nil || state.ID == metadata.ID {
+			return fmt.Errorf("physical intent runtime absence is unconfirmed: %w", errord.ErrUnavailable)
+		}
+	}
+	if err := h.verifyOriginalPhysicalIntent(metadata); err != nil {
+		return err
+	}
+	if err := cleanupCtx.Err(); err != nil {
+		return err
 	}
 	if h.xpuMgr != nil {
 		h.xpuMgr.Release(metadata.ID)
@@ -155,6 +197,44 @@ func (h *sandboxService) reconcilePhysicalIntent(
 
 	h.sandboxManager.CleanSandboxRoot(metadata.ID)
 	h.sandboxManager.ReleaseID(metadata.ID)
+	return nil
+}
+
+// Caller holds the per-sandbox physical lock. Hidden in-memory intents can
+// lag a COMMITTED disk write, so neither that cache nor ID equality alone
+// authorizes cleanup: require the complete original durable metadata too.
+func (h *sandboxService) verifyOriginalPhysicalIntent(metadata *runtime.SandboxMetadata) error {
+	if _, err := h.sandboxManager.Get(metadata.ID); !errors.Is(err, errord.ErrNotFound) {
+		return fmt.Errorf("physical intent is published or unavailable: %w", errord.ErrFailedPrecondition)
+	}
+	root := filepath.Join(h.config.RootDir, "containers", metadata.ID)
+	info, err := os.Lstat(root)
+	if err != nil || !info.IsDir() {
+		return fmt.Errorf("physical intent directory is unavailable: %w", errord.ErrFailedPrecondition)
+	}
+	f, err := os.OpenFile(filepath.Join(root, config.SandboxMetaFile), os.O_RDONLY|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return fmt.Errorf("read original physical intent: %w", err)
+	}
+	defer f.Close()
+	info, err = f.Stat()
+	if err != nil || !info.Mode().IsRegular() || info.Size() > physicalIntentMetadataLimit {
+		return fmt.Errorf("physical intent metadata is not a bounded regular file: %w", errord.ErrFailedPrecondition)
+	}
+	data, err := io.ReadAll(io.LimitReader(f, physicalIntentMetadataLimit+1))
+	if err != nil {
+		return err
+	}
+	if len(data) > physicalIntentMetadataLimit {
+		return fmt.Errorf("physical intent metadata exceeds its bound: %w", errord.ErrFailedPrecondition)
+	}
+	current := &runtime.SandboxMetadata{}
+	if err := proto.Unmarshal(data, current); err != nil {
+		return fmt.Errorf("decode original physical intent: %w", err)
+	}
+	if !proto.Equal(current, metadata) {
+		return fmt.Errorf("physical intent identity or facts changed: %w", errord.ErrFailedPrecondition)
+	}
 	return nil
 }
 

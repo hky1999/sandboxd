@@ -190,3 +190,9 @@ var _ Handler = &FakeRuntimeHandler{}
 // prepared resources so reconciliation can still locate and remove the exact
 // runtime after restart or retry.
 var ErrRestoreCleanupIncomplete = errors.New("restore runtime cleanup is incomplete")
+
+// ErrRuntimeCreationUnconfirmed marks an invoked Start/Restore whose error
+// does not prove that its physical execution is absent. The shared creation
+// owner must preserve the intent, resource leases and reserved ID for
+// authoritative reconciliation instead of rolling back uncertain resources.
+var ErrRuntimeCreationUnconfirmed = errors.New("runtime creation outcome is unconfirmed")
