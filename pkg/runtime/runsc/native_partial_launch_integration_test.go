@@ -283,7 +283,6 @@ func runNativePartialLaunchFixtureWithPublicationMode(t *testing.T, bindCgroup, 
 	require.NoError(t, err)
 	if unpublished {
 		require.Error(t, client.VerifyRuntimeGeneration(ctx, partialArgs.ID, partialArgs.ResourceGeneration))
-		require.Error(t, client.DeleteIfGeneration(ctx, partialArgs.ID, partialArgs.ResourceGeneration))
 	} else {
 		require.NoError(t, client.VerifyRuntimeGeneration(ctx, partialArgs.ID, partialArgs.ResourceGeneration))
 	}
@@ -309,7 +308,22 @@ func runNativePartialLaunchFixtureWithPublicationMode(t *testing.T, bindCgroup, 
 	verifyNativePhysicalBirth(t, peer.Sandbox.ProcessBirth)
 	verifyNativePhysicalBirth(t, peer.GoferBirth)
 	save("partial-wrong-generation-refused.json", map[string]any{"original_state_bytes_unchanged": true, "peer": peer})
-	require.NoError(t, client.VerifyRuntimeGeneration(ctx, partialArgs.ID, partialArgs.ResourceGeneration))
+	if unpublished {
+		require.Error(t, client.VerifyRuntimeGeneration(ctx, partialArgs.ID, partialArgs.ResourceGeneration))
+		// The native delete takes the original producer lock. Check its
+		// missing-birth rejection only after the audited creator has exited,
+		// not while deliberately holding that same lock in ptrace.
+		negativeCtx, cancelNegative := context.WithTimeout(ctx, 5*time.Second)
+		negativeErr := client.DeleteIfGeneration(negativeCtx, partialArgs.ID, partialArgs.ResourceGeneration)
+		cancelNegative()
+		require.Error(t, negativeErr)
+		require.NotErrorIs(t, negativeErr, context.DeadlineExceeded, "semantic rejection must not borrow a lock timeout")
+		current, err = os.ReadFile(client.stateFilePath(partialArgs.ID))
+		require.NoError(t, err)
+		require.Equal(t, original, current)
+	} else {
+		require.NoError(t, client.VerifyRuntimeGeneration(ctx, partialArgs.ID, partialArgs.ResourceGeneration))
+	}
 	if offlineCleanup {
 		group, identity, err := openOriginalLaunchCgroup(groups[partialArgs.ID])
 		require.NoError(t, err)
