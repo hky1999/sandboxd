@@ -22,10 +22,10 @@ import (
 // and Restore has returned, so a newly started workload cannot pass by reading
 // the saved token from the host export.
 const nativeRestoreMemoryWorkload = "seed=$(/bin/busybox od -An -N16 -tx1 /dev/urandom | /bin/busybox tr -d ' \\n'); " +
-	"printf '%s\\n' \"$seed\" >/tmp/native-memory-token; cat /home/marker; printf 'workload-ready\\n'; " +
+	"printf '%s\\n' \"$seed\" >/native-memory-token; cat /home/marker; printf 'workload-ready\\n'; " +
 	"printf 'memory-seed=%s\\n' \"$seed\"; " +
 	"while :; do if [ -f /home/restore-probe ]; then printf 'restored-memory=%s\\n' \"$seed\"; " +
-	"printf 'restored-file='; cat /tmp/native-memory-token; exec /bin/sleep 120; fi; /bin/sleep 0.1; done"
+	"printf 'restored-file='; cat /native-memory-token; exec /bin/sleep 120; fi; /bin/sleep 0.1; done"
 
 type nativePhysicalCheckpoint struct {
 	directory string

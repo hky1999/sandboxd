@@ -210,6 +210,9 @@ func runNativePhysicalFixture(t *testing.T, startWorkloads, restoreWorkload bool
 			config.Command = []string{"/bin/sh", "-c", "cat /home/marker; printf 'workload-ready\\n'; exec /bin/sleep 120"}
 		}
 		if restoreWorkload && len(starts) == 0 {
+			// A paired root filesystem checkpoint needs an actual writable
+			// layer; a read-only root with a separate /tmp tmpfs has none.
+			config.RootfsReadonly = false
 			config.Command = []string{"/bin/sh", "-c", nativeRestoreMemoryWorkload}
 		}
 		bundle, _, err := loader.GenerateOci(runtimecore.OciLoadOptions{
