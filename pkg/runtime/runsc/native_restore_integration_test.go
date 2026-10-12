@@ -58,7 +58,9 @@ func nativeCheckpointFiles(t *testing.T, directory string) map[string]string {
 	})
 	require.NoError(t, err)
 	require.Contains(t, files, checkpointImageName)
-	require.Contains(t, files, filepath.Join("fs", "fscheckpoint.json"))
+	// The fixed complete runtime uses the protobuf filesystem manifest.
+	// Do not substitute an older JSON-only fixture for the actual artifact.
+	require.Contains(t, files, filepath.Join("fs", "fscheckpoint.pb"))
 	return files
 }
 

@@ -359,7 +359,7 @@ func (c *Client) Checkpoint(
 
 // FsCheckpoint saves the gVisor writable-layer filestore to imageDir using
 // the upstream runsc fscheckpoint subcommand. The artifact is a raw
-// uncompressed directory tree (fscheckpoint.json + pages.img + ...) that a
+// uncompressed directory tree (fscheckpoint.pb + pages.img + ...) that a
 // later Create can consume through FsRestoreImagePath.
 func (c *Client) FsCheckpoint(ctx context.Context, id, imageDir string, leaveRunning bool) error {
 	if id == "" {
