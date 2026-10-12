@@ -48,6 +48,7 @@ func TestOriginalResourceArchiveMustPrecedeRuntimeDelete(t *testing.T) {
 	storeSandboxForDelete(t, s, "predelete-evidence")
 	require.NoError(t, s.sandboxManager.UpdateLabels("predelete-evidence", map[string]string{resourceGenerationLabel: "generation-one"}))
 	stageFilesystemOwner(t, s, "predelete-evidence", "generation-one")
+	stageEmptyDeviceOwner(t, s, "predelete-evidence", "generation-one")
 	_, err := s.DeleteIfGeneration(context.Background(), &runtime.DeleteIfGenerationRequest{ID: "predelete-evidence", ExpectedGeneration: "generation-one"})
 	require.NoError(t, err)
 	require.True(t, h.observed, "runtime handler ran without a durable matching pre-delete resource record")

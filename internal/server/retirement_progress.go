@@ -134,6 +134,7 @@ type retirementProgress struct {
 	ParentInode     uint64                   `json:"parent_inode"`
 	Steps           []string                 `json:"completed_steps"`
 	RootPending     bool                     `json:"root_pending"`
+	DeviceProtocol  uint8                    `json:"device_protocol,omitempty"`
 	IntegritySHA256 string                   `json:"integrity_sha256"`
 }
 
@@ -152,7 +153,7 @@ func (h *sandboxService) retirementProgressPath(id, generation string) (string, 
 }
 
 func validateRetirementProgress(record *retirementProgress, id, generation string) error {
-	if record.Version != 1 || record.SandboxID != id || record.Generation != generation || !validRetirementProgressKey(id) || !validRetirementProgressKey(generation) || record.DirectoryInode == 0 || record.ParentInode == 0 || record.Resources.ID != id || record.Resources.Generation != generation || len(record.Steps) > len(retirementProgressSteps) || record.IntegritySHA256 != progressDigest(*record) {
+	if record.Version != 1 || record.DeviceProtocol > 1 || record.SandboxID != id || record.Generation != generation || !validRetirementProgressKey(id) || !validRetirementProgressKey(generation) || record.DirectoryInode == 0 || record.ParentInode == 0 || record.Resources.ID != id || record.Resources.Generation != generation || len(record.Steps) > len(retirementProgressSteps) || record.IntegritySHA256 != progressDigest(*record) {
 		return fmt.Errorf("original retirement progress identity or integrity differs")
 	}
 	var metadata runtime.SandboxMetadata
@@ -405,7 +406,7 @@ func (h *sandboxService) beginRetirementProgress(metadata *runtime.SandboxMetada
 	if err := unix.Lstat(filepath.Dir(root), &parent); err != nil || parent.Mode&unix.S_IFMT != unix.S_IFDIR {
 		return nil, fmt.Errorf("original sandbox parent is unavailable")
 	}
-	record = &retirementProgress{Version: 1, SandboxID: metadata.ID, Generation: generation, Original: data, Resources: resources, DirectoryDevice: uint64(directory.Dev), DirectoryInode: directory.Ino, ParentDevice: uint64(parent.Dev), ParentInode: parent.Ino, Steps: []string{}}
+	record = &retirementProgress{Version: 1, DeviceProtocol: 1, SandboxID: metadata.ID, Generation: generation, Original: data, Resources: resources, DirectoryDevice: uint64(directory.Dev), DirectoryInode: directory.Ino, ParentDevice: uint64(parent.Dev), ParentInode: parent.Ino, Steps: []string{}}
 	if err := h.writeRetirementProgress(record); err != nil {
 		return nil, err
 	}
@@ -425,6 +426,11 @@ func (h *sandboxService) completeRetirementProgressStep(record *retirementProgre
 	}
 	if index < 0 {
 		return fmt.Errorf("unknown retirement step")
+	}
+	if step == "devices" {
+		if err := h.verifyRetirementDeviceCompletion(record); err != nil {
+			return err
+		}
 	}
 	if index < len(record.Steps) {
 		return nil
@@ -469,6 +475,9 @@ func (h *sandboxService) resumeRetirementCompletion(id, generation string) (bool
 	}
 	if present {
 		return false, nil
+	}
+	if err := h.verifyRetirementDeviceCompletion(record); err != nil {
+		return false, err
 	}
 	if err := syncRetirementDirectory(filepath.Join(h.config.RootDir, "containers")); err != nil {
 		return false, err

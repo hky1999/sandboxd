@@ -29,6 +29,7 @@ func TestDeleteIfGenerationRejectsStaleAndReturnsPhysicalReceipt(t *testing.T) {
 			ID: id, RuntimeHandler: "runsc", Labels: map[string]string{resourceGenerationLabel: generation},
 		}))
 		stageFilesystemOwner(t, s, id, generation)
+		stageEmptyDeviceOwner(t, s, id, generation)
 	}
 	store("physical-one")
 	for _, request := range []*runtime.DeleteIfGenerationRequest{nil, {ID: id}, {ExpectedGeneration: "physical-one"}} {
@@ -60,6 +61,7 @@ func TestRetirementReceiptSurvivesServiceReopen(t *testing.T) {
 	storeSandboxForDelete(t, s, id)
 	require.NoError(t, s.sandboxManager.UpdateLabels(id, map[string]string{resourceGenerationLabel: "generation"}))
 	stageFilesystemOwner(t, s, id, "generation")
+	stageEmptyDeviceOwner(t, s, id, "generation")
 	request := &runtime.DeleteIfGenerationRequest{ID: id, ExpectedGeneration: "generation"}
 	_, err := s.DeleteIfGeneration(context.Background(), request)
 	require.NoError(t, err)
@@ -107,6 +109,7 @@ func TestPendingRetirementRetriesOnlyMatchingLiveGeneration(t *testing.T) {
 	storeSandboxForDelete(t, s, id)
 	require.NoError(t, s.sandboxManager.UpdateLabels(id, map[string]string{resourceGenerationLabel: "new"}))
 	stageFilesystemOwner(t, s, id, "new")
+	stageEmptyDeviceOwner(t, s, id, "new")
 	require.NoError(t, s.writeRetirement(id, "old", false))
 	_, err := s.DeleteIfGeneration(context.Background(), &runtime.DeleteIfGenerationRequest{ID: id, ExpectedGeneration: "old"})
 	require.Equal(t, codes.FailedPrecondition, status.Code(err))
@@ -143,6 +146,7 @@ func TestDeleteIfGenerationWithholdsReceiptWhenReleaseFails(t *testing.T) {
 		ResourceFacts: map[string]string{config.ResourceNameCgroup: cgroup},
 	}))
 	stageFilesystemOwner(t, s, id, "generation")
+	stageEmptyDeviceOwner(t, s, id, "generation")
 	request := &runtime.DeleteIfGenerationRequest{ID: id, ExpectedGeneration: "generation"}
 
 	// Fault on: two delete attempts both fail inside the real release path.

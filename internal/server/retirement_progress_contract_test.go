@@ -47,6 +47,7 @@ func TestRetirementProgressCompletionFailureRetriesWithoutOriginalMetadata(t *te
 	storeSandboxForDelete(t, s, id)
 	require.NoError(t, s.sandboxManager.UpdateLabels(id, map[string]string{resourceGenerationLabel: "generation"}))
 	stageFilesystemOwner(t, s, id, "generation")
+	stageEmptyDeviceOwner(t, s, id, "generation")
 	request := &runtime.DeleteIfGenerationRequest{ID: id, ExpectedGeneration: "generation"}
 	_, err := s.DeleteIfGeneration(context.Background(), request)
 	require.Error(t, err, "completion publication is deliberately obstructed")

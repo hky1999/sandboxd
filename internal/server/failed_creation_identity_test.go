@@ -86,6 +86,7 @@ func stageFailedCreationIntent(t *testing.T, s *sandboxService) *runtime.Sandbox
 		Labels:        map[string]string{resourceGenerationLabel: uuid.NewString(), startOperationLabel: uuid.NewString()}}
 	require.NoError(t, s.sandboxManager.PersistMetadata(id, metadata))
 	stageFilesystemOwner(t, s, id, metadata.Labels[resourceGenerationLabel])
+	stageEmptyDeviceOwner(t, s, id, metadata.Labels[resourceGenerationLabel])
 	return metadata
 }
 

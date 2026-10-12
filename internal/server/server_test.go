@@ -36,6 +36,7 @@ import (
 	"github.com/inclusionAI/sandboxd/pkg/sandbox"
 	"github.com/inclusionAI/sandboxd/pkg/store"
 	"github.com/inclusionAI/sandboxd/pkg/volumemanager"
+	"github.com/inclusionAI/sandboxd/pkg/xpumanager"
 	cmap "github.com/orcaman/concurrent-map/v2"
 	"github.com/stretchr/testify/assert"
 	"google.golang.org/grpc/codes"
@@ -79,10 +80,46 @@ func newTestService(t *testing.T, handlers map[string]svc.Handler) *sandboxServi
 		networkMgr:                        newNetworkManager(nil, "", false),
 	}
 	s.ready.Store(true)
+	s.xpuMgr = deviceLeaseFixture(t, tmpDir)
 	s.recoveryReady.Store(true)
 	t.Cleanup(s.closeStartOperationJournal)
 	t.Cleanup(s.closeRetirementProgressJournal)
 	return s
+}
+
+// Device fixtures use a real private journal and an explicitly empty inventory.
+// Empty runsc configuration exits discovery before invoking any external tool.
+func deviceLeaseFixture(t *testing.T, root string) *xpumanager.Manager {
+	t.Helper()
+	m, err := xpumanager.NewWithStore("", filepath.Join(root, "containers"), store.NewStoreImp(filepath.Join(root, "devices.db")))
+	if !assert.NoError(t, err) {
+		t.FailNow()
+	}
+	t.Cleanup(func() { assert.NoError(t, m.Close()) })
+	return m
+}
+
+func stageEmptyDeviceOwner(t *testing.T, s *sandboxService, id, generation string) {
+	t.Helper()
+	manager, ok := s.xpuMgr.(generationDeviceLeaseManager)
+	if !assert.True(t, ok) {
+		t.FailNow()
+	}
+	_, err := manager.AcquireForGeneration(id, generation, nil)
+	if !assert.NoError(t, err) {
+		t.FailNow()
+	}
+}
+
+func reopenDeviceLeaseFixture(t *testing.T, original, reopened *sandboxService) {
+	t.Helper()
+	if manager, ok := original.xpuMgr.(interface{ Close() error }); ok {
+		assert.NoError(t, manager.Close())
+	}
+	if manager, ok := reopened.xpuMgr.(interface{ Close() error }); ok {
+		assert.NoError(t, manager.Close())
+	}
+	reopened.xpuMgr = deviceLeaseFixture(t, original.config.RootDir)
 }
 
 func TestWait(t *testing.T) {

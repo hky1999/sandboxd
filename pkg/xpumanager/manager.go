@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -29,6 +30,7 @@ import (
 	api "github.com/inclusionAI/sandboxd/api/runtime/v1"
 	"github.com/inclusionAI/sandboxd/config"
 	svc "github.com/inclusionAI/sandboxd/pkg/runtime"
+	"github.com/inclusionAI/sandboxd/pkg/store"
 	"github.com/sirupsen/logrus"
 )
 
@@ -54,6 +56,7 @@ type Device struct {
 
 type leaseRecord struct {
 	SandboxID  string   `json:"sandbox_id"`
+	Generation string   `json:"generation,omitempty"`
 	Type       string   `json:"type"`
 	DeviceIDs  []uint32 `json:"device_ids"`
 	DeviceUUID []string `json:"device_uuids"`
@@ -73,19 +76,17 @@ type Manager struct {
 	leases    map[string]string
 	healthy   bool
 	reason    error
+
+	generationStore   store.DbStore
+	generationOwner   *generationJournalOwner
+	generationRecords map[string]generationLeaseRecord
+	generationDigest  string
 }
 
 // New discovers the local NVIDIA inventory. Discovery failure is intentionally
 // non-fatal for sandboxd: CPU-only nodes stay usable and advertise no XPU.
 func New(runscBinary, sandboxRoot string) *Manager {
-	manager := &Manager{
-		runscBinary: runscBinary,
-		sandboxRoot: sandboxRoot,
-		run:         runCommand,
-		stat:        os.Stat,
-		devices:     make(map[uint32]Device),
-		leases:      make(map[string]string),
-	}
+	manager := newManager(runscBinary, sandboxRoot)
 	if err := manager.discoverNVIDIA(); err != nil {
 		manager.reason = err
 		logrus.Infof("xpumanager: NVIDIA GPU support unavailable: %v", err)
@@ -101,6 +102,17 @@ func New(runscBinary, sandboxRoot string) *Manager {
 	manager.healthy = true
 	logrus.Infof("xpumanager: discovered %d schedulable NVIDIA GPU(s)", len(manager.devices))
 	return manager
+}
+
+func newManager(runscBinary, sandboxRoot string) *Manager {
+	return &Manager{
+		runscBinary: runscBinary,
+		sandboxRoot: sandboxRoot,
+		run:         runCommand,
+		stat:        os.Stat,
+		devices:     make(map[uint32]Device),
+		leases:      make(map[string]string),
+	}
 }
 
 // Resources returns a deep copy of the stable capacity inventory. Active
@@ -146,58 +158,79 @@ func (m *Manager) Acquire(sandboxID string, allocations []*api.XpuAllocation) (*
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.generationOwner != nil {
+		return nil, errors.New("managed device allocation requires its original generation")
+	}
+	record, err := m.resolveLeaseLocked(sandboxID, allocations)
+	if err != nil {
+		return nil, err
+	}
+	for _, uuid := range record.DeviceUUID {
+		m.leases[uuid] = sandboxID
+	}
+	recordJSON, err := json.Marshal(record)
+	if err != nil {
+		return nil, fmt.Errorf("encode GPU lease: %w", err)
+	}
+	return nvidiaSpecUpdates(record.DeviceUUID, recordJSON), nil
+}
+
+// Resolve only; the generation path must persist ownership before leasing.
+// Caller holds m.mu. Empty allocations are an explicit CPU-only request.
+func (m *Manager) resolveLeaseLocked(sandboxID string, allocations []*api.XpuAllocation) (leaseRecord, error) {
+	if len(allocations) == 0 {
+		return leaseRecord{SandboxID: sandboxID}, nil
+	}
+	if len(allocations) != 1 || allocations[0] == nil {
+		return leaseRecord{}, errors.New("exactly one XPU allocation is supported")
+	}
+	allocation := allocations[0]
+	if strings.ToLower(strings.TrimSpace(allocation.Type)) != TypeGPU {
+		return leaseRecord{}, fmt.Errorf("unsupported XPU type %q", allocation.Type)
+	}
+	if len(allocation.DeviceIds) == 0 {
+		return leaseRecord{}, errors.New("XPU device IDs must not be empty")
+	}
 	if !m.healthy {
 		if m.reason != nil {
-			return nil, fmt.Errorf("GPU support is unavailable: %w", m.reason)
+			return leaseRecord{}, fmt.Errorf("GPU support is unavailable: %w", m.reason)
 		}
-		return nil, errors.New("GPU support is unavailable")
+		return leaseRecord{}, errors.New("GPU support is unavailable")
 	}
 
 	seen := make(map[uint32]struct{}, len(allocation.DeviceIds))
 	devices := make([]Device, 0, len(allocation.DeviceIds))
 	for _, id := range allocation.DeviceIds {
 		if _, duplicate := seen[id]; duplicate {
-			return nil, fmt.Errorf("duplicate GPU device ID %d", id)
+			return leaseRecord{}, fmt.Errorf("duplicate GPU device ID %d", id)
 		}
 		seen[id] = struct{}{}
 		device, ok := m.devices[id]
 		if !ok {
-			return nil, fmt.Errorf("GPU device ID %d is not in the node inventory", id)
+			return leaseRecord{}, fmt.Errorf("GPU device ID %d is not in the node inventory", id)
 		}
 		if owner, leased := m.leases[device.UUID]; leased && owner != sandboxID {
-			return nil, fmt.Errorf("GPU device ID %d is already leased by sandbox %s", id, owner)
+			return leaseRecord{}, fmt.Errorf("GPU device ID %d is already leased by sandbox %s", id, owner)
 		}
 		devices = append(devices, device)
 	}
 	model := devices[0].ProductModel
 	for _, device := range devices[1:] {
 		if device.ProductModel != model {
-			return nil, errors.New("all GPU devices in one allocation must have the same product model")
+			return leaseRecord{}, errors.New("all GPU devices in one allocation must have the same product model")
 		}
-	}
-	for _, device := range devices {
-		m.leases[device.UUID] = sandboxID
 	}
 
 	uuids := make([]string, len(devices))
 	for index, device := range devices {
 		uuids[index] = device.UUID
 	}
-	record := leaseRecord{
+	return leaseRecord{
 		SandboxID:  sandboxID,
 		Type:       TypeGPU,
 		DeviceIDs:  append([]uint32(nil), allocation.DeviceIds...),
 		DeviceUUID: append([]string(nil), uuids...),
-	}
-	recordJSON, err := json.Marshal(record)
-	if err != nil {
-		for _, uuid := range uuids {
-			delete(m.leases, uuid)
-		}
-		return nil, fmt.Errorf("encode GPU lease: %w", err)
-	}
-
-	return nvidiaSpecUpdates(uuids, recordJSON), nil
+	}, nil
 }
 
 // Release releases all UUID leases owned by sandboxID. It is idempotent.
@@ -207,6 +240,18 @@ func (m *Manager) Release(sandboxID string) {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.generationOwner != nil {
+		if err := m.checkGenerationJournalLocked(); err != nil {
+			logrus.WithError(err).Warn("preserve unknown device ownership during legacy release")
+			return
+		}
+		for _, record := range m.generationRecords {
+			if record.SandboxID == sandboxID && record.State != "released" {
+				logrus.Warn("legacy device release cannot retire a generation-owned allocation")
+				return
+			}
+		}
+	}
 	for uuid, owner := range m.leases {
 		if owner == sandboxID {
 			delete(m.leases, uuid)
@@ -252,10 +297,25 @@ func (m *Manager) restoreLeases() error {
 			len(record.DeviceIDs) == 0 || len(record.DeviceIDs) != len(record.DeviceUUID) {
 			return fmt.Errorf("invalid XPU allocation annotation in %s", configPath)
 		}
+		if m.generationOwner != nil && record.Generation != "" {
+			original, ok := m.generationRecords[record.Generation]
+			if !ok || original.SandboxID != record.SandboxID || !original.Allocated || !reflect.DeepEqual(original.Lease, record) {
+				return fmt.Errorf("original generation device annotation differs in %s", configPath)
+			}
+			if original.State == "released" {
+				continue // A leftover spec cannot revive an independently retired lease.
+			}
+			if original.State != "active" {
+				return fmt.Errorf("device allocation is unconfirmed in %s", configPath)
+			}
+		}
 		for index, id := range record.DeviceIDs {
 			device, ok := m.devices[id]
 			if !ok || device.UUID != record.DeviceUUID[index] {
 				return fmt.Errorf("GPU identity changed for device ID %d in %s", id, configPath)
+			}
+			if m.generationOwner != nil && record.Generation == "" && m.leases[device.UUID] != "" {
+				return fmt.Errorf("legacy device annotation overlaps generation ownership in %s", configPath)
 			}
 			if owner, duplicate := m.leases[device.UUID]; duplicate && owner != record.SandboxID {
 				return fmt.Errorf("GPU UUID %s is assigned to both %s and %s", device.UUID, owner, record.SandboxID)

@@ -37,6 +37,7 @@ func TestFailedCreationRetirementPublishesOriginalStartCompletion(t *testing.T) 
 	require.NoError(t, os.WriteFile(filepath.Join(root, config.SandboxSpecFile),
 		[]byte(`{"ociVersion":"1.0.2","root":{"path":"rootfs"},"linux":{"cgroupsPath":""},"annotations":{}}`), 0600))
 	stageFilesystemOwner(t, s, id, record.Generation)
+	stageEmptyDeviceOwner(t, s, id, record.Generation)
 
 	require.NoError(t, s.reconcilePhysicalIntent(context.Background(), metadata))
 	require.NoDirExists(t, root)

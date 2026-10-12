@@ -560,8 +560,8 @@ func (h *sandboxService) deleteSandboxRuntime(ctx context.Context, sandboxID str
 	if err := h.verifyRetirementProgressSnapshot(progress); err != nil {
 		return err
 	}
-	if h.xpuMgr != nil {
-		h.xpuMgr.Release(sandboxID)
+	if err := h.releaseDeviceLease(sandboxID, deleteGeneration); err != nil {
+		return err
 	}
 	if err := h.completeRetirementProgressStep(progress, "devices"); err != nil {
 		return err
@@ -915,6 +915,11 @@ func (h *sandboxService) Shutdown() {
 	logrus.Info("sandbox service shutdown complete")
 	h.closeStartOperationJournal()
 	h.closeRetirementProgressJournal()
+	if devices, ok := h.xpuMgr.(interface{ Close() error }); ok {
+		if err := devices.Close(); err != nil {
+			logrus.WithError(err).Warn("close device lease journal")
+		}
+	}
 }
 
 func (h *sandboxService) acquireCheckpointOperation() (func(), bool) {
@@ -1095,10 +1100,19 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 	if err := os.MkdirAll(sandboxRoot, 0755); err != nil {
 		return nil, fmt.Errorf("create sandbox root: %w", err)
 	}
-	xpuMgr := xpumanager.New(
+	xpuMgr, err := xpumanager.NewWithStore(
 		cfg.RuntimeConfig.RuntimeBinary[config.RuntimeNameRunsc],
 		sandboxRoot,
+		store.NewStoreImp(storePath),
 	)
+	if err != nil {
+		return nil, fmt.Errorf("initialize generation device ownership: %w", err)
+	}
+	defer func() {
+		if retErr != nil {
+			_ = xpuMgr.Close()
+		}
+	}()
 
 	// The optional node-resource module comes up first so its external resource
 	// socket is visible before image, volume, and sandbox initialization. Gated
@@ -1838,6 +1852,13 @@ func (h *sandboxService) createSandbox(
 			return &runtime.StartResponse{Code: -1, Message: err.Error()}, err
 		}
 	}
+	// Even an empty CPU-only device request has an original durable owner.
+	// Record before parallel preparation so a partial filesystem/network
+	// failure can retire this exact device intent without guessing absence.
+	specUpdates, err := h.acquireDeviceLease(sandboxID, metadata.Labels[resourceGenerationLabel], startReq.XpuAllocations)
+	if err != nil {
+		return &runtime.StartResponse{Code: -1, Message: fmt.Sprintf("failed to allocate original devices: %v", err)}, err
+	}
 
 	fsCh := make(chan fsPrepareResult, 1)
 	resourceCh := make(chan resourcePrepareResult, 1)
@@ -1886,21 +1907,6 @@ func (h *sandboxService) createSandbox(
 		}, err
 	}
 	runtimeRootfs := preparedFilesystem.RootfsPath()
-	var specUpdates *svc.SpecUpdates
-	if len(startReq.XpuAllocations) > 0 {
-		if h.xpuMgr == nil {
-			err := errors.New("XPU manager is not configured")
-			return &runtime.StartResponse{Code: -1, Message: err.Error()},
-				errord.ToGRPC(errord.ErrFailedPrecondition)
-		}
-		specUpdates, err = h.xpuMgr.Acquire(sandboxID, startReq.XpuAllocations)
-		if err != nil {
-			return &runtime.StartResponse{
-				Code:    -1,
-				Message: fmt.Sprintf("failed to allocate XPU devices: %v", err),
-			}, errord.ToGRPC(errord.ErrInvalidArgument)
-		}
-	}
 
 	// Rootfs env (from image mount) goes first with lowest priority; request
 	// envs follow and override on key conflict because combineEnvs uses a map

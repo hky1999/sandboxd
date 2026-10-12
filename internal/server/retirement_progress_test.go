@@ -28,6 +28,7 @@ func retirementProgressFixture(t *testing.T) (*sandboxService, *retirementProgre
 	storeSandboxForDelete(t, s, id)
 	require.NoError(t, s.sandboxManager.UpdateLabels(id, map[string]string{resourceGenerationLabel: "generation"}))
 	stageFilesystemOwner(t, s, id, "generation")
+	stageEmptyDeviceOwner(t, s, id, "generation")
 	current, err := s.sandboxManager.Get(id)
 	require.NoError(t, err)
 	resources, err := s.physicalResources(current.Metadata)
@@ -145,6 +146,9 @@ func TestRetirementProgressRejectsCorruptDuplicateAndUnsafeFiles(t *testing.T) {
 func TestRetirementProgressCompletedResourcesPreserveReplacementRoot(t *testing.T) {
 	s, p, handler := retirementProgressFixture(t)
 	for _, step := range retirementProgressSteps[:len(retirementProgressSteps)-1] {
+		if step == "devices" {
+			require.NoError(t, s.releaseDeviceLease(p.SandboxID, p.Generation))
+		}
 		require.NoError(t, s.completeRetirementProgressStep(p, step))
 	}
 	p.RootPending = true

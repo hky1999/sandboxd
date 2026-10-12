@@ -35,6 +35,7 @@ func failedCreationRetirementFixture(t *testing.T, handler svc.Handler) (*sandbo
 	require.NoError(t, os.WriteFile(filepath.Join(root, config.SandboxSpecFile),
 		[]byte(`{"ociVersion":"1.0.2","root":{"path":"rootfs"},"linux":{"cgroupsPath":""},"annotations":{}}`), 0600))
 	stageFilesystemOwner(t, s, id, record.Generation)
+	stageEmptyDeviceOwner(t, s, id, record.Generation)
 	return s, metadata, request
 }
 
@@ -44,6 +45,7 @@ func reopenFailedCreationRetirement(t *testing.T, original *sandboxService, hand
 	original.closeStartOperationJournal()
 	reopened := newTestService(t, map[string]svc.Handler{"runsc": handler})
 	reopened.config.RootDir = original.config.RootDir
+	reopenDeviceLeaseFixture(t, original, reopened)
 	var err error
 	reopened.sandboxManager, err = sandbox.NewManager(original.config.RootDir, reopened.serviceHandler, make(chan bool, 10), nil, 1000)
 	require.NoError(t, err)

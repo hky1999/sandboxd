@@ -238,6 +238,7 @@ func TestElasticStartInitializesRevisionBeforeHandler(t *testing.T) {
 func TestRetiredIncarnationRecordIsRemovedAfterDelete(t *testing.T) {
 	h, c, request := newShrinkService(t)
 	stageFilesystemOwner(t, h, "elastic", "generation-1")
+	stageEmptyDeviceOwner(t, h, "elastic", "generation-1")
 	// Leave an open owned freeze, then delete the sandbox through the
 	// physical path.
 	before, err := h.resourceStats("elastic")

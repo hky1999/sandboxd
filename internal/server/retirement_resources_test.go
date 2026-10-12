@@ -137,6 +137,7 @@ func (h *flakyDeleteHandler) Delete(_ context.Context, _ string) error {
 // trusted identity labels, plus any extra labels (typically birth evidence).
 func storeRetirementSandbox(t *testing.T, s *sandboxService, id, generation string, extraLabels map[string]string) {
 	stageFilesystemOwner(t, s, id, generation)
+	stageEmptyDeviceOwner(t, s, id, generation)
 	t.Helper()
 	bundleDir := filepath.Join(s.config.RootDir, "containers", id)
 	require.NoError(t, os.MkdirAll(bundleDir, 0755))
@@ -686,6 +687,7 @@ func TestRetirementIdentityLabelsAreAllowlisted(t *testing.T) {
 			}))
 
 			stageFilesystemOwner(t, s, id, "generation-identity")
+			stageEmptyDeviceOwner(t, s, id, "generation-identity")
 			_, err := s.DeleteIfGeneration(context.Background(), &runtime.DeleteIfGenerationRequest{ID: id, ExpectedGeneration: "generation-identity"})
 			require.NoError(t, err)
 			records := readRetirementEvidence(t, s, id, "generation-identity")

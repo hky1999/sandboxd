@@ -303,8 +303,8 @@ func (h *sandboxService) reconcilePhysicalIntentLocked(ctx context.Context, meta
 	if err := verify(); err != nil {
 		return err
 	}
-	if h.xpuMgr != nil {
-		h.xpuMgr.Release(metadata.ID)
+	if err := h.releaseDeviceLease(metadata.ID, generation); err != nil {
+		return err
 	}
 	if err := h.completeRetirementProgressStep(progress, "devices"); err != nil {
 		return err
