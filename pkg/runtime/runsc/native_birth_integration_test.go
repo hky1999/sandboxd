@@ -141,6 +141,15 @@ func (original *nativePhysicalSharedNamespace) retireEmptyFixtureRoot(t *testing
 }
 
 func TestRealNativeCreationBirthConditionalDeletionAndLivePeer(t *testing.T) {
+	runNativePhysicalFixture(t, false)
+}
+
+func TestRealNativeWorkloadStartConditionalDeletionAndLivePeer(t *testing.T) {
+	runNativePhysicalFixture(t, true)
+}
+
+func runNativePhysicalFixture(t *testing.T, startWorkloads bool) {
+	t.Helper()
 	if os.Getenv("SANDBOXD_RUN_NATIVE_BIRTH_INTEGRATION") != "1" {
 		t.Skip("requires an explicit isolated BareMetal1 native runtime test")
 	}
@@ -152,6 +161,10 @@ func TestRealNativeCreationBirthConditionalDeletionAndLivePeer(t *testing.T) {
 	require.Equal(t, expected, nativePhysicalSHA(t, binary))
 	require.Equal(t, rootfsSHA, nativePhysicalSHA(t, rootfs))
 	require.NoError(t, os.MkdirAll(evidence, 0700))
+	scope := "Two actual created runtimes; no workload start, restore or budget acceptance."
+	if startWorkloads {
+		scope = "Two actual running workloads through native birth validation, private TAP and control RPC; no restore, daemon resource or node budget acceptance."
+	}
 	save := func(name string, value any) {
 		data, err := json.MarshalIndent(value, "", "  ")
 		require.NoError(t, err)
@@ -169,6 +182,8 @@ func TestRealNativeCreationBirthConditionalDeletionAndLivePeer(t *testing.T) {
 	identities := [][2]string{{"birth-original", "generation-original"}, {"birth-peer", "generation-peer"}}
 	states := make([]*containerState, 0, len(identities))
 	handles := make([][2]int, 0, len(identities))
+	starts := make([]StartArgs, 0, len(identities))
+	var taps []*nativePhysicalTAP
 	var sharedNamespace *nativePhysicalSharedNamespace
 	for _, identity := range identities {
 		export := filepath.Join(work, identity[0]+"-export")
@@ -179,6 +194,9 @@ func TestRealNativeCreationBirthConditionalDeletionAndLivePeer(t *testing.T) {
 			DisableCgroup: true, Command: []string{"/bin/sleep", "120"},
 			Mounts: []*runtimeapi.Mount{{Type: "bind", Source: &runtimeapi.Mount_HostPath{HostPath: export}, Target: "/tmp/native-birth-export", Options: []string{"ro", "rbind"}}},
 		}
+		if startWorkloads {
+			config.Command = []string{"/bin/sh", "-c", "cat /tmp/native-birth-export/marker; printf 'workload-ready\\n'; exec /bin/sleep 120"}
+		}
 		bundle, _, err := loader.GenerateOci(runtimecore.OciLoadOptions{
 			SandboxID: config.ID, Config: config, UseGVisorRootfsImageAnnotations: true,
 			RootfsOverlayDir: filestore, RootfsOverlaySize: "64M",
@@ -187,6 +205,12 @@ func TestRealNativeCreationBirthConditionalDeletionAndLivePeer(t *testing.T) {
 		require.NoError(t, err)
 		args := StartArgs{ID: config.ID, ResourceGeneration: config.ResourceGeneration, BundleDir: bundle,
 			RootOverlay: RootFileOverlay(filestore, "64M"), UserStdout: filepath.Join(work, config.ID+".stdout"), UserStderr: filepath.Join(work, config.ID+".stderr")}
+		if startWorkloads {
+			tap := newNativePhysicalTAP(t, len(starts))
+			args.Network = tap.network
+			taps = append(taps, tap)
+		}
+		starts = append(starts, args)
 		err = client.Create(ctx, args)
 		if err != nil {
 			save(config.ID+"-create-failure.json", map[string]any{"id": config.ID, "generation": config.ResourceGeneration, "error": err.Error(), "scope": "Original native create failure; no successful retirement inferred."})
@@ -207,13 +231,39 @@ func TestRealNativeCreationBirthConditionalDeletionAndLivePeer(t *testing.T) {
 	}
 	// The host observer must map all four native PIDs, verify actual process
 	// bytes and start times outside the target cgroup before any SIGKILL path.
-	save("births-ready.json", map[string]any{"states": states, "scope": "Two actual created runtimes; no workload start, restore or budget acceptance."})
+	save("births-ready.json", map[string]any{"states": states, "scope": scope})
 	for {
 		if _, err := os.Stat(filepath.Join(evidence, "allow-original-delete")); err == nil {
 			break
 		}
 		require.NoError(t, ctx.Err(), "external original-process audit did not authorize the fixed owned test actions")
 		time.Sleep(10 * time.Millisecond)
+	}
+	if startWorkloads {
+		for index, args := range starts {
+			if err := client.Start(ctx, args); err != nil {
+				save(args.ID+"-start-failure.json", map[string]any{"id": args.ID, "generation": args.ResourceGeneration, "error": err.Error()})
+				require.NoError(t, err)
+			}
+			for {
+				output, err := os.ReadFile(args.UserStdout)
+				require.NoError(t, err)
+				if strings.Contains(string(output), args.ID+"\nworkload-ready\n") {
+					break
+				}
+				require.NoError(t, ctx.Err(), "the actual workload did not read its own export and report readiness")
+				time.Sleep(10 * time.Millisecond)
+			}
+			running, err := client.loadState(args.ID)
+			require.NoError(t, err)
+			require.Equal(t, "running", running.Status)
+			require.NoError(t, validateNativeRuntimeBirth(running, args.ID, args.ResourceGeneration))
+			require.Equal(t, states[index].Sandbox.ProcessBirth, running.Sandbox.ProcessBirth)
+			require.Equal(t, states[index].GoferBirth, running.GoferBirth)
+			verifyNativePhysicalBirth(t, running.Sandbox.ProcessBirth)
+			verifyNativePhysicalBirth(t, running.GoferBirth)
+			save(args.ID+"-workload-running.json", map[string]any{"state": running, "own_export_read": true, "workload_readiness_confirmed": true, "tap": taps[index].evidence(t)})
+		}
 	}
 	require.Error(t, client.DeleteIfGeneration(ctx, identities[0][0], "generation-wrong"))
 	for _, state := range states {
@@ -228,6 +278,14 @@ func TestRealNativeCreationBirthConditionalDeletionAndLivePeer(t *testing.T) {
 	verifyNativePhysicalBirth(t, states[1].Sandbox.ProcessBirth)
 	verifyNativePhysicalBirth(t, states[1].GoferBirth)
 	sharedNamespace.verify(t, states[1].GoferBirth)
+	if startWorkloads {
+		running, err := client.loadState(starts[1].ID)
+		require.NoError(t, err)
+		require.Equal(t, "running", running.Status)
+		for _, tap := range taps {
+			tap.verify(t)
+		}
+	}
 	save("original-deleted-peer-live.json", map[string]any{"original_id": identities[0][0], "original_exit_confirmed_by_independent_pidfds": true, "peer": states[1]})
 	require.NoError(t, client.DeleteIfGeneration(ctx, identities[1][0], identities[1][1]))
 	verifyNativePhysicalExit(t, handles[1][0])
@@ -238,6 +296,13 @@ func TestRealNativeCreationBirthConditionalDeletionAndLivePeer(t *testing.T) {
 	var final []any
 	require.NoError(t, json.Unmarshal(inventory, &final))
 	require.Empty(t, final)
-	save("final-native-inventory.json", map[string]any{"inventory": final, "scope": "Created native processes and peer protection only. No sandboxd resources, live workload, restore or node budget."})
+	save("final-native-inventory.json", map[string]any{"inventory": final, "scope": scope})
 	save("shared-fixture-namespace-cleanup.json", sharedNamespace.retireEmptyFixtureRoot(t))
+	if startWorkloads {
+		var cleaned []map[string]any
+		for _, tap := range taps {
+			cleaned = append(cleaned, tap.retire(t))
+		}
+		save("private-tap-cleanup.json", cleaned)
+	}
 }
