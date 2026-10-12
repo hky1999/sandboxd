@@ -17,6 +17,7 @@ import (
 )
 
 const runtimeResourceGenerationAnnotation = "akernel.scheduler/resource-generation"
+const runtimeCgroupParentAnnotation = "dev.gvisor.spec.cgroup-parent"
 
 func (c *Client) VerifyRuntimeGeneration(ctx context.Context, id, generation string) error {
 	if err := ctx.Err(); err != nil {
@@ -178,6 +179,11 @@ func (c *Client) verifyManagedCreateInput(args StartArgs) error {
 	}
 	if err := json.Unmarshal(data, &spec); err != nil || spec.Annotations[runtimeResourceGenerationAnnotation] != args.ResourceGeneration {
 		return errors.New("managed runtime bundle generation is missing or differs")
+	}
+	// 配套运行时会将此注解作为独立父分组，破坏原创建分组的归属。
+	// 空值和相同路径也不取得独立父分组语义，受管理创建一律拒绝。
+	if _, present := spec.Annotations[runtimeCgroupParentAnnotation]; present {
+		return errors.New("managed runtime bundle cannot override the original sandbox cgroup parent")
 	}
 	if spec.Linux.CgroupPath != args.CgroupPath {
 		return errors.New("managed runtime bundle cgroup differs from the original prepared launch")
