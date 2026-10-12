@@ -198,6 +198,7 @@ func runNativePhysicalFixture(t *testing.T, startWorkloads bool) {
 			// The fixed EROFS payload already has /home. A read-only root
 			// cannot synthesize a new mountpoint when the workload starts.
 			config.Mounts[0].Target = "/home"
+			config.Cwd = "/"
 			config.Command = []string{"/bin/sh", "-c", "cat /home/marker; printf 'workload-ready\\n'; exec /bin/sleep 120"}
 		}
 		bundle, _, err := loader.GenerateOci(runtimecore.OciLoadOptions{
