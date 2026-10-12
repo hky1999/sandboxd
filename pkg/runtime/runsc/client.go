@@ -55,6 +55,7 @@ type Client struct {
 
 	connectControl      func(string) (controlRPC, error)
 	controlPeerObserved func(map[string]any)
+	openLaunchCgroup    func(string) (*os.File, *managedLaunchCgroup, error)
 }
 
 type Options struct {
@@ -71,10 +72,13 @@ type StartArgs struct {
 	ID                 string
 	ResourceGeneration string
 	BundleDir          string
-	UserStdout         string
-	UserStderr         string
-	RootOverlay        string
-	Network            NetworkConfig
+	// CgroupPath is the original prepared logical cgroup path. Managed creates
+	// clone the launcher into its pinned directory before its first instruction.
+	CgroupPath  string
+	UserStdout  string
+	UserStderr  string
+	RootOverlay string
+	Network     NetworkConfig
 	// FsRestoreImagePath restores the gVisor writable-layer filestore from a
 	// filesystem checkpoint (runsc fscheckpoint artifact directory). Empty
 	// keeps the historical behavior of a fresh writable layer.
@@ -119,6 +123,11 @@ func (c *Client) Create(ctx context.Context, args StartArgs) error {
 		if err := c.verifyManagedCreateInput(args); err != nil {
 			return err
 		}
+	}
+	if args.ResourceGeneration != "" && args.CgroupPath != "" {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, 2*time.Minute)
+		defer cancel()
 	}
 	if err := os.MkdirAll(c.RootDir, 0711); err != nil {
 		return fmt.Errorf("create runsc root %s: %w", c.RootDir, err)
@@ -178,6 +187,13 @@ func (c *Client) Create(ctx context.Context, args StartArgs) error {
 	cmd.Stdin = stdin
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
+	launchGroup, err := c.bindManagedLaunch(ctx, args, cmd)
+	if err != nil {
+		return fmt.Errorf("bind original runsc launch cgroup: %w", err)
+	}
+	if launchGroup != nil {
+		defer launchGroup.Close()
+	}
 	start := time.Now()
 	logrus.Debugf("runsc create command started, id: %s, args: %v", args.ID, cmdArgs)
 	if err := cmd.Run(); err != nil {

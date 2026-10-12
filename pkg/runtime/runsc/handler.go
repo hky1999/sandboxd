@@ -210,6 +210,7 @@ func (r *Handler) Start(ctx context.Context, config runtimecore.StartConfig) err
 		ID:                 config.ID,
 		ResourceGeneration: config.ResourceGeneration,
 		BundleDir:          bundlePath,
+		CgroupPath:         config.CgroupPath,
 		UserStdout:         config.Stdout,
 		UserStderr:         config.Stderr,
 		RootOverlay:        rootOverlay,
@@ -356,6 +357,7 @@ func (r *Handler) Restore(
 		UserStderr:         config.Stderr,
 		RootOverlay:        rootOverlay,
 		FsRestoreImagePath: fsImagePath,
+		CgroupPath:         config.CgroupPath,
 		Network: NetworkConfig{
 			Interface:   config.Network.Interface,
 			LinkAddress: config.Network.GuestHardwareAddr(),

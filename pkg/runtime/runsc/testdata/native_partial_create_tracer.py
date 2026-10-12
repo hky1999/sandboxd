@@ -73,6 +73,15 @@ creator = {"pid": pid, "start_ticks": int(tail[19]),
            "arguments_sha256": hashlib.sha256((proc / "cmdline").read_bytes()).hexdigest(),
            "cgroup_sha256": hashlib.sha256((proc / "cgroup").read_bytes()).hexdigest()}
 assert creator["executable_sha256"] == os.environ["NATIVE_BIRTH_RUNSC_SHA256"]
+if os.environ.get("NATIVE_LAUNCH_CGROUP_PARENT"):
+    # This exec trap precedes the creator's first user instruction and any
+    # gofer dispatch. The adapter's durable intent must already exist.
+    intent_path = root / ".scheduler-launches/partial-original.json"
+    intent = json.loads(intent_path.read_bytes())
+    assert intent["sandbox_id"] == "partial-original" and intent["resource_generation"] == "generation-partial"
+    assert intent["clone_into_cgroup"] and intent["stage"] == "dispatching"
+    creator["launch_intent_present_before_first_instruction"] = True
+    creator["original_launch_intent"] = intent
 save("partial-creator-ready.json", creator)
 deadline = time.monotonic() + 120
 while not (evidence / "allow-partial-trace").exists():

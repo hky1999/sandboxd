@@ -172,9 +172,15 @@ func (c *Client) verifyManagedCreateInput(args StartArgs) error {
 	}
 	var spec struct {
 		Annotations map[string]string `json:"annotations"`
+		Linux       struct {
+			CgroupPath string `json:"cgroupsPath"`
+		} `json:"linux"`
 	}
 	if err := json.Unmarshal(data, &spec); err != nil || spec.Annotations[runtimeResourceGenerationAnnotation] != args.ResourceGeneration {
 		return errors.New("managed runtime bundle generation is missing or differs")
+	}
+	if spec.Linux.CgroupPath != args.CgroupPath {
+		return errors.New("managed runtime bundle cgroup differs from the original prepared launch")
 	}
 	if err := verifyRuntimeIdentityDirectory(args.BundleDir, original); err != nil {
 		return err

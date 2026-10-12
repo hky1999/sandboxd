@@ -23,6 +23,15 @@ import (
 // container cgroup audits the creator and all births before terminating the
 // creator by its original pidfd. No partial state is synthesized here.
 func TestRealNativePartialGoferBirthRetirementAndLivePeer(t *testing.T) {
+	runNativePartialLaunchFixture(t, false)
+}
+
+func TestRealNativeLaunchCgroupBindingBeforeChildBirthAndLivePeer(t *testing.T) {
+	runNativePartialLaunchFixture(t, true)
+}
+
+func runNativePartialLaunchFixture(t *testing.T, bindCgroup bool) {
+	t.Helper()
 	if os.Getenv("SANDBOXD_RUN_NATIVE_BIRTH_INTEGRATION") != "1" {
 		t.Skip("requires an explicit isolated BareMetal1 partial native launch test")
 	}
@@ -59,6 +68,26 @@ func TestRealNativePartialGoferBirthRetirementAndLivePeer(t *testing.T) {
 	loader, err := runtimecore.NewBundleLoader("", filepath.Join(work, "bundles"))
 	require.NoError(t, err)
 	client := NewClientWithOptions(binary, root, Options{FilestoreDir: filestore, OverlayTmpfsSize: "64M", IgnoreCgroups: true})
+	groups := make(map[string]string)
+	if bindCgroup {
+		prefix := os.Getenv("NATIVE_LAUNCH_CGROUP_PARENT")
+		parent, identity, err := openOriginalLaunchCgroup(prefix)
+		require.NoError(t, err)
+		defer parent.Close()
+		// The outside observer supplies an original owned non-root parent.
+		// The fixture never discovers or writes a different cgroup root.
+		var expected struct {
+			Device uint64 `json:"device"`
+			Inode  uint64 `json:"inode"`
+		}
+		require.NoError(t, json.Unmarshal([]byte(os.Getenv("NATIVE_LAUNCH_CGROUP_PARENT_IDENTITY")), &expected))
+		require.Equal(t, expected.Device, identity.Device)
+		require.Equal(t, expected.Inode, identity.Inode)
+		for _, id := range []string{"partial-peer", "partial-original"} {
+			groups[id] = filepath.Join(prefix, "launch-"+id)
+			require.NoError(t, os.Mkdir(filepath.Join("/sys/fs/cgroup", groups[id]), 0755))
+		}
+	}
 	makeArgs := func(id, generation string) StartArgs {
 		export := filepath.Join(work, id+"-export")
 		require.NoError(t, os.Mkdir(export, 0700))
@@ -68,12 +97,14 @@ func TestRealNativePartialGoferBirthRetirementAndLivePeer(t *testing.T) {
 			DisableCgroup: true, Cwd: "/", Command: []string{"/bin/sh", "-c", "cat /home/marker; printf 'workload-ready\\n'; exec /bin/sleep 240"},
 			Mounts: []*runtimeapi.Mount{{Type: "bind", Source: &runtimeapi.Mount_HostPath{HostPath: export}, Target: "/home", Options: []string{"ro", "rbind"}}},
 		}
+		config.CgroupPath = groups[id]
 		bundle, _, err := loader.GenerateOci(runtimecore.OciLoadOptions{
 			SandboxID: id, Config: config, UseGVisorRootfsImageAnnotations: true,
+			CgroupPath:       config.CgroupPath,
 			RootfsOverlayDir: filestore, RootfsOverlaySize: "64M", ManagedAnnotations: runtimeGenerationAnnotations(generation),
 		})
 		require.NoError(t, err)
-		return StartArgs{ID: id, ResourceGeneration: generation, BundleDir: bundle, RootOverlay: RootFileOverlay(filestore, "64M"),
+		return StartArgs{ID: id, ResourceGeneration: generation, BundleDir: bundle, CgroupPath: config.CgroupPath, RootOverlay: RootFileOverlay(filestore, "64M"),
 			UserStdout: filepath.Join(work, id+".stdout"), UserStderr: filepath.Join(work, id+".stderr")}
 	}
 	peerArgs := makeArgs("partial-peer", "generation-peer")
@@ -126,6 +157,24 @@ func TestRealNativePartialGoferBirthRetirementAndLivePeer(t *testing.T) {
 	require.Equal(t, nativeNotDispatched, partial.SentryLaunchState)
 	require.Equal(t, nativeBirthPublished, partial.GoferLaunchState)
 	partialGofer := nativePhysicalPidfd(t, partial.GoferBirth)
+	if bindCgroup {
+		for id, group := range groups {
+			data, err := os.ReadFile(filepath.Join(root, managedLaunchDirectory, id+".json"))
+			require.NoError(t, err)
+			var record managedLaunchRecord
+			require.NoError(t, json.Unmarshal(data, &record))
+			require.Equal(t, 1, record.Version)
+			require.Equal(t, id, record.SandboxID)
+			require.True(t, record.CloneIntoCgroup)
+			require.Equal(t, "dispatching", record.Stage)
+			require.Equal(t, group, record.Cgroup.Path)
+			fd, actual, err := openOriginalLaunchCgroup(group)
+			require.NoError(t, err)
+			require.Equal(t, record.Cgroup, actual)
+			require.NoError(t, fd.Close())
+			save(id+"-launch-intent.json", record)
+		}
+	}
 	original, err := os.ReadFile(client.stateFilePath(partialArgs.ID))
 	require.NoError(t, err)
 	require.NoError(t, client.VerifyRuntimeGeneration(ctx, partialArgs.ID, partialArgs.ResourceGeneration))
@@ -175,6 +224,17 @@ func TestRealNativePartialGoferBirthRetirementAndLivePeer(t *testing.T) {
 	save("final-native-inventory.json", map[string]any{"inventory": final})
 	save("shared-fixture-namespace-cleanup.json", shared.retireEmptyFixtureRoot(t))
 	save("fixture-tap-cleanup.json", peerTAP.retire(t))
+	if bindCgroup {
+		for _, group := range groups {
+			path := filepath.Join("/sys/fs/cgroup", group)
+			members, err := os.ReadFile(filepath.Join(path, "cgroup.procs"))
+			require.NoError(t, err)
+			require.Empty(t, strings.TrimSpace(string(members)))
+			require.NoError(t, os.Remove(path))
+		}
+		save("launch-cgroup-fixture-cleanup.json", map[string]any{"groups": groups, "original_empty_groups_normally_removed": true,
+			"scope": "This test's two original child cgroups only; no managed production cgroup cache or node budget settlement."})
+	}
 	save("partial-launch-summary.json", map[string]any{"producer_state_was_synthesized": false, "creator_terminated_by_external_original_pidfd": true,
 		"three_original_birth_exits_confirmed": true, "peer_workload_started": true,
 		"scope": "Actual gofer-only published birth followed by externally audited creator termination and original conditional retirement. First unpublished birth, complete daemon resources, deployment and node budget remain unverified."})
