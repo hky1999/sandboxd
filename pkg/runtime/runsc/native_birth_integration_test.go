@@ -188,7 +188,7 @@ func runNativePhysicalFixture(t *testing.T, startWorkloads bool) {
 	for _, identity := range identities {
 		export := filepath.Join(work, identity[0]+"-export")
 		require.NoError(t, os.Mkdir(export, 0700))
-		require.NoError(t, os.WriteFile(filepath.Join(export, "marker"), []byte(identity[0]), 0600))
+		require.NoError(t, os.WriteFile(filepath.Join(export, "marker"), []byte(identity[0]+"\n"), 0600))
 		config := runtimecore.StartConfig{
 			ID: identity[0], ResourceGeneration: identity[1], Rootfs: rootfs, RootfsReadonly: true,
 			DisableCgroup: true, Command: []string{"/bin/sleep", "120"},
@@ -255,7 +255,10 @@ func runNativePhysicalFixture(t *testing.T, startWorkloads bool) {
 				if strings.Contains(string(output), args.ID+"\nworkload-ready\n") {
 					break
 				}
-				require.NoError(t, ctx.Err(), "the actual workload did not read its own export and report readiness")
+				if err := ctx.Err(); err != nil {
+					save(args.ID+"-readiness-failure.json", map[string]any{"id": args.ID, "generation": args.ResourceGeneration, "stdout": string(output), "error": err.Error()})
+					require.NoError(t, err, "the actual workload did not read its own export and report readiness")
+				}
 				time.Sleep(10 * time.Millisecond)
 			}
 			running, err := client.loadState(args.ID)
