@@ -1,7 +1,7 @@
 #!/usr/bin/python3
 # Copyright (c) 2026 Ant Group Corporation.
 # SPDX-License-Identifier: Apache-2.0
-"""Pause an actual managed create after its gofer birth directory fsync.
+"""Pause actual create after birth publication or before its first rename.
 
 Explicit BareMetal1 fixture only. Never writes runtime state or sends SIGKILL.
 The external host observer audits and terminates the fixed original creator.
@@ -36,6 +36,7 @@ PTRACE_TRACEME, PTRACE_SYSCALL, PTRACE_GETREGS = 0, 24, 12
 PTRACE_SETOPTIONS = 0x4200
 PTRACE_O_TRACESYSGOOD, PTRACE_O_TRACECLONE = 1, 8
 PTRACE_EVENT_CLONE, WALL, SYS_FSYNC = 3, 0x40000000, 74
+unpublished = os.environ.get("NATIVE_STOP_BEFORE_FIRST_BIRTH_PUBLICATION") == "1"
 
 
 class Registers(ctypes.Structure):
@@ -57,6 +58,23 @@ def save(name, value):
     with (evidence / name).open("x") as stream:
         json.dump(value, stream, indent=2)
         stream.write("\n")
+
+
+def observe_unpublished_gofer(proposed):
+    # This kernel observation is not a published runtime birth. The proposed
+    # producer bytes locate its child, but do not authorize ordinary control.
+    child_pid = proposed["goferPid"]
+    assert child_pid == proposed["goferBirth"]["pid"]
+    child = Path("/proc") / str(child_pid)
+    tail = (child / "stat").read_text().rsplit(")", 1)[1].split()
+    result = {"pid": child_pid, "start_ticks": int(tail[19]),
+              "executable_sha256": hashlib.sha256((child / "exe").read_bytes()).hexdigest(),
+              "arguments_sha256": hashlib.sha256((child / "cmdline").read_bytes()).hexdigest(),
+              "cgroup_sha256": hashlib.sha256((child / "cgroup").read_bytes()).hexdigest(),
+              "observation_only": True}
+    assert result["executable_sha256"] == os.environ["NATIVE_BIRTH_RUNSC_SHA256"]
+    assert result["start_ticks"] == proposed["goferBirth"]["start_ticks"]
+    return result
 
 
 pid = os.fork()
@@ -106,7 +124,36 @@ while not paused:
             fd = Path("/proc") / str(tid) / "fd" / str(registers.rdi)
             source = fd.stat()
             target = root.stat()
-            if stat.S_ISDIR(source.st_mode) and (source.st_dev, source.st_ino) == (target.st_dev, target.st_ino):
+            if unpublished and stat.S_ISREG(source.st_mode) and source.st_dev == target.st_dev and source.st_size < 4 * 1024 * 1024:
+                linked = Path(os.readlink(fd))
+                if linked.parent == root:
+                    try:
+                        proposed_raw = fd.read_bytes()
+                        proposed = json.loads(proposed_raw)
+                        raw = state_path.read_bytes()
+                        state = json.loads(raw)
+                    except (OSError, ValueError):
+                        proposed, state = {}, {}
+                    if proposed.get("goferLaunchState") == "birth_published" and state.get("goferLaunchState") == "dispatching":
+                        assert proposed["id"] == state["id"] == "partial-original"
+                        assert proposed["resourceGeneration"] == state["resourceGeneration"] == "generation-partial"
+                        assert proposed["sentryLaunchState"] == state["sentryLaunchState"] == "not_dispatched"
+                        assert state["processBirthVersion"] == state["processLaunchVersion"] == 1
+                        assert state["runtimeDispatched"] and state["goferRequired"]
+                        assert not state.get("goferBirth") and not state.get("goferPid") and state.get("sandbox") is None
+                        observed = observe_unpublished_gofer(proposed)
+                        os.kill(pid, signal.SIGSTOP)
+                        save("partial-create-paused.json", {
+                            "creator": creator, "publishing_thread": tid,
+                            "syscall": "fsync", "syscall_number": SYS_FSYNC, "actual_return": 0,
+                            "synced_file_device": source.st_dev, "synced_file_inode": source.st_ino,
+                            "proposed_state_sha256": hashlib.sha256(proposed_raw).hexdigest(),
+                            "state_path": str(state_path), "state_sha256": hashlib.sha256(raw).hexdigest(),
+                            "original_producer_state": state, "unpublished_gofer_observation": observed,
+                            "first_birth_publication_missing": True, "runtime_state_was_written_by_tracer": False})
+                        paused = True
+                        break
+            if not unpublished and stat.S_ISDIR(source.st_mode) and (source.st_dev, source.st_ino) == (target.st_dev, target.st_ino):
                 raw = state_path.read_bytes()
                 state = json.loads(raw)
                 if state.get("goferLaunchState") == "birth_published" and state.get("sentryLaunchState") == "not_dispatched":

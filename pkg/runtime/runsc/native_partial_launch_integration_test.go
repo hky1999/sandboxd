@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -39,6 +40,38 @@ func TestRealNativeOfflineOriginalParentAfterReopenAndLivePeer(t *testing.T) {
 	runNativePartialLaunchFixtureWithCgroupProof(t, true, true, true)
 }
 
+func TestRealNativeFirstGoferBirthUnpublishedAndOriginalCgroupCleanup(t *testing.T) {
+	runNativePartialLaunchFixtureWithPublicationMode(t, true, true, true, true)
+}
+
+// Independent kernel observation, deliberately distinct from nativeRuntimeBirth.
+// It never fills the missing producer record or grants ordinary control authority.
+type nativeUnpublishedGoferObservation struct {
+	PID              int    `json:"pid"`
+	StartTicks       uint64 `json:"start_ticks"`
+	ExecutableSHA256 string `json:"executable_sha256"`
+	ArgumentsSHA256  string `json:"arguments_sha256"`
+	CgroupSHA256     string `json:"cgroup_sha256"`
+	ObservationOnly  bool   `json:"observation_only"`
+}
+
+func (o *nativeUnpublishedGoferObservation) verify(t *testing.T) {
+	t.Helper()
+	require.True(t, o.ObservationOnly)
+	require.Positive(t, o.PID)
+	root := filepath.Join("/proc", strconv.Itoa(o.PID))
+	data, err := os.ReadFile(filepath.Join(root, "stat"))
+	require.NoError(t, err)
+	fields := strings.Fields(string(data)[strings.LastIndexByte(string(data), ')')+1:])
+	require.GreaterOrEqual(t, len(fields), 20)
+	start, err := strconv.ParseUint(fields[19], 10, 64)
+	require.NoError(t, err)
+	require.Equal(t, o.StartTicks, start)
+	for name, expected := range map[string]string{"exe": o.ExecutableSHA256, "cmdline": o.ArgumentsSHA256, "cgroup": o.CgroupSHA256} {
+		require.Equal(t, expected, nativePhysicalSHA(t, filepath.Join(root, name)))
+	}
+}
+
 func runNativePartialLaunchFixture(t *testing.T, bindCgroup bool) {
 	runNativePartialLaunchFixtureWithOfflineCleanup(t, bindCgroup, false)
 }
@@ -48,9 +81,17 @@ func runNativePartialLaunchFixtureWithOfflineCleanup(t *testing.T, bindCgroup, o
 }
 
 func runNativePartialLaunchFixtureWithCgroupProof(t *testing.T, bindCgroup, offlineCleanup, parentOffline bool) {
+	runNativePartialLaunchFixtureWithPublicationMode(t, bindCgroup, offlineCleanup, parentOffline, false)
+}
+
+func runNativePartialLaunchFixtureWithPublicationMode(t *testing.T, bindCgroup, offlineCleanup, parentOffline, unpublished bool) {
 	t.Helper()
 	if os.Getenv("SANDBOXD_RUN_NATIVE_BIRTH_INTEGRATION") != "1" {
 		t.Skip("requires an explicit isolated BareMetal1 partial native launch test")
+	}
+	if unpublished {
+		require.True(t, bindCgroup && offlineCleanup && parentOffline)
+		t.Setenv("NATIVE_STOP_BEFORE_FIRST_BIRTH_PUBLICATION", "1")
 	}
 	binary, binarySHA := os.Getenv("NATIVE_BIRTH_RUNSC_BINARY"), os.Getenv("NATIVE_BIRTH_RUNSC_SHA256")
 	rootfs, rootfsSHA := os.Getenv("NATIVE_BIRTH_ROOTFS"), os.Getenv("NATIVE_BIRTH_ROOTFS_SHA256")
@@ -178,13 +219,42 @@ func runNativePartialLaunchFixtureWithCgroupProof(t *testing.T, bindCgroup, offl
 		require.NoError(t, ctx.Err())
 		time.Sleep(10 * time.Millisecond)
 	}
-	partial, err := client.loadNativeRetirementState(partialArgs.ID)
+	var partial *containerState
+	if unpublished {
+		partial, err = client.loadNativeCgroupRetirementState(partialArgs.ID)
+	} else {
+		partial, err = client.loadNativeRetirementState(partialArgs.ID)
+	}
 	require.NoError(t, err)
 	require.Empty(t, partial.Sandbox.ID)
 	require.Equal(t, "creating", partial.Status)
 	require.Equal(t, nativeNotDispatched, partial.SentryLaunchState)
-	require.Equal(t, nativeBirthPublished, partial.GoferLaunchState)
-	partialGofer := nativePhysicalPidfd(t, partial.GoferBirth)
+	var partialGofer int
+	var observed nativeUnpublishedGoferObservation
+	verifyPartialGofer := func() { verifyNativePhysicalBirth(t, partial.GoferBirth) }
+	if unpublished {
+		require.Equal(t, nativeDispatching, partial.GoferLaunchState)
+		require.Nil(t, partial.GoferBirth)
+		require.Zero(t, partial.GoferPID)
+		data, err := os.ReadFile(filepath.Join(evidence, "partial-create-paused.json"))
+		require.NoError(t, err)
+		var pause struct {
+			Observation nativeUnpublishedGoferObservation `json:"unpublished_gofer_observation"`
+			Missing     bool                              `json:"first_birth_publication_missing"`
+		}
+		require.NoError(t, json.Unmarshal(data, &pause))
+		require.True(t, pause.Missing)
+		observed = pause.Observation
+		observed.verify(t)
+		partialGofer, err = unix.PidfdOpen(observed.PID, 0)
+		require.NoError(t, err)
+		t.Cleanup(func() { unix.Close(partialGofer) })
+		observed.verify(t)
+		verifyPartialGofer = func() { observed.verify(t) }
+	} else {
+		require.Equal(t, nativeBirthPublished, partial.GoferLaunchState)
+		partialGofer = nativePhysicalPidfd(t, partial.GoferBirth)
+	}
 	if bindCgroup {
 		for id, group := range groups {
 			data, err := os.ReadFile(filepath.Join(root, managedLaunchDirectory, id+".json"))
@@ -199,7 +269,7 @@ func runNativePartialLaunchFixtureWithCgroupProof(t *testing.T, bindCgroup, offl
 			fd, actual, err := openOriginalLaunchCgroup(group)
 			require.NoError(t, err)
 			require.Equal(t, record.Cgroup, actual)
-			state, err := client.loadNativeRetirementState(id)
+			state, err := client.loadNativeCgroupRetirementState(id)
 			require.NoError(t, err)
 			require.NotNil(t, state.LaunchCgroup)
 			require.Equal(t, 1, state.LaunchCgroup.Version)
@@ -211,11 +281,16 @@ func runNativePartialLaunchFixtureWithCgroupProof(t *testing.T, bindCgroup, offl
 	}
 	original, err := os.ReadFile(client.stateFilePath(partialArgs.ID))
 	require.NoError(t, err)
-	require.NoError(t, client.VerifyRuntimeGeneration(ctx, partialArgs.ID, partialArgs.ResourceGeneration))
+	if unpublished {
+		require.Error(t, client.VerifyRuntimeGeneration(ctx, partialArgs.ID, partialArgs.ResourceGeneration))
+		require.Error(t, client.DeleteIfGeneration(ctx, partialArgs.ID, partialArgs.ResourceGeneration))
+	} else {
+		require.NoError(t, client.VerifyRuntimeGeneration(ctx, partialArgs.ID, partialArgs.ResourceGeneration))
+	}
 	_, err = client.loadStartState(partialArgs)
 	require.Error(t, err, "partial retirement source cannot authorize a control operation")
 	save("partial-births-ready.json", map[string]any{"partial": partial, "peer": peer,
-		"state_sha256": nativePhysicalSHA(t, client.stateFilePath(partialArgs.ID)), "control_source_refused": true})
+		"state_sha256": nativePhysicalSHA(t, client.stateFilePath(partialArgs.ID)), "control_source_refused": true, "unpublished_gofer_observation": observed, "first_birth_publication_missing": unpublished})
 	wait("allow-partial-delete")
 	select {
 	case err := <-creation:
@@ -259,11 +334,11 @@ func runNativePartialLaunchFixtureWithCgroupProof(t *testing.T, bindCgroup, offl
 		require.NoError(t, err)
 		signalSent := count == 0
 		if signalSent {
-			verifyNativePhysicalBirth(t, partial.GoferBirth)
+			verifyPartialGofer()
 			require.NoError(t, unix.PidfdSendSignal(partialGofer, unix.SIGKILL, nil, 0))
 		}
 		verifyNativePhysicalExit(t, partialGofer)
-		save("original-gofer-exit-before-group-removal.json", map[string]any{"original_pidfd_exit_confirmed": true, "additional_signal_sent": signalSent, "original_birth": partial.GoferBirth})
+		save("original-gofer-exit-before-group-removal.json", map[string]any{"original_pidfd_exit_confirmed": true, "additional_signal_sent": signalSent, "original_birth": partial.GoferBirth, "unpublished_observation": observed, "first_birth_publication_missing": unpublished})
 		require.NoError(t, os.Remove(filepath.Join("/sys/fs/cgroup", groups[partialArgs.ID])))
 		for _, name := range []string{"cgroup.procs", "cgroup.events"} {
 			fd, err := unix.Openat(int(group.Fd()), name, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
@@ -330,7 +405,7 @@ func runNativePartialLaunchFixtureWithCgroupProof(t *testing.T, bindCgroup, offl
 			require.NoError(t, replacement.Close())
 			require.NoError(t, os.Remove(replacementPath))
 			require.NoError(t, reopened.DeleteIfGenerationAfterCgroupParentOffline(ctx, partialArgs.ID, partialArgs.ResourceGeneration, parent, binding))
-			save("original-parent-offline-after-reopen.json", map[string]any{"original_directory_descriptor_closed": true, "new_adapter_from_original_state": true, "original_binding": binding, "online_source_refused": true, "wrong_generation_path_device_inode_refused": true, "native_parent_absence_cleanup_passed": true, "source": partial.LaunchCgroup, "node_budget_tested": false, "daemon_restart_tested": false, "first_birth_missing_tested": false})
+			save("original-parent-offline-after-reopen.json", map[string]any{"original_directory_descriptor_closed": true, "new_adapter_from_original_state": true, "original_binding": binding, "online_source_refused": true, "wrong_generation_path_device_inode_refused": true, "native_parent_absence_cleanup_passed": true, "source": partial.LaunchCgroup, "node_budget_tested": false, "daemon_restart_tested": false, "first_birth_missing_tested": unpublished})
 		} else {
 			require.NoError(t, client.DeleteIfGenerationAfterCgroupOffline(ctx, partialArgs.ID, partialArgs.ResourceGeneration, group))
 		}
@@ -375,6 +450,6 @@ func runNativePartialLaunchFixtureWithCgroupProof(t *testing.T, bindCgroup, offl
 			"scope": "This test's two original child cgroups only; no managed production cgroup cache or node budget settlement."})
 	}
 	save("partial-launch-summary.json", map[string]any{"producer_state_was_synthesized": false, "creator_terminated_by_external_original_pidfd": true,
-		"three_original_birth_exits_confirmed": true, "peer_workload_started": true,
-		"scope": "Actual gofer-only published birth followed by externally audited creator termination and original conditional retirement. First unpublished birth, complete daemon resources, deployment and node budget remain unverified."})
+		"three_original_birth_exits_confirmed": !unpublished, "three_original_process_exits_confirmed": true, "first_birth_publication_missing": unpublished, "peer_workload_started": true,
+		"scope": "Actual gofer dispatch with published or explicitly unpublished first birth, externally audited creator termination and original cgroup-offline conditional retirement. Kernel observation never fills a missing birth. Complete daemon resources, deployment and node budget remain unverified."})
 }
