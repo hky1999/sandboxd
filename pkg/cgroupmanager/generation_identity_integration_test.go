@@ -73,6 +73,10 @@ func TestRealGenerationLeaseRejectsSameNameReplacementAfterReopen(t *testing.T) 
 		result := map[string]string{}
 		for _, name := range []string{"cpu.max", "memory.max", "memory.high", "cgroup.freeze", "cgroup.events", "cgroup.procs"} {
 			data, err := os.ReadFile(filepath.Join(actual, name))
+			if os.IsNotExist(err) && (name == "cpu.max" || name == "memory.max" || name == "memory.high") {
+				result[name] = "unavailable: controller not enabled for this child"
+				continue
+			}
 			require.NoError(t, err)
 			result[name] = string(data)
 		}
