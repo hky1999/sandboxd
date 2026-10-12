@@ -45,3 +45,6 @@ running 状态只修改原状态文件句柄中的根层级 `"created"` 标记�
 配套运行时新增 processLaunchVersion=1，分别保存 goferLaunchState 和 sentryLaunchState。not_dispatched 在任何对应派发前持久保存，dispatching 在启动前发布，birth_published 与该生产端出生原子发布。完整控制路径要求 Sentry 出生已经发布及阶段一致；旧完整记录保留原约束，混合阶段或未知版本拒绝。退役的只读核验额外接受 creating 中明确未派发 Sentry 的原准备，或原 gofer 出生已发布的部分状态，必须保留完整代际、私有原状态及对应出生的结构绑定。实际信号和退出确认仍由原生条件删除取得原 pidfd 完成；只读接线和假 PID 数据不证明进程清理。
 
 任一 dispatching 缺少已发布出生继续保持未知，不凭缺少 Sentry 对象补写未派发。完整安装包、实际 gofer 部分启动清理、第一条事实未保存及其他资源完成窗口仍须独立验收，旧当前部署产物不会自动取得这些能力。
+# 部分启动的独立物理验收
+
+`TestRealNativePartialGoferBirthRetirementAndLivePeer` 必须显式启用，并在 BareMetal1 的独立容器中使用完整配套运行时和固定根文件系统。测试包装器只跟踪真实 runsc 创建进程，在原状态目录的 `fsync` 实际返回成功、gofer 出生已经发布且 Sentry 尚未派发时暂停创建进程；包装器和测试均不补写出生状态。目标 cgroup 外的观察者核验创建进程和三个原子进程的 PID、启动时间、程序摘要及归属，再通过原 pidfd 终止创建进程，之后才授权条件删除。测试分别检查创建没有成功回复、原状态字节保持、错误代际拒绝、原 gofer 退出、邻居工作负载存活及最终库存和测试资源清理。默认忽略此入口不代表物理通过；该用例不覆盖第一条出生记录缺失、完整 daemon 资源或节点预算。

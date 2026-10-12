@@ -122,7 +122,7 @@ func (original *nativePhysicalSharedNamespace) verify(t *testing.T, gofer *nativ
 func (original *nativePhysicalSharedNamespace) retireEmptyFixtureRoot(t *testing.T) map[string]any {
 	t.Helper()
 	original.verify(t, nil)
-	// All four independent process handles and the final empty inventory must
+	// All independent original process handles and the final empty inventory must
 	// already be confirmed. Release our namespace FD before normal unmount;
 	// never detach a busy mount or tear it down while the peer is alive.
 	require.NoError(t, original.namespace.Close())
@@ -137,7 +137,7 @@ func (original *nativePhysicalSharedNamespace) retireEmptyFixtureRoot(t *testing
 	return map[string]any{"root_device": original.directoryStat.Dev, "root_inode": original.directoryStat.Ino,
 		"namespace_device": original.namespaceStat.Dev, "namespace_inode": original.namespaceStat.Ino,
 		"normal_unmount_confirmed": true, "force_or_lazy_detach_used": false,
-		"scope": "This test's private shared runtime root after four independent process exits and empty inventory; not a per-container resource or daemon root."}
+		"scope": "This test's private shared runtime root after all independent original process exits and empty inventory; not a per-container resource or daemon root."}
 }
 
 func TestRealNativeCreationBirthConditionalDeletionAndLivePeer(t *testing.T) {
