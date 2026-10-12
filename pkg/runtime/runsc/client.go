@@ -25,6 +25,7 @@ import (
 	"strings"
 	"time"
 
+	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
 )
@@ -790,6 +791,10 @@ type containerState struct {
 	BundleDir            string              `json:"bundleDir"`
 	Spec                 struct {
 		Annotations map[string]string `json:"annotations"`
+		Linux       *struct {
+			CgroupsPath string `json:"cgroupsPath"`
+		} `json:"linux"`
+		Hooks *specs.Hooks `json:"hooks"`
 	} `json:"spec"`
 	Sandbox struct {
 		ResourceGeneration string              `json:"resourceGeneration"`

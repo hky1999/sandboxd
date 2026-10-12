@@ -35,11 +35,19 @@ func TestRealNativeOfflineOriginalCgroupCleanupAndLivePeer(t *testing.T) {
 	runNativePartialLaunchFixtureWithOfflineCleanup(t, true, true)
 }
 
+func TestRealNativeOfflineOriginalParentAfterReopenAndLivePeer(t *testing.T) {
+	runNativePartialLaunchFixtureWithCgroupProof(t, true, true, true)
+}
+
 func runNativePartialLaunchFixture(t *testing.T, bindCgroup bool) {
 	runNativePartialLaunchFixtureWithOfflineCleanup(t, bindCgroup, false)
 }
 
 func runNativePartialLaunchFixtureWithOfflineCleanup(t *testing.T, bindCgroup, offlineCleanup bool) {
+	runNativePartialLaunchFixtureWithCgroupProof(t, bindCgroup, offlineCleanup, false)
+}
+
+func runNativePartialLaunchFixtureWithCgroupProof(t *testing.T, bindCgroup, offlineCleanup, parentOffline bool) {
 	t.Helper()
 	if os.Getenv("SANDBOXD_RUN_NATIVE_BIRTH_INTEGRATION") != "1" {
 		t.Skip("requires an explicit isolated BareMetal1 partial native launch test")
@@ -78,6 +86,7 @@ func runNativePartialLaunchFixtureWithOfflineCleanup(t *testing.T, bindCgroup, o
 	require.NoError(t, err)
 	client := NewClientWithOptions(binary, root, Options{FilestoreDir: filestore, OverlayTmpfsSize: "64M", IgnoreCgroups: !bindCgroup})
 	groups := make(map[string]string)
+	originalGroupBindings := make(map[string]OriginalCgroupIdentity)
 	closedGroups := make(map[string]bool)
 	if bindCgroup {
 		prefix := os.Getenv("NATIVE_LAUNCH_CGROUP_PARENT")
@@ -96,7 +105,12 @@ func runNativePartialLaunchFixtureWithOfflineCleanup(t *testing.T, bindCgroup, o
 		for _, id := range []string{"partial-peer", "partial-original"} {
 			groups[id] = filepath.Join(prefix, "launch-"+id)
 			require.NoError(t, os.Mkdir(filepath.Join("/sys/fs/cgroup", groups[id]), 0755))
+			original, binding, err := openOriginalLaunchCgroup(groups[id])
+			require.NoError(t, err)
+			originalGroupBindings[id] = OriginalCgroupIdentity{Path: binding.Path, Device: binding.Device, Inode: binding.Inode}
+			require.NoError(t, original.Close())
 		}
+		save("prepared-cgroup-original-bindings.json", originalGroupBindings)
 	}
 	makeArgs := func(id, generation string) StartArgs {
 		export := filepath.Join(work, id+"-export")
@@ -225,6 +239,14 @@ func runNativePartialLaunchFixtureWithOfflineCleanup(t *testing.T, bindCgroup, o
 		group, identity, err := openOriginalLaunchCgroup(groups[partialArgs.ID])
 		require.NoError(t, err)
 		defer group.Close()
+		var parent *os.File
+		if parentOffline {
+			parent, _, err = openOriginalLaunchCgroup(filepath.Dir(groups[partialArgs.ID]))
+			require.NoError(t, err)
+			defer parent.Close()
+			require.NoError(t, client.VerifyRuntimeGenerationForCgroupRetirement(ctx, partialArgs.ID, partialArgs.ResourceGeneration, originalGroupBindings[partialArgs.ID]))
+			require.Error(t, client.DeleteIfGenerationAfterCgroupParentOffline(ctx, partialArgs.ID, partialArgs.ResourceGeneration, parent, originalGroupBindings[partialArgs.ID]))
+		}
 		require.Error(t, client.DeleteIfGenerationAfterCgroupOffline(ctx, partialArgs.ID, partialArgs.ResourceGeneration, group))
 		current, err := os.ReadFile(client.stateFilePath(partialArgs.ID))
 		require.NoError(t, err)
@@ -255,7 +277,63 @@ func runNativePartialLaunchFixtureWithOfflineCleanup(t *testing.T, bindCgroup, o
 		current, err = os.ReadFile(client.stateFilePath(partialArgs.ID))
 		require.NoError(t, err)
 		require.Equal(t, original, current)
-		require.NoError(t, client.DeleteIfGenerationAfterCgroupOffline(ctx, partialArgs.ID, partialArgs.ResourceGeneration, group))
+		if parentOffline {
+			// Drop the original leaf handle before rebuilding the adapter. A
+			// parent proof must not silently reuse or synthesize that handle.
+			require.NoError(t, group.Close())
+			reopened := NewClientWithOptions(client.Binary, client.RootDir, client.Options)
+			binding := originalGroupBindings[partialArgs.ID]
+			require.NoError(t, reopened.VerifyRuntimeGenerationForCgroupRetirement(ctx, partialArgs.ID, partialArgs.ResourceGeneration, binding))
+			for _, change := range []string{"generation", "path", "device", "inode"} {
+				changedBinding := binding
+				generation := partialArgs.ResourceGeneration
+				switch change {
+				case "generation":
+					generation = "generation-wrong"
+				case "path":
+					changedBinding.Path = groups[peerArgs.ID]
+				case "device":
+					changedBinding.Device++
+				case "inode":
+					changedBinding.Inode++
+				}
+				require.Error(t, reopened.DeleteIfGenerationAfterCgroupParentOffline(ctx, partialArgs.ID, generation, parent, changedBinding))
+				current, err := os.ReadFile(client.stateFilePath(partialArgs.ID))
+				require.NoError(t, err)
+				require.Equal(t, original, current)
+			}
+			peerGroup, _, err := openOriginalLaunchCgroup(groups[peerArgs.ID])
+			require.NoError(t, err)
+			require.Error(t, reopened.DeleteIfGenerationAfterCgroupParentOffline(ctx, partialArgs.ID, partialArgs.ResourceGeneration, peerGroup, binding))
+			require.NoError(t, peerGroup.Close())
+			replacementPath := filepath.Join("/sys/fs/cgroup", groups[partialArgs.ID])
+			require.NoError(t, os.Mkdir(replacementPath, 0755))
+			replacement, actual, err := openOriginalLaunchCgroup(groups[partialArgs.ID])
+			require.NoError(t, err)
+			require.NotEqual(t, binding.Inode, actual.Inode)
+			controls := func() map[string]string {
+				values := map[string]string{}
+				for _, name := range []string{"cgroup.procs", "cgroup.events", "cgroup.freeze"} {
+					data, err := os.ReadFile(filepath.Join(replacementPath, name))
+					require.NoError(t, err)
+					values[name] = string(data)
+				}
+				return values
+			}
+			before := controls()
+			require.Error(t, reopened.DeleteIfGenerationAfterCgroupParentOffline(ctx, partialArgs.ID, partialArgs.ResourceGeneration, parent, binding))
+			require.Equal(t, before, controls())
+			current, err := os.ReadFile(client.stateFilePath(partialArgs.ID))
+			require.NoError(t, err)
+			require.Equal(t, original, current)
+			save("same-name-replacement-parent-proof-refused.json", map[string]any{"original": binding, "replacement": actual, "before": before, "after": controls(), "original_state_bytes_unchanged": true, "wrong_parent_descriptor_refused": true})
+			require.NoError(t, replacement.Close())
+			require.NoError(t, os.Remove(replacementPath))
+			require.NoError(t, reopened.DeleteIfGenerationAfterCgroupParentOffline(ctx, partialArgs.ID, partialArgs.ResourceGeneration, parent, binding))
+			save("original-parent-offline-after-reopen.json", map[string]any{"original_directory_descriptor_closed": true, "new_adapter_from_original_state": true, "original_binding": binding, "online_source_refused": true, "wrong_generation_path_device_inode_refused": true, "native_parent_absence_cleanup_passed": true, "source": partial.LaunchCgroup, "node_budget_tested": false, "daemon_restart_tested": false, "first_birth_missing_tested": false})
+		} else {
+			require.NoError(t, client.DeleteIfGenerationAfterCgroupOffline(ctx, partialArgs.ID, partialArgs.ResourceGeneration, group))
+		}
 		closedGroups[groups[partialArgs.ID]] = true
 	} else {
 		require.NoError(t, client.DeleteIfGeneration(ctx, partialArgs.ID, partialArgs.ResourceGeneration))

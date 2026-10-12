@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -86,7 +88,33 @@ func (c *Client) DeleteIfGenerationAfterCgroupOffline(ctx context.Context, id, g
 	return c.deleteWithOriginalCgroup(ctx, id, generation, original)
 }
 
+// OriginalCgroupIdentity comes from the original generation lease, not from a
+// later lookup of the same path or a replacement native state file.
+type OriginalCgroupIdentity struct {
+	Path   string
+	Device uint64
+	Inode  uint64
+}
+
+func (original OriginalCgroupIdentity) valid() bool {
+	return filepath.IsAbs(original.Path) && validLaunchCgroupPath(original.Path) && original.Device != 0 && original.Inode != 0
+}
+
+// Parent proof is a separate restart protocol. The original path/device/inode
+// must also be passed so a replacement producer record cannot borrow the same
+// parent descriptor. Unsupported native flags remain unconfirmed.
+func (c *Client) DeleteIfGenerationAfterCgroupParentOffline(ctx context.Context, id, generation string, parent *os.File, original OriginalCgroupIdentity) error {
+	if parent == nil || !original.valid() {
+		return errors.New("original offline parent or original lease identity is missing")
+	}
+	return c.deleteWithCgroupProof(ctx, id, generation, nil, parent, original)
+}
+
 func (c *Client) deleteWithOriginalCgroup(ctx context.Context, id, generation string, original *os.File) error {
+	return c.deleteWithCgroupProof(ctx, id, generation, original, nil, OriginalCgroupIdentity{})
+}
+
+func (c *Client) deleteWithCgroupProof(ctx context.Context, id, generation string, original, parent *os.File, binding OriginalCgroupIdentity) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -94,13 +122,21 @@ func (c *Client) deleteWithOriginalCgroup(ctx context.Context, id, generation st
 		return errors.New("original native runtime deletion identity is invalid")
 	}
 	args := append(c.globalArgs(), "delete", "--force", "--expected-resource-generation="+generation)
+	if original != nil && parent != nil {
+		return errors.New("original cgroup cleanup accepts exactly one proof descriptor")
+	}
 	if original != nil {
 		args = append(args, "--scheduler-offline-cgroup-fd=3")
+	} else if parent != nil {
+		args = append(args, "--scheduler-offline-cgroup-parent-fd=3", "--scheduler-original-cgroup-path="+binding.Path,
+			"--scheduler-original-cgroup-device="+strconv.FormatUint(binding.Device, 10), "--scheduler-original-cgroup-inode="+strconv.FormatUint(binding.Inode, 10))
 	}
 	args = append(args, id)
 	cmd := exec.CommandContext(ctx, c.Binary, args...)
 	if original != nil {
 		cmd.ExtraFiles = []*os.File{original}
+	} else if parent != nil {
+		cmd.ExtraFiles = []*os.File{parent}
 	}
 	var output boundedRuntimeOutput
 	cmd.Stdout, cmd.Stderr = &output, &output
