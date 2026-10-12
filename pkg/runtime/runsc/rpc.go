@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"runtime"
 	"sync"
 
@@ -70,13 +71,48 @@ type rpcClient struct {
 }
 
 func connectRPC(path string) (*rpcClient, error) {
+	address := path
+	var directory *os.File
+	var originalDirectory, originalSocket unix.Stat_t
+	if len(path) >= len(unix.RawSockaddrUnix{}.Path) {
+		if !filepath.IsAbs(path) || filepath.Clean(path) != path {
+			return nil, fmt.Errorf("long control socket path is not an exact absolute path")
+		}
+		var err error
+		directory, originalDirectory, err = openRuntimeIdentityDirectory(filepath.Dir(path))
+		if err != nil {
+			return nil, fmt.Errorf("open original long control socket directory: %w", err)
+		}
+		defer directory.Close()
+		if err := unix.Fstatat(int(directory.Fd()), filepath.Base(path), &originalSocket, unix.AT_SYMLINK_NOFOLLOW); err != nil || originalSocket.Mode&unix.S_IFMT != unix.S_IFSOCK {
+			return nil, fmt.Errorf("long control endpoint is not the original directory's socket")
+		}
+		if err := verifyRuntimeIdentityDirectory(filepath.Dir(path), originalDirectory); err != nil {
+			return nil, err
+		}
+		address = fmt.Sprintf("/proc/self/fd/%d/%s", directory.Fd(), filepath.Base(path))
+		if len(address) >= len(unix.RawSockaddrUnix{}.Path) {
+			return nil, fmt.Errorf("control socket basename exceeds the Unix address limit")
+		}
+	}
 	fd, err := unix.Socket(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
 	if err != nil {
 		return nil, err
 	}
-	if err := unix.Connect(fd, &unix.SockaddrUnix{Name: path}); err != nil {
+	if err := unix.Connect(fd, &unix.SockaddrUnix{Name: address}); err != nil {
 		_ = unix.Close(fd)
 		return nil, err
+	}
+	if directory != nil {
+		var current unix.Stat_t
+		if err := unix.Fstatat(int(directory.Fd()), filepath.Base(path), &current, unix.AT_SYMLINK_NOFOLLOW); err != nil || current.Dev != originalSocket.Dev || current.Ino != originalSocket.Ino || current.Mode != originalSocket.Mode {
+			_ = unix.Close(fd)
+			return nil, fmt.Errorf("long control socket changed while connecting")
+		}
+		if err := verifyRuntimeIdentityDirectory(filepath.Dir(path), originalDirectory); err != nil {
+			_ = unix.Close(fd)
+			return nil, err
+		}
 	}
 	return &rpcClient{fd: fd}, nil
 }

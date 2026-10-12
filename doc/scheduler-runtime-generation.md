@@ -21,3 +21,5 @@ RuntimeGenerationVerifier 是只读拒绝条件。正常删除和失败创建对
 gVisor 默认把 gofer 的空网络 namespace 固定在共享运行时根目录的 `null-netns` 挂载点，供后续 gofer 复用。它属于共享根目录生命周期，删除某一个容器不能卸载活动邻居使用的共享缓存。物理用例保存本测试私有根目录及原网络 namespace 的设备号、inode 和句柄，核验两份 gofer 使用相同缓存，并在目标退役后确认邻居与缓存仍保持原身份。只有四个独立 pidfd 确认退出、原生库存为空之后，才通过原目录句柄普通卸载本测试的原缓存，不使用强制或延迟卸载；随后临时目录清理仍须成功。该测试根目录清理不代表平台 daemon 共享缓存、部分启动或其他来源的清理已经验收。
 
 `TestRealNativeWorkloadStartConditionalDeletionAndLivePeer` 使用相同的显式启用及固定输入，但额外在独立容器的私有网络 namespace 中创建两个 TAP，通过实际 `Client.Start` 执行网络设置和开始运行的控制 RPC。两个工作负载分别读取自己的只读导出文件并报告就绪，要求状态为 running、原 Sentry／gofer 出生记录不变。目标退役后邻居仍须运行；最后四个原句柄确认退出、库存为空，再清理原共享缓存及原 TAP。TAP 清理核对网络 namespace、ifindex、名称和 MAC，失败不借用同名设备，也不改原平台网络。该专项仍不提供独立 Restore、完整 sandboxd 资源或节点预算故障证明。
+
+Linux Unix socket 连接地址的路径字段只有 108 字节，直接连接还要保留结束符。较长的控制 socket 路径通过原私有目录句柄和 `/proc/self/fd/<原目录句柄>/<原文件名>` 连接同一个文件，不改变 socket 所在目录或采用其他实例的 endpoint。长路径要求规范绝对路径、私有原目录和普通 socket，连接前后核对原目录与 socket 的设备号、inode 和模式；socket 文件名自身仍超限时明确拒绝。持有目录只解决路径长度及该次连接中的路径核对，不提供运行时生命周期锁或所有控制 RPC 的原进程授权证明；这些边界继续单独验收。
