@@ -754,16 +754,19 @@ func (c *Client) ListJSON(ctx context.Context) ([]byte, error) {
 }
 
 type containerState struct {
-	ResourceGeneration  string              `json:"resourceGeneration"`
-	ProcessBirthVersion int                 `json:"processBirthVersion"`
-	RuntimeDispatched   bool                `json:"runtimeDispatched"`
-	GoferRequired       bool                `json:"goferRequired"`
-	GoferPID            int                 `json:"goferPid"`
-	GoferBirth          *nativeRuntimeBirth `json:"goferBirth"`
-	ID                  string              `json:"id"`
-	Status              string              `json:"status"`
-	BundleDir           string              `json:"bundleDir"`
-	Spec                struct {
+	ResourceGeneration   string              `json:"resourceGeneration"`
+	ProcessBirthVersion  int                 `json:"processBirthVersion"`
+	RuntimeDispatched    bool                `json:"runtimeDispatched"`
+	GoferRequired        bool                `json:"goferRequired"`
+	GoferPID             int                 `json:"goferPid"`
+	GoferBirth           *nativeRuntimeBirth `json:"goferBirth"`
+	ProcessLaunchVersion int                 `json:"processLaunchVersion"`
+	GoferLaunchState     string              `json:"goferLaunchState"`
+	SentryLaunchState    string              `json:"sentryLaunchState"`
+	ID                   string              `json:"id"`
+	Status               string              `json:"status"`
+	BundleDir            string              `json:"bundleDir"`
+	Spec                 struct {
 		Annotations map[string]string `json:"annotations"`
 	} `json:"spec"`
 	Sandbox struct {

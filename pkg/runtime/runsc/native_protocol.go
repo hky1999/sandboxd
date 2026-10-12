@@ -66,6 +66,9 @@ func validateNativeRuntimeBirth(state *containerState, id, generation string) er
 	} else if state.GoferBirth != nil || state.GoferPID != 0 {
 		return errors.New("native runtime no-gofer fact contradicts original ownership")
 	}
+	if err := validateNativeLaunchStages(state, true); err != nil {
+		return err
+	}
 	return nil
 }
 

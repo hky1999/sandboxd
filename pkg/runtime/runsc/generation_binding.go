@@ -25,7 +25,7 @@ func (c *Client) VerifyRuntimeGeneration(ctx context.Context, id, generation str
 	if !runtimeInventoryID(generation) {
 		return errors.New("original runtime resource generation is missing or invalid")
 	}
-	state, err := c.loadState(id)
+	state, err := c.loadNativeRetirementState(id)
 	if err != nil {
 		return err
 	}
