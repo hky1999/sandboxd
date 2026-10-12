@@ -41,6 +41,51 @@ var _ runtimecore.CheckpointRestoreCapabilitiesProvider = &Handler{}
 var _ runtimecore.SandboxDefaultsProvider = &Handler{}
 var _ runtimecore.RuntimeGenerationVerifier = &Handler{}
 var _ runtimecore.GenerationRuntimeDeleter = &Handler{}
+var _ runtimecore.CgroupRuntimeRetirer = &Handler{}
+
+func (r *Handler) VerifyRuntimeCgroupGeneration(ctx context.Context, id, generation string, identity runtimecore.CgroupRuntimeIdentity) error {
+	client, ok := r.runsc.(interface {
+		VerifyRuntimeGenerationForCgroupRetirement(context.Context, string, string, OriginalCgroupIdentity) error
+	})
+	if !ok {
+		return errors.New("runsc client cannot verify original cgroup generation")
+	}
+	return client.VerifyRuntimeGenerationForCgroupRetirement(ctx, id, generation, OriginalCgroupIdentity{Path: identity.Path, Device: identity.Device, Inode: identity.Inode})
+}
+
+func (r *Handler) DeleteRuntimeAfterCgroupClosed(ctx context.Context, id, generation string, proof runtimecore.CgroupRuntimeProof) error {
+	if proof.Identity.Path == "" || proof.Identity.Device == 0 || proof.Identity.Inode == 0 {
+		return errors.New("original runtime cgroup proof binding is missing")
+	}
+	var err error
+	if proof.Directory != nil {
+		client, ok := r.runsc.(interface {
+			DeleteIfGenerationAfterCgroupOffline(context.Context, string, string, *os.File) error
+		})
+		if !ok {
+			return errors.New("runsc client cannot verify original closed cgroup descriptor")
+		}
+		err = client.DeleteIfGenerationAfterCgroupOffline(ctx, id, generation, proof.Directory)
+	} else if proof.Parent != nil {
+		client, ok := r.runsc.(interface {
+			DeleteIfGenerationAfterCgroupParentOffline(context.Context, string, string, *os.File, OriginalCgroupIdentity) error
+		})
+		if !ok {
+			return errors.New("runsc client cannot verify original cgroup parent after restart")
+		}
+		err = client.DeleteIfGenerationAfterCgroupParentOffline(ctx, id, generation, proof.Parent, OriginalCgroupIdentity{Path: proof.Identity.Path, Device: proof.Identity.Device, Inode: proof.Identity.Inode})
+	} else {
+		return errors.New("original closed cgroup descriptors unavailable")
+	}
+	if err != nil {
+		return err
+	}
+	bundlePath, err := util.JoinWithinRoot(r.sandboxRoot, id)
+	if err != nil {
+		return err
+	}
+	return cleanupRunscNVProxyRootfs(bundlePath)
+}
 
 func (r *Handler) DeleteRuntimeIfGeneration(ctx context.Context, id, generation string) error {
 	client, ok := r.runsc.(interface {

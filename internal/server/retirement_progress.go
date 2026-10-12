@@ -17,9 +17,11 @@ import (
 	"reflect"
 	"strings"
 	"syscall"
+	"time"
 
 	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
 	"github.com/inclusionAI/sandboxd/config"
+	"github.com/inclusionAI/sandboxd/pkg/cgroupmanager"
 	"github.com/inclusionAI/sandboxd/pkg/sandbox"
 	"golang.org/x/sys/unix"
 	"google.golang.org/protobuf/proto"
@@ -135,7 +137,15 @@ type retirementProgress struct {
 	Steps           []string                 `json:"completed_steps"`
 	RootPending     bool                     `json:"root_pending"`
 	DeviceProtocol  uint8                    `json:"device_protocol,omitempty"`
+	CgroupClose     *retirementCgroupClose   `json:"cgroup_close,omitempty"`
 	IntegritySHA256 string                   `json:"integrity_sha256"`
+}
+
+type retirementCgroupClose struct {
+	Identity              cgroupmanager.CgroupIdentity                 `json:"identity"`
+	Request               cgroupmanager.GenerationCgroupCloseRequest   `json:"request"`
+	RuntimeSourceVerified bool                                         `json:"runtime_source_verified"`
+	Continuations         []cgroupmanager.GenerationCgroupCloseRequest `json:"continuations,omitempty"`
 }
 
 func progressDigest(record retirementProgress) string {
@@ -153,8 +163,21 @@ func (h *sandboxService) retirementProgressPath(id, generation string) (string, 
 }
 
 func validateRetirementProgress(record *retirementProgress, id, generation string) error {
-	if record.Version != 1 || record.DeviceProtocol > 1 || record.SandboxID != id || record.Generation != generation || !validRetirementProgressKey(id) || !validRetirementProgressKey(generation) || record.DirectoryInode == 0 || record.ParentInode == 0 || record.Resources.ID != id || record.Resources.Generation != generation || len(record.Steps) > len(retirementProgressSteps) || record.IntegritySHA256 != progressDigest(*record) {
+	if (record.Version != 1 && record.Version != 2) || record.DeviceProtocol > 1 || record.SandboxID != id || record.Generation != generation || !validRetirementProgressKey(id) || !validRetirementProgressKey(generation) || record.DirectoryInode == 0 || record.ParentInode == 0 || record.Resources.ID != id || record.Resources.Generation != generation || len(record.Steps) > len(retirementProgressSteps) || record.IntegritySHA256 != progressDigest(*record) {
 		return fmt.Errorf("original retirement progress identity or integrity differs")
+	}
+	if record.CgroupClose != nil {
+		close := record.CgroupClose
+		if record.Version != 2 || !close.RuntimeSourceVerified || close.Identity.Path == "" || close.Identity.Device == 0 || close.Identity.Inode == 0 ||
+			close.Identity.Path != record.Resources.Resources[config.ResourceNameCgroup] || close.Request.Path != close.Identity.Path || close.Request.Generation != generation ||
+			!validRetirementProgressKey(close.Request.OperationID) || close.Request.ExpectedRevision != 0 || close.Request.Deadline.IsZero() {
+			return fmt.Errorf("original retirement cgroup close binding is invalid")
+		}
+		if err := cgroupmanager.ValidateGenerationCloseContinuations(close.Request, close.Continuations); err != nil {
+			return err
+		}
+	} else if record.Version != 1 {
+		return fmt.Errorf("retirement progress version requires an original cgroup close")
 	}
 	var metadata runtime.SandboxMetadata
 	if err := proto.Unmarshal(record.Original, &metadata); err != nil || metadata.ID != id || metadata.Labels[resourceGenerationLabel] != generation || metadata.RuntimeHandler == "" {
@@ -304,6 +327,31 @@ func (h *sandboxService) writeRetirementProgress(record *retirementProgress) err
 	}
 	if current != nil {
 		before, after := *current, *record
+		// The original snapshot stays immutable. Only the first, verified close
+		// intent may be added, before any retirement step has completed. Once
+		// saved, its identity and entire request remain first-wins.
+		if current.CgroupClose == nil && record.CgroupClose != nil {
+			if len(current.Steps) != 0 || len(record.Steps) != 0 || current.RootPending || record.RootPending {
+				return fmt.Errorf("original cgroup close intent must precede runtime retirement")
+			}
+			before.Version, after.Version = 0, 0
+			before.CgroupClose, after.CgroupClose = nil, nil
+		} else if current.CgroupClose != nil && record.CgroupClose != nil {
+			old, next := *current.CgroupClose, *record.CgroupClose
+			if len(next.Continuations) > len(old.Continuations) {
+				previous := old.Request
+				if len(old.Continuations) != 0 {
+					previous = old.Continuations[len(old.Continuations)-1]
+				}
+				if len(next.Continuations) != len(old.Continuations)+1 ||
+					!reflect.DeepEqual(next.Continuations[:len(old.Continuations)], old.Continuations) && len(old.Continuations) != 0 ||
+					time.Now().Before(previous.Deadline) || len(current.Steps) != 0 || len(record.Steps) != 0 {
+					return fmt.Errorf("close continuation must follow the expired original history before retirement")
+				}
+				old.Continuations, next.Continuations = nil, nil
+				before.CgroupClose, after.CgroupClose = &old, &next
+			}
+		}
 		before.Steps, after.Steps = nil, nil
 		before.RootPending, after.RootPending = false, false
 		before.IntegritySHA256, after.IntegritySHA256 = "", ""

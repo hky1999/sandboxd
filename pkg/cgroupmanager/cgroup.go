@@ -634,7 +634,7 @@ func (c *CgroupManager) storeLeaseState(releasedPath, releasedGeneration string)
 			time.Since(start).Milliseconds(),
 		)
 	}()
-	state := storedCgroupIDs{SchemaVersion: 5, LeaseOwners: make(map[string]string), LeaseIdentities: make(map[string]CgroupIdentity), LeaseScopes: make(map[string]generationLeaseScope), LeaseClosures: make(map[string]generationCgroupClosure), CompletedGenerations: make(map[string]string)}
+	state := storedCgroupIDs{SchemaVersion: 6, LeaseOwners: make(map[string]string), LeaseIdentities: make(map[string]CgroupIdentity), LeaseScopes: make(map[string]generationLeaseScope), LeaseClosures: make(map[string]generationCgroupClosure), CompletedGenerations: make(map[string]string)}
 	for _, id := range c.usingID.Keys() {
 		if id == releasedPath {
 			continue

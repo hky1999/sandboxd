@@ -230,20 +230,17 @@ func (h *sandboxService) reconcilePhysicalIntentLocked(ctx context.Context, meta
 		return err
 	}
 	if runtimeCount == 1 {
-		if generation != "" {
-			if verifier, ok := handler.(svc.RuntimeGenerationVerifier); ok {
-				if err := verifier.VerifyRuntimeGeneration(cleanupCtx, metadata.ID, generation); err != nil {
-					return fmt.Errorf("verify original intent runtime generation: %w", err)
-				}
+		if err := h.retireOriginalRuntime(cleanupCtx, handler, metadata, progress); err != nil && !errors.Is(err, errord.ErrNotFound) {
+			return fmt.Errorf("delete original intent runtime %s: %w", metadata.ID, err)
+		}
+	} else {
+		if err := h.confirmAbsentRuntimeCgroup(cleanupCtx, handler, progress); err != nil {
+			return err
+		}
+		if cleaner, ok := handler.(svc.PreparedStateCleaner); ok {
+			if err := cleaner.CleanupPreparedState(cleanupCtx, metadata.ID); err != nil {
+				return fmt.Errorf("cleanup prepared runtime state %s: %w", metadata.ID, err)
 			}
-		}
-		if err := deleteOriginalRuntime(cleanupCtx, handler, metadata.ID, generation); err != nil &&
-			!errors.Is(err, errord.ErrNotFound) {
-			return fmt.Errorf("delete runtime for physical intent %s: %w", metadata.ID, err)
-		}
-	} else if cleaner, ok := handler.(svc.PreparedStateCleaner); ok {
-		if err := cleaner.CleanupPreparedState(cleanupCtx, metadata.ID); err != nil {
-			return fmt.Errorf("cleanup prepared runtime state for physical intent %s: %w", metadata.ID, err)
 		}
 	}
 	// A returned Delete/cleanup alone does not prove physical absence. Check

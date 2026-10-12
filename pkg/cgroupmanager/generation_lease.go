@@ -133,12 +133,19 @@ func (c *CgroupManager) completeLeaseRelease(path, generation string) error {
 // Called before workers start. Legacy active entries stay unowned; they are
 // never silently assigned a generation or accepted by the conditional API.
 func (c *CgroupManager) restoreGenerationLeases(state storedCgroupIDs) error {
-	if (state.SchemaVersion != 0 && state.SchemaVersion != 2 && state.SchemaVersion != 4 && state.SchemaVersion != 5) ||
+	if (state.SchemaVersion != 0 && state.SchemaVersion != 2 && state.SchemaVersion != 4 && state.SchemaVersion != 5 && state.SchemaVersion != 6) ||
 		(state.SchemaVersion == 0 && (len(state.LeaseOwners) != 0 || len(state.CompletedGenerations) != 0 || len(state.LeaseIdentities) != 0 || len(state.LeaseScopes) != 0)) ||
-		(state.SchemaVersion != 4 && state.SchemaVersion != 5 && (len(state.LeaseIdentities) != 0 || len(state.LeaseScopes) != 0)) ||
-		(state.SchemaVersion != 5 && len(state.LeaseClosures) != 0) ||
+		(state.SchemaVersion != 4 && state.SchemaVersion != 5 && state.SchemaVersion != 6 && (len(state.LeaseIdentities) != 0 || len(state.LeaseScopes) != 0)) ||
+		(state.SchemaVersion != 5 && state.SchemaVersion != 6 && len(state.LeaseClosures) != 0) ||
 		len(state.LeaseOwners)+len(state.CompletedGenerations) > generationLeaseLimit {
 		return fmt.Errorf("cgroup lease journal schema or capacity is invalid: %w", errord.ErrFailedPrecondition)
+	}
+	if state.SchemaVersion != 6 {
+		for _, closure := range state.LeaseClosures {
+			if len(closure.Continuations) != 0 {
+				return fmt.Errorf("legacy cgroup close cannot contain continuation history: %w", errord.ErrFailedPrecondition)
+			}
+		}
 	}
 	identities := make(map[string]CgroupIdentity, len(state.LeaseIdentities))
 	for path, identity := range state.LeaseIdentities {

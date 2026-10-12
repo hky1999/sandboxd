@@ -470,7 +470,7 @@ func (h *sandboxService) deleteSandboxRuntime(ctx context.Context, sandboxID str
 		return err
 	}
 	var progress *retirementProgress
-	if expected != "" {
+	if c.Metadata.Labels[resourceGenerationLabel] != "" {
 		progress, err = h.beginRetirementProgress(proto.Clone(c.Metadata).(*runtime.SandboxMetadata), resource)
 		if err != nil {
 			return err
@@ -507,14 +507,7 @@ func (h *sandboxService) deleteSandboxRuntime(ctx context.Context, sandboxID str
 	if err := h.verifyRetirementProgressSnapshot(progress); err != nil {
 		return err
 	}
-	if generation := c.Metadata.Labels[resourceGenerationLabel]; generation != "" {
-		if verifier, ok := handler.(svc.RuntimeGenerationVerifier); ok {
-			if err := verifier.VerifyRuntimeGeneration(ctx, sandboxID, generation); err != nil {
-				return fmt.Errorf("verify original runtime resource generation before delete: %w", err)
-			}
-		}
-	}
-	err = deleteOriginalRuntime(ctx, handler, sandboxID, c.Metadata.Labels[resourceGenerationLabel])
+	err = h.retireOriginalRuntime(ctx, handler, c.Metadata, progress)
 	if err != nil && !errors.Is(err, errord.ErrNotFound) {
 		metrics.RecordRuntimeCallResult("delete", "failed", c.Metadata.RuntimeHandler)
 		logrus.WithField(trace.ContextKeyTraceId, traceID).Errorf("runtime handler force delete sandbox failed: %v", err)

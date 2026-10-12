@@ -17,6 +17,7 @@ package runtime
 import (
 	"context"
 	"errors"
+	"os"
 	"time"
 
 	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
@@ -116,6 +117,28 @@ type RuntimeGenerationVerifier interface {
 // deletion when this mutation capability is absent.
 type GenerationRuntimeDeleter interface {
 	DeleteRuntimeIfGeneration(context.Context, string, string) error
+}
+
+// CgroupRuntimeIdentity is supplied from the original resource lease.
+type CgroupRuntimeIdentity struct {
+	Path   string
+	Device uint64
+	Inode  uint64
+}
+
+// CgroupRuntimeProof borrows original descriptors while the caller owns them.
+// A closed group alone never represents full sandbox or node-budget completion.
+type CgroupRuntimeProof struct {
+	Identity  CgroupRuntimeIdentity
+	Directory *os.File
+	Parent    *os.File
+}
+
+// CgroupRuntimeRetirer is distinct from ordinary process/control verification.
+// It permits unknown dispatch only after original group closure is proven.
+type CgroupRuntimeRetirer interface {
+	VerifyRuntimeCgroupGeneration(context.Context, string, string, CgroupRuntimeIdentity) error
+	DeleteRuntimeAfterCgroupClosed(context.Context, string, string, CgroupRuntimeProof) error
 }
 
 // CheckpointOptions describes physical checkpoint behavior. It is kept at

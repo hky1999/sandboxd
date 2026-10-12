@@ -26,12 +26,47 @@ type GenerationCgroupCloseRequest struct {
 }
 
 type generationCgroupClosure struct {
-	Request  GenerationCgroupCloseRequest `json:"request"`
-	Revision uint64                       `json:"revision"`
-	Identity CgroupIdentity               `json:"identity"`
-	Parent   CgroupIdentity               `json:"parent"`
-	Scope    generationLeaseScope         `json:"scope"`
-	Closed   bool                         `json:"closed"`
+	Request       GenerationCgroupCloseRequest   `json:"request"`
+	Revision      uint64                         `json:"revision"`
+	Identity      CgroupIdentity                 `json:"identity"`
+	Parent        CgroupIdentity                 `json:"parent"`
+	Scope         generationLeaseScope           `json:"scope"`
+	Closed        bool                           `json:"closed"`
+	Continuations []GenerationCgroupCloseRequest `json:"continuations,omitempty"`
+}
+
+// GenerationLeaseSnapshot copies the original persisted binding and close
+// request. It never adopts the current directory or transfers kernel authority.
+type GenerationLeaseSnapshot struct {
+	Identity      CgroupIdentity
+	CloseRequest  *GenerationCgroupCloseRequest
+	Closed        bool
+	Continuations []GenerationCgroupCloseRequest
+}
+
+func (c *CgroupManager) InspectGenerationLease(path, generation string) (GenerationLeaseSnapshot, error) {
+	c.leaseMu.Lock()
+	defer c.leaseMu.Unlock()
+	if !validLeaseGeneration(generation) || !belongsToRoot(path, c.rootName) || !c.usingID.Has(path) || c.leaseOwners[path] != generation {
+		return GenerationLeaseSnapshot{}, fmt.Errorf("original generation lease ownership unavailable: %w", errord.ErrFailedPrecondition)
+	}
+	identity, known := c.leaseIdentities[path]
+	scope, scoped := c.leaseScopes[path]
+	current, err := c.generationScope()
+	if !known || !scoped || identity.Path != path || identity.Device == 0 || identity.Inode == 0 || !scope.valid() || err != nil || current != scope {
+		return GenerationLeaseSnapshot{}, fmt.Errorf("original generation lease binding or scope unavailable: %w", errord.ErrFailedPrecondition)
+	}
+	snapshot := GenerationLeaseSnapshot{Identity: identity}
+	if record, closing := c.leaseClosures[path]; closing {
+		request := record.Request
+		if request.Path != path || request.Generation != generation || record.Identity != identity || record.Scope != scope {
+			return GenerationLeaseSnapshot{}, fmt.Errorf("original close request differs from its lease: %w", errord.ErrFailedPrecondition)
+		}
+		snapshot.CloseRequest = &request
+		snapshot.Closed = record.Closed
+		snapshot.Continuations = append([]GenerationCgroupCloseRequest(nil), record.Continuations...)
+	}
+	return snapshot, nil
 }
 
 // ClosedGenerationCgroup holds the original kernel objects for native runtime
@@ -79,14 +114,51 @@ func sameCloseRequest(a, b GenerationCgroupCloseRequest) bool {
 		a.ExpectedRevision == b.ExpectedRevision && a.Deadline.Equal(b.Deadline)
 }
 
+const generationCloseContinuationLimit = 128
+
+// ValidateGenerationCloseContinuations checks immutable original ownership and
+// a bounded, unique, revision-ordered continuation history. It grants no physical
+// authority: the lease, original directory and observation scope are still checked.
+func ValidateGenerationCloseContinuations(original GenerationCgroupCloseRequest, continuations []GenerationCgroupCloseRequest) error {
+	if len(continuations) > generationCloseContinuationLimit {
+		return fmt.Errorf("original cgroup close continuation history is full")
+	}
+	seen := map[string]bool{original.OperationID: true}
+	deadline := original.Deadline
+	for i, request := range continuations {
+		if request.Path != original.Path || request.Generation != original.Generation ||
+			!validLeaseGeneration(request.OperationID) || seen[request.OperationID] ||
+			request.ExpectedRevision != uint64(i+1) || !request.Deadline.After(deadline) {
+			return fmt.Errorf("original cgroup close continuation identity, revision or deadline differs")
+		}
+		seen[request.OperationID] = true
+		deadline = request.Deadline
+	}
+	return nil
+}
+
 // CloseForGeneration permanently drains and removes one generation's cgroup.
 // It persists the complete intent before any effect and the closed result before
 // returning proof. The lease remains occupied until the caller has separately
 // cleaned the native runtime and other resources and calls RecycleForGeneration.
 func (c *CgroupManager) CloseForGeneration(ctx context.Context, request GenerationCgroupCloseRequest) (*ClosedGenerationCgroup, error) {
+	return c.closeForGeneration(ctx, request, nil)
+}
+
+// ContinueCloseForGeneration authorizes another bounded attempt after the
+// previous deadline. The original request never changes. A new operation and
+// revision are saved before effects; exact retry resolves that same attempt.
+func (c *CgroupManager) ContinueCloseForGeneration(ctx context.Context, original, continuation GenerationCgroupCloseRequest) (*ClosedGenerationCgroup, error) {
+	return c.closeForGeneration(ctx, original, &continuation)
+}
+
+func (c *CgroupManager) closeForGeneration(ctx context.Context, request GenerationCgroupCloseRequest, continuation *GenerationCgroupCloseRequest) (*ClosedGenerationCgroup, error) {
 	if ctx == nil || !belongsToRoot(request.Path, c.rootName) || !validLeaseGeneration(request.Generation) ||
 		!validLeaseGeneration(request.OperationID) || request.ExpectedRevision != 0 || request.Deadline.IsZero() {
 		return nil, fmt.Errorf("invalid original cgroup close request: %w", errord.ErrInvalidArgument)
+	}
+	if continuation != nil && continuation.ExpectedRevision == 0 {
+		return nil, fmt.Errorf("close continuation must carry its own revision: %w", errord.ErrInvalidArgument)
 	}
 	c.leaseMu.Lock()
 	defer c.leaseMu.Unlock()
@@ -110,7 +182,39 @@ func (c *CgroupManager) CloseForGeneration(ctx context.Context, request Generati
 	var parent *CgroupIdentity
 	if pending {
 		parent = &original.Parent
-	} else if err := closeContextError(ctx, request.Deadline); err != nil {
+	} else if continuation == nil {
+		if err := closeContextError(ctx, request.Deadline); err != nil {
+			return nil, err
+		}
+	}
+	active := request
+	if len(original.Continuations) != 0 {
+		active = original.Continuations[len(original.Continuations)-1]
+	}
+	appendContinuation := false
+	if continuation != nil && !sameCloseRequest(*continuation, active) {
+		if original.Closed || time.Now().Before(active.Deadline) ||
+			continuation.ExpectedRevision != uint64(1+len(original.Continuations)) {
+			return nil, fmt.Errorf("original close continuation requires the expired current revision: %w", errord.ErrFailedPrecondition)
+		}
+		proposed := append(append([]GenerationCgroupCloseRequest(nil), original.Continuations...), *continuation)
+		if err := ValidateGenerationCloseContinuations(request, proposed); err != nil {
+			return nil, err
+		}
+		if err := closeContextError(ctx, continuation.Deadline); err != nil {
+			return nil, err
+		}
+		appendContinuation = true
+	} else if continuation == nil && len(original.Continuations) != 0 && !original.Closed {
+		return nil, fmt.Errorf("original close has a separately authorized continuation: %w", errord.ErrFailedPrecondition)
+	}
+	if continuation != nil && !appendContinuation && !pending {
+		return nil, fmt.Errorf("original close continuation cannot borrow an unprepared lease: %w", errord.ErrFailedPrecondition)
+	}
+	if continuation != nil {
+		active = *continuation
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	directory, err := backend.openGenerationDirectory(identity, scope, parent, pending)
@@ -123,6 +227,11 @@ func (c *CgroupManager) CloseForGeneration(ctx context.Context, request Generati
 		if c.leaseClosures == nil {
 			c.leaseClosures = make(map[string]generationCgroupClosure)
 		}
+		c.leaseClosures[request.Path] = original
+	}
+	if appendContinuation {
+		original.Continuations = append(append([]GenerationCgroupCloseRequest(nil), original.Continuations...), *continuation)
+		original.Revision = uint64(1 + len(original.Continuations))
 		c.leaseClosures[request.Path] = original
 	}
 	// Also rewrite an in-memory intent after an uncertain StoreRaw. There are
@@ -138,10 +247,10 @@ func (c *CgroupManager) CloseForGeneration(ctx context.Context, request Generati
 		return nil, fmt.Errorf("completed original cgroup close is not physically absent: %w", errord.ErrFailedPrecondition)
 	}
 	if !absent {
-		if err := closeContextError(ctx, request.Deadline); err != nil {
+		if err := closeContextError(ctx, active.Deadline); err != nil {
 			return nil, err
 		}
-		bounded, cancel := context.WithDeadline(ctx, request.Deadline)
+		bounded, cancel := context.WithDeadline(ctx, active.Deadline)
 		defer cancel()
 		if err := directory.verify(); err != nil {
 			return nil, err
@@ -149,7 +258,7 @@ func (c *CgroupManager) CloseForGeneration(ctx context.Context, request Generati
 		if err := directory.drain(bounded); err != nil {
 			return nil, err
 		}
-		if err := closeContextError(bounded, request.Deadline); err != nil {
+		if err := closeContextError(bounded, active.Deadline); err != nil {
 			return nil, err
 		}
 		if err := directory.remove(); err != nil {
@@ -187,9 +296,12 @@ func (c *CgroupManager) restoreGenerationClosures(records map[string]generationC
 		request := record.Request
 		if request.Path != path || request.Generation != c.leaseOwners[path] ||
 			!validLeaseGeneration(request.OperationID) || request.ExpectedRevision != 0 || request.Deadline.IsZero() ||
-			record.Revision != 1 || record.Identity != c.leaseIdentities[path] || record.Scope != c.leaseScopes[path] ||
+			record.Revision != uint64(1+len(record.Continuations)) || record.Identity != c.leaseIdentities[path] || record.Scope != c.leaseScopes[path] ||
 			!record.Scope.valid() || record.Parent.Path != filepath.Dir(path) || record.Parent.Device == 0 || record.Parent.Inode == 0 {
 			return fmt.Errorf("original cgroup close journal is inconsistent: %w", errord.ErrFailedPrecondition)
+		}
+		if err := ValidateGenerationCloseContinuations(request, record.Continuations); err != nil {
+			return err
 		}
 	}
 	c.leaseClosures = records
