@@ -141,14 +141,14 @@ func (original *nativePhysicalSharedNamespace) retireEmptyFixtureRoot(t *testing
 }
 
 func TestRealNativeCreationBirthConditionalDeletionAndLivePeer(t *testing.T) {
-	runNativePhysicalFixture(t, false)
+	runNativePhysicalFixture(t, false, false)
 }
 
 func TestRealNativeWorkloadStartConditionalDeletionAndLivePeer(t *testing.T) {
-	runNativePhysicalFixture(t, true)
+	runNativePhysicalFixture(t, true, false)
 }
 
-func runNativePhysicalFixture(t *testing.T, startWorkloads bool) {
+func runNativePhysicalFixture(t *testing.T, startWorkloads, restoreWorkload bool) {
 	t.Helper()
 	if os.Getenv("SANDBOXD_RUN_NATIVE_BIRTH_INTEGRATION") != "1" {
 		t.Skip("requires an explicit isolated BareMetal1 native runtime test")
@@ -165,6 +165,9 @@ func runNativePhysicalFixture(t *testing.T, startWorkloads bool) {
 	if startWorkloads {
 		scope = "Two actual running workloads through native birth validation, private TAP and control RPC; no restore, daemon resource or node budget acceptance."
 	}
+	if restoreWorkload {
+		scope = "Actual independent Restore of a checkpoint into fresh native identity with memory/file verification and live peer; no full daemon resource or node budget acceptance."
+	}
 	save := func(name string, value any) {
 		data, err := json.MarshalIndent(value, "", "  ")
 		require.NoError(t, err)
@@ -177,12 +180,17 @@ func runNativePhysicalFixture(t *testing.T, startWorkloads bool) {
 	loader, err := runtimecore.NewBundleLoader("", bundles)
 	require.NoError(t, err)
 	client := NewClientWithOptions(binary, root, Options{FilestoreDir: filestore, OverlayTmpfsSize: "64M", IgnoreCgroups: true})
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	duration := 90 * time.Second
+	if restoreWorkload {
+		duration = 150 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), duration)
 	defer cancel()
 	identities := [][2]string{{"birth-original", "generation-original"}, {"birth-peer", "generation-peer"}}
 	states := make([]*containerState, 0, len(identities))
 	handles := make([][2]int, 0, len(identities))
 	starts := make([]StartArgs, 0, len(identities))
+	configs := make([]runtimecore.StartConfig, 0, len(identities))
 	var taps []*nativePhysicalTAP
 	var sharedNamespace *nativePhysicalSharedNamespace
 	for _, identity := range identities {
@@ -201,6 +209,9 @@ func runNativePhysicalFixture(t *testing.T, startWorkloads bool) {
 			config.Cwd = "/"
 			config.Command = []string{"/bin/sh", "-c", "cat /home/marker; printf 'workload-ready\\n'; exec /bin/sleep 120"}
 		}
+		if restoreWorkload && len(starts) == 0 {
+			config.Command = []string{"/bin/sh", "-c", nativeRestoreMemoryWorkload}
+		}
 		bundle, _, err := loader.GenerateOci(runtimecore.OciLoadOptions{
 			SandboxID: config.ID, Config: config, UseGVisorRootfsImageAnnotations: true,
 			RootfsOverlayDir: filestore, RootfsOverlaySize: "64M",
@@ -215,6 +226,7 @@ func runNativePhysicalFixture(t *testing.T, startWorkloads bool) {
 			taps = append(taps, tap)
 		}
 		starts = append(starts, args)
+		configs = append(configs, config)
 		err = client.Create(ctx, args)
 		if err != nil {
 			save(config.ID+"-create-failure.json", map[string]any{"id": config.ID, "generation": config.ResourceGeneration, "error": err.Error(), "scope": "Original native create failure; no successful retirement inferred."})
@@ -280,6 +292,10 @@ func runNativePhysicalFixture(t *testing.T, startWorkloads bool) {
 			save(args.ID+"-workload-running.json", map[string]any{"state": running, "own_export_read": true, "workload_readiness_confirmed": true, "tap": taps[index].evidence(t)})
 		}
 	}
+	var checkpoint *nativePhysicalCheckpoint
+	if restoreWorkload {
+		checkpoint = prepareNativePhysicalCheckpoint(t, ctx, client, starts[0], states[0], save)
+	}
 	require.Error(t, client.DeleteIfGeneration(ctx, identities[0][0], "generation-wrong"))
 	for _, state := range states {
 		verifyNativePhysicalBirth(t, state.Sandbox.ProcessBirth)
@@ -302,6 +318,10 @@ func runNativePhysicalFixture(t *testing.T, startWorkloads bool) {
 		}
 	}
 	save("original-deleted-peer-live.json", map[string]any{"original_id": identities[0][0], "original_exit_confirmed_by_independent_pidfds": true, "peer": states[1]})
+	if restoreWorkload {
+		restoredTap := restoreNativePhysicalCheckpoint(t, ctx, client, loader, checkpoint, configs[0], states[1], sharedNamespace, len(taps), save)
+		taps = append(taps, restoredTap)
+	}
 	require.NoError(t, client.DeleteIfGeneration(ctx, identities[1][0], identities[1][1]))
 	verifyNativePhysicalExit(t, handles[1][0])
 	verifyNativePhysicalExit(t, handles[1][1])
