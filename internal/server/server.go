@@ -132,6 +132,7 @@ type sandboxService struct {
 	deleteGroup                       singleflight.Group
 	resourceLocks                     physicalLocks
 	retirementMu                      sync.Mutex
+	retirementProgressJournal         *retirementProgressJournal
 	startOperationMu                  sync.Mutex
 	startJournal                      *startOperationJournal
 	aclMu                             sync.Mutex
@@ -383,6 +384,11 @@ func (h *sandboxService) deleteSandboxRuntime(ctx context.Context, sandboxID str
 		if receipt != nil && receipt.Complete {
 			return nil
 		}
+		if completed, err := h.resumeRetirementCompletion(sandboxID, expected); err != nil {
+			return err
+		} else if completed {
+			return nil
+		}
 	}
 
 	c, err := h.sandboxManager.Get(sandboxID)
@@ -423,6 +429,13 @@ func (h *sandboxService) deleteSandboxRuntime(ctx context.Context, sandboxID str
 	if err != nil {
 		return err
 	}
+	var progress *retirementProgress
+	if expected != "" {
+		progress, err = h.beginRetirementProgress(proto.Clone(c.Metadata).(*runtime.SandboxMetadata), resource)
+		if err != nil {
+			return err
+		}
+	}
 
 	// Preserve the last daemon-owned observations of a scheduler-managed
 	// generation across the physical delete: external polls can no longer see
@@ -451,6 +464,9 @@ func (h *sandboxService) deleteSandboxRuntime(ctx context.Context, sandboxID str
 		}
 	}
 
+	if err := h.verifyRetirementProgressSnapshot(progress); err != nil {
+		return err
+	}
 	err = handler.Delete(ctx, sandboxID)
 	if err != nil && !errors.Is(err, errord.ErrNotFound) {
 		metrics.RecordRuntimeCallResult("delete", "failed", c.Metadata.RuntimeHandler)
@@ -458,6 +474,20 @@ func (h *sandboxService) deleteSandboxRuntime(ctx context.Context, sandboxID str
 		return errord.ToGRPC(err)
 	}
 	metrics.RecordRuntimeCallResult("delete", "success", c.Metadata.RuntimeHandler)
+	if progress != nil {
+		states, err := handler.List(ctx)
+		if err != nil {
+			return fmt.Errorf("verify original runtime absence: %w", err)
+		}
+		for _, state := range states {
+			if state == nil || state.ID == sandboxID {
+				return fmt.Errorf("original runtime absence is unconfirmed")
+			}
+		}
+		if err := h.completeRetirementProgressStep(progress, "runtime"); err != nil {
+			return err
+		}
+	}
 	if h.resourceMod != nil {
 		h.resourceMod.ReleaseTransientMemory(
 			firecrackerCheckpointReservationOwner(sandboxID),
@@ -476,18 +506,19 @@ func (h *sandboxService) deleteSandboxRuntime(ctx context.Context, sandboxID str
 			return err
 		}
 	}
-	if h.networkMgr != nil {
-		h.networkMgr.cleanupDnatRules(sandboxID)
-		h.networkMgr.releaseDnatPorts(sandboxID)
+	if err := h.verifyRetirementProgressSnapshot(progress); err != nil {
+		return err
 	}
-	if h.xpuMgr != nil {
-		h.xpuMgr.Release(sandboxID)
-	}
-
 	if err := h.deactivateStartNetwork(resource); err != nil {
 		return err
 	}
+	if err := h.completeRetirementProgressStep(progress, "network_disconnected"); err != nil {
+		return err
+	}
 
+	if err := h.verifyRetirementProgressSnapshot(progress); err != nil {
+		return err
+	}
 	var fsReleaseErr error
 	if deleteGeneration != "" {
 		fsReleaseErr = h.fsMgr.ReleaseIfGeneration(sandboxID, deleteGeneration)
@@ -497,6 +528,12 @@ func (h *sandboxService) deleteSandboxRuntime(ctx context.Context, sandboxID str
 	if fsReleaseErr != nil {
 		return fsReleaseErr
 	}
+	if err := h.completeRetirementProgressStep(progress, "filesystem"); err != nil {
+		return err
+	}
+	if err := h.verifyRetirementProgressSnapshot(progress); err != nil {
+		return err
+	}
 	if h.aclMgr != nil {
 		h.aclMu.Lock()
 		aclErr := h.aclMgr.Remove(sandboxID)
@@ -505,8 +542,51 @@ func (h *sandboxService) deleteSandboxRuntime(ctx context.Context, sandboxID str
 			return fmt.Errorf("remove network ACL for sandbox %s: %w", sandboxID, aclErr)
 		}
 	}
+	if err := h.completeRetirementProgressStep(progress, "acl"); err != nil {
+		return err
+	}
+	if err := h.verifyRetirementProgressSnapshot(progress); err != nil {
+		return err
+	}
+	if h.xpuMgr != nil {
+		h.xpuMgr.Release(sandboxID)
+	}
+	if err := h.completeRetirementProgressStep(progress, "devices"); err != nil {
+		return err
+	}
+	if err := h.verifyRetirementProgressSnapshot(progress); err != nil {
+		return err
+	}
+	if progress != nil {
+		if err := h.cleanupPhysicalDnatFacts(c.Metadata, resource); err != nil {
+			return err
+		}
+	} else if h.networkMgr != nil {
+		h.networkMgr.cleanupDnatRules(sandboxID)
+	}
+	if h.networkMgr != nil {
+		h.networkMgr.releaseDnatPorts(sandboxID)
+	}
+	if err := h.completeRetirementProgressStep(progress, "dnat"); err != nil {
+		return err
+	}
+	if err := h.verifyRetirementProgressSnapshot(progress); err != nil {
+		return err
+	}
 	if err := h.releaseStartResources(resource); err != nil {
 		return err
+	}
+	if err := h.completeRetirementProgressStep(progress, "resources"); err != nil {
+		return err
+	}
+	if progress != nil {
+		if _, err := h.verifyRetirementProgressRoot(progress, false); err != nil {
+			return err
+		}
+		progress.RootPending = true
+		if err := h.writeRetirementProgress(progress); err != nil {
+			return err
+		}
 	}
 
 	h.sandboxManager.Delete(sandboxID)
@@ -519,6 +599,9 @@ func (h *sandboxService) deleteSandboxRuntime(ctx context.Context, sandboxID str
 			return fmt.Errorf("sandbox metadata retirement not confirmed: %v", err)
 		}
 		if err := syncRetirementDirectory(filepath.Dir(root)); err != nil {
+			return err
+		}
+		if err := h.completeRetirementProgressStep(progress, "root"); err != nil {
 			return err
 		}
 		if err := h.writeRetirement(sandboxID, expected, true); err != nil {
@@ -819,6 +902,7 @@ func (h *sandboxService) Shutdown() {
 	}
 	logrus.Info("sandbox service shutdown complete")
 	h.closeStartOperationJournal()
+	h.closeRetirementProgressJournal()
 }
 
 func (h *sandboxService) acquireCheckpointOperation() (func(), bool) {
