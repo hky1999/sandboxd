@@ -230,10 +230,18 @@ func runNativePartialLaunchFixtureWithOfflineCleanup(t *testing.T, bindCgroup, o
 		require.NoError(t, err)
 		require.Equal(t, original, current)
 		save("original-online-cgroup-refused.json", map[string]any{"original_state_bytes_unchanged": true, "identity": identity})
-		// 外部观察者已固定原进程，发送前再次核验该出生及独立句柄。
-		verifyNativePhysicalBirth(t, partial.GoferBirth)
-		require.NoError(t, unix.PidfdSendSignal(partialGofer, unix.SIGKILL, nil, 0))
+		// 原创建进程退出后，gofer 可能已经退出。保留的原句柄能确认它，
+		// 不要求原 PID 仍有 exe，也不查找同号的新进程取得退出证明。
+		polls := []unix.PollFd{{Fd: int32(partialGofer), Events: unix.POLLIN}}
+		count, err := unix.Poll(polls, 0)
+		require.NoError(t, err)
+		signalSent := count == 0
+		if signalSent {
+			verifyNativePhysicalBirth(t, partial.GoferBirth)
+			require.NoError(t, unix.PidfdSendSignal(partialGofer, unix.SIGKILL, nil, 0))
+		}
 		verifyNativePhysicalExit(t, partialGofer)
+		save("original-gofer-exit-before-group-removal.json", map[string]any{"original_pidfd_exit_confirmed": true, "additional_signal_sent": signalSent, "original_birth": partial.GoferBirth})
 		require.NoError(t, os.Remove(filepath.Join("/sys/fs/cgroup", groups[partialArgs.ID])))
 		for _, name := range []string{"cgroup.procs", "cgroup.events"} {
 			fd, err := unix.Openat(int(group.Fd()), name, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
