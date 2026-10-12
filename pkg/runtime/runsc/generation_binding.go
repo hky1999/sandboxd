@@ -106,15 +106,23 @@ func (c *Client) loadBoundedNativeState(id string) (*containerState, error) {
 	if err != nil {
 		return nil, err
 	}
+	state, err := decodeNativeState(data, id)
+	if err != nil {
+		return nil, err
+	}
+	if err := verifyRuntimeIdentityDirectory(c.RootDir, original); err != nil {
+		return nil, err
+	}
+	return state, nil
+}
+
+func decodeNativeState(data []byte, id string) (*containerState, error) {
 	var state containerState
 	if err := json.Unmarshal(data, &state); err != nil {
 		return nil, errors.New("native runtime control state is malformed")
 	}
 	if state.ID != id || state.Sandbox.ID != id || !knownRuntimeInventoryStatus(state.Status) || state.Sandbox.Pid < 0 || state.Sandbox.ControlSocketPath == "" {
 		return nil, errors.New("native runtime control state belongs to another or incomplete physical identity")
-	}
-	if err := verifyRuntimeIdentityDirectory(c.RootDir, original); err != nil {
-		return nil, err
 	}
 	return &state, nil
 }
@@ -124,16 +132,23 @@ func (c *Client) loadStartState(args StartArgs) (*containerState, error) {
 	if err != nil || args.ResourceGeneration == "" {
 		return state, err
 	}
-	if !runtimeInventoryID(args.ResourceGeneration) || state.Spec.Annotations[runtimeResourceGenerationAnnotation] != args.ResourceGeneration {
-		return nil, errors.New("native runtime resource generation is missing or differs")
-	}
-	if state.BundleDir != args.BundleDir || state.Status != "created" || state.Sandbox.Pid <= 0 {
-		return nil, errors.New("native runtime start source is not the original created bundle and active process reference")
-	}
-	if err := validateNativeRuntimeBirth(state, args.ID, args.ResourceGeneration); err != nil {
+	if err := validateStartState(state, args); err != nil {
 		return nil, err
 	}
 	return state, nil
+}
+
+func validateStartState(state *containerState, args StartArgs) error {
+	if !runtimeInventoryID(args.ResourceGeneration) || state.Spec.Annotations[runtimeResourceGenerationAnnotation] != args.ResourceGeneration {
+		return errors.New("native runtime resource generation is missing or differs")
+	}
+	if state.BundleDir != args.BundleDir || state.Status != "created" || state.Sandbox.Pid <= 0 {
+		return errors.New("native runtime start source is not the original created bundle and active process reference")
+	}
+	if err := validateNativeRuntimeBirth(state, args.ID, args.ResourceGeneration); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (c *Client) verifyManagedCreateInput(args StartArgs) error {

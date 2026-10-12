@@ -42,6 +42,9 @@ func TestCreateLinksAndRoutesArgsImplementsFilePayloader(t *testing.T) {
 
 func TestMarkStateRunningPreservesStateFields(t *testing.T) {
 	root := t.TempDir()
+	if err := os.Chmod(root, 0700); err != nil {
+		t.Fatal(err)
+	}
 	id := "sandbox-1"
 	client := NewClient("/usr/local/bin/runsc", root)
 	statePath := filepath.Join(root, id+"_sandbox:"+id+".state")

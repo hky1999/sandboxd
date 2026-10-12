@@ -17,7 +17,6 @@ package runsc
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -262,11 +261,15 @@ func readOutputSnippet(path string) string {
 // Start configures external networking with a cached TAP FD and starts the root
 // container through gVisor's existing control RPCs.
 func (c *Client) Start(ctx context.Context, args StartArgs) error {
+	if args.Network.Interface == nil {
+		return fmt.Errorf("network interface is nil for %s", args.ID)
+	}
 	logrus.Debugf("runsc start rpc flow started, id: %s", args.ID)
-	state, err := c.loadStartState(args)
+	transition, state, err := c.beginStartTransition(ctx, args)
 	if err != nil {
 		return fmt.Errorf("load runsc state for %s: %w", args.ID, err)
 	}
+	defer transition.close()
 	logrus.Debugf("runsc start loaded state, id: %s, control_socket: %s", args.ID, state.Sandbox.ControlSocketPath)
 
 	logrus.Debugf("runsc start opening TAP, id: %s, interface: %+v", args.ID, args.Network.Interface)
@@ -284,7 +287,7 @@ func (c *Client) Start(ctx context.Context, args StartArgs) error {
 	logrus.Debugf("runsc start built network args, id: %s", args.ID)
 
 	logrus.Debugf("runsc start connecting control socket, id: %s, socket: %s", args.ID, state.Sandbox.ControlSocketPath)
-	conn, err := c.connectControl(state.Sandbox.ControlSocketPath)
+	conn, err := transition.connect(ctx, state.Sandbox.ControlSocketPath)
 	if err != nil {
 		return fmt.Errorf("connect runsc control socket for %s: %w", args.ID, err)
 	}
@@ -294,10 +297,13 @@ func (c *Client) Start(ctx context.Context, args StartArgs) error {
 	if err := callContextWithTimeout(ctx, conn, contMgrSetNetworkArgs, networkArgs, nil, 30*time.Second); err != nil {
 		return fmt.Errorf("set network arguments for %s: %w", args.ID, err)
 	}
+	if err := transition.check(ctx); err != nil {
+		return err
+	}
 	if err := callContextWithTimeout(ctx, conn, contMgrRootContainerStart, &args.ID, nil, 30*time.Second); err != nil {
 		return fmt.Errorf("start root container %s: %w", args.ID, err)
 	}
-	if err := c.markStateRunning(args.ID); err != nil {
+	if err := transition.markRunning(ctx); err != nil {
 		return fmt.Errorf("mark runsc state running for %s: %w", args.ID, err)
 	}
 	return nil
@@ -454,10 +460,11 @@ func (c *Client) Restore(ctx context.Context, args StartArgs, imagePath string) 
 		return fmt.Errorf("network interface is nil for %s", args.ID)
 	}
 
-	state, err := c.loadStartState(args)
+	transition, state, err := c.beginStartTransition(ctx, args)
 	if err != nil {
 		return fmt.Errorf("load runsc state for %s: %w", args.ID, err)
 	}
+	defer transition.close()
 	tap, err := OpenTAP(*args.Network.Interface)
 	if err != nil {
 		return err
@@ -468,7 +475,7 @@ func (c *Client) Restore(ctx context.Context, args StartArgs, imagePath string) 
 	if err != nil {
 		return err
 	}
-	conn, err := c.connectControl(state.Sandbox.ControlSocketPath)
+	conn, err := transition.connect(ctx, state.Sandbox.ControlSocketPath)
 	if err != nil {
 		return fmt.Errorf("connect runsc control socket for %s: %w", args.ID, err)
 	}
@@ -493,10 +500,13 @@ func (c *Client) Restore(ctx context.Context, args StartArgs, imagePath string) 
 		opts.HaveDeviceFile = true
 		opts.payload.Files = append(opts.payload.Files, device)
 	}
+	if err := transition.check(ctx); err != nil {
+		return err
+	}
 	if err := callContext(ctx, conn, contMgrRestore, opts, nil); err != nil {
 		return fmt.Errorf("restore root container %s: %w", args.ID, err)
 	}
-	if err := c.markStateRunning(args.ID); err != nil {
+	if err := transition.markRunning(ctx); err != nil {
 		return fmt.Errorf("mark runsc state running for %s: %w", args.ID, err)
 	}
 	return nil
@@ -767,62 +777,10 @@ func (c *Client) stateFilePath(id string) string {
 }
 
 func (c *Client) markStateRunning(id string) error {
-	path := c.stateFilePath(id)
-	data, err := os.ReadFile(path)
+	transition, err := c.beginStateTransition(context.Background(), id, false)
 	if err != nil {
 		return err
 	}
-
-	var raw map[string]any
-	if err := json.Unmarshal(data, &raw); err != nil {
-		return fmt.Errorf("parse runsc state %s: %w", path, err)
-	}
-	raw["status"] = "running"
-
-	out, err := json.Marshal(raw)
-	if err != nil {
-		return fmt.Errorf("encode runsc state %s: %w", path, err)
-	}
-
-	info, err := os.Stat(path)
-	if err != nil {
-		return err
-	}
-	mode := info.Mode().Perm()
-	if mode == 0 {
-		mode = 0640
-	}
-
-	tmp, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp-")
-	if err != nil {
-		return err
-	}
-	tmpPath := tmp.Name()
-	cleanup := true
-	defer func() {
-		if cleanup {
-			_ = os.Remove(tmpPath)
-		}
-	}()
-
-	if _, err := tmp.Write(out); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Chmod(mode); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(tmpPath, path); err != nil {
-		return err
-	}
-	cleanup = false
-	return nil
+	defer transition.close()
+	return transition.markRunning(context.Background())
 }

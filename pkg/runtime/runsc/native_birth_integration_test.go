@@ -244,6 +244,7 @@ func runNativePhysicalFixture(t *testing.T, startWorkloads bool) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	if startWorkloads {
+		verifyNativeTransitionRefusals(t, ctx, client, starts[0], save)
 		for index, args := range starts {
 			if err := client.Start(ctx, args); err != nil {
 				save(args.ID+"-start-failure.json", map[string]any{"id": args.ID, "generation": args.ResourceGeneration, "error": err.Error()})
