@@ -72,6 +72,8 @@ type rpcClient struct {
 	verifySender      func() error
 	verifiedSenderPID int
 	verifiedFrames    uint64
+	// Private fault boundary for isolated tests. Normal transports leave it nil.
+	afterRequestSent func(string, int) error
 }
 
 func (c *rpcClient) requireSender(pid int, verify func() error) error {
@@ -173,6 +175,11 @@ func (c *rpcClient) Call(method string, arg any, result any) error {
 
 	if err := c.marshal(&clientCall{Method: method, Arg: arg}, files); err != nil {
 		return err
+	}
+	if c.afterRequestSent != nil {
+		if err := c.afterRequestSent(method, c.fd); err != nil {
+			return err
+		}
 	}
 
 	callR := callResult{Result: result}

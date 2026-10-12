@@ -141,14 +141,14 @@ func (original *nativePhysicalSharedNamespace) retireEmptyFixtureRoot(t *testing
 }
 
 func TestRealNativeCreationBirthConditionalDeletionAndLivePeer(t *testing.T) {
-	runNativePhysicalFixture(t, false, false)
+	runNativePhysicalFixture(t, false, false, false)
 }
 
 func TestRealNativeWorkloadStartConditionalDeletionAndLivePeer(t *testing.T) {
-	runNativePhysicalFixture(t, true, false)
+	runNativePhysicalFixture(t, true, false, false)
 }
 
-func runNativePhysicalFixture(t *testing.T, startWorkloads, restoreWorkload bool) {
+func runNativePhysicalFixture(t *testing.T, startWorkloads, restoreWorkload, restoreReplyLost bool) {
 	t.Helper()
 	if os.Getenv("SANDBOXD_RUN_NATIVE_BIRTH_INTEGRATION") != "1" {
 		t.Skip("requires an explicit isolated BareMetal1 native runtime test")
@@ -167,6 +167,9 @@ func runNativePhysicalFixture(t *testing.T, startWorkloads, restoreWorkload bool
 	}
 	if restoreWorkload {
 		scope = "Actual independent Restore of a checkpoint into fresh native identity with memory/file verification and live peer; no full daemon resource or node budget acceptance."
+	}
+	if restoreReplyLost {
+		scope = "Fully sent actual Restore request with kernel read-side shutdown losing the reply; created metadata retained while original memory/file prove physical execution, then original conditional retirement. No node budget acceptance."
 	}
 	save := func(name string, value any) {
 		data, err := json.MarshalIndent(value, "", "  ")
@@ -322,7 +325,7 @@ func runNativePhysicalFixture(t *testing.T, startWorkloads, restoreWorkload bool
 	}
 	save("original-deleted-peer-live.json", map[string]any{"original_id": identities[0][0], "original_exit_confirmed_by_independent_pidfds": true, "peer": states[1]})
 	if restoreWorkload {
-		restoredTap := restoreNativePhysicalCheckpoint(t, ctx, client, loader, checkpoint, configs[0], states[1], sharedNamespace, len(taps), save)
+		restoredTap := restoreNativePhysicalCheckpoint(t, ctx, client, loader, checkpoint, configs[0], states[1], sharedNamespace, len(taps), restoreReplyLost, save)
 		taps = append(taps, restoredTap)
 	}
 	require.NoError(t, client.DeleteIfGeneration(ctx, identities[1][0], identities[1][1]))

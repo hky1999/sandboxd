@@ -270,6 +270,17 @@ func (h *sandboxService) startSandboxRuntime(
 		}
 	}
 
+	phase := "start"
+	if startConfig.CheckpointDir != "" {
+		phase = "restore"
+	}
+	if err = h.verifyPreparedElasticLimits(startConfig, phase, metadata); err != nil {
+		return err
+	}
+	if err = h.initializeResourceRevision(startConfig, metadata); err != nil {
+		return err
+	}
+
 	if startConfig.CheckpointDir != "" {
 		if managed, ok := handler.(svc.ManagedCheckpointHandler); ok {
 			// The scheduler line restores through the managed interface so
@@ -304,17 +315,14 @@ func (h *sandboxService) startSandboxRuntime(
 			)
 		}
 	} else {
-		if err = h.verifyPreparedElasticLimits(startConfig, "start", metadata); err != nil {
-			return err
-		}
-		if err = h.initializeResourceRevision(startConfig, metadata); err != nil {
-			return err
-		}
 		err = handler.Start(ctx, startConfig)
 	}
 	if err != nil {
 		logrus.WithField(trace.ContextKeyTraceId, traceID).Errorf("runtime handler create sandbox failed: %v", err)
-		return errors.Join(errord.ToGRPC(err), svc.ErrRuntimeCreationUnconfirmed)
+		// Keep the runtime's classification (including incomplete Restore
+		// cleanup and cancellation) alongside the public gRPC status. The
+		// conversion alone has no original error chain for reconciliation.
+		return errors.Join(errord.ToGRPC(err), err, svc.ErrRuntimeCreationUnconfirmed)
 	}
 
 	logrus.WithField(trace.ContextKeyTraceId, traceID).Infof("StartSandbox %s success, traceID: %v, spanId: %v, cost: %v", startConfig.ID, traceID, spanID, time.Since(start).String())

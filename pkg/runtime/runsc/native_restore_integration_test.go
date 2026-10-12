@@ -5,6 +5,7 @@ package runsc
 
 import (
 	"context"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -15,6 +16,7 @@ import (
 
 	runtimecore "github.com/inclusionAI/sandboxd/pkg/runtime"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sys/unix"
 )
 
 // The token remains in the shell's memory. The file lives in the sandbox's
@@ -35,7 +37,11 @@ type nativePhysicalCheckpoint struct {
 }
 
 func TestRealNativeWorkloadRestoreBirthAndLivePeer(t *testing.T) {
-	runNativePhysicalFixture(t, true, true)
+	runNativePhysicalFixture(t, true, true, false)
+}
+
+func TestRealNativeWorkloadRestoreLostReplyAndLivePeer(t *testing.T) {
+	runNativePhysicalFixture(t, true, true, true)
 }
 
 func nativeCheckpointFiles(t *testing.T, directory string) map[string]string {
@@ -96,7 +102,7 @@ func prepareNativePhysicalCheckpoint(t *testing.T, ctx context.Context, client *
 	return &nativePhysicalCheckpoint{directory: directory, seed: seed, files: files, source: source}
 }
 
-func restoreNativePhysicalCheckpoint(t *testing.T, ctx context.Context, client *Client, loader *runtimecore.BundleLoader, checkpoint *nativePhysicalCheckpoint, config runtimecore.StartConfig, peer *containerState, shared *nativePhysicalSharedNamespace, tapIndex int, save func(string, any)) *nativePhysicalTAP {
+func restoreNativePhysicalCheckpoint(t *testing.T, ctx context.Context, client *Client, loader *runtimecore.BundleLoader, checkpoint *nativePhysicalCheckpoint, config runtimecore.StartConfig, peer *containerState, shared *nativePhysicalSharedNamespace, tapIndex int, loseReply bool, save func(string, any)) *nativePhysicalTAP {
 	t.Helper()
 	config.ID, config.ResourceGeneration = "birth-restored", "generation-restored"
 	bundle, _, err := loader.GenerateOci(runtimecore.OciLoadOptions{SandboxID: config.ID, Config: config,
@@ -133,9 +139,45 @@ func restoreNativePhysicalCheckpoint(t *testing.T, ctx context.Context, client *
 	}
 	image := filepath.Join(checkpoint.directory, checkpointImageName)
 	verifyNativePhysicalRestoreRefusals(t, ctx, client, args, image, created, peer, save)
-	if err := client.Restore(ctx, args, image); err != nil {
-		save("native-restore-failure.json", map[string]any{"sandbox_id": args.ID, "resource_generation": args.ResourceGeneration, "error": err.Error()})
+	before, err := os.ReadFile(client.stateFilePath(args.ID))
+	require.NoError(t, err)
+	dial := client.connectControl
+	shutdown := false
+	if loseReply {
+		client.connectControl = func(path string) (controlRPC, error) {
+			conn, err := dial(path)
+			if err != nil {
+				return nil, err
+			}
+			rpc, ok := conn.(*rpcClient)
+			require.True(t, ok)
+			rpc.afterRequestSent = func(method string, fd int) error {
+				if method != contMgrRestore {
+					return nil
+				}
+				// The whole real request and donated files were sent. Do not
+				// deserialize its reply or fabricate a successful completion.
+				err := unix.Shutdown(fd, unix.SHUT_RD)
+				shutdown = err == nil
+				return err
+			}
+			return rpc, nil
+		}
+		defer func() { client.connectControl = dial }()
+	}
+	restoreErr := client.Restore(ctx, args, image)
+	if loseReply {
+		require.True(t, shutdown)
+		require.ErrorIs(t, restoreErr, io.EOF)
+		after, err := os.ReadFile(client.stateFilePath(args.ID))
 		require.NoError(t, err)
+		require.Equal(t, before, after, "unknown Restore must not commit running metadata")
+		save("native-restore-lost-reply.json", map[string]any{"sandbox_id": args.ID, "resource_generation": args.ResourceGeneration,
+			"fully_sent_request_then_kernel_read_shutdown": true, "actual_restore_returned_eof": true,
+			"created_metadata_bytes_unchanged": true, "error": restoreErr.Error(), "scope": "Real socket reply loss; subsequent workload proof determines physical effect. No node budget or automatic retry."})
+	} else if restoreErr != nil {
+		save("native-restore-failure.json", map[string]any{"sandbox_id": args.ID, "resource_generation": args.ResourceGeneration, "error": restoreErr.Error()})
+		require.NoError(t, restoreErr)
 	}
 	// The source is gone. Only the restored shell can observe this fresh probe.
 	export := config.Mounts[0].GetHostPath()
@@ -155,7 +197,11 @@ func restoreNativePhysicalCheckpoint(t *testing.T, ctx context.Context, client *
 	}
 	running, err := client.loadState(args.ID)
 	require.NoError(t, err)
-	require.Equal(t, "running", running.Status)
+	if loseReply {
+		require.Equal(t, "created", running.Status, "physical effect must not be misreported as a confirmed reply")
+	} else {
+		require.Equal(t, "running", running.Status)
+	}
 	require.NoError(t, validateNativeRuntimeBirth(running, args.ID, args.ResourceGeneration))
 	require.Equal(t, created.Sandbox.ProcessBirth, running.Sandbox.ProcessBirth)
 	require.Equal(t, created.GoferBirth, running.GoferBirth)
@@ -166,7 +212,8 @@ func restoreNativePhysicalCheckpoint(t *testing.T, ctx context.Context, client *
 	require.Equal(t, checkpoint.files, nativeCheckpointFiles(t, checkpoint.directory))
 	save("native-restored-workload-running.json", map[string]any{"state": running, "in_memory_seed": checkpoint.seed,
 		"restored_memory_and_file_match": true, "stdout": string(output), "checkpoint_files_unchanged": true,
-		"source_already_retired": true, "new_producer_birth_preserved": true, "live_peer_preserved": true, "tap": tap.evidence(t)})
+		"source_already_retired": true, "new_producer_birth_preserved": true, "live_peer_preserved": true,
+		"restore_reply_lost": loseReply, "tap": tap.evidence(t)})
 	require.Error(t, client.DeleteIfGeneration(ctx, args.ID, checkpoint.source.ResourceGeneration))
 	verifyNativePhysicalBirth(t, running.Sandbox.ProcessBirth)
 	verifyNativePhysicalBirth(t, peer.Sandbox.ProcessBirth)
