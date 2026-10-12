@@ -4,6 +4,7 @@
 package cgroupmanager
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 
@@ -48,11 +49,37 @@ func (c *CgroupManager) AllocateForGeneration(generation string) (string, error)
 		c.leaseOwners = make(map[string]string)
 	}
 	c.leaseOwners[path] = generation
+	// 分配时捕获原物理身份，不能在回收时采用后来同名目录的身份。
+	identity, identityErr := c.ops.identity(path)
+	if identity.Path == "" {
+		identity.Path = path
+	}
+	if identityErr == nil && (identity.Path != path || identity.Device == 0 || identity.Inode == 0) {
+		identityErr = errors.New("allocated cgroup directory identity is incomplete or differs")
+	}
+	scope, scopeErr := c.generationScope()
+	if scopeErr == nil && !scope.valid() {
+		scopeErr = errors.New("allocated cgroup observation scope is incomplete")
+	}
+	identityErr = errors.Join(identityErr, scopeErr)
+	if identityErr == nil {
+		if c.leaseIdentities == nil {
+			c.leaseIdentities = make(map[string]CgroupIdentity)
+		}
+		c.leaseIdentities[path] = identity
+		if c.leaseScopes == nil {
+			c.leaseScopes = make(map[string]generationLeaseScope)
+		}
+		c.leaseScopes[path] = scope
+	}
 	c.storeDirty.Store(true)
 	if err := c.storeLeaseState("", ""); err != nil {
-		return path, err
+		return path, errors.Join(identityErr, err)
 	}
-	return path, nil
+	if identityErr == nil {
+		identityErr = c.verifyGenerationDirectory(path, generation)
+	}
+	return path, identityErr
 }
 
 // RecycleForGeneration replays a durable original release without touching a
@@ -72,6 +99,9 @@ func (c *CgroupManager) RecycleForGeneration(path, generation string) error {
 	if !c.usingID.Has(path) || c.leaseOwners[path] != generation {
 		return fmt.Errorf("cgroup lease generation is missing or changed: %w", errord.ErrFailedPrecondition)
 	}
+	if err := c.verifyGenerationDirectory(path, generation); err != nil {
+		return fmt.Errorf("original cgroup lease cannot authorize release: %w: %w", errord.ErrFailedPrecondition, err)
+	}
 	return c.recycle(path, generation)
 }
 
@@ -88,6 +118,8 @@ func (c *CgroupManager) completeLeaseRelease(path, generation string) error {
 		}
 		c.completedGenerations[generation] = path
 		delete(c.leaseOwners, path)
+		delete(c.leaseIdentities, path)
+		delete(c.leaseScopes, path)
 	}
 	c.usingID.Pop(path)
 	c.storeDirty.Store(true)
@@ -97,10 +129,25 @@ func (c *CgroupManager) completeLeaseRelease(path, generation string) error {
 // Called before workers start. Legacy active entries stay unowned; they are
 // never silently assigned a generation or accepted by the conditional API.
 func (c *CgroupManager) restoreGenerationLeases(state storedCgroupIDs) error {
-	if (state.SchemaVersion != 0 && state.SchemaVersion != 2) ||
-		(state.SchemaVersion == 0 && (len(state.LeaseOwners) != 0 || len(state.CompletedGenerations) != 0)) ||
+	if (state.SchemaVersion != 0 && state.SchemaVersion != 2 && state.SchemaVersion != 4) ||
+		(state.SchemaVersion == 0 && (len(state.LeaseOwners) != 0 || len(state.CompletedGenerations) != 0 || len(state.LeaseIdentities) != 0 || len(state.LeaseScopes) != 0)) ||
+		(state.SchemaVersion != 4 && (len(state.LeaseIdentities) != 0 || len(state.LeaseScopes) != 0)) ||
 		len(state.LeaseOwners)+len(state.CompletedGenerations) > generationLeaseLimit {
 		return fmt.Errorf("cgroup lease journal schema or capacity is invalid: %w", errord.ErrFailedPrecondition)
+	}
+	identities := make(map[string]CgroupIdentity, len(state.LeaseIdentities))
+	for path, identity := range state.LeaseIdentities {
+		if state.LeaseOwners[path] == "" || identity.Path != path || identity.Device == 0 || identity.Inode == 0 || !state.LeaseScopes[path].valid() {
+			return fmt.Errorf("cgroup lease original directory binding is invalid: %w", errord.ErrFailedPrecondition)
+		}
+		identities[path] = identity
+	}
+	scopes := make(map[string]generationLeaseScope, len(state.LeaseScopes))
+	for path, scope := range state.LeaseScopes {
+		if _, known := identities[path]; !known || !scope.valid() {
+			return fmt.Errorf("cgroup lease original scope binding invalid: %w", errord.ErrFailedPrecondition)
+		}
+		scopes[path] = scope
 	}
 	owners := make(map[string]string, len(state.LeaseOwners))
 	seen := make(map[string]bool, len(state.LeaseOwners))
@@ -120,6 +167,8 @@ func (c *CgroupManager) restoreGenerationLeases(state storedCgroupIDs) error {
 		completed[generation] = path
 	}
 	c.leaseOwners = owners
+	c.leaseIdentities = identities
+	c.leaseScopes = scopes
 	c.completedGenerations = completed
 	return nil
 }

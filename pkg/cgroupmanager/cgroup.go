@@ -53,6 +53,9 @@ type CgroupManager struct {
 	// leaseMu serializes ownership, durable handout/release and pool reuse.
 	leaseMu              sync.Mutex
 	leaseOwners          map[string]string
+	leaseIdentities      map[string]CgroupIdentity
+	leaseScopes          map[string]generationLeaseScope
+	readGenerationScope  func() (generationLeaseScope, error)
 	completedGenerations map[string]string
 
 	// cgroups contains every physical child owned by this manager, including
@@ -94,10 +97,12 @@ type createResult struct {
 }
 
 type storedCgroupIDs struct {
-	SchemaVersion        int               `json:"schema_version,omitempty"`
-	Items                []string          `json:"items"`
-	LeaseOwners          map[string]string `json:"lease_owners,omitempty"`
-	CompletedGenerations map[string]string `json:"completed_generations,omitempty"`
+	SchemaVersion        int                             `json:"schema_version,omitempty"`
+	Items                []string                        `json:"items"`
+	LeaseOwners          map[string]string               `json:"lease_owners,omitempty"`
+	LeaseIdentities      map[string]CgroupIdentity       `json:"lease_identities,omitempty"`
+	LeaseScopes          map[string]generationLeaseScope `json:"lease_scopes,omitempty"`
+	CompletedGenerations map[string]string               `json:"completed_generations,omitempty"`
 }
 
 // CacheSizeLimit exposes the configured cache target for metrics reporting.
@@ -228,7 +233,13 @@ func (c *CgroupManager) recycle(id, generation string) error {
 		return nil
 	}
 
-	if err := c.cleanForReuse(id); err != nil {
+	var cleanErr error
+	if generation != "" {
+		cleanErr = c.cleanGenerationForReuse(id, generation)
+	} else {
+		cleanErr = c.cleanForReuse(id)
+	}
+	if err := cleanErr; err != nil {
 		// MINIMAL TRANSACTION: an unverified drain/reset is NOT a release.
 		// Keep the lease (persisted), the registry entry and the capacity —
 		// no idle admission, no asynchronous GC. The same identity's retry
@@ -268,6 +279,20 @@ func (c *CgroupManager) cleanForReuse(name string) error {
 		return fmt.Errorf("reset OOM state: %w", err)
 	}
 	return nil
+}
+
+// 每一步之前和完成之后都复核原身份，变化时保留租约和占用。
+// 此校验不代替后续原目录句柄执行与持久关闭协议。
+func (c *CgroupManager) cleanGenerationForReuse(name, generation string) error {
+	for _, operation := range []func(string) error{c.ops.kill, c.ops.reset, c.oom.Reset} {
+		if err := c.verifyGenerationDirectory(name, generation); err != nil {
+			return err
+		}
+		if err := operation(name); err != nil {
+			return err
+		}
+	}
+	return c.verifyGenerationDirectory(name, generation)
 }
 
 // Allocate hands out an idle cgroup name (e.g. "/sandbox/<id>"). On a cache
@@ -595,7 +620,7 @@ func (c *CgroupManager) storeLeaseState(releasedPath, releasedGeneration string)
 			time.Since(start).Milliseconds(),
 		)
 	}()
-	state := storedCgroupIDs{SchemaVersion: 2, LeaseOwners: make(map[string]string), CompletedGenerations: make(map[string]string)}
+	state := storedCgroupIDs{SchemaVersion: 4, LeaseOwners: make(map[string]string), LeaseIdentities: make(map[string]CgroupIdentity), LeaseScopes: make(map[string]generationLeaseScope), CompletedGenerations: make(map[string]string)}
 	for _, id := range c.usingID.Keys() {
 		if id == releasedPath {
 			continue
@@ -603,6 +628,12 @@ func (c *CgroupManager) storeLeaseState(releasedPath, releasedGeneration string)
 		state.Items = append(state.Items, id)
 		if owner := c.leaseOwners[id]; owner != "" {
 			state.LeaseOwners[id] = owner
+			if identity, known := c.leaseIdentities[id]; known {
+				state.LeaseIdentities[id] = identity
+				if scope, known := c.leaseScopes[id]; known {
+					state.LeaseScopes[id] = scope
+				}
+			}
 		}
 	}
 	for generation, path := range c.completedGenerations {
