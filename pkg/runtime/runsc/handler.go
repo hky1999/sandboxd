@@ -40,6 +40,24 @@ var _ runtimecore.ManagedCheckpointHandler = &Handler{}
 var _ runtimecore.CheckpointRestoreCapabilitiesProvider = &Handler{}
 var _ runtimecore.SandboxDefaultsProvider = &Handler{}
 var _ runtimecore.RuntimeGenerationVerifier = &Handler{}
+var _ runtimecore.GenerationRuntimeDeleter = &Handler{}
+
+func (r *Handler) DeleteRuntimeIfGeneration(ctx context.Context, id, generation string) error {
+	client, ok := r.runsc.(interface {
+		DeleteIfGeneration(context.Context, string, string) error
+	})
+	if !ok {
+		return errors.New("runsc client cannot perform original generation-conditional deletion")
+	}
+	if err := client.DeleteIfGeneration(ctx, id, generation); err != nil {
+		return err
+	}
+	bundlePath, err := util.JoinWithinRoot(r.sandboxRoot, id)
+	if err != nil {
+		return fmt.Errorf("resolve original runsc sandbox bundle: %w", err)
+	}
+	return cleanupRunscNVProxyRootfs(bundlePath)
+}
 
 func (r *Handler) VerifyRuntimeGeneration(ctx context.Context, id, generation string) error {
 	verifier, ok := r.runsc.(interface {

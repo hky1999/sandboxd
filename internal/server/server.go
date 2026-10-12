@@ -506,7 +506,7 @@ func (h *sandboxService) deleteSandboxRuntime(ctx context.Context, sandboxID str
 			}
 		}
 	}
-	err = handler.Delete(ctx, sandboxID)
+	err = deleteOriginalRuntime(ctx, handler, sandboxID, c.Metadata.Labels[resourceGenerationLabel])
 	if err != nil && !errors.Is(err, errord.ErrNotFound) {
 		metrics.RecordRuntimeCallResult("delete", "failed", c.Metadata.RuntimeHandler)
 		logrus.WithField(trace.ContextKeyTraceId, traceID).Errorf("runtime handler force delete sandbox failed: %v", err)

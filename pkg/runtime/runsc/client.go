@@ -165,6 +165,9 @@ func (c *Client) Create(ctx context.Context, args StartArgs) error {
 	}
 	cmdArgs = append(cmdArgs, "--overlay2="+rootOverlay)
 	cmdArgs = append(cmdArgs, "create")
+	if args.ResourceGeneration != "" {
+		cmdArgs = append(cmdArgs, "--scheduler-resource-generation="+args.ResourceGeneration)
+	}
 	cmdArgs = append(cmdArgs, "--bundle", args.BundleDir)
 	if args.FsRestoreImagePath != "" {
 		cmdArgs = append(cmdArgs, "--fs-restore-image-path", args.FsRestoreImagePath)
@@ -734,16 +737,24 @@ func (c *Client) ListJSON(ctx context.Context) ([]byte, error) {
 }
 
 type containerState struct {
-	ID        string `json:"id"`
-	Status    string `json:"status"`
-	BundleDir string `json:"bundleDir"`
-	Spec      struct {
+	ResourceGeneration  string              `json:"resourceGeneration"`
+	ProcessBirthVersion int                 `json:"processBirthVersion"`
+	RuntimeDispatched   bool                `json:"runtimeDispatched"`
+	GoferRequired       bool                `json:"goferRequired"`
+	GoferPID            int                 `json:"goferPid"`
+	GoferBirth          *nativeRuntimeBirth `json:"goferBirth"`
+	ID                  string              `json:"id"`
+	Status              string              `json:"status"`
+	BundleDir           string              `json:"bundleDir"`
+	Spec                struct {
 		Annotations map[string]string `json:"annotations"`
 	} `json:"spec"`
 	Sandbox struct {
-		ID                string `json:"id"`
-		ControlSocketPath string `json:"controlSocketPath"`
-		Pid               int    `json:"pid"`
+		ResourceGeneration string              `json:"resourceGeneration"`
+		ProcessBirth       *nativeRuntimeBirth `json:"processBirth"`
+		ID                 string              `json:"id"`
+		ControlSocketPath  string              `json:"controlSocketPath"`
+		Pid                int                 `json:"pid"`
 	} `json:"sandbox"`
 }
 

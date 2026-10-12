@@ -130,6 +130,9 @@ func (c *Client) loadStartState(args StartArgs) (*containerState, error) {
 	if state.BundleDir != args.BundleDir || state.Status != "created" || state.Sandbox.Pid <= 0 {
 		return nil, errors.New("native runtime start source is not the original created bundle and active process reference")
 	}
+	if err := validateNativeRuntimeBirth(state, args.ID, args.ResourceGeneration); err != nil {
+		return nil, err
+	}
 	return state, nil
 }
 

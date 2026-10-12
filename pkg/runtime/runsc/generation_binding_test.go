@@ -23,11 +23,21 @@ func generationStateBytes(t *testing.T, id, generation, bundle string) []byte {
 	t.Helper()
 	data, err := json.Marshal(map[string]any{
 		"id": id, "status": "created", "bundleDir": bundle,
-		"spec":    map[string]any{"annotations": runtimeGenerationAnnotations(generation)},
-		"sandbox": map[string]any{"id": id, "pid": 987654321, "controlSocketPath": "/original/control.sock"},
+		"resourceGeneration": generation, "processBirthVersion": 1, "runtimeDispatched": true,
+		"spec": map[string]any{"annotations": runtimeGenerationAnnotations(generation)},
+		"sandbox": map[string]any{"id": id, "pid": 987654321, "controlSocketPath": "/original/control.sock",
+			"resourceGeneration": generation, "processBirth": controlledBirth(id, generation, "sentry", 987654321)},
 	})
 	require.NoError(t, err)
 	return data
+}
+
+func controlledBirth(id, generation, role string, pid int) map[string]any {
+	return map[string]any{"version": 1, "container_id": id, "resource_generation": generation, "role": role,
+		"pid": pid, "start_ticks": 10, "initializer_pid": 123,
+		"executable_sha256": strings.Repeat("a", 64), "arguments_sha256": strings.Repeat("b", 64),
+		"cgroup_sha256": strings.Repeat("c", 64),
+		"scope":         map[string]any{"boot_id": "controlled-unit-boot", "pid_namespace_device": 5, "pid_namespace_inode": 9}}
 }
 
 func managedGenerationClient(t *testing.T) (*Client, StartArgs, string) {

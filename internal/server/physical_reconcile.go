@@ -237,7 +237,7 @@ func (h *sandboxService) reconcilePhysicalIntentLocked(ctx context.Context, meta
 				}
 			}
 		}
-		if err := handler.Delete(cleanupCtx, metadata.ID); err != nil &&
+		if err := deleteOriginalRuntime(cleanupCtx, handler, metadata.ID, generation); err != nil &&
 			!errors.Is(err, errord.ErrNotFound) {
 			return fmt.Errorf("delete runtime for physical intent %s: %w", metadata.ID, err)
 		}

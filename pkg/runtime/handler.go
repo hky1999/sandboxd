@@ -111,6 +111,13 @@ type RuntimeGenerationVerifier interface {
 	VerifyRuntimeGeneration(context.Context, string, string) error
 }
 
+// GenerationRuntimeDeleter performs a native conditional deletion. A runtime
+// that provides the verifier must not silently fall back to unconditional
+// deletion when this mutation capability is absent.
+type GenerationRuntimeDeleter interface {
+	DeleteRuntimeIfGeneration(context.Context, string, string) error
+}
+
 // CheckpointOptions describes physical checkpoint behavior. It is kept at
 // the optional runtime capability boundary so runtimes without checkpoint
 // support do not need to understand it.
