@@ -98,6 +98,7 @@ func runNativePartialLaunchFixture(t *testing.T, bindCgroup bool) {
 			Mounts: []*runtimeapi.Mount{{Type: "bind", Source: &runtimeapi.Mount_HostPath{HostPath: export}, Target: "/home", Options: []string{"ro", "rbind"}}},
 		}
 		config.CgroupPath = groups[id]
+		config.DisableCgroup = !bindCgroup
 		bundle, _, err := loader.GenerateOci(runtimecore.OciLoadOptions{
 			SandboxID: id, Config: config, UseGVisorRootfsImageAnnotations: true,
 			CgroupPath:       config.CgroupPath,
