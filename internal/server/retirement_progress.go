@@ -182,14 +182,28 @@ func (h *sandboxService) readRetirementProgress(id, generation string) (*retirem
 
 func (h *sandboxService) readRetirementProgressLocked(j *retirementProgressJournal, id, generation string) (*retirementProgress, error) {
 	_, path := h.retirementProgressPath(id, generation)
-	fd, err := unix.Openat(int(j.directory.Fd()), filepath.Base(path), unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	record, err := h.readRetirementProgressFileLocked(j, filepath.Base(path))
+	if err != nil || record == nil {
+		return record, err
+	}
+	if err := validateRetirementProgress(record, id, generation); err != nil {
+		return nil, err
+	}
+	return record, nil
+}
+
+func (h *sandboxService) readRetirementProgressFileLocked(j *retirementProgressJournal, name string) (*retirementProgress, error) {
+	if filepath.Base(name) != name {
+		return nil, fmt.Errorf("retirement progress name is not a filename")
+	}
+	fd, err := unix.Openat(int(j.directory.Fd()), name, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
 	}
-	f := os.NewFile(uintptr(fd), path)
+	f := os.NewFile(uintptr(fd), name)
 	defer f.Close()
 	info, err := f.Stat()
 	if err != nil {
@@ -216,8 +230,12 @@ func (h *sandboxService) readRetirementProgressLocked(j *retirementProgressJourn
 	if err := rejectRetirementProgressDuplicates(json.NewDecoder(bytes.NewReader(data))); err != nil {
 		return nil, err
 	}
-	if err := validateRetirementProgress(&record, id, generation); err != nil {
+	if err := validateRetirementProgress(&record, record.SandboxID, record.Generation); err != nil {
 		return nil, err
+	}
+	_, expected := h.retirementProgressPath(record.SandboxID, record.Generation)
+	if filepath.Base(expected) != name {
+		return nil, fmt.Errorf("retirement progress filename differs from original identity")
 	}
 	return &record, nil
 }

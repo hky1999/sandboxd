@@ -443,7 +443,8 @@ func TestFSOwnershipMissingJournalStopsPhysicalReconciliation(t *testing.T) {
 	require.FileExists(t, filepath.Join(s.config.RootDir, "containers", metadata.ID, config.SandboxMetaFile))
 	receipt, err := s.readRetirement(metadata.ID, metadata.Labels[resourceGenerationLabel])
 	require.NoError(t, err)
-	require.Nil(t, receipt)
+	require.NotNil(t, receipt, "failed creation registers pending retirement before cleanup")
+	require.False(t, receipt.Complete, "missing filesystem ownership cannot prove completion")
 }
 
 func TestFSOwnershipMissingPublishedOwnerBlocksOrphanCleanup(t *testing.T) {

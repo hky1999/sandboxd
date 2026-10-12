@@ -249,9 +249,10 @@ func TestReconcilePhysicalIntentCleansOriginalAndPreservesNeighbor(t *testing.T)
 	require.Equal(t, []string{"original-cgroup"}, cgroups.recycles)
 	require.Empty(t, s.sandboxManager.ListPhysicalIntents())
 	require.NoDirExists(t, filepath.Join(s.config.RootDir, "containers", metadata.ID))
-	// This boundary only verifies cleanup ownership. A durable completed
-	// retirement proof for a failed creation is still a separate requirement.
+	// The original failed creation now uses the same durable completion proof
+	// as conditional retirement; neighbor resources remain untouched.
 	receipt, err := s.readRetirement(metadata.ID, metadata.Labels[resourceGenerationLabel])
 	require.NoError(t, err)
-	require.Nil(t, receipt)
+	require.NotNil(t, receipt)
+	require.True(t, receipt.Complete)
 }

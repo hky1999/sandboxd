@@ -81,6 +81,7 @@ func newTestService(t *testing.T, handlers map[string]svc.Handler) *sandboxServi
 	s.ready.Store(true)
 	s.recoveryReady.Store(true)
 	t.Cleanup(s.closeStartOperationJournal)
+	t.Cleanup(s.closeRetirementProgressJournal)
 	return s
 }
 

@@ -382,7 +382,19 @@ func (h *sandboxService) deleteSandboxRuntime(ctx context.Context, sandboxID str
 			return readErr
 		}
 		if receipt != nil && receipt.Complete {
-			return nil
+			return h.forgetCompletedFailedCreationIntent(sandboxID, expected)
+		}
+		// An unpublished INTENT is still a physical owner. Conditional cleanup
+		// may reconcile only this original generation under the already-held
+		// physical lock; legacy Delete must not silently adopt such an intent.
+		for _, metadata := range h.sandboxManager.ListPhysicalIntents() {
+			if metadata.ID != sandboxID {
+				continue
+			}
+			if metadata.Labels[resourceGenerationLabel] != expected {
+				return errord.ToGRPCf(errord.ErrFailedPrecondition, "physical intent resource generation changed before delete")
+			}
+			return h.reconcilePhysicalIntentLocked(ctx, metadata)
 		}
 		if completed, err := h.resumeRetirementCompletion(sandboxID, expected); err != nil {
 			return err

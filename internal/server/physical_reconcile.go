@@ -71,7 +71,30 @@ func (h *sandboxService) recoverPhysicalState(ctx context.Context) error {
 // after COMMITTED, so retaining an INTENT can never be required for replay.
 func (h *sandboxService) reconcilePhysicalIntents(ctx context.Context) error {
 	intents := h.sandboxManager.ListPhysicalIntents()
+	histories, err := h.failedCreationRetirementSnapshots(ctx)
+	if err != nil {
+		return err
+	}
+	type identity struct{ id, generation string }
+	seen := make(map[identity]*runtime.SandboxMetadata, len(intents))
+	for _, metadata := range intents {
+		seen[identity{metadata.ID, metadata.Labels[resourceGenerationLabel]}] = metadata
+	}
+	for _, metadata := range histories {
+		key := identity{metadata.ID, metadata.Labels[resourceGenerationLabel]}
+		if current := seen[key]; current != nil {
+			if !proto.Equal(current, metadata) {
+				return fmt.Errorf("original physical intent differs from retirement history")
+			}
+			continue
+		}
+		seen[key] = metadata
+		intents = append(intents, metadata)
+	}
 	sort.Slice(intents, func(i, j int) bool {
+		if intents[i].ID == intents[j].ID {
+			return intents[i].Labels[resourceGenerationLabel] < intents[j].Labels[resourceGenerationLabel]
+		}
 		return intents[i].ID < intents[j].ID
 	})
 	for _, metadata := range intents {
@@ -122,7 +145,63 @@ func (h *sandboxService) reconcilePhysicalIntent(
 		return err
 	}
 	defer unlock()
+	return h.reconcilePhysicalIntentLocked(cleanupCtx, metadata)
+}
+
+// Caller holds the same physical lock used by creation and conditional delete.
+// Both explicit reconciliation and DeleteIfGeneration enter this one path;
+// acquiring the non-reentrant lock again here would deadlock failed cleanup.
+func (h *sandboxService) reconcilePhysicalIntentLocked(ctx context.Context, metadata *runtime.SandboxMetadata) error {
+	if metadata == nil || !config.IsValidSandboxID(metadata.ID) || metadata.RuntimeHandler == "" ||
+		metadata.PhysicalPhase != runtime.SandboxPhysicalPhase_SANDBOX_PHYSICAL_PHASE_INTENT {
+		return fmt.Errorf("physical intent metadata is incomplete: %w", errord.ErrFailedPrecondition)
+	}
+	metadata = proto.Clone(metadata).(*runtime.SandboxMetadata)
+	cleanupCtx, cancel := context.WithTimeout(ctx, physicalIntentCleanupTimeout)
+	defer cancel()
+	generation := metadata.Labels[resourceGenerationLabel]
+	if generation != "" {
+		receipt, err := h.readRetirement(metadata.ID, generation)
+		if err != nil {
+			return err
+		}
+		if receipt != nil && receipt.Complete {
+			return h.forgetCompletedFailedCreationIntent(metadata.ID, generation)
+		}
+		if complete, err := h.resumeRetirementCompletion(metadata.ID, generation); err != nil {
+			return err
+		} else if complete {
+			return h.sandboxManager.ForgetRetiredPhysicalIntent(metadata)
+		}
+	}
 	if err := h.verifyOriginalPhysicalIntent(metadata); err != nil {
+		return err
+	}
+	resources, resourceErr := h.physicalResources(metadata)
+	if resourceErr != nil && (generation != "" || !errors.Is(resourceErr, os.ErrNotExist)) {
+		return fmt.Errorf("collect original resources for physical intent %s: %w", metadata.ID, resourceErr)
+	}
+	var progress *retirementProgress
+	if generation != "" {
+		prepared, err := h.beginRetirementProgress(metadata, resources)
+		if err != nil {
+			return err
+		}
+		progress = prepared
+		if err := h.writeRetirement(metadata.ID, generation, false); err != nil {
+			return err
+		}
+	}
+	verify := func() error {
+		if err := cleanupCtx.Err(); err != nil {
+			return err
+		}
+		if err := h.verifyOriginalPhysicalIntent(metadata); err != nil {
+			return err
+		}
+		return h.verifyRetirementProgressSnapshot(progress)
+	}
+	if err := verify(); err != nil {
 		return err
 	}
 	handler, ok := h.serviceHandler.Get(metadata.RuntimeHandler)
@@ -147,10 +226,7 @@ func (h *sandboxService) reconcilePhysicalIntent(
 	if runtimeCount > 1 {
 		return fmt.Errorf("physical intent runtime inventory is ambiguous: %w", errord.ErrUnavailable)
 	}
-	if err := h.verifyOriginalPhysicalIntent(metadata); err != nil {
-		return err
-	}
-	if err := cleanupCtx.Err(); err != nil {
+	if err := verify(); err != nil {
 		return err
 	}
 	if runtimeCount == 1 {
@@ -174,15 +250,11 @@ func (h *sandboxService) reconcilePhysicalIntent(
 			return fmt.Errorf("physical intent runtime absence is unconfirmed: %w", errord.ErrUnavailable)
 		}
 	}
-	if err := h.verifyOriginalPhysicalIntent(metadata); err != nil {
+	if err := verify(); err != nil {
 		return err
 	}
-	if err := cleanupCtx.Err(); err != nil {
+	if err := h.completeRetirementProgressStep(progress, "runtime"); err != nil {
 		return err
-	}
-	resources, resourceErr := h.physicalResources(metadata)
-	if resourceErr != nil && !errors.Is(resourceErr, os.ErrNotExist) {
-		return fmt.Errorf("collect resources for physical intent %s: %w", metadata.ID, resourceErr)
 	}
 	// Failed creation retains any installed policy together with its endpoint.
 	// Disconnect the original lease before removing ACLs, and never allow a
@@ -192,6 +264,31 @@ func (h *sandboxService) reconcilePhysicalIntent(
 			return fmt.Errorf("deactivate network for physical intent %s: %w", metadata.ID, err)
 		}
 	}
+	if err := h.completeRetirementProgressStep(progress, "network_disconnected"); err != nil {
+		return err
+	}
+	if err := verify(); err != nil {
+		return err
+	}
+	if h.fsMgr != nil {
+		var fsErr error
+		if generation != "" {
+			fsErr = h.fsMgr.ReleaseIfGeneration(metadata.ID, generation)
+		} else {
+			fsErr = h.fsMgr.Release(metadata.ID)
+		}
+		if fsErr != nil {
+			return fmt.Errorf("release filesystem for physical intent %s: %w", metadata.ID, fsErr)
+		}
+	} else if progress != nil {
+		return fmt.Errorf("original filesystem manager is unavailable")
+	}
+	if err := h.completeRetirementProgressStep(progress, "filesystem"); err != nil {
+		return err
+	}
+	if err := verify(); err != nil {
+		return err
+	}
 	if h.aclMgr != nil {
 		h.aclMu.Lock()
 		aclErr := h.aclMgr.Remove(metadata.ID)
@@ -200,19 +297,20 @@ func (h *sandboxService) reconcilePhysicalIntent(
 			return fmt.Errorf("remove network ACL for physical intent %s: %w", metadata.ID, aclErr)
 		}
 	}
+	if err := h.completeRetirementProgressStep(progress, "acl"); err != nil {
+		return err
+	}
+	if err := verify(); err != nil {
+		return err
+	}
 	if h.xpuMgr != nil {
 		h.xpuMgr.Release(metadata.ID)
 	}
-	if h.fsMgr != nil {
-		var fsErr error
-		if generation := metadata.Labels[resourceGenerationLabel]; generation != "" {
-			fsErr = h.fsMgr.ReleaseIfGeneration(metadata.ID, generation)
-		} else {
-			fsErr = h.fsMgr.Release(metadata.ID)
-		}
-		if fsErr != nil {
-			return fmt.Errorf("release filesystem for physical intent %s: %w", metadata.ID, fsErr)
-		}
+	if err := h.completeRetirementProgressStep(progress, "devices"); err != nil {
+		return err
+	}
+	if err := verify(); err != nil {
+		return err
 	}
 
 	if cleanupErr := h.cleanupPhysicalDnatFacts(metadata, resources); cleanupErr != nil {
@@ -221,10 +319,22 @@ func (h *sandboxService) reconcilePhysicalIntent(
 	if h.networkMgr != nil {
 		h.networkMgr.releaseDnatPorts(metadata.ID)
 	}
+	if err := h.completeRetirementProgressStep(progress, "dnat"); err != nil {
+		return err
+	}
+	if err := verify(); err != nil {
+		return err
+	}
 	if resourceErr == nil {
 		if err := h.releaseStartResources(resources); err != nil {
 			return fmt.Errorf("release resources for physical intent %s: %w", metadata.ID, err)
 		}
+	}
+	if err := h.completeRetirementProgressStep(progress, "resources"); err != nil {
+		return err
+	}
+	if progress != nil {
+		return h.finishFailedCreationRetirement(cleanupCtx, metadata, progress)
 	}
 
 	h.sandboxManager.CleanSandboxRoot(metadata.ID)
@@ -244,7 +354,7 @@ func (h *sandboxService) verifyOriginalPhysicalIntent(metadata *runtime.SandboxM
 	if err != nil || !info.IsDir() {
 		return fmt.Errorf("physical intent directory is unavailable: %w", errord.ErrFailedPrecondition)
 	}
-	f, err := os.OpenFile(filepath.Join(root, config.SandboxMetaFile), os.O_RDONLY|unix.O_NOFOLLOW, 0)
+	f, err := os.OpenFile(filepath.Join(root, config.SandboxMetaFile), os.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
 	if err != nil {
 		return fmt.Errorf("read original physical intent: %w", err)
 	}
@@ -308,7 +418,8 @@ func (h *sandboxService) cleanupPhysicalDnatFacts(
 	}
 	encoded, ok := resources.Resources[config.ResourceNameInterface]
 	if !ok {
-		return nil
+		return fmt.Errorf("physical intent %s DNAT cleanup lacks its original network resource: %w",
+			metadata.ID, errord.ErrFailedPrecondition)
 	}
 	network, err := networkmanager.NewNetResource(encoded)
 	if err != nil {

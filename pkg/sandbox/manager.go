@@ -920,6 +920,36 @@ func (m *Manager) CleanSandboxRoot(id string) {
 	}
 }
 
+// ForgetRetiredPhysicalIntent releases only the still-cached original intent.
+// The caller holds the physical resource lock and has durably published the
+// matching completion receipt. Removing files is a separate checked operation;
+// neither a missing cache nor another incarnation authorizes releasing its ID.
+func (m *Manager) ForgetRetiredPhysicalIntent(metadata *runtime.SandboxMetadata) error {
+	if metadata == nil || metadata.PhysicalPhase != runtime.SandboxPhysicalPhase_SANDBOX_PHYSICAL_PHASE_INTENT {
+		return fmt.Errorf("retired physical intent metadata is required")
+	}
+	if m.physicalIntents == nil {
+		return nil
+	}
+	original, ok := m.physicalIntents.Get(metadata.ID)
+	if !ok || original == nil || !proto.Equal(original.Metadata, metadata) {
+		return nil
+	}
+	if m.sandboxes.Has(metadata.ID) {
+		return fmt.Errorf("retired physical intent is now published")
+	}
+	root, err := util.JoinWithinRoot(m.root, metadata.ID)
+	if err != nil {
+		return err
+	}
+	if _, err := os.Lstat(root); !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("retired physical intent root is not confirmed absent: %v", err)
+	}
+	m.physicalIntents.Remove(metadata.ID)
+	m.ReleaseID(metadata.ID)
+	return nil
+}
+
 func (m *Manager) Delete(id string) {
 	if sb, ok := m.sandboxes.Get(id); ok {
 		m.notifySandboxStopped(sb)
