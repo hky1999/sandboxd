@@ -39,6 +39,17 @@ var _ runtimecore.Handler = &Handler{}
 var _ runtimecore.ManagedCheckpointHandler = &Handler{}
 var _ runtimecore.CheckpointRestoreCapabilitiesProvider = &Handler{}
 var _ runtimecore.SandboxDefaultsProvider = &Handler{}
+var _ runtimecore.RuntimeGenerationVerifier = &Handler{}
+
+func (r *Handler) VerifyRuntimeGeneration(ctx context.Context, id, generation string) error {
+	verifier, ok := r.runsc.(interface {
+		VerifyRuntimeGeneration(context.Context, string, string) error
+	})
+	if !ok {
+		return errors.New("runsc client cannot verify the original resource generation")
+	}
+	return verifier.VerifyRuntimeGeneration(ctx, id, generation)
+}
 
 const (
 	ImageName                  = "rootfs.img"
@@ -153,6 +164,7 @@ func (r *Handler) Start(ctx context.Context, config runtimecore.StartConfig) err
 		UseGVisorRootfsImageAnnotations: true,
 		RootfsOverlayDir:                r.filestoreDir,
 		RootfsOverlaySize:               rootOverlaySize,
+		ManagedAnnotations:              runtimeGenerationAnnotations(config.ResourceGeneration),
 	})
 	if err != nil {
 		return fmt.Errorf("generate OCI bundle: %w", err)
@@ -177,11 +189,12 @@ func (r *Handler) Start(ctx context.Context, config runtimecore.StartConfig) err
 	}
 
 	startArgs := StartArgs{
-		ID:          config.ID,
-		BundleDir:   bundlePath,
-		UserStdout:  config.Stdout,
-		UserStderr:  config.Stderr,
-		RootOverlay: rootOverlay,
+		ID:                 config.ID,
+		ResourceGeneration: config.ResourceGeneration,
+		BundleDir:          bundlePath,
+		UserStdout:         config.Stdout,
+		UserStderr:         config.Stderr,
+		RootOverlay:        rootOverlay,
 		Network: NetworkConfig{
 			Interface:   config.Network.Interface,
 			LinkAddress: config.Network.GuestHardwareAddr(),
@@ -192,12 +205,18 @@ func (r *Handler) Start(ctx context.Context, config runtimecore.StartConfig) err
 	}
 	start := time.Now()
 	if err := r.runsc.Create(ctx, startArgs); err != nil {
+		if config.ResourceGeneration != "" {
+			return errors.Join(err, runtimecore.ErrRuntimeCreationUnconfirmed)
+		}
 		if cleanupNVProxyRootfs != nil {
 			return errors.Join(err, cleanupNVProxyRootfs())
 		}
 		return err
 	}
 	if err := r.runsc.Start(ctx, startArgs); err != nil {
+		if config.ResourceGeneration != "" {
+			return errors.Join(err, runtimecore.ErrRuntimeCreationUnconfirmed)
+		}
 		r.cleanupOnFailure(ctx, traceID.String(), config.ID, "runsc start failed")
 		if cleanupNVProxyRootfs != nil {
 			return errors.Join(err, cleanupNVProxyRootfs())
@@ -275,6 +294,7 @@ func (r *Handler) Restore(
 		UseGVisorRootfsImageAnnotations: true,
 		RootfsOverlayDir:                r.filestoreDir,
 		RootfsOverlaySize:               rootOverlaySize,
+		ManagedAnnotations:              runtimeGenerationAnnotations(config.ResourceGeneration),
 	})
 	if err != nil {
 		return fmt.Errorf("generate OCI bundle: %w", err)
@@ -312,6 +332,7 @@ func (r *Handler) Restore(
 
 	startArgs := StartArgs{
 		ID:                 config.ID,
+		ResourceGeneration: config.ResourceGeneration,
 		BundleDir:          bundlePath,
 		UserStdout:         config.Stdout,
 		UserStderr:         config.Stderr,
@@ -327,9 +348,15 @@ func (r *Handler) Restore(
 	}
 	start := time.Now()
 	if err := r.runsc.Create(ctx, startArgs); err != nil {
+		if config.ResourceGeneration != "" {
+			return errors.Join(err, runtimecore.ErrRestoreCleanupIncomplete)
+		}
 		return errors.Join(err, cleanupFailure())
 	}
 	if err := r.runsc.Restore(ctx, startArgs, imagePath); err != nil {
+		if config.ResourceGeneration != "" {
+			return errors.Join(err, runtimecore.ErrRestoreCleanupIncomplete)
+		}
 		return errors.Join(err, cleanupFailure())
 	}
 	logrus.WithField(trace.ContextKeyTraceId, traceID).Debugf(

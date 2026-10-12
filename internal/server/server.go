@@ -229,6 +229,16 @@ func (h *sandboxService) startSandboxRuntime(
 	startConfig svc.StartConfig,
 	metadata *runtime.SandboxMetadata,
 ) (err error) {
+	startConfig.ResourceGeneration = ""
+	if metadata != nil {
+		if metadata.ID != startConfig.ID {
+			if startConfig.Annotations[elasticResourcesLabel] != "" {
+				return fmt.Errorf("elastic start birth evidence requires prepared INTENT metadata for this generation: runtime metadata belongs to another sandbox")
+			}
+			return fmt.Errorf("runtime start metadata belongs to another sandbox")
+		}
+		startConfig.ResourceGeneration = metadata.Labels[resourceGenerationLabel]
+	}
 	traceID, spanID := trace.GetContextID(ctx)
 	start := time.Now()
 	defer func() {
@@ -318,6 +328,16 @@ func (h *sandboxService) restoreSandboxRuntime(
 	checkpointImage string,
 	metadata *runtime.SandboxMetadata,
 ) (err error) {
+	startConfig.ResourceGeneration = ""
+	if metadata != nil {
+		if metadata.ID != startConfig.ID {
+			if startConfig.Annotations[elasticResourcesLabel] != "" {
+				return fmt.Errorf("elastic restore birth evidence requires prepared INTENT metadata for this generation: runtime metadata belongs to another sandbox")
+			}
+			return fmt.Errorf("runtime restore metadata belongs to another sandbox")
+		}
+		startConfig.ResourceGeneration = metadata.Labels[resourceGenerationLabel]
+	}
 	if err = h.checkRuntime(runtimeName); err != nil {
 		return fmt.Errorf("runtime %q is not available: %w", runtimeName, err)
 	}
@@ -478,6 +498,13 @@ func (h *sandboxService) deleteSandboxRuntime(ctx context.Context, sandboxID str
 
 	if err := h.verifyRetirementProgressSnapshot(progress); err != nil {
 		return err
+	}
+	if generation := c.Metadata.Labels[resourceGenerationLabel]; generation != "" {
+		if verifier, ok := handler.(svc.RuntimeGenerationVerifier); ok {
+			if err := verifier.VerifyRuntimeGeneration(ctx, sandboxID, generation); err != nil {
+				return fmt.Errorf("verify original runtime resource generation before delete: %w", err)
+			}
+		}
 	}
 	err = handler.Delete(ctx, sandboxID)
 	if err != nil && !errors.Is(err, errord.ErrNotFound) {

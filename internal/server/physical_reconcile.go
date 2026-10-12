@@ -230,6 +230,13 @@ func (h *sandboxService) reconcilePhysicalIntentLocked(ctx context.Context, meta
 		return err
 	}
 	if runtimeCount == 1 {
+		if generation != "" {
+			if verifier, ok := handler.(svc.RuntimeGenerationVerifier); ok {
+				if err := verifier.VerifyRuntimeGeneration(cleanupCtx, metadata.ID, generation); err != nil {
+					return fmt.Errorf("verify original intent runtime generation: %w", err)
+				}
+			}
+		}
 		if err := handler.Delete(cleanupCtx, metadata.ID); err != nil &&
 			!errors.Is(err, errord.ErrNotFound) {
 			return fmt.Errorf("delete runtime for physical intent %s: %w", metadata.ID, err)

@@ -20,7 +20,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -69,12 +68,13 @@ type Options struct {
 }
 
 type StartArgs struct {
-	ID          string
-	BundleDir   string
-	UserStdout  string
-	UserStderr  string
-	RootOverlay string
-	Network     NetworkConfig
+	ID                 string
+	ResourceGeneration string
+	BundleDir          string
+	UserStdout         string
+	UserStderr         string
+	RootOverlay        string
+	Network            NetworkConfig
 	// FsRestoreImagePath restores the gVisor writable-layer filestore from a
 	// filesystem checkpoint (runsc fscheckpoint artifact directory). Empty
 	// keeps the historical behavior of a fresh writable layer.
@@ -103,6 +103,9 @@ func NewClientWithOptions(binary, rootDir string, options Options) *Client {
 // regular files for stdio so the boot/gofer processes do not inherit pipes held
 // by exec.Cmd, which can otherwise make create appear to hang.
 func (c *Client) Create(ctx context.Context, args StartArgs) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if args.ID == "" {
 		return fmt.Errorf("container id is empty")
 	}
@@ -112,8 +115,23 @@ func (c *Client) Create(ctx context.Context, args StartArgs) error {
 	if c.Options.FilestoreDir == "" {
 		return fmt.Errorf("filestore directory is empty for %s", args.ID)
 	}
+	if args.ResourceGeneration != "" {
+		if err := c.verifyManagedCreateInput(args); err != nil {
+			return err
+		}
+	}
 	if err := os.MkdirAll(c.RootDir, 0711); err != nil {
 		return fmt.Errorf("create runsc root %s: %w", c.RootDir, err)
+	}
+	if args.ResourceGeneration != "" {
+		root, original, err := openRuntimeIdentityDirectory(c.RootDir)
+		if err != nil {
+			return fmt.Errorf("open managed runtime root before create: %w", err)
+		}
+		defer root.Close()
+		if err := verifyRuntimeIdentityDirectory(c.RootDir, original); err != nil {
+			return err
+		}
 	}
 
 	stdin, err := os.Open(os.DevNull)
@@ -169,6 +187,11 @@ func (c *Client) Create(ctx context.Context, args StartArgs) error {
 		return fmt.Errorf("runsc create %s failed: %w", args.ID, err)
 	}
 	logrus.Debugf("runsc create command finished, id: %s, cost: %v", args.ID, time.Since(start))
+	if args.ResourceGeneration != "" {
+		if _, err := c.loadStartState(args); err != nil {
+			return fmt.Errorf("created runsc state has unconfirmed ownership: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -237,7 +260,7 @@ func readOutputSnippet(path string) string {
 // container through gVisor's existing control RPCs.
 func (c *Client) Start(ctx context.Context, args StartArgs) error {
 	logrus.Debugf("runsc start rpc flow started, id: %s", args.ID)
-	state, err := c.loadState(args.ID)
+	state, err := c.loadStartState(args)
 	if err != nil {
 		return fmt.Errorf("load runsc state for %s: %w", args.ID, err)
 	}
@@ -428,7 +451,7 @@ func (c *Client) Restore(ctx context.Context, args StartArgs, imagePath string) 
 		return fmt.Errorf("network interface is nil for %s", args.ID)
 	}
 
-	state, err := c.loadState(args.ID)
+	state, err := c.loadStartState(args)
 	if err != nil {
 		return fmt.Errorf("load runsc state for %s: %w", args.ID, err)
 	}
@@ -711,8 +734,12 @@ func (c *Client) ListJSON(ctx context.Context) ([]byte, error) {
 }
 
 type containerState struct {
-	ID      string `json:"id"`
-	Status  string `json:"status"`
+	ID        string `json:"id"`
+	Status    string `json:"status"`
+	BundleDir string `json:"bundleDir"`
+	Spec      struct {
+		Annotations map[string]string `json:"annotations"`
+	} `json:"spec"`
 	Sandbox struct {
 		ID                string `json:"id"`
 		ControlSocketPath string `json:"controlSocketPath"`
@@ -721,28 +748,7 @@ type containerState struct {
 }
 
 func (c *Client) loadState(id string) (*containerState, error) {
-	path := c.stateFilePath(id)
-	f, err := os.Open(path)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil, os.ErrNotExist
-		}
-		return nil, err
-	}
-	defer f.Close()
-
-	data, err := io.ReadAll(f)
-	if err != nil {
-		return nil, err
-	}
-	var state containerState
-	if err := json.Unmarshal(data, &state); err != nil {
-		return nil, fmt.Errorf("parse runsc state %s: %w", path, err)
-	}
-	if state.Sandbox.ControlSocketPath == "" {
-		return nil, fmt.Errorf("state file %s does not contain sandbox.controlSocketPath", path)
-	}
-	return &state, nil
+	return c.loadBoundedNativeState(id)
 }
 
 func (c *Client) stateFilePath(id string) string {

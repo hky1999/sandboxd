@@ -104,6 +104,13 @@ type PreparedStateCleaner interface {
 	CleanupPreparedState(context.Context, string) error
 }
 
+// RuntimeGenerationVerifier rejects a native execution whose recorded
+// generation differs from the original daemon metadata. This read-only guard
+// is not an atomic conditional mutation or a process-birth/exit certificate.
+type RuntimeGenerationVerifier interface {
+	VerifyRuntimeGeneration(context.Context, string, string) error
+}
+
 // CheckpointOptions describes physical checkpoint behavior. It is kept at
 // the optional runtime capability boundary so runtimes without checkpoint
 // support do not need to understand it.
@@ -116,7 +123,10 @@ type CheckpointOptions struct {
 }
 
 type StartConfig struct {
-	ID                      string
+	ID string
+	// ResourceGeneration comes from the daemon's durable physical metadata,
+	// never from request or checkpoint annotations. Empty denotes legacy input.
+	ResourceGeneration      string
 	Hostname                string
 	Command                 []string
 	Mounts                  []*runtime.Mount
