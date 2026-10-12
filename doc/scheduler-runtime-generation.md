@@ -17,3 +17,5 @@ RuntimeGenerationVerifier 是只读拒绝条件。正常删除和失败创建对
 匹配注解和 PID 数字不能单独证明原进程退出；只读核验不能写成完整退役证书，原生状态缺失不能写成原执行从未存在。原生协议与条件删除的创建进程物理用例不等于完整工作负载生命周期、恢复或预算验收。第一条事实尚未保存的窗口、部分启动、宿主路径与锁的替换、运行时辅助进程、实际 Start 与独立 Restore、完整物理清理及预算仍须分别验收。
 
 永久物理用例 `TestRealNativeCreationBirthConditionalDeletionAndLivePeer` 默认不执行，只有 `SANDBOXD_RUN_NATIVE_BIRTH_INTEGRATION=1` 时启用。必须指定绝对路径 `NATIVE_BIRTH_RUNSC_BINARY`、`NATIVE_BIRTH_ROOTFS`、`NATIVE_BIRTH_EVIDENCE` 和对应 `NATIVE_BIRTH_RUNSC_SHA256`、`NATIVE_BIRTH_ROOTFS_SHA256`；显式启用但前置条件缺失时失败。使用完整配套运行时包，在 BareMetal1 独立容器中创建两个运行时，要求外部观察者先核验四个原进程，随后拒绝错误代际并确认原进程退出及邻居存活。测试另外持有四个原进程 pidfd，独立确认退出，不能仅以状态文件消失判断成功。这个用例不启动应用工作负载、不恢复检查点，也不修改平台节点预算。
+
+gVisor 默认把 gofer 的空网络 namespace 固定在共享运行时根目录的 `null-netns` 挂载点，供后续 gofer 复用。它属于共享根目录生命周期，删除某一个容器不能卸载活动邻居使用的共享缓存。物理用例保存本测试私有根目录及原网络 namespace 的设备号、inode 和句柄，核验两份 gofer 使用相同缓存，并在目标退役后确认邻居与缓存仍保持原身份。只有四个独立 pidfd 确认退出、原生库存为空之后，才通过原目录句柄普通卸载本测试的原缓存，不使用强制或延迟卸载；随后临时目录清理仍须成功。该测试根目录清理不代表平台 daemon 共享缓存、部分启动或其他来源的清理已经验收。

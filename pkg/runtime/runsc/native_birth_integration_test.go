@@ -69,6 +69,77 @@ func verifyNativePhysicalExit(t *testing.T, fd int) {
 	require.NotZero(t, polls[0].Revents&(unix.POLLIN|unix.POLLHUP))
 }
 
+// The null network namespace belongs to this private runtime root and is
+// shared by its gofers. It must survive either container's retirement.
+type nativePhysicalSharedNamespace struct {
+	directory     *os.File
+	directoryStat unix.Stat_t
+	namespace     *os.File
+	namespaceStat unix.Stat_t
+	root          string
+}
+
+func nativePhysicalNullNamespace(t *testing.T, root string) *nativePhysicalSharedNamespace {
+	t.Helper()
+	directory, original, err := openRuntimeIdentityDirectory(root)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = directory.Close() })
+	fd, err := unix.Openat(int(directory.Fd()), "null-netns", unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	require.NoError(t, err)
+	namespace := os.NewFile(uintptr(fd), "original private shared null namespace")
+	t.Cleanup(func() { _ = namespace.Close() })
+	var source unix.Stat_t
+	require.NoError(t, unix.Fstat(fd, &source))
+	var filesystem unix.Statfs_t
+	require.NoError(t, unix.Fstatfs(fd, &filesystem))
+	require.EqualValues(t, unix.NSFS_MAGIC, filesystem.Type)
+	kind, err := unix.IoctlRetInt(fd, unix.NS_GET_NSTYPE)
+	require.NoError(t, err)
+	require.Equal(t, unix.CLONE_NEWNET, kind)
+	return &nativePhysicalSharedNamespace{directory: directory, directoryStat: original, namespace: namespace, namespaceStat: source, root: root}
+}
+
+func (original *nativePhysicalSharedNamespace) verify(t *testing.T, gofer *nativeRuntimeBirth) {
+	t.Helper()
+	var directory, namespace unix.Stat_t
+	require.NoError(t, unix.Lstat(original.root, &directory))
+	require.Equal(t, original.directoryStat.Dev, directory.Dev)
+	require.Equal(t, original.directoryStat.Ino, directory.Ino)
+	require.Equal(t, original.directoryStat.Mode, directory.Mode)
+	require.Equal(t, original.directoryStat.Uid, directory.Uid)
+	require.NoError(t, unix.Fstatat(int(original.directory.Fd()), "null-netns", &namespace, unix.AT_SYMLINK_NOFOLLOW))
+	require.Equal(t, original.namespaceStat.Dev, namespace.Dev)
+	require.Equal(t, original.namespaceStat.Ino, namespace.Ino)
+	require.Equal(t, original.namespaceStat.Mode, namespace.Mode)
+	if gofer != nil {
+		var current unix.Stat_t
+		require.NoError(t, unix.Stat(filepath.Join("/proc", strconv.Itoa(gofer.PID), "ns/net"), &current))
+		require.Equal(t, namespace.Dev, current.Dev)
+		require.Equal(t, namespace.Ino, current.Ino)
+	}
+}
+
+func (original *nativePhysicalSharedNamespace) retireEmptyFixtureRoot(t *testing.T) map[string]any {
+	t.Helper()
+	original.verify(t, nil)
+	// All four independent process handles and the final empty inventory must
+	// already be confirmed. Release our namespace FD before normal unmount;
+	// never detach a busy mount or tear it down while the peer is alive.
+	require.NoError(t, original.namespace.Close())
+	path := filepath.Join("/proc/self/fd", strconv.Itoa(int(original.directory.Fd())), "null-netns")
+	require.NoError(t, unix.Unmount(path, 0))
+	fd, err := unix.Openat(int(original.directory.Fd()), "null-netns", unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	require.NoError(t, err)
+	defer unix.Close(fd)
+	var filesystem unix.Statfs_t
+	require.NoError(t, unix.Fstatfs(fd, &filesystem))
+	require.NotEqualValues(t, unix.NSFS_MAGIC, filesystem.Type)
+	return map[string]any{"root_device": original.directoryStat.Dev, "root_inode": original.directoryStat.Ino,
+		"namespace_device": original.namespaceStat.Dev, "namespace_inode": original.namespaceStat.Ino,
+		"normal_unmount_confirmed": true, "force_or_lazy_detach_used": false,
+		"scope": "This test's private shared runtime root after four independent process exits and empty inventory; not a per-container resource or daemon root."}
+}
+
 func TestRealNativeCreationBirthConditionalDeletionAndLivePeer(t *testing.T) {
 	if os.Getenv("SANDBOXD_RUN_NATIVE_BIRTH_INTEGRATION") != "1" {
 		t.Skip("requires an explicit isolated BareMetal1 native runtime test")
@@ -98,6 +169,7 @@ func TestRealNativeCreationBirthConditionalDeletionAndLivePeer(t *testing.T) {
 	identities := [][2]string{{"birth-original", "generation-original"}, {"birth-peer", "generation-peer"}}
 	states := make([]*containerState, 0, len(identities))
 	handles := make([][2]int, 0, len(identities))
+	var sharedNamespace *nativePhysicalSharedNamespace
 	for _, identity := range identities {
 		export := filepath.Join(work, identity[0]+"-export")
 		require.NoError(t, os.Mkdir(export, 0700))
@@ -126,6 +198,10 @@ func TestRealNativeCreationBirthConditionalDeletionAndLivePeer(t *testing.T) {
 		verifyNativePhysicalBirth(t, state.Sandbox.ProcessBirth)
 		verifyNativePhysicalBirth(t, state.GoferBirth)
 		handles = append(handles, [2]int{nativePhysicalPidfd(t, state.Sandbox.ProcessBirth), nativePhysicalPidfd(t, state.GoferBirth)})
+		if sharedNamespace == nil {
+			sharedNamespace = nativePhysicalNullNamespace(t, root)
+		}
+		sharedNamespace.verify(t, state.GoferBirth)
 		save(config.ID+"-birth.json", state)
 		states = append(states, state)
 	}
@@ -151,6 +227,7 @@ func TestRealNativeCreationBirthConditionalDeletionAndLivePeer(t *testing.T) {
 	require.NoFileExists(t, client.stateFilePath(identities[0][0]))
 	verifyNativePhysicalBirth(t, states[1].Sandbox.ProcessBirth)
 	verifyNativePhysicalBirth(t, states[1].GoferBirth)
+	sharedNamespace.verify(t, states[1].GoferBirth)
 	save("original-deleted-peer-live.json", map[string]any{"original_id": identities[0][0], "original_exit_confirmed_by_independent_pidfds": true, "peer": states[1]})
 	require.NoError(t, client.DeleteIfGeneration(ctx, identities[1][0], identities[1][1]))
 	verifyNativePhysicalExit(t, handles[1][0])
@@ -162,4 +239,5 @@ func TestRealNativeCreationBirthConditionalDeletionAndLivePeer(t *testing.T) {
 	require.NoError(t, json.Unmarshal(inventory, &final))
 	require.Empty(t, final)
 	save("final-native-inventory.json", map[string]any{"inventory": final, "scope": "Created native processes and peer protection only. No sandboxd resources, live workload, restore or node budget."})
+	save("shared-fixture-namespace-cleanup.json", sharedNamespace.retireEmptyFixtureRoot(t))
 }
