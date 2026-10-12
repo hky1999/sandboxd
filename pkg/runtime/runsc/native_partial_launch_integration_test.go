@@ -99,6 +99,9 @@ func runNativePartialLaunchFixture(t *testing.T, bindCgroup bool) {
 		}
 		config.CgroupPath = groups[id]
 		config.DisableCgroup = !bindCgroup
+		if bindCgroup {
+			config.Resources = &runtimeapi.LinuxSandboxResources{}
+		}
 		bundle, _, err := loader.GenerateOci(runtimecore.OciLoadOptions{
 			SandboxID: id, Config: config, UseGVisorRootfsImageAnnotations: true,
 			CgroupPath:       config.CgroupPath,
