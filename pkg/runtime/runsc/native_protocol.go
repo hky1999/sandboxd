@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 )
@@ -73,14 +74,34 @@ func validateNativeRuntimeBirth(state *containerState, id, generation string) er
 }
 
 func (c *Client) DeleteIfGeneration(ctx context.Context, id, generation string) error {
+	return c.deleteWithOriginalCgroup(ctx, id, generation, nil)
+}
+
+// DeleteIfGenerationAfterCgroupOffline 把调用方持有的原目录句柄交给原生核验。
+// 原生源码须在派发前记录同一分组，且核验其已离线；不使用兼容回退。
+func (c *Client) DeleteIfGenerationAfterCgroupOffline(ctx context.Context, id, generation string, original *os.File) error {
+	if original == nil {
+		return errors.New("original offline cgroup descriptor is missing")
+	}
+	return c.deleteWithOriginalCgroup(ctx, id, generation, original)
+}
+
+func (c *Client) deleteWithOriginalCgroup(ctx context.Context, id, generation string, original *os.File) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	if !runtimeInventoryID(id) || !runtimeInventoryID(generation) {
 		return errors.New("original native runtime deletion identity is invalid")
 	}
-	args := append(c.globalArgs(), "delete", "--force", "--expected-resource-generation="+generation, id)
+	args := append(c.globalArgs(), "delete", "--force", "--expected-resource-generation="+generation)
+	if original != nil {
+		args = append(args, "--scheduler-offline-cgroup-fd=3")
+	}
+	args = append(args, id)
 	cmd := exec.CommandContext(ctx, c.Binary, args...)
+	if original != nil {
+		cmd.ExtraFiles = []*os.File{original}
+	}
 	var output boundedRuntimeOutput
 	cmd.Stdout, cmd.Stderr = &output, &output
 	if err := cmd.Run(); err != nil {

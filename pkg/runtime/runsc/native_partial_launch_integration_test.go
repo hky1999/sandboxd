@@ -16,6 +16,7 @@ import (
 	runtimeapi "github.com/inclusionAI/sandboxd/api/runtime/v1"
 	runtimecore "github.com/inclusionAI/sandboxd/pkg/runtime"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sys/unix"
 )
 
 // The external ptrace wrapper stops the real producer after a successful
@@ -30,7 +31,15 @@ func TestRealNativeLaunchCgroupBindingBeforeChildBirthAndLivePeer(t *testing.T) 
 	runNativePartialLaunchFixture(t, true)
 }
 
+func TestRealNativeOfflineOriginalCgroupCleanupAndLivePeer(t *testing.T) {
+	runNativePartialLaunchFixtureWithOfflineCleanup(t, true, true)
+}
+
 func runNativePartialLaunchFixture(t *testing.T, bindCgroup bool) {
+	runNativePartialLaunchFixtureWithOfflineCleanup(t, bindCgroup, false)
+}
+
+func runNativePartialLaunchFixtureWithOfflineCleanup(t *testing.T, bindCgroup, offlineCleanup bool) {
 	t.Helper()
 	if os.Getenv("SANDBOXD_RUN_NATIVE_BIRTH_INTEGRATION") != "1" {
 		t.Skip("requires an explicit isolated BareMetal1 partial native launch test")
@@ -67,8 +76,9 @@ func runNativePartialLaunchFixture(t *testing.T, bindCgroup bool) {
 	require.NoError(t, os.MkdirAll(filestore, 0700))
 	loader, err := runtimecore.NewBundleLoader("", filepath.Join(work, "bundles"))
 	require.NoError(t, err)
-	client := NewClientWithOptions(binary, root, Options{FilestoreDir: filestore, OverlayTmpfsSize: "64M", IgnoreCgroups: true})
+	client := NewClientWithOptions(binary, root, Options{FilestoreDir: filestore, OverlayTmpfsSize: "64M", IgnoreCgroups: !bindCgroup})
 	groups := make(map[string]string)
+	closedGroups := make(map[string]bool)
 	if bindCgroup {
 		prefix := os.Getenv("NATIVE_LAUNCH_CGROUP_PARENT")
 		parent, identity, err := openOriginalLaunchCgroup(prefix)
@@ -175,6 +185,12 @@ func runNativePartialLaunchFixture(t *testing.T, bindCgroup bool) {
 			fd, actual, err := openOriginalLaunchCgroup(group)
 			require.NoError(t, err)
 			require.Equal(t, record.Cgroup, actual)
+			state, err := client.loadNativeRetirementState(id)
+			require.NoError(t, err)
+			require.NotNil(t, state.LaunchCgroup)
+			require.Equal(t, 1, state.LaunchCgroup.Version)
+			require.Equal(t, actual, &state.LaunchCgroup.managedLaunchCgroup)
+			save(id+"-producer-cgroup.json", state.LaunchCgroup)
 			require.NoError(t, fd.Close())
 			save(id+"-launch-intent.json", record)
 		}
@@ -205,7 +221,37 @@ func runNativePartialLaunchFixture(t *testing.T, bindCgroup bool) {
 	verifyNativePhysicalBirth(t, peer.GoferBirth)
 	save("partial-wrong-generation-refused.json", map[string]any{"original_state_bytes_unchanged": true, "peer": peer})
 	require.NoError(t, client.VerifyRuntimeGeneration(ctx, partialArgs.ID, partialArgs.ResourceGeneration))
-	require.NoError(t, client.DeleteIfGeneration(ctx, partialArgs.ID, partialArgs.ResourceGeneration))
+	if offlineCleanup {
+		group, identity, err := openOriginalLaunchCgroup(groups[partialArgs.ID])
+		require.NoError(t, err)
+		defer group.Close()
+		require.Error(t, client.DeleteIfGenerationAfterCgroupOffline(ctx, partialArgs.ID, partialArgs.ResourceGeneration, group))
+		current, err := os.ReadFile(client.stateFilePath(partialArgs.ID))
+		require.NoError(t, err)
+		require.Equal(t, original, current)
+		save("original-online-cgroup-refused.json", map[string]any{"original_state_bytes_unchanged": true, "identity": identity})
+		// 外部观察者已固定原进程，发送前再次核验该出生及独立句柄。
+		verifyNativePhysicalBirth(t, partial.GoferBirth)
+		require.NoError(t, unix.PidfdSendSignal(partialGofer, unix.SIGKILL, nil, 0))
+		verifyNativePhysicalExit(t, partialGofer)
+		require.NoError(t, os.Remove(filepath.Join("/sys/fs/cgroup", groups[partialArgs.ID])))
+		for _, name := range []string{"cgroup.procs", "cgroup.events"} {
+			fd, err := unix.Openat(int(group.Fd()), name, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+			if err == nil {
+				unix.Close(fd)
+			}
+			require.ErrorIs(t, err, unix.ENOENT)
+		}
+		save("original-offline-cgroup.json", map[string]any{"identity": identity, "original_empty_group_normally_removed": true, "original_control_entries_absent": true, "source": partial.LaunchCgroup})
+		require.Error(t, client.DeleteIfGenerationAfterCgroupOffline(ctx, partialArgs.ID, "generation-wrong", group))
+		current, err = os.ReadFile(client.stateFilePath(partialArgs.ID))
+		require.NoError(t, err)
+		require.Equal(t, original, current)
+		require.NoError(t, client.DeleteIfGenerationAfterCgroupOffline(ctx, partialArgs.ID, partialArgs.ResourceGeneration, group))
+		closedGroups[groups[partialArgs.ID]] = true
+	} else {
+		require.NoError(t, client.DeleteIfGeneration(ctx, partialArgs.ID, partialArgs.ResourceGeneration))
+	}
 	verifyNativePhysicalExit(t, partialGofer)
 	require.NoFileExists(t, client.stateFilePath(partialArgs.ID))
 	verifyNativePhysicalBirth(t, peer.Sandbox.ProcessBirth)
@@ -230,6 +276,9 @@ func runNativePartialLaunchFixture(t *testing.T, bindCgroup bool) {
 	save("fixture-tap-cleanup.json", peerTAP.retire(t))
 	if bindCgroup {
 		for _, group := range groups {
+			if closedGroups[group] {
+				continue
+			}
 			path := filepath.Join("/sys/fs/cgroup", group)
 			members, err := os.ReadFile(filepath.Join(path, "cgroup.procs"))
 			require.NoError(t, err)

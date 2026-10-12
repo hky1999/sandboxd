@@ -161,7 +161,12 @@ func (c *Client) Create(ctx context.Context, args StartArgs) error {
 	}
 	defer stderr.Close()
 
-	cmdArgs := append(c.globalArgs(),
+	globalArgs := c.globalArgs()
+	if args.ResourceGeneration != "" && args.CgroupPath != "" && !c.Options.IgnoreCgroups {
+		// 调度器已准备并绑定原分组，运行时子进程只继承它。
+		globalArgs = append(globalArgs, "--ignore-cgroups")
+	}
+	cmdArgs := append(globalArgs,
 		"-network=sandbox",
 	)
 	cmdArgs = append(cmdArgs, c.Options.ExtraArgs...)
@@ -778,6 +783,7 @@ type containerState struct {
 	GoferBirth           *nativeRuntimeBirth `json:"goferBirth"`
 	ProcessLaunchVersion int                 `json:"processLaunchVersion"`
 	GoferLaunchState     string              `json:"goferLaunchState"`
+	LaunchCgroup         *nativeLaunchCgroup `json:"launchCgroup"`
 	SentryLaunchState    string              `json:"sentryLaunchState"`
 	ID                   string              `json:"id"`
 	Status               string              `json:"status"`

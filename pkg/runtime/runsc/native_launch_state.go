@@ -15,6 +15,18 @@ const (
 	nativeBirthPublished = "birth_published"
 )
 
+// 原生生产端在派发前保存；没有这份记录不能使用离线分组清理入口。
+type nativeLaunchCgroup struct {
+	Version int `json:"version"`
+	managedLaunchCgroup
+	RootDevice        uint64 `json:"root_device"`
+	RootInode         uint64 `json:"root_inode"`
+	ParentDevice      uint64 `json:"parent_device"`
+	ParentInode       uint64 `json:"parent_inode"`
+	PIDNamespaceDev   uint64 `json:"pid_namespace_device"`
+	PIDNamespaceInode uint64 `json:"pid_namespace_inode"`
+}
+
 func validateNativeLaunchStages(state *containerState, requireSentry bool) error {
 	if state.ProcessLaunchVersion == 0 {
 		if state.GoferLaunchState != "" || state.SentryLaunchState != "" {
