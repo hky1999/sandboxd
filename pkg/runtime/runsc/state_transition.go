@@ -36,6 +36,7 @@ type runtimeStateTransition struct {
 	bundleIdentity     unix.Stat_t
 	bundleData         []byte
 	bundleFileIdentity unix.Stat_t
+	serving            *nativeServingProcess
 }
 
 type originalRuntimeStateFile interface {
@@ -139,6 +140,9 @@ func (c *Client) beginStateTransition(ctx context.Context, id string, managed bo
 }
 
 func (g *runtimeStateTransition) close() {
+	if g.serving != nil {
+		g.serving.close()
+	}
 	if g.bundle != nil {
 		_ = g.bundle.Close()
 	}
@@ -154,6 +158,11 @@ func (g *runtimeStateTransition) close() {
 }
 
 func (g *runtimeStateTransition) check(ctx context.Context) error {
+	if g.serving != nil {
+		if err := g.serving.live(ctx); err != nil {
+			return err
+		}
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}

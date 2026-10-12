@@ -245,6 +245,13 @@ func runNativePhysicalFixture(t *testing.T, startWorkloads bool) {
 	}
 	if startWorkloads {
 		verifyNativeTransitionRefusals(t, ctx, client, starts[0], save)
+		verifyNativeServingPeerRefusal(t, ctx, client, starts[0], states[0], states[1], save)
+		client.controlPeerObserved = func(proof map[string]any) {
+			id, ok := proof["sandbox_id"].(string)
+			require.True(t, ok)
+			require.Equal(t, proof["serving_pid"], proof["verified_kernel_sender_pid"])
+			save(id+"-control-peer-proof.json", proof)
+		}
 		for index, args := range starts {
 			if err := client.Start(ctx, args); err != nil {
 				save(args.ID+"-start-failure.json", map[string]any{"id": args.ID, "generation": args.ResourceGeneration, "error": err.Error()})

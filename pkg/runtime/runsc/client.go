@@ -53,7 +53,8 @@ type Client struct {
 	RootDir string
 	Options Options
 
-	connectControl func(string) (controlRPC, error)
+	connectControl      func(string) (controlRPC, error)
+	controlPeerObserved func(map[string]any)
 }
 
 type Options struct {
@@ -270,6 +271,14 @@ func (c *Client) Start(ctx context.Context, args StartArgs) error {
 		return fmt.Errorf("load runsc state for %s: %w", args.ID, err)
 	}
 	defer transition.close()
+	conn, err := transition.connect(ctx, state.Sandbox.ControlSocketPath)
+	if err != nil {
+		return fmt.Errorf("connect runsc control socket for %s: %w", args.ID, err)
+	}
+	defer conn.Close()
+	if err := transition.authenticate(ctx, conn, state, args); err != nil {
+		return err
+	}
 	logrus.Debugf("runsc start loaded state, id: %s, control_socket: %s", args.ID, state.Sandbox.ControlSocketPath)
 
 	logrus.Debugf("runsc start opening TAP, id: %s, interface: %+v", args.ID, args.Network.Interface)
@@ -287,11 +296,6 @@ func (c *Client) Start(ctx context.Context, args StartArgs) error {
 	logrus.Debugf("runsc start built network args, id: %s", args.ID)
 
 	logrus.Debugf("runsc start connecting control socket, id: %s, socket: %s", args.ID, state.Sandbox.ControlSocketPath)
-	conn, err := transition.connect(ctx, state.Sandbox.ControlSocketPath)
-	if err != nil {
-		return fmt.Errorf("connect runsc control socket for %s: %w", args.ID, err)
-	}
-	defer conn.Close()
 	logrus.Debugf("runsc start connected control socket, id: %s", args.ID)
 
 	if err := callContextWithTimeout(ctx, conn, contMgrSetNetworkArgs, networkArgs, nil, 30*time.Second); err != nil {
@@ -465,6 +469,14 @@ func (c *Client) Restore(ctx context.Context, args StartArgs, imagePath string) 
 		return fmt.Errorf("load runsc state for %s: %w", args.ID, err)
 	}
 	defer transition.close()
+	conn, err := transition.connect(ctx, state.Sandbox.ControlSocketPath)
+	if err != nil {
+		return fmt.Errorf("connect runsc control socket for %s: %w", args.ID, err)
+	}
+	defer conn.Close()
+	if err := transition.authenticate(ctx, conn, state, args); err != nil {
+		return err
+	}
 	tap, err := OpenTAP(*args.Network.Interface)
 	if err != nil {
 		return err
@@ -475,11 +487,6 @@ func (c *Client) Restore(ctx context.Context, args StartArgs, imagePath string) 
 	if err != nil {
 		return err
 	}
-	conn, err := transition.connect(ctx, state.Sandbox.ControlSocketPath)
-	if err != nil {
-		return fmt.Errorf("connect runsc control socket for %s: %w", args.ID, err)
-	}
-	defer conn.Close()
 
 	if err := callContextWithTimeout(ctx, conn, contMgrSetNetworkArgs, networkArgs, nil, 30*time.Second); err != nil {
 		return fmt.Errorf("set network arguments for %s: %w", args.ID, err)

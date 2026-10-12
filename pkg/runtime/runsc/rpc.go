@@ -66,8 +66,25 @@ type callResult struct {
 }
 
 type rpcClient struct {
-	mu sync.Mutex
-	fd int
+	mu                sync.Mutex
+	fd                int
+	expectedSenderPID int
+	verifySender      func() error
+	verifiedSenderPID int
+	verifiedFrames    uint64
+}
+
+func (c *rpcClient) requireSender(pid int, verify func() error) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if pid <= 0 || verify == nil {
+		return fmt.Errorf("original control sender proof is incomplete")
+	}
+	if err := unix.SetsockoptInt(c.fd, unix.SOL_SOCKET, unix.SO_PASSCRED, 1); err != nil {
+		return err
+	}
+	c.expectedSenderPID, c.verifySender = pid, verify
+	return nil
 }
 
 func connectRPC(path string) (*rpcClient, error) {
@@ -209,27 +226,72 @@ func (c *rpcClient) marshal(v any, files []*os.File) error {
 
 func (c *rpcClient) unmarshal(v any) ([]*os.File, error) {
 	firstByte := make([]byte, 1)
-	oob := make([]byte, unix.CmsgSpace(maxFiles*4))
-	n, oobn, _, _, err := unix.Recvmsg(c.fd, firstByte, oob, 0)
+	n, files, err := c.receiveFrame(firstByte)
 	if err != nil {
 		return nil, err
 	}
-	if n == 0 {
-		return nil, io.EOF
-	}
-
-	files, err := parseFiles(oob[:oobn])
-	if err != nil {
-		return nil, err
-	}
-
-	decoder := json.NewDecoder(io.MultiReader(bytes.NewReader(firstByte[:n]), fdReader{fd: c.fd}))
+	reader := &rpcReplyReader{client: c, received: n}
+	decoder := json.NewDecoder(io.MultiReader(bytes.NewReader(firstByte[:n]), reader))
 	decoder.UseNumber()
 	if err := decoder.Decode(v); err != nil {
 		closeAll(files)
 		return nil, err
 	}
 	return files, nil
+}
+
+// Credentials are received on every stream read. Checking just the first byte
+// would let a different process append the rest of an inherited connection.
+func (c *rpcClient) receiveFrame(data []byte) (int, []*os.File, error) {
+	oob := make([]byte, unix.CmsgSpace(maxFiles*4)+unix.CmsgSpace(unix.SizeofUcred))
+	n, oobn, flags, _, err := unix.Recvmsg(c.fd, data, oob, unix.MSG_CMSG_CLOEXEC)
+	if err != nil {
+		return 0, nil, err
+	}
+	if n == 0 {
+		return 0, nil, io.EOF
+	}
+	files, credentials, err := parseControlData(oob[:oobn])
+	if err == nil && flags&(unix.MSG_CTRUNC|unix.MSG_TRUNC) != 0 {
+		err = fmt.Errorf("control response ancillary data was truncated")
+	}
+	if err == nil && c.expectedSenderPID != 0 {
+		if credentials == nil || int(credentials.Pid) != c.expectedSenderPID {
+			err = fmt.Errorf("control response is not from the original serving process")
+		} else {
+			err = c.verifySender()
+			if err == nil {
+				c.verifiedSenderPID = int(credentials.Pid)
+				c.verifiedFrames++
+			}
+		}
+	}
+	if err != nil {
+		closeAll(files)
+		return 0, nil, err
+	}
+	return n, files, nil
+}
+
+type rpcReplyReader struct {
+	client   *rpcClient
+	received int
+}
+
+func (r *rpcReplyReader) Read(data []byte) (int, error) {
+	if r.received >= runtimeStateBytes {
+		return 0, fmt.Errorf("control response exceeds its byte limit")
+	}
+	if len(data) > runtimeStateBytes-r.received {
+		data = data[:runtimeStateBytes-r.received]
+	}
+	n, files, err := r.client.receiveFrame(data)
+	if len(files) != 0 {
+		closeAll(files)
+		return 0, fmt.Errorf("control response donated descriptors after its first byte")
+	}
+	r.received += n
+	return n, err
 }
 
 type fdReader struct {
@@ -245,25 +307,48 @@ func (r fdReader) Read(p []byte) (int, error) {
 }
 
 func parseFiles(oob []byte) ([]*os.File, error) {
+	files, _, err := parseControlData(oob)
+	return files, err
+}
+
+func parseControlData(oob []byte) ([]*os.File, *unix.Ucred, error) {
 	if len(oob) == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 	msgs, err := unix.ParseSocketControlMessage(oob)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	var files []*os.File
+	var credentials *unix.Ucred
+	var invalid error
 	for _, msg := range msgs {
+		if msg.Header.Level == unix.SOL_SOCKET && msg.Header.Type == unix.SCM_CREDENTIALS {
+			var err error
+			if credentials != nil {
+				invalid = fmt.Errorf("duplicate control sender credentials")
+				continue
+			}
+			credentials, err = unix.ParseUnixCredentials(&msg)
+			if err != nil {
+				invalid = err
+			}
+			continue
+		}
 		fds, err := unix.ParseUnixRights(&msg)
 		if err != nil {
-			closeAll(files)
-			return nil, err
+			invalid = err
+			continue
 		}
 		for _, fd := range fds {
 			files = append(files, os.NewFile(uintptr(fd), "runsc-urpc-fd"))
 		}
 	}
-	return files, nil
+	if invalid != nil {
+		closeAll(files)
+		return nil, nil, invalid
+	}
+	return files, credentials, nil
 }
 
 func closeAll(files []*os.File) {
