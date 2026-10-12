@@ -658,16 +658,56 @@ func isRunscNotFound(output []byte) bool {
 }
 
 func (c *Client) ListJSON(ctx context.Context) ([]byte, error) {
-	args := append(c.globalArgs(), "list", "--format", "json")
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	fd, err := unix.Open(c.RootDir, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, fmt.Errorf("open original runtime inventory root: %w", err)
+	}
+	directory := os.NewFile(uintptr(fd), c.RootDir)
+	defer directory.Close()
+	var root, current unix.Stat_t
+	if err := unix.Fstat(fd, &root); err != nil || root.Mode&0022 != 0 || root.Uid != uint32(os.Geteuid()) {
+		return nil, errors.New("runtime inventory root is not owned by this observer")
+	}
+	before, err := readRuntimeInventory(ctx, directory)
+	if err != nil {
+		return nil, err
+	}
+	args := c.globalArgs()
+	if len(args) < 2 || args[0] != "--root" || args[1] != c.RootDir {
+		return nil, errors.New("runtime inventory root argument is not canonical")
+	}
+	// Bind the CLI to the same held root as both snapshots. A path exchange
+	// during exec must not redirect its observation to another directory.
+	args[1] = "/proc/self/fd/3"
+	args = append(args, "list", "--format", "json")
 	cmd := exec.CommandContext(ctx, c.Binary, args...)
-	out, err := cmd.Output()
+	cmd.ExtraFiles = []*os.File{directory}
+	var out boundedRuntimeOutput
+	cmd.Stdout = &out
+	err = cmd.Run()
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, ctxErr
 		}
 		return nil, fmt.Errorf("runsc list failed: %w", err)
 	}
-	return out, nil
+	after, err := readRuntimeInventory(ctx, directory)
+	if err != nil {
+		return nil, err
+	}
+	if err := unix.Lstat(c.RootDir, &current); err != nil || current.Dev != root.Dev || current.Ino != root.Ino || current.Mode != root.Mode || current.Uid != root.Uid {
+		return nil, errors.New("original runtime inventory root changed")
+	}
+	if err := verifyRuntimeInventory(before, after, out.Bytes()); err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return out.Bytes(), nil
 }
 
 type containerState struct {
