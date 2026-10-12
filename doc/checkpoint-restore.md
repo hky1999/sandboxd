@@ -501,3 +501,5 @@ runsc 的新库存读取在 CLI 前后独立枚举本地原状态文件，并让
 `DeleteIfGenerationAfterCgroupOffline` 只把调用方持有的原目录句柄传给配套原生核验。原生运行时在原状态锁内再次核对完整来源、代际和首次保存的分组身份；原目录仍在线、普通空目录、字段缺失、来源替换或观察环境改变时拒绝。核对原目录的必需 `cgroup.procs` 和 `cgroup.events` 都已因目录删除而不可打开后，才允许清理原运行时状态，不补写进程出生或发送新的信号。依据是 [Linux 7.0 cgroup 删除实现](https://github.com/torvalds/linux/blob/v7.0/kernel/cgroup/cgroup.c) 和 [cgroup v2 的删除语义](https://www.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html)：删除前排除成员和在线子分组，再阻止新成员进入。本入口尚未接通 daemon 的持久分组关闭、重启恢复、分组租约结算或节点预算；调用成功不能作为完整沙箱退役回执。
 
 在派发前，适配器向持久运行时目录的 .scheduler-launches 保存独占的原创建意图，包含资源代际、独立操作编号、日志修订、有效期限、参数摘要、cgroup 设备／inode、启动环境及 namespace 身份。文件和目录同步成功后才允许派发，来源替换、日志冲突或保存失败拒绝。保留的 dispatching 不等于实际启动、停止或预算归还证明；日志没有自动回收，已确认退役后的安全回收与重启恢复仍待后续接线。该能力不关闭第一条 gofer／Sentry 出生缺失、其他资源效果或完整预算问题。显式不管理 cgroup 的原生专项继续使用原出生协议，不因此获得缺失出生时的清理授权。
+
+原分组管理器新增 `CloseForGeneration` 的持久关闭意图与完成，使用原目录句柄进行观测和分组信号；关闭后仍保留租约。原分组移除而完成保存失败时，可在原启动／namespace／挂载根及父目录匹配、原名称缺失的条件下重开确认；同名替代和来源变化拒绝。原父目录证明尚未接入配套原生恢复和 daemon，第一条出生缺失及完整沙箱退役／节点预算继续开放。普通 rmdir 不具备 inode 原子比较，真实竞争边界继续留在缺口。完整契约和显式物理验收范围见 [资源租约关闭协议](scheduler-resource-leases.md)。

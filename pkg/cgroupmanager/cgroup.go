@@ -55,6 +55,7 @@ type CgroupManager struct {
 	leaseOwners          map[string]string
 	leaseIdentities      map[string]CgroupIdentity
 	leaseScopes          map[string]generationLeaseScope
+	leaseClosures        map[string]generationCgroupClosure
 	readGenerationScope  func() (generationLeaseScope, error)
 	completedGenerations map[string]string
 
@@ -97,12 +98,13 @@ type createResult struct {
 }
 
 type storedCgroupIDs struct {
-	SchemaVersion        int                             `json:"schema_version,omitempty"`
-	Items                []string                        `json:"items"`
-	LeaseOwners          map[string]string               `json:"lease_owners,omitempty"`
-	LeaseIdentities      map[string]CgroupIdentity       `json:"lease_identities,omitempty"`
-	LeaseScopes          map[string]generationLeaseScope `json:"lease_scopes,omitempty"`
-	CompletedGenerations map[string]string               `json:"completed_generations,omitempty"`
+	SchemaVersion        int                                `json:"schema_version,omitempty"`
+	Items                []string                           `json:"items"`
+	LeaseOwners          map[string]string                  `json:"lease_owners,omitempty"`
+	LeaseIdentities      map[string]CgroupIdentity          `json:"lease_identities,omitempty"`
+	LeaseScopes          map[string]generationLeaseScope    `json:"lease_scopes,omitempty"`
+	LeaseClosures        map[string]generationCgroupClosure `json:"lease_closures,omitempty"`
+	CompletedGenerations map[string]string                  `json:"completed_generations,omitempty"`
 }
 
 // CacheSizeLimit exposes the configured cache target for metrics reporting.
@@ -524,6 +526,7 @@ func NewCgroupManager(
 		usingIDs.Set(id, struct{}{})
 	}
 
+	reservedNames := append(cgroups.Keys(), usingIDs.Keys()...)
 	c := &CgroupManager{
 		max:        max,
 		cacheSize:  cfg.CgroupCacheSize,
@@ -532,7 +535,7 @@ func NewCgroupManager(
 		usingID:    usingIDs,
 		idleID:     util.New(""),
 		cgroups:    cgroups,
-		generator:  util.NewFixedLengthIDGenerator(12, cgroups.Keys(), util.PrefixID(filepath.Join("/", rootName)+"/")),
+		generator:  util.NewFixedLengthIDGenerator(12, reservedNames, util.PrefixID(filepath.Join("/", rootName)+"/")),
 		createReqs: make(chan *createRequest, max),
 		db:         db,
 		gcQueue:    util.New(""),
@@ -546,6 +549,17 @@ func NewCgroupManager(
 	}
 
 	for id := range cgroups.Items() {
+		if _, closing := c.leaseClosures[id]; closing {
+			// A pending or closed lease is never initialized as a reusable
+			// group. Recovery must retain it without resetting any controls.
+			continue
+		}
+		if generation := c.leaseOwners[id]; generation != "" {
+			if err := c.verifyGenerationDirectory(id, generation); err != nil {
+				logrus.Warnf("retain unverifiable generation-owned cgroup %s without modifying it: %v", id, err)
+				continue
+			}
+		}
 		if err := ops.setPidsLimit(id, cfg.PidsMax); err != nil {
 			return nil, fmt.Errorf("restore pids limit for cgroup %s: %w", id, err)
 		}
@@ -620,7 +634,7 @@ func (c *CgroupManager) storeLeaseState(releasedPath, releasedGeneration string)
 			time.Since(start).Milliseconds(),
 		)
 	}()
-	state := storedCgroupIDs{SchemaVersion: 4, LeaseOwners: make(map[string]string), LeaseIdentities: make(map[string]CgroupIdentity), LeaseScopes: make(map[string]generationLeaseScope), CompletedGenerations: make(map[string]string)}
+	state := storedCgroupIDs{SchemaVersion: 5, LeaseOwners: make(map[string]string), LeaseIdentities: make(map[string]CgroupIdentity), LeaseScopes: make(map[string]generationLeaseScope), LeaseClosures: make(map[string]generationCgroupClosure), CompletedGenerations: make(map[string]string)}
 	for _, id := range c.usingID.Keys() {
 		if id == releasedPath {
 			continue
@@ -628,6 +642,9 @@ func (c *CgroupManager) storeLeaseState(releasedPath, releasedGeneration string)
 		state.Items = append(state.Items, id)
 		if owner := c.leaseOwners[id]; owner != "" {
 			state.LeaseOwners[id] = owner
+			if closure, known := c.leaseClosures[id]; known {
+				state.LeaseClosures[id] = closure
+			}
 			if identity, known := c.leaseIdentities[id]; known {
 				state.LeaseIdentities[id] = identity
 				if scope, known := c.leaseScopes[id]; known {

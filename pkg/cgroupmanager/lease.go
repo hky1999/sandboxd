@@ -31,6 +31,11 @@ func (c *CgroupManager) Prepare(
 	name string,
 	resource *runtime.LinuxSandboxResources,
 ) error {
+	c.leaseMu.Lock()
+	defer c.leaseMu.Unlock()
+	if _, closing := c.leaseClosures[name]; closing {
+		return fmt.Errorf("cgroup %s is permanently closing", name)
+	}
 	if !belongsToRoot(name, c.rootName) || !c.usingID.Has(name) {
 		return fmt.Errorf("cgroup %s is not an allocated child of %s", name, c.rootName)
 	}
@@ -90,6 +95,11 @@ func (c *CgroupManager) ReadFreeze(name string) (FreezeState, error) {
 
 // WriteFreeze sets the freeze request bit of an allocated sandbox cgroup.
 func (c *CgroupManager) WriteFreeze(name string, frozen bool) error {
+	c.leaseMu.Lock()
+	defer c.leaseMu.Unlock()
+	if _, closing := c.leaseClosures[name]; closing {
+		return fmt.Errorf("cgroup %s is permanently closing", name)
+	}
 	if !belongsToRoot(name, c.rootName) || !c.cgroups.Has(name) {
 		return fmt.Errorf("cgroup %s is not an owned child of %s", name, c.rootName)
 	}
@@ -99,6 +109,11 @@ func (c *CgroupManager) WriteFreeze(name string, frozen bool) error {
 // WriteMemoryLimits applies the two memory controls in the fixed shrink order
 // (memory.high, then memory.max) to an allocated sandbox cgroup.
 func (c *CgroupManager) WriteMemoryLimits(name string, highBytes, maxBytes uint64) error {
+	c.leaseMu.Lock()
+	defer c.leaseMu.Unlock()
+	if _, closing := c.leaseClosures[name]; closing {
+		return fmt.Errorf("cgroup %s is permanently closing", name)
+	}
 	if !belongsToRoot(name, c.rootName) || !c.cgroups.Has(name) {
 		return fmt.Errorf("cgroup %s is not an owned child of %s", name, c.rootName)
 	}

@@ -99,6 +99,9 @@ func (c *CgroupManager) RecycleForGeneration(path, generation string) error {
 	if !c.usingID.Has(path) || c.leaseOwners[path] != generation {
 		return fmt.Errorf("cgroup lease generation is missing or changed: %w", errord.ErrFailedPrecondition)
 	}
+	if _, closing := c.leaseClosures[path]; closing {
+		return c.recycleClosedGeneration(path, generation)
+	}
 	if err := c.verifyGenerationDirectory(path, generation); err != nil {
 		return fmt.Errorf("original cgroup lease cannot authorize release: %w: %w", errord.ErrFailedPrecondition, err)
 	}
@@ -120,6 +123,7 @@ func (c *CgroupManager) completeLeaseRelease(path, generation string) error {
 		delete(c.leaseOwners, path)
 		delete(c.leaseIdentities, path)
 		delete(c.leaseScopes, path)
+		delete(c.leaseClosures, path)
 	}
 	c.usingID.Pop(path)
 	c.storeDirty.Store(true)
@@ -129,9 +133,10 @@ func (c *CgroupManager) completeLeaseRelease(path, generation string) error {
 // Called before workers start. Legacy active entries stay unowned; they are
 // never silently assigned a generation or accepted by the conditional API.
 func (c *CgroupManager) restoreGenerationLeases(state storedCgroupIDs) error {
-	if (state.SchemaVersion != 0 && state.SchemaVersion != 2 && state.SchemaVersion != 4) ||
+	if (state.SchemaVersion != 0 && state.SchemaVersion != 2 && state.SchemaVersion != 4 && state.SchemaVersion != 5) ||
 		(state.SchemaVersion == 0 && (len(state.LeaseOwners) != 0 || len(state.CompletedGenerations) != 0 || len(state.LeaseIdentities) != 0 || len(state.LeaseScopes) != 0)) ||
-		(state.SchemaVersion != 4 && (len(state.LeaseIdentities) != 0 || len(state.LeaseScopes) != 0)) ||
+		(state.SchemaVersion != 4 && state.SchemaVersion != 5 && (len(state.LeaseIdentities) != 0 || len(state.LeaseScopes) != 0)) ||
+		(state.SchemaVersion != 5 && len(state.LeaseClosures) != 0) ||
 		len(state.LeaseOwners)+len(state.CompletedGenerations) > generationLeaseLimit {
 		return fmt.Errorf("cgroup lease journal schema or capacity is invalid: %w", errord.ErrFailedPrecondition)
 	}
@@ -170,5 +175,5 @@ func (c *CgroupManager) restoreGenerationLeases(state storedCgroupIDs) error {
 	c.leaseIdentities = identities
 	c.leaseScopes = scopes
 	c.completedGenerations = completed
-	return nil
+	return c.restoreGenerationClosures(state.LeaseClosures)
 }
