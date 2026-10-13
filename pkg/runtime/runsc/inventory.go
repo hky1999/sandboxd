@@ -13,7 +13,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 
 	"golang.org/x/sys/unix"
@@ -24,15 +26,17 @@ const runtimeStateBytes = 8 * 1024 * 1024
 const runtimeInventoryBytes = 16 * 1024 * 1024
 
 type runtimeInventoryFile struct {
-	Device    uint64
-	Inode     uint64
-	Size      int64
-	Digest    string
-	ID        string
-	SandboxID string
-	Bundle    string
-	PID       int
-	Status    string
+	Device             uint64
+	Inode              uint64
+	Size               int64
+	Digest             string
+	ID                 string
+	SandboxID          string
+	Bundle             string
+	PID                int
+	Status             string
+	ManagedCreating    bool
+	ResourceGeneration string
 }
 
 type runtimeListedState struct {
@@ -150,13 +154,62 @@ func readRuntimeInventory(ctx context.Context, directory *os.File) (map[string]r
 		if decoder.Decode(&trailing) != io.EOF {
 			return nil, errors.New("original runtime state has trailing data")
 		}
-		if raw.ID != id || raw.Sandbox == nil || raw.Sandbox.ID != sandboxID || raw.Sandbox.PID < 0 || !knownRuntimeInventoryStatus(raw.Status) {
+		if raw.ID != id || !knownRuntimeInventoryStatus(raw.Status) {
 			return nil, errors.New("native runtime identity differs from its state filename")
 		}
+		pid, generation, creating := 0, "", false
+		if raw.Status == "creating" {
+			owner, err := decodeNativeCgroupRetirementState(data, id)
+			if err != nil || id != sandboxID || !filepath.IsAbs(raw.Bundle) || filepath.Clean(raw.Bundle) != raw.Bundle {
+				return nil, errors.New("creating inventory lacks a complete original managed cgroup owner")
+			}
+			generation, creating = owner.ResourceGeneration, true
+		} else {
+			if raw.Sandbox == nil || raw.Sandbox.ID != sandboxID || raw.Sandbox.PID < 0 {
+				return nil, errors.New("native runtime sandbox differs from its state filename")
+			}
+			pid = raw.Sandbox.PID
+		}
 		digest := sha256.Sum256(data)
-		result[entry.Name()] = runtimeInventoryFile{Device: uint64(before.Dev), Inode: before.Ino, Size: before.Size, Digest: hex.EncodeToString(digest[:]), ID: id, SandboxID: sandboxID, Bundle: raw.Bundle, PID: raw.Sandbox.PID, Status: raw.Status}
+		result[entry.Name()] = runtimeInventoryFile{Device: uint64(before.Dev), Inode: before.Ino, Size: before.Size, Digest: hex.EncodeToString(digest[:]), ID: id, SandboxID: sandboxID, Bundle: raw.Bundle, PID: pid, Status: raw.Status, ManagedCreating: creating, ResourceGeneration: generation}
 	}
 	return result, nil
+}
+
+// A managed creator may still hold its native lock. Never wait on that lock to
+// decide possible ownership: every private state file is counted from the same
+// stable root snapshots. Recorded lifecycle/PIDs are observations, not liveness,
+// readiness, process birth or mutation authority. The caller still verifies
+// original generation, cgroup leases and physical effects before settlement.
+func creatingRuntimeInventory(files map[string]runtimeInventoryFile) ([]byte, bool, error) {
+	creating := false
+	names := make([]string, 0, len(files))
+	for name, file := range files {
+		names = append(names, name)
+		creating = creating || file.ManagedCreating
+	}
+	if !creating {
+		return nil, false, nil
+	}
+	sort.Strings(names)
+	states := make([]*runtimeListedState, 0, len(files))
+	for _, name := range names {
+		file := files[name]
+		pid := file.PID
+		if file.ManagedCreating || file.Status == "stopped" {
+			pid = 0
+		}
+		annotations := map[string]string{"akernel.scheduler/inventory-observation": "original-state-possible-owner"}
+		if file.ManagedCreating {
+			annotations[runtimeResourceGenerationAnnotation] = file.ResourceGeneration
+		}
+		states = append(states, &runtimeListedState{ID: file.ID, Status: file.Status, PID: pid, Bundle: file.Bundle, Annotations: annotations})
+	}
+	data, err := json.Marshal(states)
+	if err != nil || len(data) > runtimeInventoryBytes {
+		return nil, true, errors.New("creating inventory exceeds its bounded output")
+	}
+	return data, true, nil
 }
 
 func sameRuntimeInventoryStat(a, b unix.Stat_t) bool {
@@ -201,6 +254,10 @@ func verifyRuntimeInventory(before, after map[string]runtimeInventoryFile, data 
 			return errors.New("runtime list belongs to another state or bundle")
 		}
 		switch state.Status {
+		case "creating":
+			if !file.ManagedCreating || file.Status != "creating" || state.PID != 0 || state.Annotations[runtimeResourceGenerationAnnotation] != file.ResourceGeneration {
+				return errors.New("creating inventory differs from original possible owner")
+			}
 		case "created", "running", "paused":
 			if state.Status != file.Status || state.PID <= 0 || state.PID != file.PID {
 				return errors.New("live runtime list identity differs from its native state")

@@ -283,6 +283,29 @@ func runNativePartialLaunchFixtureWithPublicationMode(t *testing.T, bindCgroup, 
 	require.NoError(t, err)
 	if unpublished {
 		require.Error(t, client.VerifyRuntimeGeneration(ctx, partialArgs.ID, partialArgs.ResourceGeneration))
+		// The real creator still holds its lock. Inventory must report this
+		// possible owner without waiting on CLI list or inventing a birth.
+		inventoryCtx, cancelInventory := context.WithTimeout(ctx, 5*time.Second)
+		inventory, inventoryErr := client.ListJSON(inventoryCtx)
+		cancelInventory()
+		require.NoError(t, inventoryErr)
+		var possible []*runtimeListedState
+		require.NoError(t, json.Unmarshal(inventory, &possible))
+		require.Len(t, possible, 2)
+		var creating *runtimeListedState
+		for _, state := range possible {
+			if state.ID == partialArgs.ID {
+				creating = state
+			}
+		}
+		require.NotNil(t, creating)
+		require.Equal(t, "creating", creating.Status)
+		require.Zero(t, creating.PID)
+		require.Equal(t, partialArgs.ResourceGeneration, creating.Annotations[runtimeResourceGenerationAnnotation])
+		current, err := os.ReadFile(client.stateFilePath(partialArgs.ID))
+		require.NoError(t, err)
+		require.Equal(t, original, current)
+		save("unpublished-creating-inventory.json", map[string]any{"inventory_known": true, "possible_owners": possible, "original_birth_still_missing": true, "creator_lock_still_held": true, "original_formal_state_bytes_unchanged": true, "node_budget_tested": false})
 	} else {
 		require.NoError(t, client.VerifyRuntimeGeneration(ctx, partialArgs.ID, partialArgs.ResourceGeneration))
 	}

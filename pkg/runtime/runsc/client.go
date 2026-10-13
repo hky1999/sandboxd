@@ -740,6 +740,25 @@ func (c *Client) ListJSON(ctx context.Context) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	if output, creating, err := creatingRuntimeInventory(before); creating || err != nil {
+		if err != nil {
+			return nil, err
+		}
+		after, err := readRuntimeInventory(ctx, directory)
+		if err != nil {
+			return nil, err
+		}
+		if err := unix.Lstat(c.RootDir, &current); err != nil || current.Dev != root.Dev || current.Ino != root.Ino || current.Mode != root.Mode || current.Uid != root.Uid {
+			return nil, errors.New("original creating inventory root changed")
+		}
+		if err := verifyRuntimeInventory(before, after, output); err != nil {
+			return nil, err
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		return output, nil
+	}
 	args := c.globalArgs()
 	if len(args) < 2 || args[0] != "--root" || args[1] != c.RootDir {
 		return nil, errors.New("runtime inventory root argument is not canonical")
