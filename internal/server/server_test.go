@@ -158,8 +158,10 @@ func TestResetMetadataIfResourceStateIncompatible_RemovesLegacyResourceState(t *
 	db := store.NewStoreImp(storePath)
 	assert.NoError(t, db.StoreRaw(config.CgroupBucket, []byte{0x0b, 0x0a, 0x05}))
 
-	assert.NoError(t, resetMetadataIfResourceStateIncompatible(storePath))
-	assert.NoFileExists(t, storePath)
+	// Keep the existing name in the regression inventory, but require startup
+	// rejection and preservation of the original database for recovery.
+	assert.Error(t, resetMetadataIfResourceStateIncompatible(storePath))
+	assert.FileExists(t, storePath)
 }
 
 func TestResetMetadataIfResourceStateIncompatible_KeepsJSONResourceState(t *testing.T) {

@@ -87,7 +87,7 @@ Per-sandbox managed storage comprises the private ext4 writable layer, virtio-fs
 
 # ChunkDB Capacity Contract
 
-The optional `[plugin.image].chunk_db_size` is node-wide and must reach every distill-fs mount, stats, and GC invocation, including daemon recovery. Sandboxd owns capacity consistency; distill-fs does not coordinate or validate agreement across processes. Empty configuration must omit the new flag for compatibility with older binaries. Existing databases cannot resize; Pod hostname changes clear the image-manager root, while same-Pod service restarts preserve it.
+The optional `[plugin.image].chunk_db_size` is node-wide and must reach every distill-fs mount, stats, and GC invocation, including daemon recovery. Sandboxd owns capacity consistency; distill-fs does not coordinate or validate agreement across processes. Empty configuration must omit the new flag for compatibility with older binaries. Existing databases cannot resize. A missing or foreign hostname stamp with existing state refuses startup and preserves the store, runtime state and image-manager root for explicit recovery; same-container service restarts preserve them. Incompatible resource metadata also refuses startup without deleting the database.
 
 `make distillfs-test` runs real FUSE mount, read, stats, GC, and daemon recovery checks in a private mount namespace. It requires sudo, `/dev/fuse`, and `mkfs.erofs`; `DISTILL_FS_BINARY` selects the production executable (default `output/distill-fs/distill_fs`). The storage CI job downloads and verifies the formal release pinned in `third_party/runtime-versions.env` before running it. Explicitly enabled integration must fail when prerequisites are missing, never silently skip.
 
