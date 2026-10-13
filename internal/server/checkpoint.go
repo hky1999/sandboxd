@@ -977,16 +977,45 @@ func (h *sandboxService) retireParkedSource(ctx context.Context, sandboxID strin
 	return h.forceRetireParkedSource(ctx, sandboxID, runtimeHandler)
 }
 
-// forceRetireParkedSource destroys the source runtime directly and confirms
-// the manager observed the exit. The caller already holds the sandbox's
-// physical resource lock, so the daemon-level delete path — which re-acquires
-// it — must not be used here.
+// forceRetireParkedSource uses the same original runtime retirement journal
+// as deletion, then confirms exit. The caller already holds the physical lock;
+// the full delete path must not be re-entered and other resources stay held.
 func (h *sandboxService) forceRetireParkedSource(ctx context.Context, sandboxID string, runtimeHandler svc.Handler) error {
 	logrus.Warnf("parked source %s did not exit after checkpoint; forcing runtime retirement", sandboxID)
 	destroyCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), checkpointForcedRetireTimeout)
 	defer cancel()
-	if err := runtimeHandler.Delete(destroyCtx, sandboxID); err != nil {
+	source, err := h.sandboxManager.Get(sandboxID)
+	if err != nil || source == nil || source.Metadata == nil {
+		return fmt.Errorf("parked source original metadata unavailable: %w", errord.ErrFailedPrecondition)
+	}
+	metadata := proto.Clone(source.Metadata).(*runtime.SandboxMetadata)
+	var progress *retirementProgress
+	if metadata.Labels[resourceGenerationLabel] != "" {
+		resources, err := h.physicalResources(metadata)
+		if err != nil {
+			return fmt.Errorf("parked source original resources unavailable: %w", err)
+		}
+		progress, err = h.beginRetirementProgress(metadata, resources)
+		if err != nil {
+			return fmt.Errorf("persist parked source retirement intent: %w", err)
+		}
+	}
+	if err := h.retireOriginalRuntime(destroyCtx, runtimeHandler, metadata, progress); err != nil {
 		return fmt.Errorf("parked source %s did not exit after checkpoint and forced retirement failed: %w", sandboxID, err)
+	}
+	if progress != nil {
+		states, err := runtimeHandler.List(destroyCtx)
+		if err != nil {
+			return fmt.Errorf("verify parked source original runtime absence: %w", err)
+		}
+		for _, state := range states {
+			if state == nil || state.ID == sandboxID {
+				return fmt.Errorf("parked source original runtime absence is unconfirmed")
+			}
+		}
+		if err := h.completeRetirementProgressStep(progress, "runtime"); err != nil {
+			return fmt.Errorf("persist parked source runtime completion: %w", err)
+		}
 	}
 	if _, err := h.sandboxManager.WaitForExit(destroyCtx, sandboxID); err != nil {
 		return fmt.Errorf("parked source %s did not observe exit after forced retirement: %w", sandboxID, err)
