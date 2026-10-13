@@ -120,7 +120,9 @@ while True:
                          'tracer_cgroup': Path('/proc/self/cgroup').read_text(),
                          'runtime_state_modified_by_tracer': False})
                     continue
-    elif stop not in (signal.SIGTRAP, signal.SIGSTOP):
+    elif stop not in (signal.SIGTRAP, signal.SIGSTOP, signal.SIGTRAP | 0x80):
+        # Other threads still produce syscall stops while the selected thread
+        # is held. 133 is a ptrace stop marker, never a deliverable signal.
         delivery = stop
     if tid != held_tid:
         ptrace(SYSCALL, tid, data=ctypes.c_void_p(delivery))
