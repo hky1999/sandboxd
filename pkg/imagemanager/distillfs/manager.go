@@ -54,7 +54,9 @@ type DaemonCreateOpt struct {
 }
 
 func (opts *DaemonCreateOpt) overwriteOSSConfig() bool {
-	return opts.Endpoint != "" && opts.Bucket != "" && opts.ObjectPrefix != ""
+	// An empty prefix is a valid object at the bucket root. The explicit source
+	// must not inherit the template endpoint, bucket or prefix in that case.
+	return opts.Endpoint != "" && opts.Bucket != ""
 }
 
 type Manager interface {

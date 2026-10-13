@@ -310,6 +310,7 @@ func TestManager_CreateDaemon_OSS(t *testing.T) {
 
 	mgr, err := NewManager(&ManagerConfig{
 		Root:              tmpDir,
+		DisableCgroup:     true,
 		OSSCfgPath:        ossCfgPath,
 		NydusCfgPath:      nydusCfgPath,
 		BinPath:           "/usr/local/bin/distill_fs",
@@ -325,6 +326,20 @@ func TestManager_CreateDaemon_OSS(t *testing.T) {
 		opts     *DaemonCreateOpt
 		validate func(*testing.T, *Daemon)
 	}{
+		{
+			name: "create OSS daemon for root object without template source inheritance",
+			opts: &DaemonCreateOpt{
+				ID:       "test-root-object",
+				Name:     "rootfs.erofs",
+				Endpoint: "objects.example",
+				Bucket:   "requested-bucket",
+			},
+			validate: func(t *testing.T, d *Daemon) {
+				if d.config.Oss.Endpoint != "objects.example" || d.config.Oss.BucketName != "requested-bucket" || d.config.Oss.ObjectPrefix != "" {
+					t.Error("root object must use its explicit endpoint and bucket without the template prefix")
+				}
+			},
+		},
 		{
 			name: "create OSS daemon with explicit credentials",
 			opts: &DaemonCreateOpt{
