@@ -240,3 +240,9 @@ resources, including pooled TAPs, ephemeral runc veth pairs and namespaces,
 SNAT and DNAT rules, ACL hooks, and the `sandbox0` bridge. Kubernetes must
 allow enough termination grace time for cleanup; SIGKILL cannot run shutdown
 hooks.
+
+## 调度器清理中断的显式物理验收工具
+
+`daemon_cgroup_close_tracer.py` 仅在 BareMetal1 专属测试容器中启用，要求 `SANDBOXD_DAEMON_RETIREMENT_FIXTURE=1` 和匹配的 `DAEMON_FIXTURE_BINARY_SHA256`。它将自己放入独立观察分组，将被观察的真实 sandboxd 放入服务分组，只在已选择的原沙箱分组 `cgroup.kill` 写入系统调用进入内核前保留原线程停点；其他线程继续运行。工具核对原目录设备号／inode、正式退休操作的原代际、关闭请求及未完成步骤，只读记录，不补写运行时状态，也不发送 SIGKILL。外部宿主观察者必须在派发删除前固定原守护进程和四个原运行时进程的启动时间、程序摘要及 pidfd，随后核对停点和两份持久意图，再授权终止原守护进程。
+
+`cgroup-journal-read` 从固定的 `/test-state/store/metadata.db` 以只读方式、最多一秒锁等待读取原 cgroup JSON，只有显式测试开关打开时可运行。它不修改数据库，不决定预算，不把目录不存在或操作期限经过当成退役完成。恢复必须保留原关闭请求，再在必要时使用单独持久的继续请求；只有原条件退役和匹配完成回执才支持结算。完整物理结果和部署范围以 AKernel scheduler 的版本台账及独立证据为准。
