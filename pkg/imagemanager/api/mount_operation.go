@@ -256,7 +256,13 @@ func (w *HttpWorker) inspectMountOperation(r *mountOperationRecord) (*MountOpera
 	if d == nil {
 		return result, nil
 	}
-	phase, err := d.InspectPhysicalGeneration(r.PhysicalGeneration)
+	var phase string
+	var err error
+	if r.RetirementRequested {
+		phase, err = d.InspectPhysicalGenerationForRetirement(r.PhysicalGeneration)
+	} else {
+		phase, err = d.InspectPhysicalGeneration(r.PhysicalGeneration)
+	}
 	if err != nil {
 		return result, nil
 	}
@@ -308,11 +314,13 @@ func (w *HttpWorker) recoverBoundMountOperation(r *mountOperationRecord) (*Mount
 		if result.State != "ready" && result.State != "release_pending" {
 			return nil, fmt.Errorf("original mount result is unresolved")
 		}
-		if err := w.recordMountGeneration(r.ImageURL, "nydus", r.NydusImageURL, r.MountPoint, r.PhysicalGeneration); err != nil {
-			return nil, err
+		if !r.RetirementRequested {
+			if err := w.recordMountGeneration(r.ImageURL, "nydus", r.NydusImageURL, r.MountPoint, r.PhysicalGeneration); err != nil {
+				return nil, err
+			}
 		}
 	}
-	info, err := w.recoverDaemonMount(r.DaemonID, r.PhysicalGeneration, r.Kind == "oss")
+	info, err := w.recoverDaemonMountForRetirement(r.DaemonID, r.PhysicalGeneration, r.Kind == "oss", r.RetirementRequested)
 	if err != nil {
 		return nil, err
 	}

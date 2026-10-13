@@ -114,7 +114,29 @@ func (w *HttpWorker) RetireMountOperation(req *MountOperationRetirement) (*Mount
 		return nil, fmt.Errorf("original mount retirement source changed")
 	}
 	if r != nil && r.Phase != "intent" {
-		return w.inspectMountOperation(r) // Exact terminal replay never touches a replacement.
+		if r.Phase != "not_allocated" && !r.RetirementRequested {
+			original := *r
+			next := original
+			next.RetirementRequested = true
+			raw, err := encodeMountOperation(&next)
+			if err != nil {
+				return nil, err
+			}
+			if err := w.mountStore.db.Update(func(tx *bolt.Tx) error {
+				current, err := readMountOperation(tx, req.OperationID)
+				if err != nil {
+					return err
+				}
+				if current == nil || *current != original {
+					return fmt.Errorf("original bound mount changed before retirement fence")
+				}
+				return tx.Bucket(mountOperationsBucket).Put([]byte(req.OperationID), raw)
+			}); err != nil {
+				return nil, err
+			}
+			r = &next
+		}
+		return w.inspectMountOperation(r) // The fence grants cleanup, never completion.
 	}
 	if r != nil && r.PreparationProtocol != 1 {
 		return nil, fmt.Errorf("legacy original mount intent is unresolved")

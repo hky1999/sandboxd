@@ -51,6 +51,17 @@ func (d *Daemon) bindOriginalMount(bind func(generation, target string) error) e
 // InspectPhysicalGeneration reattaches only a known original record. It NEVER
 // starts a process, remounts a URL, or borrows a replacement generation.
 func (d *Daemon) InspectPhysicalGeneration(generation string) (string, error) {
+	return d.inspectPhysicalGeneration(generation, false)
+}
+
+// This read-only capability grants only an original cleanup handle. The caller
+// must first persist its bound operation retirement fence. It never starts or
+// stops a process, mounts a source, or claims release completion.
+func (d *Daemon) InspectPhysicalGenerationForRetirement(generation string) (string, error) {
+	return d.inspectPhysicalGeneration(generation, true)
+}
+
+func (d *Daemon) inspectPhysicalGeneration(generation string, retirement bool) (string, error) {
 	release, err := d.ownership.acquire()
 	if err != nil {
 		return "", err
@@ -84,6 +95,9 @@ func (d *Daemon) InspectPhysicalGeneration(generation string) (string, error) {
 	}
 	if err := d.ensurePhysicalPublication(); err != nil {
 		return "", err
+	}
+	if retirement && p.Phase != "released" {
+		return "releasing", nil
 	}
 	switch p.Phase {
 	case "released", "releasing", "not_started":

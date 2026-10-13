@@ -13,6 +13,14 @@ func (w *HttpWorker) recoverDaemonMount(id, generation string, oss bool) (*Mount
 }
 
 func (w *HttpWorker) recoverDaemonMountBound(id, nydusURL, generation string, oss bool, bind mountBinding) (*MountInfo, error) {
+	return w.recoverDaemonMountWithPurpose(id, nydusURL, generation, oss, bind, false)
+}
+
+func (w *HttpWorker) recoverDaemonMountForRetirement(id, generation string, oss, retirement bool) (*MountInfo, error) {
+	return w.recoverDaemonMountWithPurpose(id, "", generation, oss, nil, retirement)
+}
+
+func (w *HttpWorker) recoverDaemonMountWithPurpose(id, nydusURL, generation string, oss bool, bind mountBinding, retirement bool) (*MountInfo, error) {
 	if !validMountGeneration(generation) || w.mgr == nil {
 		return nil, fmt.Errorf("original daemon mount identity is required")
 	}
@@ -20,7 +28,13 @@ func (w *HttpWorker) recoverDaemonMountBound(id, nydusURL, generation string, os
 	if d == nil {
 		return nil, fmt.Errorf("original daemon mount is missing")
 	}
-	phase, err := d.InspectPhysicalGeneration(generation)
+	var phase string
+	var err error
+	if retirement {
+		phase, err = d.InspectPhysicalGenerationForRetirement(generation)
+	} else {
+		phase, err = d.InspectPhysicalGeneration(generation)
+	}
 	if err != nil {
 		return nil, err
 	}
