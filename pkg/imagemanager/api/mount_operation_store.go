@@ -174,7 +174,7 @@ func decodeMountOperation(raw []byte) (*mountOperationRecord, error) {
 		return nil, err
 	}
 	var fields map[string]json.RawMessage
-	if err := json.Unmarshal(envelope["record"], &fields); err != nil || len(fields) < 9 || len(fields) > 10 {
+	if err := json.Unmarshal(envelope["record"], &fields); err != nil || len(fields) < 9 || len(fields) > 11 {
 		return nil, fmt.Errorf("mount operation fields are incomplete")
 	}
 	if err := exactMountJSONFields(fields, "operation_id", "request_fingerprint", "kind", "phase", "physical_generation", "daemon_id", "mount_point", "image_url", "nydus_image_url", "preparation_protocol", "retirement_requested"); err != nil {
