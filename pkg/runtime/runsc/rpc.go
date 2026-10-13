@@ -74,6 +74,9 @@ type rpcClient struct {
 	verifiedFrames    uint64
 	// Private fault boundary for isolated tests. Normal transports leave it nil.
 	afterRequestSent func(string, int) error
+	// Per-connection syscall boundaries used only by ordinary transport tests.
+	sendmsgN func(int, []byte, []byte, unix.Sockaddr, int) (int, error)
+	recvmsg  func(int, []byte, []byte, int) (int, int, int, unix.Sockaddr, error)
 }
 
 func (c *rpcClient) requireSender(pid int, verify func() error) error {
@@ -213,13 +216,13 @@ func (c *rpcClient) marshal(v any, files []*os.File) error {
 		oob = unix.UnixRights(fds...)
 	}
 
-	n, err := unix.SendmsgN(c.fd, data, oob, nil, 0)
+	n, err := c.sendFrame(data, oob)
 	runtime.KeepAlive(files)
 	if err != nil {
 		return err
 	}
 	for n < len(data) {
-		written, err := unix.SendmsgN(c.fd, data[n:], nil, nil, 0)
+		written, err := c.sendFrame(data[n:], nil)
 		if err != nil {
 			return err
 		}
@@ -229,6 +232,21 @@ func (c *rpcClient) marshal(v any, files []*os.File) error {
 		n += written
 	}
 	return nil
+}
+
+// EINTR means this syscall transferred no bytes. Retry only that syscall on
+// the original connection; never restart Call or resend an accepted prefix.
+func (c *rpcClient) sendFrame(data, oob []byte) (int, error) {
+	send := c.sendmsgN
+	if send == nil {
+		send = unix.SendmsgN
+	}
+	for {
+		n, err := send(c.fd, data, oob, nil, 0)
+		if err != unix.EINTR || n > 0 {
+			return n, err
+		}
+	}
 }
 
 func (c *rpcClient) unmarshal(v any) ([]*os.File, error) {
@@ -251,7 +269,16 @@ func (c *rpcClient) unmarshal(v any) ([]*os.File, error) {
 // would let a different process append the rest of an inherited connection.
 func (c *rpcClient) receiveFrame(data []byte) (int, []*os.File, error) {
 	oob := make([]byte, unix.CmsgSpace(maxFiles*4)+unix.CmsgSpace(unix.SizeofUcred))
-	n, oobn, flags, _, err := unix.Recvmsg(c.fd, data, oob, unix.MSG_CMSG_CLOEXEC)
+	receive := c.recvmsg
+	if receive == nil {
+		receive = unix.Recvmsg
+	}
+	n, oobn, flags, _, err := receive(c.fd, data, oob, unix.MSG_CMSG_CLOEXEC)
+	for err == unix.EINTR && n <= 0 {
+		// No reply data was consumed. Continue the original frame read, retaining
+		// its sender checks and MSG_CMSG_CLOEXEC handling below.
+		n, oobn, flags, _, err = receive(c.fd, data, oob, unix.MSG_CMSG_CLOEXEC)
+	}
 	if err != nil {
 		return 0, nil, err
 	}
