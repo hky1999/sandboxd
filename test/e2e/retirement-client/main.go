@@ -41,6 +41,18 @@ func invoke(ctx context.Context, client runtimeapi.SandboxServiceClient, method 
 			return nil, err
 		}
 		return client.DeleteIfGeneration(ctx, request)
+	case "CheckpointIfGeneration":
+		request := new(runtimeapi.CheckpointIfGenerationRequest)
+		if err := decode(request); err != nil {
+			return nil, err
+		}
+		return client.CheckpointIfGeneration(ctx, request)
+	case "Restore":
+		request := new(runtimeapi.RestoreRequest)
+		if err := decode(request); err != nil {
+			return nil, err
+		}
+		return client.Restore(ctx, request)
 	case "List":
 		request := new(runtimeapi.ListSandboxesRequest)
 		if err := decode(request); err != nil {
