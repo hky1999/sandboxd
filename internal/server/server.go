@@ -149,23 +149,39 @@ type sandboxService struct {
 }
 
 // loadRuntimeHandlers loads runtime handlers with exponential backoff.
-// It blocks until all configured runtimes are loaded or timeout is reached.
-func (h *sandboxService) loadRuntimeHandlers() {
+// A configured required runtime must initialize before startup can continue.
+func (h *sandboxService) loadRuntimeHandlers() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	return h.loadRuntimeHandlersWithContext(ctx, newRuntimeHandler)
+}
+
+func (h *sandboxService) loadRuntimeHandlersWithContext(ctx context.Context, create func(config.Config, string, string) (svc.Handler, error)) error {
 	logrus.Debugf("loading runtime handlers: %v", h.config.PluginConfig.RuntimeConfig.RuntimeBinary)
 
 	// Disk path "containers" is retained for state-recovery compatibility.
 	sandboxesRoot := filepath.Join(h.config.RootDir, "containers")
 	if err := os.MkdirAll(sandboxesRoot, 0755); err != nil {
-		logrus.Errorf("create sandboxes dir failed: %v", err)
+		return fmt.Errorf("create runtime bundle directory: %w", err)
 	}
 
-	const maxWait = 30 * time.Second
 	backoff := 100 * time.Millisecond
-	deadline := time.Now().Add(maxWait)
+	runtimeNames := make([]string, 0, len(h.config.RuntimeConfig.RuntimeBinary))
+	for name := range h.config.RuntimeConfig.RuntimeBinary {
+		runtimeNames = append(runtimeNames, name)
+	}
+	sort.Strings(runtimeNames)
 
 	for {
-		allLoaded := true
-		for runtimeName, runtimeBin := range h.config.PluginConfig.RuntimeConfig.RuntimeBinary {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("runtime initialization cancelled: %w", err)
+		}
+		var requiredErr error
+		for _, runtimeName := range runtimeNames {
+			if err := ctx.Err(); err != nil {
+				return fmt.Errorf("runtime initialization cancelled: %w", errors.Join(requiredErr, err))
+			}
+			runtimeBin := h.config.RuntimeConfig.RuntimeBinary[runtimeName]
 			if h.config.DisableCgroup && runtimeName != config.RuntimeNameRunsc {
 				logrus.Warnf(
 					"runtime %v is not registered: experimental cgroup-disabled "+
@@ -177,11 +193,14 @@ func (h *sandboxService) loadRuntimeHandlers() {
 			if h.serviceHandler.Has(runtimeName) {
 				continue
 			}
-			handler, err := newRuntimeHandler(h.config, runtimeBin, runtimeName)
+			handler, err := create(h.config, runtimeBin, runtimeName)
+			if err == nil && handler == nil {
+				err = errors.New("runtime initializer returned no handler")
+			}
 			if err != nil {
 				if runtimeName == config.RuntimeNameRunsc {
 					logrus.Warnf("load required runtime %v handler failed: %v", runtimeName, err)
-					allLoaded = false
+					requiredErr = fmt.Errorf("required runtime %s initialization failed: %w", runtimeName, err)
 				} else {
 					// Optional runtimes are node capabilities. A node that does
 					// not meet their host requirements remains ready and omits
@@ -190,21 +209,28 @@ func (h *sandboxService) loadRuntimeHandlers() {
 				}
 				continue
 			}
+			if err := ctx.Err(); err != nil {
+				return fmt.Errorf("runtime initialization completed after cancellation: %w", err)
+			}
 			logrus.Infof("loaded runtime handler for %v", runtimeName)
 			h.serviceHandler.Set(runtimeName, handler)
 		}
 
-		if allLoaded || time.Now().After(deadline) {
-			if !allLoaded {
-				logrus.Errorf("timeout waiting for runtime handlers after %v", maxWait)
-			}
-			return
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("runtime initialization cancelled: %w", errors.Join(requiredErr, err))
+		}
+		if requiredErr == nil {
+			return nil
 		}
 
-		time.Sleep(backoff)
-		if backoff < 5*time.Second {
-			backoff *= 2
+		timer := time.NewTimer(backoff)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return fmt.Errorf("required runtime startup incomplete: %w", errors.Join(requiredErr, ctx.Err()))
+		case <-timer.C:
 		}
+		backoff = min(backoff*2, 5*time.Second)
 	}
 }
 
@@ -1178,7 +1204,9 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 			}
 		}
 	}()
-	s.loadRuntimeHandlers()
+	if err := s.loadRuntimeHandlers(); err != nil {
+		return nil, fmt.Errorf("initialize required runtimes: %w", err)
+	}
 	if nodeResMod != nil && cfg.RuntimeConfig.FilestoreDir != "" {
 		nodeResMod.SetEphemeralStorageProvider(s.volumeMgr)
 	}
