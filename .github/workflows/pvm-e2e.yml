@@ -15,14 +15,15 @@ jobs:
     timeout-minutes: 180
     env:
       DOCKER_HOST: unix:///run/pvm-ci-docker.sock
-      PVM_CI_OUTPUT: ${{ runner.temp }}/pvm-ci
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
       - name: Verify disposable L1 boundary
-        run: python3 test/e2e/pvm-l1.py
+        run: |
+          echo "PVM_CI_OUTPUT=${RUNNER_TEMP}/pvm-ci" >>"${GITHUB_ENV}"
+          python3 test/e2e/pvm-l1.py
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
         with:
