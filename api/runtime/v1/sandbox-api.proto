@@ -63,6 +63,9 @@ service SandboxService {
   // numbers must equal the live limits; the daemon freezes the sandbox's host
   // cgroup for the write window and never changes the scheduler lifecycle.
   rpc ShrinkResources(ShrinkResourcesRequest) returns (ResizeResourcesResponse) {}
+  // Reconcile an original command without performing resource writes.
+  // An unstarted command can be durably fenced only after its original expiry.
+  rpc ResolveResourceOperation(ResolveResourceOperationRequest) returns (ResizeResourcesResponse) {}
   // ListAvailableRuntimes lists runtime classes whose handlers are ready.
   rpc ListAvailableRuntimes(ListAvailableRuntimesRequest) returns (ListAvailableRuntimesResponse) {}
   // SetNetworkPolicy atomically replaces the network policy of a running sandbox.
@@ -785,4 +788,12 @@ message DeleteIfGenerationRequest {
 }
 message DeleteIfGenerationResponse {
   string retired_generation = 1;
+}
+
+// The complete original request and its RPC kind are immutable. This endpoint
+// never applies the target or renews a deadline. A closed outcome is read back;
+// an expired unstarted request consumes its revision with unchanged limits.
+message ResolveResourceOperationRequest {
+  ResizeResourcesRequest original = 1;
+  bool shrink = 2;
 }

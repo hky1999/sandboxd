@@ -309,3 +309,12 @@ event watchers — never a write target, never a replacement for journal
 identity verification. pending=true never closes an UNKNOWN by itself:
 reconciliation must match operation_id and revision with pending=false,
 verified limits and an unfrozen sandbox.
+
+
+# 调度器过期资源操作的结算
+
+`ResolveResourceOperation` 接收原 `ResizeResourcesRequest` 和原缩容种类，必须保留原请求的全部字段与截止时间。它只回读已经登记的终态，或在物理资源锁内为已经过期、从未执行且源资源完整匹配的请求持久登记不执行结果；后者消耗下一资源修订号，保留原操作编号和完整指纹，但不写资源上限、不取得冻结归属、不延长期限。未过期的新请求、原操作仍未完成、身份或指纹不符、日志缺失损坏、源资源或解冻状态不完整时拒绝结算。失败或回复丢失后必须保留预留，重新回读或按同一代际退役，不能用超时证明资源已经归还。
+
+原上限、正确的 memory.high、原操作编号、递增修订号、已关闭日志和确认解冻共同证明该操作没有改变额度；此时 `complete=false`，不能当作目标已经执行成功。同一操作编号换期限或换参数必须拒绝。后台恢复在取得物理资源锁后重新读取日志，只处理仍匹配原修订号、操作编号和完整指纹的未关闭操作，不能依据加锁前的快照解冻或发布旧修订号。
+
+普通组件测试验证接口、日志及预算契约；此处不声明动态资源的匹配生产部署或物理故障验收完成。

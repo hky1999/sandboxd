@@ -33,24 +33,25 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	SandboxService_Start_FullMethodName                  = "/runtime.v1.SandboxService/Start"
-	SandboxService_StartOperation_FullMethodName         = "/runtime.v1.SandboxService/StartOperation"
-	SandboxService_GetStartOperation_FullMethodName      = "/runtime.v1.SandboxService/GetStartOperation"
-	SandboxService_Checkpoint_FullMethodName             = "/runtime.v1.SandboxService/Checkpoint"
-	SandboxService_CheckpointIfGeneration_FullMethodName = "/runtime.v1.SandboxService/CheckpointIfGeneration"
-	SandboxService_Pause_FullMethodName                  = "/runtime.v1.SandboxService/Pause"
-	SandboxService_Resume_FullMethodName                 = "/runtime.v1.SandboxService/Resume"
-	SandboxService_Restore_FullMethodName                = "/runtime.v1.SandboxService/Restore"
-	SandboxService_DeleteCheckpoint_FullMethodName       = "/runtime.v1.SandboxService/DeleteCheckpoint"
-	SandboxService_Delete_FullMethodName                 = "/runtime.v1.SandboxService/Delete"
-	SandboxService_DeleteIfGeneration_FullMethodName     = "/runtime.v1.SandboxService/DeleteIfGeneration"
-	SandboxService_Wait_FullMethodName                   = "/runtime.v1.SandboxService/Wait"
-	SandboxService_List_FullMethodName                   = "/runtime.v1.SandboxService/List"
-	SandboxService_Stats_FullMethodName                  = "/runtime.v1.SandboxService/Stats"
-	SandboxService_ResizeResources_FullMethodName        = "/runtime.v1.SandboxService/ResizeResources"
-	SandboxService_ShrinkResources_FullMethodName        = "/runtime.v1.SandboxService/ShrinkResources"
-	SandboxService_ListAvailableRuntimes_FullMethodName  = "/runtime.v1.SandboxService/ListAvailableRuntimes"
-	SandboxService_SetNetworkPolicy_FullMethodName       = "/runtime.v1.SandboxService/SetNetworkPolicy"
+	SandboxService_Start_FullMethodName                    = "/runtime.v1.SandboxService/Start"
+	SandboxService_StartOperation_FullMethodName           = "/runtime.v1.SandboxService/StartOperation"
+	SandboxService_GetStartOperation_FullMethodName        = "/runtime.v1.SandboxService/GetStartOperation"
+	SandboxService_Checkpoint_FullMethodName               = "/runtime.v1.SandboxService/Checkpoint"
+	SandboxService_CheckpointIfGeneration_FullMethodName   = "/runtime.v1.SandboxService/CheckpointIfGeneration"
+	SandboxService_Pause_FullMethodName                    = "/runtime.v1.SandboxService/Pause"
+	SandboxService_Resume_FullMethodName                   = "/runtime.v1.SandboxService/Resume"
+	SandboxService_Restore_FullMethodName                  = "/runtime.v1.SandboxService/Restore"
+	SandboxService_DeleteCheckpoint_FullMethodName         = "/runtime.v1.SandboxService/DeleteCheckpoint"
+	SandboxService_Delete_FullMethodName                   = "/runtime.v1.SandboxService/Delete"
+	SandboxService_DeleteIfGeneration_FullMethodName       = "/runtime.v1.SandboxService/DeleteIfGeneration"
+	SandboxService_Wait_FullMethodName                     = "/runtime.v1.SandboxService/Wait"
+	SandboxService_List_FullMethodName                     = "/runtime.v1.SandboxService/List"
+	SandboxService_Stats_FullMethodName                    = "/runtime.v1.SandboxService/Stats"
+	SandboxService_ResizeResources_FullMethodName          = "/runtime.v1.SandboxService/ResizeResources"
+	SandboxService_ShrinkResources_FullMethodName          = "/runtime.v1.SandboxService/ShrinkResources"
+	SandboxService_ResolveResourceOperation_FullMethodName = "/runtime.v1.SandboxService/ResolveResourceOperation"
+	SandboxService_ListAvailableRuntimes_FullMethodName    = "/runtime.v1.SandboxService/ListAvailableRuntimes"
+	SandboxService_SetNetworkPolicy_FullMethodName         = "/runtime.v1.SandboxService/SetNetworkPolicy"
 )
 
 // SandboxServiceClient is the client API for SandboxService service.
@@ -102,6 +103,9 @@ type SandboxServiceClient interface {
 	// numbers must equal the live limits; the daemon freezes the sandbox's host
 	// cgroup for the write window and never changes the scheduler lifecycle.
 	ShrinkResources(ctx context.Context, in *ShrinkResourcesRequest, opts ...grpc.CallOption) (*ResizeResourcesResponse, error)
+	// Reconcile an original command without performing resource writes.
+	// An unstarted command can be durably fenced only after its original expiry.
+	ResolveResourceOperation(ctx context.Context, in *ResolveResourceOperationRequest, opts ...grpc.CallOption) (*ResizeResourcesResponse, error)
 	// ListAvailableRuntimes lists runtime classes whose handlers are ready.
 	ListAvailableRuntimes(ctx context.Context, in *ListAvailableRuntimesRequest, opts ...grpc.CallOption) (*ListAvailableRuntimesResponse, error)
 	// SetNetworkPolicy atomically replaces the network policy of a running sandbox.
@@ -276,6 +280,16 @@ func (c *sandboxServiceClient) ShrinkResources(ctx context.Context, in *ShrinkRe
 	return out, nil
 }
 
+func (c *sandboxServiceClient) ResolveResourceOperation(ctx context.Context, in *ResolveResourceOperationRequest, opts ...grpc.CallOption) (*ResizeResourcesResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ResizeResourcesResponse)
+	err := c.cc.Invoke(ctx, SandboxService_ResolveResourceOperation_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *sandboxServiceClient) ListAvailableRuntimes(ctx context.Context, in *ListAvailableRuntimesRequest, opts ...grpc.CallOption) (*ListAvailableRuntimesResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ListAvailableRuntimesResponse)
@@ -345,6 +359,9 @@ type SandboxServiceServer interface {
 	// numbers must equal the live limits; the daemon freezes the sandbox's host
 	// cgroup for the write window and never changes the scheduler lifecycle.
 	ShrinkResources(context.Context, *ShrinkResourcesRequest) (*ResizeResourcesResponse, error)
+	// Reconcile an original command without performing resource writes.
+	// An unstarted command can be durably fenced only after its original expiry.
+	ResolveResourceOperation(context.Context, *ResolveResourceOperationRequest) (*ResizeResourcesResponse, error)
 	// ListAvailableRuntimes lists runtime classes whose handlers are ready.
 	ListAvailableRuntimes(context.Context, *ListAvailableRuntimesRequest) (*ListAvailableRuntimesResponse, error)
 	// SetNetworkPolicy atomically replaces the network policy of a running sandbox.
@@ -406,6 +423,9 @@ func (UnimplementedSandboxServiceServer) ResizeResources(context.Context, *Resiz
 }
 func (UnimplementedSandboxServiceServer) ShrinkResources(context.Context, *ShrinkResourcesRequest) (*ResizeResourcesResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ShrinkResources not implemented")
+}
+func (UnimplementedSandboxServiceServer) ResolveResourceOperation(context.Context, *ResolveResourceOperationRequest) (*ResizeResourcesResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ResolveResourceOperation not implemented")
 }
 func (UnimplementedSandboxServiceServer) ListAvailableRuntimes(context.Context, *ListAvailableRuntimesRequest) (*ListAvailableRuntimesResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ListAvailableRuntimes not implemented")
@@ -722,6 +742,24 @@ func _SandboxService_ShrinkResources_Handler(srv interface{}, ctx context.Contex
 	return interceptor(ctx, in, info, handler)
 }
 
+func _SandboxService_ResolveResourceOperation_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ResolveResourceOperationRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SandboxServiceServer).ResolveResourceOperation(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SandboxService_ResolveResourceOperation_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SandboxServiceServer).ResolveResourceOperation(ctx, req.(*ResolveResourceOperationRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _SandboxService_ListAvailableRuntimes_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(ListAvailableRuntimesRequest)
 	if err := dec(in); err != nil {
@@ -828,6 +866,10 @@ var SandboxService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ShrinkResources",
 			Handler:    _SandboxService_ShrinkResources_Handler,
+		},
+		{
+			MethodName: "ResolveResourceOperation",
+			Handler:    _SandboxService_ResolveResourceOperation_Handler,
 		},
 		{
 			MethodName: "ListAvailableRuntimes",

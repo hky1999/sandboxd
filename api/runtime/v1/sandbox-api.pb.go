@@ -4505,6 +4505,61 @@ func (x *DeleteIfGenerationResponse) GetRetiredGeneration() string {
 	return ""
 }
 
+// The complete original request and its RPC kind are immutable. This endpoint
+// never applies the target or renews a deadline. A closed outcome is read back;
+// an expired unstarted request consumes its revision with unchanged limits.
+type ResolveResourceOperationRequest struct {
+	state         protoimpl.MessageState  `protogen:"open.v1"`
+	Original      *ResizeResourcesRequest `protobuf:"bytes,1,opt,name=original,proto3" json:"original,omitempty"`
+	Shrink        bool                    `protobuf:"varint,2,opt,name=shrink,proto3" json:"shrink,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ResolveResourceOperationRequest) Reset() {
+	*x = ResolveResourceOperationRequest{}
+	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[51]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ResolveResourceOperationRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ResolveResourceOperationRequest) ProtoMessage() {}
+
+func (x *ResolveResourceOperationRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[51]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ResolveResourceOperationRequest.ProtoReflect.Descriptor instead.
+func (*ResolveResourceOperationRequest) Descriptor() ([]byte, []int) {
+	return file_api_runtime_v1_sandbox_api_proto_rawDescGZIP(), []int{51}
+}
+
+func (x *ResolveResourceOperationRequest) GetOriginal() *ResizeResourcesRequest {
+	if x != nil {
+		return x.Original
+	}
+	return nil
+}
+
+func (x *ResolveResourceOperationRequest) GetShrink() bool {
+	if x != nil {
+		return x.Shrink
+	}
+	return false
+}
+
 var File_api_runtime_v1_sandbox_api_proto protoreflect.FileDescriptor
 
 const file_api_runtime_v1_sandbox_api_proto_rawDesc = "" +
@@ -4860,7 +4915,10 @@ const file_api_runtime_v1_sandbox_api_proto_rawDesc = "" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12/\n" +
 	"\x13expected_generation\x18\x02 \x01(\tR\x12expectedGeneration\"K\n" +
 	"\x1aDeleteIfGenerationResponse\x12-\n" +
-	"\x12retired_generation\x18\x01 \x01(\tR\x11retiredGeneration*\xc8\x01\n" +
+	"\x12retired_generation\x18\x01 \x01(\tR\x11retiredGeneration\"y\n" +
+	"\x1fResolveResourceOperationRequest\x12>\n" +
+	"\boriginal\x18\x01 \x01(\v2\".runtime.v1.ResizeResourcesRequestR\boriginal\x12\x16\n" +
+	"\x06shrink\x18\x02 \x01(\bR\x06shrink*\xc8\x01\n" +
 	"\x13StartOperationState\x12!\n" +
 	"\x1dSTART_OPERATION_STATE_UNKNOWN\x10\x00\x12!\n" +
 	"\x1dSTART_OPERATION_STATE_PENDING\x10\x01\x12!\n" +
@@ -4897,7 +4955,7 @@ const file_api_runtime_v1_sandbox_api_proto_rawDesc = "" +
 	"\x14SandboxPhysicalPhase\x12&\n" +
 	"\"SANDBOX_PHYSICAL_PHASE_UNSPECIFIED\x10\x00\x12!\n" +
 	"\x1dSANDBOX_PHYSICAL_PHASE_INTENT\x10\x01\x12$\n" +
-	" SANDBOX_PHYSICAL_PHASE_COMMITTED\x10\x022\xeb\v\n" +
+	" SANDBOX_PHYSICAL_PHASE_COMMITTED\x10\x022\xdb\f\n" +
 	"\x0eSandboxService\x12>\n" +
 	"\x05Start\x12\x18.runtime.v1.StartRequest\x1a\x19.runtime.v1.StartResponse\"\x00\x12Y\n" +
 	"\x0eStartOperation\x12!.runtime.v1.StartOperationRequest\x1a\".runtime.v1.StartOperationResponse\"\x00\x12_\n" +
@@ -4916,6 +4974,7 @@ const file_api_runtime_v1_sandbox_api_proto_rawDesc = "" +
 	"\x05Stats\x12\x18.runtime.v1.StatsRequest\x1a\x19.runtime.v1.StatsResponse\"\x00\x12\\\n" +
 	"\x0fResizeResources\x12\".runtime.v1.ResizeResourcesRequest\x1a#.runtime.v1.ResizeResourcesResponse\"\x00\x12\\\n" +
 	"\x0fShrinkResources\x12\".runtime.v1.ShrinkResourcesRequest\x1a#.runtime.v1.ResizeResourcesResponse\"\x00\x12n\n" +
+	"\x18ResolveResourceOperation\x12+.runtime.v1.ResolveResourceOperationRequest\x1a#.runtime.v1.ResizeResourcesResponse\"\x00\x12n\n" +
 	"\x15ListAvailableRuntimes\x12(.runtime.v1.ListAvailableRuntimesRequest\x1a).runtime.v1.ListAvailableRuntimesResponse\"\x00\x12_\n" +
 	"\x10SetNetworkPolicy\x12#.runtime.v1.SetNetworkPolicyRequest\x1a$.runtime.v1.SetNetworkPolicyResponse\"\x00B3Z1github.com/inclusionAI/sandboxd/api/runtime/v1;v1b\x06proto3"
 
@@ -4932,79 +4991,80 @@ func file_api_runtime_v1_sandbox_api_proto_rawDescGZIP() []byte {
 }
 
 var file_api_runtime_v1_sandbox_api_proto_enumTypes = make([]protoimpl.EnumInfo, 8)
-var file_api_runtime_v1_sandbox_api_proto_msgTypes = make([]protoimpl.MessageInfo, 63)
+var file_api_runtime_v1_sandbox_api_proto_msgTypes = make([]protoimpl.MessageInfo, 64)
 var file_api_runtime_v1_sandbox_api_proto_goTypes = []any{
-	(StartOperationState)(0),              // 0: runtime.v1.StartOperationState
-	(NetworkPolicyAction)(0),              // 1: runtime.v1.NetworkPolicyAction
-	(NetworkDirection)(0),                 // 2: runtime.v1.NetworkDirection
-	(NetworkProtocol)(0),                  // 3: runtime.v1.NetworkProtocol
-	(TrafficPolicyMode)(0),                // 4: runtime.v1.TrafficPolicyMode
-	(RootfsSrcType)(0),                    // 5: runtime.v1.RootfsSrcType
-	(SandboxState)(0),                     // 6: runtime.v1.SandboxState
-	(SandboxPhysicalPhase)(0),             // 7: runtime.v1.SandboxPhysicalPhase
-	(*StartOperationRequest)(nil),         // 8: runtime.v1.StartOperationRequest
-	(*GetStartOperationRequest)(nil),      // 9: runtime.v1.GetStartOperationRequest
-	(*StartOperationResponse)(nil),        // 10: runtime.v1.StartOperationResponse
-	(*NetworkEndpoint)(nil),               // 11: runtime.v1.NetworkEndpoint
-	(*PortRange)(nil),                     // 12: runtime.v1.PortRange
-	(*TrafficRule)(nil),                   // 13: runtime.v1.TrafficRule
-	(*TrafficPolicy)(nil),                 // 14: runtime.v1.TrafficPolicy
-	(*DNSRule)(nil),                       // 15: runtime.v1.DNSRule
-	(*DNSPolicy)(nil),                     // 16: runtime.v1.DNSPolicy
-	(*NetworkPolicy)(nil),                 // 17: runtime.v1.NetworkPolicy
-	(*SetNetworkPolicyRequest)(nil),       // 18: runtime.v1.SetNetworkPolicyRequest
-	(*SetNetworkPolicyResponse)(nil),      // 19: runtime.v1.SetNetworkPolicyResponse
-	(*S3Config)(nil),                      // 20: runtime.v1.S3Config
-	(*RootfsConfig)(nil),                  // 21: runtime.v1.RootfsConfig
-	(*Mount)(nil),                         // 22: runtime.v1.Mount
-	(*XpuAllocation)(nil),                 // 23: runtime.v1.XpuAllocation
-	(*CheckpointInfo)(nil),                // 24: runtime.v1.CheckpointInfo
-	(*StartRequest)(nil),                  // 25: runtime.v1.StartRequest
-	(*StartResponse)(nil),                 // 26: runtime.v1.StartResponse
-	(*CheckpointRequest)(nil),             // 27: runtime.v1.CheckpointRequest
-	(*CheckpointResponse)(nil),            // 28: runtime.v1.CheckpointResponse
-	(*CheckpointIfGenerationRequest)(nil), // 29: runtime.v1.CheckpointIfGenerationRequest
-	(*PauseRequest)(nil),                  // 30: runtime.v1.PauseRequest
-	(*PauseResponse)(nil),                 // 31: runtime.v1.PauseResponse
-	(*DeleteCheckpointRequest)(nil),       // 32: runtime.v1.DeleteCheckpointRequest
-	(*DeleteCheckpointResponse)(nil),      // 33: runtime.v1.DeleteCheckpointResponse
-	(*RestoreRequest)(nil),                // 34: runtime.v1.RestoreRequest
-	(*DeleteRequest)(nil),                 // 35: runtime.v1.DeleteRequest
-	(*DeleteResponse)(nil),                // 36: runtime.v1.DeleteResponse
-	(*WaitRequest)(nil),                   // 37: runtime.v1.WaitRequest
-	(*WaitResponse)(nil),                  // 38: runtime.v1.WaitResponse
-	(*ListSandboxesRequest)(nil),          // 39: runtime.v1.ListSandboxesRequest
-	(*ListSandboxesResponse)(nil),         // 40: runtime.v1.ListSandboxesResponse
-	(*SandboxStatus)(nil),                 // 41: runtime.v1.SandboxStatus
-	(*KeyValue)(nil),                      // 42: runtime.v1.KeyValue
-	(*LinuxSandboxResources)(nil),         // 43: runtime.v1.LinuxSandboxResources
-	(*HugepageLimit)(nil),                 // 44: runtime.v1.HugepageLimit
-	(*SandboxMetadata)(nil),               // 45: runtime.v1.SandboxMetadata
-	(*SandboxMetadataList)(nil),           // 46: runtime.v1.SandboxMetadataList
-	(*StatsRequest)(nil),                  // 47: runtime.v1.StatsRequest
-	(*StatsResponse)(nil),                 // 48: runtime.v1.StatsResponse
-	(*ListAvailableRuntimesRequest)(nil),  // 49: runtime.v1.ListAvailableRuntimesRequest
-	(*RuntimeInfo)(nil),                   // 50: runtime.v1.RuntimeInfo
-	(*ListAvailableRuntimesResponse)(nil), // 51: runtime.v1.ListAvailableRuntimesResponse
-	(*RestoreIdentity)(nil),               // 52: runtime.v1.RestoreIdentity
-	(*ResourceLimits)(nil),                // 53: runtime.v1.ResourceLimits
-	(*ResizeResourcesRequest)(nil),        // 54: runtime.v1.ResizeResourcesRequest
-	(*ShrinkResourcesRequest)(nil),        // 55: runtime.v1.ShrinkResourcesRequest
-	(*ResizeResourcesResponse)(nil),       // 56: runtime.v1.ResizeResourcesResponse
-	(*DeleteIfGenerationRequest)(nil),     // 57: runtime.v1.DeleteIfGenerationRequest
-	(*DeleteIfGenerationResponse)(nil),    // 58: runtime.v1.DeleteIfGenerationResponse
-	nil,                                   // 59: runtime.v1.StartRequest.EnvsEntry
-	nil,                                   // 60: runtime.v1.StartRequest.ResourcesEntry
-	nil,                                   // 61: runtime.v1.StartRequest.LabelsEntry
-	nil,                                   // 62: runtime.v1.StartRequest.MetricLabelsEntry
-	nil,                                   // 63: runtime.v1.ListSandboxesRequest.SelectorEntry
-	nil,                                   // 64: runtime.v1.SandboxStatus.LabelsEntry
-	nil,                                   // 65: runtime.v1.SandboxStatus.MetricLabelsEntry
-	nil,                                   // 66: runtime.v1.LinuxSandboxResources.UnifiedEntry
-	nil,                                   // 67: runtime.v1.SandboxMetadata.LabelsEntry
-	nil,                                   // 68: runtime.v1.SandboxMetadata.MetricLabelsEntry
-	nil,                                   // 69: runtime.v1.SandboxMetadata.ResourceFactsEntry
-	nil,                                   // 70: runtime.v1.SandboxMetadataList.SandboxesEntry
+	(StartOperationState)(0),                // 0: runtime.v1.StartOperationState
+	(NetworkPolicyAction)(0),                // 1: runtime.v1.NetworkPolicyAction
+	(NetworkDirection)(0),                   // 2: runtime.v1.NetworkDirection
+	(NetworkProtocol)(0),                    // 3: runtime.v1.NetworkProtocol
+	(TrafficPolicyMode)(0),                  // 4: runtime.v1.TrafficPolicyMode
+	(RootfsSrcType)(0),                      // 5: runtime.v1.RootfsSrcType
+	(SandboxState)(0),                       // 6: runtime.v1.SandboxState
+	(SandboxPhysicalPhase)(0),               // 7: runtime.v1.SandboxPhysicalPhase
+	(*StartOperationRequest)(nil),           // 8: runtime.v1.StartOperationRequest
+	(*GetStartOperationRequest)(nil),        // 9: runtime.v1.GetStartOperationRequest
+	(*StartOperationResponse)(nil),          // 10: runtime.v1.StartOperationResponse
+	(*NetworkEndpoint)(nil),                 // 11: runtime.v1.NetworkEndpoint
+	(*PortRange)(nil),                       // 12: runtime.v1.PortRange
+	(*TrafficRule)(nil),                     // 13: runtime.v1.TrafficRule
+	(*TrafficPolicy)(nil),                   // 14: runtime.v1.TrafficPolicy
+	(*DNSRule)(nil),                         // 15: runtime.v1.DNSRule
+	(*DNSPolicy)(nil),                       // 16: runtime.v1.DNSPolicy
+	(*NetworkPolicy)(nil),                   // 17: runtime.v1.NetworkPolicy
+	(*SetNetworkPolicyRequest)(nil),         // 18: runtime.v1.SetNetworkPolicyRequest
+	(*SetNetworkPolicyResponse)(nil),        // 19: runtime.v1.SetNetworkPolicyResponse
+	(*S3Config)(nil),                        // 20: runtime.v1.S3Config
+	(*RootfsConfig)(nil),                    // 21: runtime.v1.RootfsConfig
+	(*Mount)(nil),                           // 22: runtime.v1.Mount
+	(*XpuAllocation)(nil),                   // 23: runtime.v1.XpuAllocation
+	(*CheckpointInfo)(nil),                  // 24: runtime.v1.CheckpointInfo
+	(*StartRequest)(nil),                    // 25: runtime.v1.StartRequest
+	(*StartResponse)(nil),                   // 26: runtime.v1.StartResponse
+	(*CheckpointRequest)(nil),               // 27: runtime.v1.CheckpointRequest
+	(*CheckpointResponse)(nil),              // 28: runtime.v1.CheckpointResponse
+	(*CheckpointIfGenerationRequest)(nil),   // 29: runtime.v1.CheckpointIfGenerationRequest
+	(*PauseRequest)(nil),                    // 30: runtime.v1.PauseRequest
+	(*PauseResponse)(nil),                   // 31: runtime.v1.PauseResponse
+	(*DeleteCheckpointRequest)(nil),         // 32: runtime.v1.DeleteCheckpointRequest
+	(*DeleteCheckpointResponse)(nil),        // 33: runtime.v1.DeleteCheckpointResponse
+	(*RestoreRequest)(nil),                  // 34: runtime.v1.RestoreRequest
+	(*DeleteRequest)(nil),                   // 35: runtime.v1.DeleteRequest
+	(*DeleteResponse)(nil),                  // 36: runtime.v1.DeleteResponse
+	(*WaitRequest)(nil),                     // 37: runtime.v1.WaitRequest
+	(*WaitResponse)(nil),                    // 38: runtime.v1.WaitResponse
+	(*ListSandboxesRequest)(nil),            // 39: runtime.v1.ListSandboxesRequest
+	(*ListSandboxesResponse)(nil),           // 40: runtime.v1.ListSandboxesResponse
+	(*SandboxStatus)(nil),                   // 41: runtime.v1.SandboxStatus
+	(*KeyValue)(nil),                        // 42: runtime.v1.KeyValue
+	(*LinuxSandboxResources)(nil),           // 43: runtime.v1.LinuxSandboxResources
+	(*HugepageLimit)(nil),                   // 44: runtime.v1.HugepageLimit
+	(*SandboxMetadata)(nil),                 // 45: runtime.v1.SandboxMetadata
+	(*SandboxMetadataList)(nil),             // 46: runtime.v1.SandboxMetadataList
+	(*StatsRequest)(nil),                    // 47: runtime.v1.StatsRequest
+	(*StatsResponse)(nil),                   // 48: runtime.v1.StatsResponse
+	(*ListAvailableRuntimesRequest)(nil),    // 49: runtime.v1.ListAvailableRuntimesRequest
+	(*RuntimeInfo)(nil),                     // 50: runtime.v1.RuntimeInfo
+	(*ListAvailableRuntimesResponse)(nil),   // 51: runtime.v1.ListAvailableRuntimesResponse
+	(*RestoreIdentity)(nil),                 // 52: runtime.v1.RestoreIdentity
+	(*ResourceLimits)(nil),                  // 53: runtime.v1.ResourceLimits
+	(*ResizeResourcesRequest)(nil),          // 54: runtime.v1.ResizeResourcesRequest
+	(*ShrinkResourcesRequest)(nil),          // 55: runtime.v1.ShrinkResourcesRequest
+	(*ResizeResourcesResponse)(nil),         // 56: runtime.v1.ResizeResourcesResponse
+	(*DeleteIfGenerationRequest)(nil),       // 57: runtime.v1.DeleteIfGenerationRequest
+	(*DeleteIfGenerationResponse)(nil),      // 58: runtime.v1.DeleteIfGenerationResponse
+	(*ResolveResourceOperationRequest)(nil), // 59: runtime.v1.ResolveResourceOperationRequest
+	nil,                                     // 60: runtime.v1.StartRequest.EnvsEntry
+	nil,                                     // 61: runtime.v1.StartRequest.ResourcesEntry
+	nil,                                     // 62: runtime.v1.StartRequest.LabelsEntry
+	nil,                                     // 63: runtime.v1.StartRequest.MetricLabelsEntry
+	nil,                                     // 64: runtime.v1.ListSandboxesRequest.SelectorEntry
+	nil,                                     // 65: runtime.v1.SandboxStatus.LabelsEntry
+	nil,                                     // 66: runtime.v1.SandboxStatus.MetricLabelsEntry
+	nil,                                     // 67: runtime.v1.LinuxSandboxResources.UnifiedEntry
+	nil,                                     // 68: runtime.v1.SandboxMetadata.LabelsEntry
+	nil,                                     // 69: runtime.v1.SandboxMetadata.MetricLabelsEntry
+	nil,                                     // 70: runtime.v1.SandboxMetadata.ResourceFactsEntry
+	nil,                                     // 71: runtime.v1.SandboxMetadataList.SandboxesEntry
 }
 var file_api_runtime_v1_sandbox_api_proto_depIdxs = []int32{
 	25, // 0: runtime.v1.StartOperationRequest.start:type_name -> runtime.v1.StartRequest
@@ -5031,80 +5091,83 @@ var file_api_runtime_v1_sandbox_api_proto_depIdxs = []int32{
 	20, // 21: runtime.v1.RootfsConfig.s3_config:type_name -> runtime.v1.S3Config
 	20, // 22: runtime.v1.Mount.s3_config:type_name -> runtime.v1.S3Config
 	21, // 23: runtime.v1.StartRequest.rootfs:type_name -> runtime.v1.RootfsConfig
-	59, // 24: runtime.v1.StartRequest.envs:type_name -> runtime.v1.StartRequest.EnvsEntry
+	60, // 24: runtime.v1.StartRequest.envs:type_name -> runtime.v1.StartRequest.EnvsEntry
 	22, // 25: runtime.v1.StartRequest.mounts:type_name -> runtime.v1.Mount
-	60, // 26: runtime.v1.StartRequest.resources:type_name -> runtime.v1.StartRequest.ResourcesEntry
-	61, // 27: runtime.v1.StartRequest.labels:type_name -> runtime.v1.StartRequest.LabelsEntry
-	62, // 28: runtime.v1.StartRequest.metric_labels:type_name -> runtime.v1.StartRequest.MetricLabelsEntry
+	61, // 26: runtime.v1.StartRequest.resources:type_name -> runtime.v1.StartRequest.ResourcesEntry
+	62, // 27: runtime.v1.StartRequest.labels:type_name -> runtime.v1.StartRequest.LabelsEntry
+	63, // 28: runtime.v1.StartRequest.metric_labels:type_name -> runtime.v1.StartRequest.MetricLabelsEntry
 	23, // 29: runtime.v1.StartRequest.xpu_allocations:type_name -> runtime.v1.XpuAllocation
 	17, // 30: runtime.v1.StartRequest.network_policy:type_name -> runtime.v1.NetworkPolicy
 	24, // 31: runtime.v1.StartRequest.checkpoint_info:type_name -> runtime.v1.CheckpointInfo
 	27, // 32: runtime.v1.CheckpointIfGenerationRequest.checkpoint:type_name -> runtime.v1.CheckpointRequest
 	25, // 33: runtime.v1.RestoreRequest.config:type_name -> runtime.v1.StartRequest
-	63, // 34: runtime.v1.ListSandboxesRequest.selector:type_name -> runtime.v1.ListSandboxesRequest.SelectorEntry
+	64, // 34: runtime.v1.ListSandboxesRequest.selector:type_name -> runtime.v1.ListSandboxesRequest.SelectorEntry
 	41, // 35: runtime.v1.ListSandboxesResponse.sandboxes:type_name -> runtime.v1.SandboxStatus
 	6,  // 36: runtime.v1.SandboxStatus.state:type_name -> runtime.v1.SandboxState
-	64, // 37: runtime.v1.SandboxStatus.labels:type_name -> runtime.v1.SandboxStatus.LabelsEntry
+	65, // 37: runtime.v1.SandboxStatus.labels:type_name -> runtime.v1.SandboxStatus.LabelsEntry
 	22, // 38: runtime.v1.SandboxStatus.mounts:type_name -> runtime.v1.Mount
 	42, // 39: runtime.v1.SandboxStatus.envs:type_name -> runtime.v1.KeyValue
 	43, // 40: runtime.v1.SandboxStatus.resources:type_name -> runtime.v1.LinuxSandboxResources
-	65, // 41: runtime.v1.SandboxStatus.metric_labels:type_name -> runtime.v1.SandboxStatus.MetricLabelsEntry
+	66, // 41: runtime.v1.SandboxStatus.metric_labels:type_name -> runtime.v1.SandboxStatus.MetricLabelsEntry
 	44, // 42: runtime.v1.LinuxSandboxResources.hugepage_limits:type_name -> runtime.v1.HugepageLimit
-	66, // 43: runtime.v1.LinuxSandboxResources.unified:type_name -> runtime.v1.LinuxSandboxResources.UnifiedEntry
-	67, // 44: runtime.v1.SandboxMetadata.labels:type_name -> runtime.v1.SandboxMetadata.LabelsEntry
-	68, // 45: runtime.v1.SandboxMetadata.metric_labels:type_name -> runtime.v1.SandboxMetadata.MetricLabelsEntry
+	67, // 43: runtime.v1.LinuxSandboxResources.unified:type_name -> runtime.v1.LinuxSandboxResources.UnifiedEntry
+	68, // 44: runtime.v1.SandboxMetadata.labels:type_name -> runtime.v1.SandboxMetadata.LabelsEntry
+	69, // 45: runtime.v1.SandboxMetadata.metric_labels:type_name -> runtime.v1.SandboxMetadata.MetricLabelsEntry
 	7,  // 46: runtime.v1.SandboxMetadata.physical_phase:type_name -> runtime.v1.SandboxPhysicalPhase
 	52, // 47: runtime.v1.SandboxMetadata.restore_identity:type_name -> runtime.v1.RestoreIdentity
-	69, // 48: runtime.v1.SandboxMetadata.resource_facts:type_name -> runtime.v1.SandboxMetadata.ResourceFactsEntry
-	70, // 49: runtime.v1.SandboxMetadataList.sandboxes:type_name -> runtime.v1.SandboxMetadataList.SandboxesEntry
+	70, // 48: runtime.v1.SandboxMetadata.resource_facts:type_name -> runtime.v1.SandboxMetadata.ResourceFactsEntry
+	71, // 49: runtime.v1.SandboxMetadataList.sandboxes:type_name -> runtime.v1.SandboxMetadataList.SandboxesEntry
 	50, // 50: runtime.v1.ListAvailableRuntimesResponse.runtimes:type_name -> runtime.v1.RuntimeInfo
 	53, // 51: runtime.v1.ResizeResourcesRequest.expected:type_name -> runtime.v1.ResourceLimits
 	53, // 52: runtime.v1.ResizeResourcesRequest.target:type_name -> runtime.v1.ResourceLimits
 	53, // 53: runtime.v1.ShrinkResourcesRequest.expected:type_name -> runtime.v1.ResourceLimits
 	53, // 54: runtime.v1.ShrinkResourcesRequest.target:type_name -> runtime.v1.ResourceLimits
 	48, // 55: runtime.v1.ResizeResourcesResponse.actual:type_name -> runtime.v1.StatsResponse
-	45, // 56: runtime.v1.SandboxMetadataList.SandboxesEntry.value:type_name -> runtime.v1.SandboxMetadata
-	25, // 57: runtime.v1.SandboxService.Start:input_type -> runtime.v1.StartRequest
-	8,  // 58: runtime.v1.SandboxService.StartOperation:input_type -> runtime.v1.StartOperationRequest
-	9,  // 59: runtime.v1.SandboxService.GetStartOperation:input_type -> runtime.v1.GetStartOperationRequest
-	27, // 60: runtime.v1.SandboxService.Checkpoint:input_type -> runtime.v1.CheckpointRequest
-	29, // 61: runtime.v1.SandboxService.CheckpointIfGeneration:input_type -> runtime.v1.CheckpointIfGenerationRequest
-	30, // 62: runtime.v1.SandboxService.Pause:input_type -> runtime.v1.PauseRequest
-	30, // 63: runtime.v1.SandboxService.Resume:input_type -> runtime.v1.PauseRequest
-	34, // 64: runtime.v1.SandboxService.Restore:input_type -> runtime.v1.RestoreRequest
-	32, // 65: runtime.v1.SandboxService.DeleteCheckpoint:input_type -> runtime.v1.DeleteCheckpointRequest
-	35, // 66: runtime.v1.SandboxService.Delete:input_type -> runtime.v1.DeleteRequest
-	57, // 67: runtime.v1.SandboxService.DeleteIfGeneration:input_type -> runtime.v1.DeleteIfGenerationRequest
-	37, // 68: runtime.v1.SandboxService.Wait:input_type -> runtime.v1.WaitRequest
-	39, // 69: runtime.v1.SandboxService.List:input_type -> runtime.v1.ListSandboxesRequest
-	47, // 70: runtime.v1.SandboxService.Stats:input_type -> runtime.v1.StatsRequest
-	54, // 71: runtime.v1.SandboxService.ResizeResources:input_type -> runtime.v1.ResizeResourcesRequest
-	55, // 72: runtime.v1.SandboxService.ShrinkResources:input_type -> runtime.v1.ShrinkResourcesRequest
-	49, // 73: runtime.v1.SandboxService.ListAvailableRuntimes:input_type -> runtime.v1.ListAvailableRuntimesRequest
-	18, // 74: runtime.v1.SandboxService.SetNetworkPolicy:input_type -> runtime.v1.SetNetworkPolicyRequest
-	26, // 75: runtime.v1.SandboxService.Start:output_type -> runtime.v1.StartResponse
-	10, // 76: runtime.v1.SandboxService.StartOperation:output_type -> runtime.v1.StartOperationResponse
-	10, // 77: runtime.v1.SandboxService.GetStartOperation:output_type -> runtime.v1.StartOperationResponse
-	28, // 78: runtime.v1.SandboxService.Checkpoint:output_type -> runtime.v1.CheckpointResponse
-	28, // 79: runtime.v1.SandboxService.CheckpointIfGeneration:output_type -> runtime.v1.CheckpointResponse
-	31, // 80: runtime.v1.SandboxService.Pause:output_type -> runtime.v1.PauseResponse
-	31, // 81: runtime.v1.SandboxService.Resume:output_type -> runtime.v1.PauseResponse
-	26, // 82: runtime.v1.SandboxService.Restore:output_type -> runtime.v1.StartResponse
-	33, // 83: runtime.v1.SandboxService.DeleteCheckpoint:output_type -> runtime.v1.DeleteCheckpointResponse
-	36, // 84: runtime.v1.SandboxService.Delete:output_type -> runtime.v1.DeleteResponse
-	58, // 85: runtime.v1.SandboxService.DeleteIfGeneration:output_type -> runtime.v1.DeleteIfGenerationResponse
-	38, // 86: runtime.v1.SandboxService.Wait:output_type -> runtime.v1.WaitResponse
-	40, // 87: runtime.v1.SandboxService.List:output_type -> runtime.v1.ListSandboxesResponse
-	48, // 88: runtime.v1.SandboxService.Stats:output_type -> runtime.v1.StatsResponse
-	56, // 89: runtime.v1.SandboxService.ResizeResources:output_type -> runtime.v1.ResizeResourcesResponse
-	56, // 90: runtime.v1.SandboxService.ShrinkResources:output_type -> runtime.v1.ResizeResourcesResponse
-	51, // 91: runtime.v1.SandboxService.ListAvailableRuntimes:output_type -> runtime.v1.ListAvailableRuntimesResponse
-	19, // 92: runtime.v1.SandboxService.SetNetworkPolicy:output_type -> runtime.v1.SetNetworkPolicyResponse
-	75, // [75:93] is the sub-list for method output_type
-	57, // [57:75] is the sub-list for method input_type
-	57, // [57:57] is the sub-list for extension type_name
-	57, // [57:57] is the sub-list for extension extendee
-	0,  // [0:57] is the sub-list for field type_name
+	54, // 56: runtime.v1.ResolveResourceOperationRequest.original:type_name -> runtime.v1.ResizeResourcesRequest
+	45, // 57: runtime.v1.SandboxMetadataList.SandboxesEntry.value:type_name -> runtime.v1.SandboxMetadata
+	25, // 58: runtime.v1.SandboxService.Start:input_type -> runtime.v1.StartRequest
+	8,  // 59: runtime.v1.SandboxService.StartOperation:input_type -> runtime.v1.StartOperationRequest
+	9,  // 60: runtime.v1.SandboxService.GetStartOperation:input_type -> runtime.v1.GetStartOperationRequest
+	27, // 61: runtime.v1.SandboxService.Checkpoint:input_type -> runtime.v1.CheckpointRequest
+	29, // 62: runtime.v1.SandboxService.CheckpointIfGeneration:input_type -> runtime.v1.CheckpointIfGenerationRequest
+	30, // 63: runtime.v1.SandboxService.Pause:input_type -> runtime.v1.PauseRequest
+	30, // 64: runtime.v1.SandboxService.Resume:input_type -> runtime.v1.PauseRequest
+	34, // 65: runtime.v1.SandboxService.Restore:input_type -> runtime.v1.RestoreRequest
+	32, // 66: runtime.v1.SandboxService.DeleteCheckpoint:input_type -> runtime.v1.DeleteCheckpointRequest
+	35, // 67: runtime.v1.SandboxService.Delete:input_type -> runtime.v1.DeleteRequest
+	57, // 68: runtime.v1.SandboxService.DeleteIfGeneration:input_type -> runtime.v1.DeleteIfGenerationRequest
+	37, // 69: runtime.v1.SandboxService.Wait:input_type -> runtime.v1.WaitRequest
+	39, // 70: runtime.v1.SandboxService.List:input_type -> runtime.v1.ListSandboxesRequest
+	47, // 71: runtime.v1.SandboxService.Stats:input_type -> runtime.v1.StatsRequest
+	54, // 72: runtime.v1.SandboxService.ResizeResources:input_type -> runtime.v1.ResizeResourcesRequest
+	55, // 73: runtime.v1.SandboxService.ShrinkResources:input_type -> runtime.v1.ShrinkResourcesRequest
+	59, // 74: runtime.v1.SandboxService.ResolveResourceOperation:input_type -> runtime.v1.ResolveResourceOperationRequest
+	49, // 75: runtime.v1.SandboxService.ListAvailableRuntimes:input_type -> runtime.v1.ListAvailableRuntimesRequest
+	18, // 76: runtime.v1.SandboxService.SetNetworkPolicy:input_type -> runtime.v1.SetNetworkPolicyRequest
+	26, // 77: runtime.v1.SandboxService.Start:output_type -> runtime.v1.StartResponse
+	10, // 78: runtime.v1.SandboxService.StartOperation:output_type -> runtime.v1.StartOperationResponse
+	10, // 79: runtime.v1.SandboxService.GetStartOperation:output_type -> runtime.v1.StartOperationResponse
+	28, // 80: runtime.v1.SandboxService.Checkpoint:output_type -> runtime.v1.CheckpointResponse
+	28, // 81: runtime.v1.SandboxService.CheckpointIfGeneration:output_type -> runtime.v1.CheckpointResponse
+	31, // 82: runtime.v1.SandboxService.Pause:output_type -> runtime.v1.PauseResponse
+	31, // 83: runtime.v1.SandboxService.Resume:output_type -> runtime.v1.PauseResponse
+	26, // 84: runtime.v1.SandboxService.Restore:output_type -> runtime.v1.StartResponse
+	33, // 85: runtime.v1.SandboxService.DeleteCheckpoint:output_type -> runtime.v1.DeleteCheckpointResponse
+	36, // 86: runtime.v1.SandboxService.Delete:output_type -> runtime.v1.DeleteResponse
+	58, // 87: runtime.v1.SandboxService.DeleteIfGeneration:output_type -> runtime.v1.DeleteIfGenerationResponse
+	38, // 88: runtime.v1.SandboxService.Wait:output_type -> runtime.v1.WaitResponse
+	40, // 89: runtime.v1.SandboxService.List:output_type -> runtime.v1.ListSandboxesResponse
+	48, // 90: runtime.v1.SandboxService.Stats:output_type -> runtime.v1.StatsResponse
+	56, // 91: runtime.v1.SandboxService.ResizeResources:output_type -> runtime.v1.ResizeResourcesResponse
+	56, // 92: runtime.v1.SandboxService.ShrinkResources:output_type -> runtime.v1.ResizeResourcesResponse
+	56, // 93: runtime.v1.SandboxService.ResolveResourceOperation:output_type -> runtime.v1.ResizeResourcesResponse
+	51, // 94: runtime.v1.SandboxService.ListAvailableRuntimes:output_type -> runtime.v1.ListAvailableRuntimesResponse
+	19, // 95: runtime.v1.SandboxService.SetNetworkPolicy:output_type -> runtime.v1.SetNetworkPolicyResponse
+	77, // [77:96] is the sub-list for method output_type
+	58, // [58:77] is the sub-list for method input_type
+	58, // [58:58] is the sub-list for extension type_name
+	58, // [58:58] is the sub-list for extension extendee
+	0,  // [0:58] is the sub-list for field type_name
 }
 
 func init() { file_api_runtime_v1_sandbox_api_proto_init() }
@@ -5128,7 +5191,7 @@ func file_api_runtime_v1_sandbox_api_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_api_runtime_v1_sandbox_api_proto_rawDesc), len(file_api_runtime_v1_sandbox_api_proto_rawDesc)),
 			NumEnums:      8,
-			NumMessages:   63,
+			NumMessages:   64,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

@@ -139,6 +139,19 @@ func (h *sandboxService) reconcileOpenResourceState(ctx context.Context, state *
 		return err
 	}
 	defer unlock()
+	// A scanner may have waited behind a live command. Never act on its old
+	// freeze ownership or write an obsolete revision after acquiring the lock.
+	current, loaded, err := h.loadResourceOperationState(state.SandboxID, state.ResourceGeneration)
+	if err != nil {
+		return err
+	}
+	if loaded != resourceStateLoaded {
+		return fmt.Errorf("resource state changed or became unavailable before recovery")
+	}
+	if !current.open() || current.Revision != state.Revision || current.LastOperationID != state.LastOperationID || current.LastFingerprint != state.LastFingerprint {
+		return nil
+	}
+	state = current
 	matches, err := h.resourceIncarnationStillMatches(state)
 	if err != nil {
 		return err
