@@ -1575,6 +1575,13 @@ func (h *sandboxService) createSandbox(
 		if err != nil {
 			return &runtime.StartResponse{Code: -1, Message: err.Error()}, errord.ToGRPC(err)
 		}
+		// Start and StartOperation also carry restores through CheckpointInfo.
+		// Apply the saved source policy before admission, just as Restore does;
+		// no allocator or runtime may see unverified checkpoint limits.
+		if err := applyCheckpointResourceLimits(startReq, checkpointDir); err != nil {
+			return &runtime.StartResponse{Code: -1, Message: err.Error()},
+				errord.ToGRPC(fmt.Errorf("%v: %w", err, errord.ErrFailedPrecondition))
+		}
 	}
 	// A caller cannot choose/reuse the physical resource incarnation.
 	if startReq.Labels == nil {
@@ -1589,7 +1596,7 @@ func (h *sandboxService) createSandbox(
 	// before it can reach the metadata and annotations copies. A restored
 	// generation always gets a newly observed record.
 	delete(startReq.Labels, birthResourcesLabel)
-	if err := validateElasticResources(startReq, h.config, options.checkpointImage != ""); err != nil {
+	if err := validateElasticResources(startReq, h.config, options.checkpointImage != "" || checkpointDir != ""); err != nil {
 		return &runtime.StartResponse{Code: -1, Message: err.Error()},
 			errord.ToGRPC(fmt.Errorf("%v: %w", err, errord.ErrInvalidArgument))
 	}
