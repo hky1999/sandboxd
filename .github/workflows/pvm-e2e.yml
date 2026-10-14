@@ -24,6 +24,16 @@ jobs:
         run: |
           echo "PVM_CI_OUTPUT=${RUNNER_TEMP}/pvm-ci" >>"${GITHUB_ENV}"
           python3 test/e2e/pvm-l1.py
+      - name: Install L1 build and runtime prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 test/e2e/pvm-l1.py
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y build-essential pkg-config libseccomp-dev \
+            iproute2 iptables erofs-utils xfsprogs fuse3 e2fsprogs \
+            clang llvm jq cpio curl git
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
         with:
