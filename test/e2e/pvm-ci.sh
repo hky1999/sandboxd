@@ -9,8 +9,12 @@ python3 "${root}/test/e2e/pvm-l1.py" > "${out}/l1-before.json"
 [[ -n "${DOCKER_HOST:-}" && "${DOCKER_HOST}" == unix:///run/pvm-ci-docker.sock ]] || {
   echo 'PVM CI requires its private L1 Docker daemon' >&2; exit 1;
 }
-! pgrep -x firecracker
-! pgrep -x sandboxd
+for process in firecracker sandboxd virtiofsd; do
+  if pgrep -x "${process}"; then
+    echo "PVM CI refuses an existing ${process} process" >&2
+    exit 1
+  fi
+done
 if [[ -d /sys/module/kvm_pvm ]]; then
   python3 "${root}/test/e2e/pvm-l1.py" --probe > "${out}/abi.json"
 else
@@ -42,6 +46,9 @@ for runtime in firecracker-pvm firecracker-pvm-incremental firecracker-pvm-virti
 done
 dmesg > "${out}/l1.dmesg"
 if grep -E 'BUG:|Oops|WARNING:|general protection' "${out}/l1.dmesg"; then exit 1; fi
-! pgrep -x firecracker
-! pgrep -x sandboxd
-! pgrep -x virtiofsd
+for process in firecracker sandboxd virtiofsd; do
+  if pgrep -x "${process}"; then
+    echo "PVM CI left an unexpected ${process} process" >&2
+    exit 1
+  fi
+done

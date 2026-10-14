@@ -248,7 +248,7 @@ hooks.
 
 ### PVM node validation
 
-The optional `firecracker-pvm`, `firecracker-pvm-incremental`, and `firecracker-pvm-virtiofs` cases require a dedicated x86-64 PVM host kernel with `kvm_pvm` already loaded. They are excluded from the default hardware-KVM matrix and do not install kernels or switch host modules. Select a checksum-pinned PVM candidate through a separate `RUNTIME_VERSIONS_FILE` that contains the complete runtime manifest with only the Firecracker release, URL, and SHA-256 tuple changed; the targeted image rejects a bundle whose `kernel_profile` differs from the selected runtime. Do not modify the default release pins until the exact CI candidate has been qualified and promoted. The agent initrd is built from the consuming sandboxd revision.
+The optional `firecracker-pvm`, `firecracker-pvm-incremental`, and `firecracker-pvm-virtiofs` cases require a dedicated x86-64 PVM host kernel with `kvm_pvm` already loaded. They are excluded from the default hardware-KVM matrix and do not install kernels or switch host modules. Select the independently locked PVM candidate through `third_party/firecracker-pvm-candidate.json` and `prepare-firecracker-pvm.py`; the targeted image rejects a bundle whose `kernel_profile` differs from the selected runtime. Do not modify the default release pins until the exact CI candidate has been qualified and promoted. The agent initrd is built from the consuming sandboxd revision.
 
 ```sh
 RUNTIME_VERSIONS_FILE=/path/to/pvm-candidate-versions.env \
