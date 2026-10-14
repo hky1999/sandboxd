@@ -60,5 +60,5 @@ jobs:
         run: |
           set -euo pipefail
           python3 test/e2e/pvm-l1.py
-          if [[ -d /sys/module/kvm_pvm ]]; then sudo rmmod kvm_pvm; fi
-          if [[ -d /sys/module/kvm ]]; then sudo rmmod kvm; fi
+          if [[ -d /sys/module/kvm_pvm ]]; then rmmod kvm_pvm; fi
+          if [[ -d /sys/module/kvm ]]; then rmmod kvm; fi
