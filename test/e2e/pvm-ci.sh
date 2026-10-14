@@ -29,6 +29,11 @@ export PVM_CANDIDATE_ARCHIVE="${PVM_CANDIDATE_ARCHIVE:-/opt/akernel-pvm-ci/firec
 export GOMAXPROCS=2 GOFLAGS=-p=2
 python3 third_party/test_prepare_firecracker_pvm.py -v
 make check-fmt vet test e2e-runtime-binaries
+fixture="${PVM_CI_FIXTURES:-/opt/akernel-pvm-ci/fixtures.json}"
+[[ -f "${fixture}" ]]
+export E2E_OCI_REGISTRY_SCHEME=http
+export E2E_OCI_ROOTFS_IMAGE=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["runtime_oci"])' "$fixture")
+docker start review-registry >/dev/null
 for runtime in firecracker-pvm firecracker-pvm-incremental firecracker-pvm-virtiofs; do
   SANDBOXD_E2E_CONTAINER="pvm-ci-${GITHUB_RUN_ID:-local}-${runtime}" \
     SANDBOXD_E2E_DISABLED_CONTAINER="pvm-ci-${GITHUB_RUN_ID:-local}-${runtime}-no-cgroup" \

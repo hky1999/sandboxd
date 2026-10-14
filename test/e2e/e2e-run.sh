@@ -32,6 +32,8 @@ FIRECRACKER_CHECKPOINT_MODE="${E2E_FIRECRACKER_CHECKPOINT_MODE:-}"
 FIRECRACKER_VIRTIOFS="${E2E_FIRECRACKER_VIRTIOFS:-0}"
 FIRECRACKER_INITRD="${E2E_FIRECRACKER_INITRD:-/opt/firecracker/initrd.img}"
 OCI_ROOTFS_IMAGE="${E2E_OCI_ROOTFS_IMAGE:-docker.io/library/redis:7-alpine}"
+OCI_REGISTRY_SCHEME="${E2E_OCI_REGISTRY_SCHEME:-https}"
+case "${OCI_REGISTRY_SCHEME}" in http|https) ;; *) echo 'invalid OCI registry scheme' >&2; exit 1 ;; esac
 FIRECRACKER_OVERLAY_BYTES="${E2E_FIRECRACKER_OVERLAY_BYTES:-134217728}"
 HOST_MOUNT="${E2E_HOST_MOUNT:-/e2e/host-mount}"
 WWW_ROOT="${E2E_WWW_ROOT:-/e2e/www}"
@@ -395,7 +397,7 @@ write_config() {
 }
 EOF
 
-    cat > "${CONFIG_DIR}/registry.json" <<'EOF'
+    cat > "${CONFIG_DIR}/registry.json" <<EOF
 {
   "registry": {
     "auth": "",
@@ -409,7 +411,7 @@ EOF
       "url": ""
     },
     "repo": "",
-    "scheme": "https",
+    "scheme": "${OCI_REGISTRY_SCHEME}",
     "skip_verify": true,
     "timeout": 300
   },
