@@ -55,6 +55,7 @@ REDIS_EROFS_ROOTFS="${E2E_REDIS_EROFS_ROOTFS:-/e2e/redis-rootfs.erofs}"
 REDIS_DNAT_HOST_PORT="${E2E_REDIS_DNAT_HOST_PORT:-18379}"
 REDIS_GUEST_PORT="${E2E_REDIS_GUEST_PORT:-6379}"
 REDIS_RESULT_KEY="${E2E_REDIS_RESULT_KEY:-}"
+REDIS_READY_KEY="${E2E_REDIS_READY_KEY:-${REDIS_RESULT_KEY}:ready}"
 REDIS_BENCHMARK_REQUESTS="${E2E_REDIS_BENCHMARK_REQUESTS:-20000}"
 STRESS_ROUNDS="${E2E_STRESS_ROUNDS:-0}"
 STRESS_CONCURRENCY="${E2E_STRESS_CONCURRENCY:-8}"
@@ -1344,6 +1345,8 @@ run_network_soak() {
         sleep 0.1
     done
     assert_eq "${got}" "PONG" "${runtime} guest Redis readiness"
+    sbox_cmd exec -- "${SANDBOX_ID}" /usr/local/bin/redis-cli \
+        -h "${REDIS_HOST}" -p 6379 SET "${REDIS_READY_KEY}" ready >/dev/null
 
     local egress_ip
     egress_ip="$(ip -4 route get "${REDIS_HOST}" | awk \

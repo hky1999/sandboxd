@@ -18,6 +18,7 @@ set -Eeuo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 . "${SCRIPT_DIR}/gvisor-bundle.sh"
+. "${SCRIPT_DIR}/redis-stage.sh"
 
 DOCKER="${DOCKER:-docker}"
 IMAGE="${SANDBOXD_E2E_IMAGE:-sandboxd-e2e:local}"
@@ -52,6 +53,7 @@ REDIS_CONTAINER="${CONTAINER}-redis"
 REDIS_ROOTFS_CONTAINER="${CONTAINER}-redis-rootfs"
 REDIS_NETWORK="${CONTAINER}-network"
 REDIS_RESULT_KEY="sandboxd-e2e:${CONTAINER}:dnat"
+REDIS_READY_KEY="${REDIS_RESULT_KEY}:ready"
 REDIS_FIXTURE_DIR=""
 REDIS_HOST=""
 SANDBOXD_HOME_FIXTURE_DIR=""
@@ -175,9 +177,16 @@ prepare_network_soak() {
     [ -n "${REDIS_HOST}" ] || fail "external Redis has no container IP"
     "${DOCKER}" exec "${REDIS_CONTAINER}" \
         redis-cli set "${REDIS_RESULT_KEY}" pending >/dev/null
+    "${DOCKER}" exec "${REDIS_CONTAINER}" \
+        redis-cli set "${REDIS_READY_KEY}" waiting >/dev/null
 }
 
 run_redis_dnat_benchmark() {
+    if ! wait_for_redis_soak_stage; then
+        "${DOCKER}" exec "${REDIS_CONTAINER}" \
+            redis-cli set "${REDIS_RESULT_KEY}" fail >/dev/null || true
+        return 1
+    fi
     local seen_container=0
     local redis_ready=0
     local i
@@ -462,6 +471,7 @@ if [ "${E2E_NETWORK_SOAK}" = "1" ]; then
         -e "E2E_REDIS_HOST=${REDIS_HOST}"
         -e "E2E_REDIS_DNAT_HOST_PORT=${REDIS_DNAT_HOST_PORT}"
         -e "E2E_REDIS_RESULT_KEY=${REDIS_RESULT_KEY}"
+        -e "E2E_REDIS_READY_KEY=${REDIS_READY_KEY}"
         -v "${REDIS_FIXTURE_DIR}:/e2e-fixtures:ro"
     )
 fi

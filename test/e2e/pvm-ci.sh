@@ -32,6 +32,7 @@ cd "${root}"
 export PVM_CANDIDATE_ARCHIVE="${PVM_CANDIDATE_ARCHIVE:-/opt/akernel-pvm-ci/firecracker.tgz}"
 export GOMAXPROCS=2 GOFLAGS=-p=2
 python3 third_party/test_prepare_firecracker_pvm.py -v
+python3 test/e2e/test_redis_stage.py -v
 make check-fmt vet test e2e-runtime-binaries
 fixture="${PVM_CI_FIXTURES:-/opt/akernel-pvm-ci/fixtures.json}"
 [[ -f "${fixture}" ]]
