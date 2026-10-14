@@ -1,0 +1,13 @@
+{
+  "schema": 1,
+  "repository": "akernel-dev/firecracker",
+  "commit": "7f2d16f8577e985eb1c6464af3ef555696ada95d",
+  "run_id": 38544186470,
+  "artifact_id": 11884092997,
+  "artifact_digest": "sha256:b46a2b1370a00a3a698076e3a61af9f716529377321095565232a3e844ec23f3",
+  "release_tag": "v1.16.1-akernel.4",
+  "archive_name": "firecracker-v1.16.1-akernel.4-x86_64.tgz",
+  "archive_sha256": "599d48ecc5abef026b8fd9037b2413c2dc7b555708ae4984362a9283e1a3381b",
+  "guest_commit": "ca68979e554da5c483c627ced55cb7a55f605b11",
+  "guest_source_sha256": "f3ed347a283bd55d7c8def667d5e9c24e7226c88f6eebf64e5001c81963b8d46"
+}
