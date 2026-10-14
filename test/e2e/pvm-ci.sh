@@ -20,6 +20,10 @@ else
   insmod /opt/akernel-pvm-ci/modules/kvm-pvm.ko
   python3 "${root}/test/e2e/pvm-l1.py" --probe > "${out}/abi.json"
 fi
+for module in erofs fuse loop tun br_netfilter ip_tables ip6_tables \
+  iptable_filter ip6table_filter iptable_nat ip6table_nat xt_conntrack xt_connmark; do
+  modprobe "${module}"
+done
 cd "${root}"
 export PVM_CANDIDATE_ARCHIVE="${PVM_CANDIDATE_ARCHIVE:-/opt/akernel-pvm-ci/firecracker.tgz}"
 export GOMAXPROCS=2 GOFLAGS=-p=2
