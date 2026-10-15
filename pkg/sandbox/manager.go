@@ -198,6 +198,9 @@ func (m *Manager) loop() {
 	housekeepingTicker := time.NewTicker(35 * time.Second)
 	defer housekeepingTicker.Stop()
 
+	// Inspect recovered state immediately; later passes keep their periodic cadence.
+	go m.housekeeping()
+
 	for {
 		select {
 		case <-housekeepingTicker.C:
@@ -326,6 +329,12 @@ func (m *Manager) StoreMetadata(id string, data *runtime.SandboxMetadata) error 
 }
 
 func (m *Manager) housekeeping() {
+	select {
+	case <-m.stopChan:
+		return
+	default:
+	}
+
 	// Avoid reentry
 	isRunning := m.isHousekeepingRunning.Swap(true)
 	if isRunning {
@@ -335,16 +344,20 @@ func (m *Manager) housekeeping() {
 
 	logrus.Debugf("start housekeeping: %d sandboxes", m.sandboxes.Count())
 	start := time.Now()
+	healthy := true
 
 	// 1. Health check
 	defer func() {
 		spent := time.Since(start)
 		if spent >= config.HouseKeepingMaxCostTime {
 			logrus.Warnf("housekeeping finished, cost %v which is too long", spent)
-			m.healthChan <- false
+			healthy = false
 		} else {
 			logrus.Debugf("housekeeping finished, cost %v", spent)
-			m.healthChan <- true
+		}
+		select {
+		case m.healthChan <- healthy:
+		case <-m.stopChan:
 		}
 	}()
 
@@ -357,7 +370,9 @@ func (m *Manager) housekeeping() {
 		states, err := handler.List(ctx)
 		if err != nil {
 			logrus.Errorf("list %s sandboxes failed: %v", r, err)
-			continue
+			healthy = false
+			// An unavailable inventory cannot authorize state removal or readiness.
+			return
 		}
 		for idx := range states {
 			cstates[states[idx].ID] = states[idx]
