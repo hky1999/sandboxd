@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify the locked PVM candidate and stage its original archive for builds."""
+"""Verify a separately pinned PVM bundle and stage its original build archive."""
 
 from __future__ import annotations
 
@@ -66,6 +66,17 @@ def load_pin(path: Path) -> dict:
         pin["archive_name"] == f"firecracker-{pin['release_tag']}-x86_64.tgz",
         "invalid PVM candidate",
     )
+    require(
+        pin.get("distribution", "actions") in ("actions", "release"),
+        "invalid distribution",
+    )
+    if pin.get("distribution") == "release":
+        require(
+            pin["archive_url"]
+            == f"https://github.com/{pin['repository']}/releases/download/"
+            f"{pin['release_tag']}/{pin['archive_name']}",
+            "release URL does not match the pinned repository, tag and archive",
+        )
     return pin
 
 
@@ -176,7 +187,7 @@ def api(path: str, token: str) -> dict:
         return json.load(response)
 
 
-def download(pin: dict, destination: Path, token: str) -> None:
+def download_actions(pin: dict, destination: Path, token: str) -> None:
     require(token, "GH_TOKEN is required to download an Actions candidate")
     root = "repos/" + pin["repository"]
     run = api(f"{root}/actions/runs/{pin['run_id']}", token)
@@ -233,10 +244,31 @@ def download(pin: dict, destination: Path, token: str) -> None:
                 shutil.copyfileobj(source, output)
 
 
+def download(pin: dict, destination: Path, token: str) -> None:
+    if pin.get("distribution", "actions") == "actions":
+        download_actions(pin, destination, token)
+        return
+    # Public promoted assets do not require Actions access or its expiring ZIP.
+    # No token is attached to either GitHub or the signed storage redirect.
+    with (
+        urllib.request.urlopen(pin["archive_url"], timeout=60) as response,
+        destination.open("wb") as stream,
+    ):
+        require(
+            urllib.parse.urlsplit(response.url).scheme == "https",
+            "insecure release redirect",
+        )
+        total = 0
+        for block in iter(lambda: response.read(1024 * 1024), b""):
+            total += len(block)
+            require(total <= MAX_BYTES, "release archive exceeds size limit")
+            stream.write(block)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--pin", type=Path, default=ROOT / "firecracker-pvm-candidate.json"
+        "--pin", type=Path, default=ROOT / "firecracker-pvm.json"
     )
     parser.add_argument(
         "--archive",
@@ -251,7 +283,7 @@ def main() -> None:
     parser.add_argument(
         "--fields",
         action="store_true",
-        help="print the release, archive checksum and Actions source URI",
+        help="print the release, archive checksum and pinned download source",
     )
     args = parser.parse_args()
     pin = load_pin(args.pin)
@@ -259,7 +291,9 @@ def main() -> None:
         print(pin["release_tag"])
         print(pin["archive_sha256"])
         print(
-            f"github-actions://{pin['repository']}/{pin['artifact_id']}/{pin['archive_name']}"
+            pin["archive_url"]
+            if pin.get("distribution") == "release"
+            else f"github-actions://{pin['repository']}/{pin['artifact_id']}/{pin['archive_name']}"
         )
         return
     args.destination.parent.mkdir(parents=True, exist_ok=True)

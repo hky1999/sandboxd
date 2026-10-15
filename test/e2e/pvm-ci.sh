@@ -29,7 +29,10 @@ for module in erofs fuse loop tun br_netfilter ip_tables ip6_tables \
   modprobe "${module}"
 done
 cd "${root}"
-export PVM_CANDIDATE_ARCHIVE="${PVM_CANDIDATE_ARCHIVE:-/opt/akernel-pvm-ci/firecracker.tgz}"
+distribution=$(python3 -c 'import json;print(json.load(open("third_party/firecracker-pvm.json")).get("distribution","actions"))')
+if [[ "${distribution}" == actions ]]; then
+  export PVM_CANDIDATE_ARCHIVE="${PVM_CANDIDATE_ARCHIVE:-/opt/akernel-pvm-ci/firecracker.tgz}"
+fi
 export GOMAXPROCS=2 GOFLAGS=-p=2
 python3 third_party/test_prepare_firecracker_pvm.py -v
 python3 test/e2e/test_redis_stage.py -v

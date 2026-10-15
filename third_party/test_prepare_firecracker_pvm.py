@@ -11,6 +11,7 @@ import sys
 import tarfile
 import tempfile
 import unittest
+from unittest import mock
 
 SCRIPT = Path(__file__).with_name("prepare-firecracker-pvm.py")
 spec = importlib.util.spec_from_file_location("candidate", SCRIPT)
@@ -143,6 +144,85 @@ class CandidateTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("kernel_profile", result.stderr)
             self.assertFalse((root / "staged.tgz").exists())
+
+    def release_pin(self, pin, pin_path):
+        pin = dict(pin, distribution="release")
+        pin["archive_url"] = (
+            f"https://github.com/{pin['repository']}/releases/download/"
+            f"{pin['release_tag']}/{pin['archive_name']}"
+        )
+        pin_path.write_text(json.dumps(pin))
+        return candidate.load_pin(pin_path)
+
+    def test_promoted_release_reuses_original_verification_without_actions(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            archive, pin, pin_path = self.fixture(root)
+            pin = self.release_pin(pin, pin_path)
+            response = io.BytesIO(archive.read_bytes())
+            response.url = "https://release-assets.githubusercontent.com/signed-asset"
+            destination = root / "downloaded.tgz"
+            with (
+                mock.patch.object(candidate.urllib.request, "urlopen", return_value=response) as get,
+                mock.patch.object(candidate, "download_actions") as actions,
+            ):
+                candidate.download(pin, destination, "must-not-be-sent")
+            get.assert_called_once_with(pin["archive_url"], timeout=60)
+            actions.assert_not_called()
+            self.assertEqual(candidate.verify_archive(destination, pin)["kernel_profile"], "pvm")
+
+    def test_release_url_must_match_exact_pin(self):
+        with tempfile.TemporaryDirectory() as d:
+            _, original, pin_path = self.fixture(Path(d))
+            pin = self.release_pin(original, pin_path)
+            for url in (
+                pin["archive_url"].replace("akernel-dev", "another-owner"),
+                pin["archive_url"].replace("/v1.16.1-akernel.4/", "/latest/"),
+                pin["archive_url"] + "?mirror=unreviewed",
+                pin["archive_url"].replace("https:", "http:"),
+            ):
+                with self.subTest(url=url):
+                    pin_path.write_text(json.dumps(dict(pin, archive_url=url)))
+                    with self.assertRaisesRegex(ValueError, "release URL"):
+                        candidate.load_pin(pin_path)
+
+    def test_unknown_distribution_is_rejected(self):
+        with tempfile.TemporaryDirectory() as d:
+            _, pin, pin_path = self.fixture(Path(d))
+            pin_path.write_text(json.dumps(dict(pin, distribution="automatic-fallback")))
+            with self.assertRaisesRegex(ValueError, "distribution"):
+                candidate.load_pin(pin_path)
+
+    def test_oversized_release_download_is_rejected(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            _, pin, pin_path = self.fixture(root)
+            pin = self.release_pin(pin, pin_path)
+            response = io.BytesIO(b"oversized")
+            response.url = pin["archive_url"]
+            with (
+                mock.patch.object(candidate, "MAX_BYTES", 4),
+                mock.patch.object(candidate.urllib.request, "urlopen", return_value=response),
+                self.assertRaisesRegex(ValueError, "size limit"),
+            ):
+                candidate.download(pin, root / "downloaded.tgz", "")
+
+    def test_failed_release_verification_never_publishes_a_staged_archive(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            archive, pin, pin_path = self.fixture(root)
+            pin = self.release_pin(pin, pin_path)
+            archive.write_bytes(archive.read_bytes() + b"corrupted")
+            destination = root / "staged.tgz"
+            result = subprocess.run(
+                [sys.executable, "-O", str(SCRIPT), "--pin", str(pin_path),
+                 "--archive", str(archive), "--destination", str(destination)],
+                capture_output=True, text=True,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("checksum mismatch", result.stderr)
+            self.assertFalse(destination.exists())
+            self.assertFalse(destination.with_suffix(".pending").exists())
 
 
 if __name__ == "__main__":
