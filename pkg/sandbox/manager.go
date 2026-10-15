@@ -89,6 +89,10 @@ type Manager struct {
 	// isHousekeepingRunning prevents overlapping runtime/disk reconciliation
 	// passes when one pass lasts longer than the periodic interval.
 	isHousekeepingRunning atomic.Bool
+
+	// Runtime poll failures are local to that backend, not process health.
+	runtimePollErrors sync.Map // runtime name -> error
+	runtimePollBusy   sync.Map // runtime name -> *atomic.Bool
 }
 
 // exitNotifier is a one-shot broadcast channel used to wake up any number of
@@ -272,39 +276,31 @@ func (m *Manager) housekeeping() {
 	defer m.isHousekeepingRunning.Store(false)
 
 	logrus.Debugf("start housekeeping: %d sandboxes", m.sandboxes.Count())
+	pollStarted := time.Now()
+	cstates, polled := m.collectRuntimeStates(10 * time.Second)
+	pollCost := time.Since(pollStarted)
+	// Process readiness measures local reconciliation. A slow runtime poll
+	// closes only that runtime's admission and cannot poison other handlers.
 	start := time.Now()
-
-	// 1. Health check
 	defer func() {
 		spent := time.Since(start)
+		logrus.Debugf("housekeeping phases: runtime_poll=%s local=%s", pollCost, spent)
 		if spent >= config.HouseKeepingMaxCostTime {
-			logrus.Warnf("housekeeping finished, cost %v which is too long", spent)
+			logrus.Warnf("housekeeping local reconciliation cost %v which is too long", spent)
 			m.healthChan <- false
 		} else {
-			logrus.Debugf("housekeeping finished, cost %v", spent)
 			m.healthChan <- true
 		}
 	}()
 
-	// 2. Maintain m.sandboxes
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	cstates := make(map[string]*svc.State)
-
-	for r, handler := range m.serviceHandler.Items() {
-		states, err := handler.List(ctx)
-		if err != nil {
-			logrus.Errorf("list %s sandboxes failed: %v", r, err)
-			continue
-		}
-		for idx := range states {
-			cstates[states[idx].ID] = states[idx]
-		}
-	}
-
 	for id, sb := range m.sandboxes.Items() {
 		if sb == nil {
 			m.sandboxes.Remove(id)
+			continue
+		}
+		// A failed or canceled list says nothing about these sandboxes.
+		// Preserve metadata/status and let their existing monitors continue.
+		if sb.Metadata != nil && !polled[sb.Metadata.RuntimeHandler] {
 			continue
 		}
 

@@ -194,3 +194,9 @@ ownership, mode, inode, and size options.
 The private ext4 image, including native writable mount data, remains in the
 filestore across sandboxd restart so the handler can recover the running VMM.
 It is cleaned by normal or idempotent sandbox deletion.
+
+### Runtime inventory failures and readiness
+
+Periodic runtime inventories run concurrently with independent ten-second budgets. A failed or timed-out inventory closes admission and removes only that runtime class from `ListAvailableRuntimes`; existing sandbox metadata and status remain intact. A later successful inventory reopens the class. Delete and cleanup operations remain available during degradation. A handler that ignores cancellation cannot accumulate overlapping inventory calls across passes.
+
+Process readiness still checks recovery, resource/image/storage modules and the five-second budget for local housekeeping work. Time spent waiting for external runtime inventories is accounted separately, so a slow `runsc list` cannot mark an otherwise healthy Firecracker/PVM service unready. Runtime inventory warnings identify the affected class. This does not make slow local metadata storage healthy or bypass backend/restore compatibility checks.
