@@ -674,6 +674,20 @@ func resetMetadataIfResourceStateIncompatible(storePath string) error {
 	return nil
 }
 
+func memoryLimitDistillReserve(cfg config.Config) ([]int64, error) {
+	if !cfg.MemoryLimit.Enabled {
+		return nil, nil
+	}
+	if cfg.DisableCgroup || cfg.CgroupCacheSize <= 0 {
+		return nil, fmt.Errorf("memory_limit requires enabled cgroup management and a positive cgroup_cache_size")
+	}
+	reserve, err := imagemanager.ParseCgroupMemoryLimit(cfg.CgroupMemoryLimit)
+	if err != nil || reserve <= 0 {
+		return nil, fmt.Errorf("memory_limit requires a positive finite plugin.image.cgroup_memory_limit, got %q", cfg.CgroupMemoryLimit)
+	}
+	return []int64{reserve}, nil
+}
+
 func NewSandboxService(root, configPath string) (result SandboxService, retErr error) {
 	// if root dir is not exist, create it
 	if _, err := os.Stat(root); os.IsNotExist(err) {
@@ -704,6 +718,10 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 		return nil, fmt.Errorf("resource configuration: %w", err)
 	}
 	cfg.CPULimitMode = cpuLimitMode
+	distillReserve, err := memoryLimitDistillReserve(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("resource configuration: %w", err)
+	}
 
 	natBackend, err := resolveNATBackend(cfg.NatBackend)
 	if err != nil {
@@ -735,8 +753,8 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 		sandboxRoot,
 	)
 
-	// The optional node-resource module comes up first so its external resource
-	// socket is visible before image, volume, and sandbox initialization. Gated
+	// Construct the optional node-resource module first, but start reporting
+	// only after parent limits and all capacity sources are installed. Gated
 	// on [plugin.node_resource]: deployments that don't report node resources
 	// omit the section, Kubernetes deployments use the default provider, and
 	// standalone deployments can explicitly select the read-only cgroup
@@ -751,19 +769,7 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 			return nil, fmt.Errorf("node-resource module init: %w", merr)
 		}
 		mod.SetXPUProvider(xpuMgr)
-		if serr := mod.Start(); serr != nil {
-			// NewModule already started the OTel collector's periodic-reader
-			// goroutine; if Start then fails to bind /var/run/resource.sock we
-			// must drain that collector so it doesn't outlive sandboxd's init.
-			mod.Stop()
-			return nil, fmt.Errorf("node-resource module start: %w", serr)
-		}
 		nodeResMod = mod
-		provider := cfg.NodeResourceConfig.Provider
-		if provider == "" {
-			provider = resourcemanager.ProviderKubernetes
-		}
-		logrus.Infof("node-resource module ready, provider=%s sock=%s", provider, sockPath)
 		defer func() {
 			if retErr != nil {
 				mod.Stop()
@@ -849,11 +855,23 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 	maxSandboxLimit := networkmanager.MaxSandboxLimit(cfg.MaxInstanceNum)
 	var cgroupMgr *cgroupmanager.CgroupManager
 	if !cfg.DisableCgroup && cfg.CgroupCacheSize > 0 {
-		cgroupMgr, err = cgroupmanager.NewCgroupManager(s.store, cfg.ResourceConfig, maxSandboxLimit)
+		cgroupMgr, err = cgroupmanager.NewCgroupManager(s.store, cfg.ResourceConfig, maxSandboxLimit, distillReserve...)
 		if err != nil {
 			return nil, err
 		}
 		s.cgroupMgr = cgroupMgr
+		if cfg.MemoryLimit.Enabled && nodeResMod != nil {
+			maxBytes, headroomBytes := cgroupMgr.MemoryLimit()
+			root := cfg.CgroupRootName
+			if root == "" {
+				root = config.DefaultCgroupRoot
+			}
+			root = filepath.Clean("/" + strings.TrimPrefix(root, "/"))
+			if err := nodeResMod.SetMemoryLimit(root, maxBytes, headroomBytes); err != nil {
+				_ = cgroupMgr.ShutDown()
+				return nil, fmt.Errorf("node-resource memory limit: %w", err)
+			}
+		}
 		metrics.RecordResourceGauge("cgroup", float64(cgroupMgr.CacheSizeLimit()))
 		if nodeResMod != nil {
 			nodeResMod.SetCgroupStatsReader(cgroupMgr.Stats)
@@ -935,6 +953,11 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 	); err != nil {
 		return nil, err
 	}
+	defer func() {
+		if retErr != nil {
+			s.sandboxManager.Stop()
+		}
+	}()
 	if nodeResMod != nil {
 		nodeResMod.SetSandboxMetricsSource(s.sandboxManager)
 		s.sandboxManager.OnSandboxStopped = nodeResMod.MarkSandboxStopped
@@ -953,6 +976,18 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 		if err := s.aclMgr.Restore(bindings); err != nil {
 			return nil, fmt.Errorf("restore network ACL state: %w", err)
 		}
+	}
+
+	// Reporting starts with the effective parent ceiling already installed.
+	if nodeResMod != nil {
+		if err := nodeResMod.Start(); err != nil {
+			return nil, fmt.Errorf("node-resource module start: %w", err)
+		}
+		provider := cfg.NodeResourceConfig.Provider
+		if provider == "" {
+			provider = resourcemanager.ProviderKubernetes
+		}
+		logrus.Infof("node-resource module ready, provider=%s sock=%s", provider, cfg.SockPath)
 	}
 
 	// health check from sandbox manager housekeeping.

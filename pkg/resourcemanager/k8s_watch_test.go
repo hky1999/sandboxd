@@ -320,7 +320,7 @@ func TestK8sWatchResourceManagerGetAvailableResource(t *testing.T) {
 	cpu, mem, err := mgr.GetAvailableResource()
 	assert.NoError(t, err)
 	assert.Equal(t, int64(2500), cpu)
-	assert.Equal(t, int64(6<<30), mem)
+	assert.Equal(t, int64((6<<30)+(512<<20)), mem)
 
 	mgr.allocatedCPU = 5000
 	mgr.allocatedMem = int64(12 << 30)

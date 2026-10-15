@@ -172,6 +172,11 @@ func (m *Module) Stop() {
 // transition right now.
 func (m *Module) Healthy() bool { return m.healthy.Load() }
 
+// ParseCgroupMemoryLimit parses the same budget used to cap distill-fs.
+func ParseCgroupMemoryLimit(value string) (int64, error) {
+	return parseMemorySize(value)
+}
+
 // parseMemorySize mirrors the helper in the standalone main.go so that the
 // flag's accepted values ("512MiB", "2GiB", "1024", "") behave identically.
 func parseMemorySize(s string) (int64, error) {

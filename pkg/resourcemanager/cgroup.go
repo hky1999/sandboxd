@@ -43,9 +43,10 @@ type cgroupHierarchy struct {
 	current    string
 }
 
-// cgroupResourceManager reports the effective CPU and memory capacity of the
-// cgroup containing sandboxd. It never creates cgroups or writes controller
-// files, so it is safe to use with cgroup-disabled sandbox execution.
+// cgroupResourceManager reports effective CPU and memory capacity using
+// sandboxd's cgroup by default. A configured memory limit switches only memory
+// to the managed sandbox root. The provider never writes controller files, so
+// it is safe to use with cgroup-disabled sandbox execution.
 type cgroupResourceManager struct {
 	mode      cgroups.CGMode
 	cpu       cgroupHierarchy
@@ -239,6 +240,24 @@ func (m *cgroupResourceManager) GetAvailableResource() (int64, int64, error) {
 
 func (*cgroupResourceManager) Stop() {}
 
+func (m *cgroupResourceManager) setMemoryRoot(root string) error {
+	if hierarchyEmpty(m.memory) {
+		return fmt.Errorf("memory-controller hierarchy is unavailable")
+	}
+	if !filepath.IsAbs(root) || filepath.Clean(root) != root || root == "/" {
+		return fmt.Errorf("managed memory cgroup must be an absolute non-root cgroup name")
+	}
+	hierarchy := cgroupHierarchy{
+		mountpoint: m.memory.mountpoint,
+		current:    filepath.Join(m.memory.mountpoint, root),
+	}
+	if _, _, err := readMemoryLimit(hierarchy, m.mode); err != nil {
+		return fmt.Errorf("managed memory cgroup %s: %w", root, err)
+	}
+	m.memory = hierarchy
+	return nil
+}
+
 func (m *cgroupResourceManager) cpuCapacity() (int64, error) {
 	candidates := make([]int64, 0, 3)
 	if online, err := readCPUSetFile(m.cpuOnline); err == nil && online > 0 {
@@ -289,10 +308,6 @@ func (m *cgroupResourceManager) memoryCapacity() (int64, error) {
 	result := minPositive(candidates...)
 	if result == 0 {
 		return 0, fmt.Errorf("could not determine effective cgroup memory capacity")
-	}
-	// Match the Kubernetes provider's conservative, stable wire value.
-	if rounded := (result >> 30) << 30; rounded > 0 {
-		result = rounded
 	}
 	return result, nil
 }

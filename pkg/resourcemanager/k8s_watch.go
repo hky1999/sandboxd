@@ -523,7 +523,6 @@ func (mgr *k8sWatchResourceManager) GetAvailableResource() (int64, int64, error)
 	totalCPU, totalMem, allocatedCPU, allocatedMem := mgr.snapshot()
 	cpuMilli := maxInt64(totalCPU-allocatedCPU, 0)
 	memBytes := maxInt64(totalMem-allocatedMem, 0)
-	memBytes = (memBytes >> 30) << 30
 	logrus.Infof("report k8s watch resource info: total(cpu: %d, mem: %d), allocated(cpu: %d, mem: %d), available(cpu: %d, mem: %d)",
 		totalCPU, totalMem, allocatedCPU, allocatedMem, cpuMilli, memBytes)
 	return cpuMilli, memBytes, nil

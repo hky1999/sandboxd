@@ -17,6 +17,7 @@ package resourcemanager
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net"
 	"net/http"
 	"os"
@@ -53,6 +54,8 @@ type Module struct {
 	ephemeralStorageAvailable uint64
 	ephemeralStorageReady     bool
 	transientMemory           map[string]int64
+	memoryCeiling             int64
+	started                   bool
 
 	lastRefresh atomic.Int64 // unix-nano of most recent successful refresh
 	listener    net.Listener
@@ -115,6 +118,34 @@ func NewModule(sockPath, provider string) (*Module, error) {
 	return m, nil
 }
 
+// SetMemoryLimit clips each refreshed provider capacity to maxBytes-headroomBytes.
+// For the cgroup provider, root is the managed cgroup name within its visible
+// memory-controller mount. CPU capacity continues to use sandboxd's own group.
+// Other providers retain their existing policies before the capacity is clipped.
+// Call this before Start, after the managed root's limit has been applied.
+func (m *Module) SetMemoryLimit(root string, maxBytes, headroomBytes int64) error {
+	if maxBytes <= 0 || headroomBytes < 0 || headroomBytes >= maxBytes {
+		return fmt.Errorf("memory limit must satisfy max > headroom >= 0")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.started {
+		return fmt.Errorf("memory limit must be configured before Start")
+	}
+	select {
+	case <-m.stopCh:
+		return fmt.Errorf("resource manager is stopped")
+	default:
+	}
+	if provider, ok := m.nodeResource.(*cgroupResourceManager); ok {
+		if err := provider.setMemoryRoot(root); err != nil {
+			return err
+		}
+	}
+	m.memoryCeiling = maxBytes - headroomBytes
+	return nil
+}
+
 // SetSandboxMetricsSource connects the node metrics collector to sandbox
 // lifecycle state once the sandbox manager is ready.
 func (m *Module) SetSandboxMetricsSource(source SandboxMetricsSource) {
@@ -161,6 +192,16 @@ func (m *Module) MarkSandboxStopped(target sandbox.MetricsTarget) {
 // Start launches the refresh loop and HTTP server. It returns once the
 // listener is bound so external collectors can use the socket immediately.
 func (m *Module) Start() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.started {
+		return fmt.Errorf("resource manager is already started")
+	}
+	select {
+	case <-m.stopCh:
+		return fmt.Errorf("resource manager is stopped")
+	default:
+	}
 	if _, err := os.Stat(m.sockPath); err == nil {
 		os.Remove(m.sockPath)
 	}
@@ -169,6 +210,7 @@ func (m *Module) Start() error {
 		return err
 	}
 	m.listener = ln
+	m.started = true
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/resource", func(w http.ResponseWriter, r *http.Request) {
@@ -209,12 +251,15 @@ func (m *Module) Start() error {
 // first caller observed stopCh as closed.
 func (m *Module) Stop() {
 	m.closeOnce.Do(func() {
+		m.mu.Lock()
 		close(m.stopCh)
+		listener := m.listener
+		m.mu.Unlock()
 		if m.nodeResource != nil {
 			m.nodeResource.Stop()
 		}
-		if m.listener != nil {
-			_ = m.listener.Close()
+		if listener != nil {
+			_ = listener.Close()
 		}
 		if m.collectorShutdown != nil {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -336,6 +381,9 @@ func (m *Module) refreshOnce() {
 	// millicores (see standalone main.go for the same division).
 	cpu /= 1000
 	m.mu.Lock()
+	if m.memoryCeiling > 0 && mem > m.memoryCeiling {
+		mem = m.memoryCeiling
+	}
 	m.availCpu = cpu
 	m.availMem = mem
 	m.mu.Unlock()

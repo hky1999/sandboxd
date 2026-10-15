@@ -212,6 +212,9 @@ type FirecrackerConfig struct {
 type ResourceConfig struct {
 	MaxInstanceNum int `toml:"max_instance_num" json:"maxInstanceNum"`
 
+	// MemoryLimit optionally budgets and caps the sandbox parent on cgroup v2.
+	MemoryLimit MemoryLimitConfig `toml:"memory_limit" json:"memoryLimit"`
+
 	// CPULimitMode controls how requested CPU millicores are enforced. Shares
 	// preserves the historical relative-weight behavior, while quota applies a
 	// CFS bandwidth limit that runtimes can use to size their CPU topology.
@@ -233,6 +236,18 @@ type ResourceConfig struct {
 	PidsMax int64 `toml:"pids_max" json:"pidsMax"`
 	// InterfaceCacheSize is the size of interface cache. Default is same as max_instance_num.
 	InterfaceCacheSize int `toml:"interface_cache_size" json:"interfaceCacheSize"`
+}
+
+// MemoryLimitConfig contains deployment budgets, not current memory usage.
+// Sizes are integer bytes or B/KiB/MiB/GiB/TiB. ControlReserve also accepts
+// "auto" to reuse the visible system.slice memory.max.
+type MemoryLimitConfig struct {
+	Enabled         bool   `toml:"enabled" json:"enabled"`
+	SystemReserve   string `toml:"system_reserve" json:"systemReserve"`
+	ControlReserve  string `toml:"control_reserve" json:"controlReserve"`
+	OtherReserve    string `toml:"other_reserve" json:"otherReserve"`
+	SafetyBuffer    string `toml:"safety_buffer" json:"safetyBuffer"`
+	RuntimeHeadroom string `toml:"runtime_headroom" json:"runtimeHeadroom"`
 }
 
 // NormalizeRunscPlatform validates the configured gVisor platform. An empty
