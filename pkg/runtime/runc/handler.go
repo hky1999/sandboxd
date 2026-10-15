@@ -167,6 +167,11 @@ func runcCgroupPath(parent string) string {
 }
 
 func (r *Handler) Start(ctx context.Context, startConfig runtimecore.StartConfig) (retErr error) {
+	// Image preparation can finish after the caller's create deadline.
+	// Do not allocate runtime state or launch a shim for that late result.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if startConfig.Network == nil {
 		return fmt.Errorf("runc network is required")
 	}
@@ -204,6 +209,9 @@ func (r *Handler) Start(ctx context.Context, startConfig runtimecore.StartConfig
 	if err != nil {
 		return fmt.Errorf("generate runc OCI bundle: %w", err)
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err := ensureRuncConsoleMount(spec); err != nil {
 		return err
 	}
@@ -228,6 +236,9 @@ func (r *Handler) Start(ctx context.Context, startConfig runtimecore.StartConfig
 			retErr = errors.Join(retErr, cleanupRootfs())
 		}
 	}()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	if err := r.launchShim(bundlePath, startConfig); err != nil {
 		return err
@@ -281,6 +292,9 @@ func (r *Handler) waitStarted(ctx context.Context, bundlePath string) error {
 	timer := time.NewTimer(config.DefaultTimeout)
 	defer timer.Stop()
 	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if _, err := os.Stat(filepath.Join(bundlePath, runcshim.InitPIDFile)); err == nil {
 			return nil
 		}
@@ -307,18 +321,26 @@ func (r *Handler) Delete(ctx context.Context, sandboxID string) error {
 		config.StopTimeout+5*time.Second,
 	)
 	defer cancel()
-	stopErr := r.stopContainer(cleanupCtx, sandboxID)
-	bundlePath, pathErr := util.JoinWithinRoot(r.sandboxRoot, sandboxID)
-	if pathErr != nil {
-		return errors.Join(stopErr, pathErr)
+	if err := r.stopContainer(cleanupCtx, sandboxID); err != nil {
+		return err
+	}
+	bundlePath, err := util.JoinWithinRoot(r.sandboxRoot, sandboxID)
+	if err != nil {
+		return err
 	}
 	r.stopShim(bundlePath)
-	return errors.Join(
-		stopErr,
-		cleanupRuncRootfs(bundlePath),
-		cleanupRuncMounts(bundlePath),
-		cleanupRuncStorage(r.storageRoot, sandboxID),
-	)
+	return r.cleanupFiles(bundlePath, sandboxID)
+}
+
+// Keep private storage until every preceding runtime/mount cleanup succeeds.
+func (r *Handler) cleanupFiles(bundlePath, sandboxID string) error {
+	if err := cleanupRuncRootfs(bundlePath); err != nil {
+		return err
+	}
+	if err := cleanupRuncMounts(bundlePath); err != nil {
+		return err
+	}
+	return cleanupRuncStorage(r.storageRoot, sandboxID)
 }
 
 func (r *Handler) stopContainer(ctx context.Context, sandboxID string) error {
@@ -338,7 +360,7 @@ func (r *Handler) stopContainer(ctx context.Context, sandboxID string) error {
 			_, _ = r.waitStopped(ctx, sandboxID, 2*time.Second)
 		}
 	}
-	return IgnoreMissing(r.client.Delete(ctx, sandboxID, true))
+	return r.client.Delete(ctx, sandboxID, true)
 }
 
 func (r *Handler) waitStopped(ctx context.Context, sandboxID string, timeout time.Duration) (bool, error) {
@@ -581,16 +603,12 @@ func (r *Handler) reconcileOrphans() error {
 		}
 		logrus.Warnf("runc: cleaning orphaned sandbox %s without metadata", sandboxID)
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), config.StopTimeout)
-		deleteErr := IgnoreMissing(r.client.Delete(cleanupCtx, sandboxID, true))
+		deleteErr := r.client.Delete(cleanupCtx, sandboxID, true)
 		cancel()
 		if deleteErr != nil {
 			return fmt.Errorf("delete orphaned runc sandbox %s: %w", sandboxID, deleteErr)
 		}
-		if err := errors.Join(
-			cleanupRuncRootfs(bundlePath),
-			cleanupRuncMounts(bundlePath),
-			cleanupRuncStorage(r.storageRoot, sandboxID),
-		); err != nil {
+		if err := r.cleanupFiles(bundlePath, sandboxID); err != nil {
 			return fmt.Errorf("clean orphaned runc sandbox %s: %w", sandboxID, err)
 		}
 	}

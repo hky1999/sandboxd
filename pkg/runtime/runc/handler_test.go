@@ -16,6 +16,8 @@ package runc
 
 import (
 	"context"
+	"errors"
+	"net"
 	"os"
 	"path/filepath"
 	"testing"
@@ -23,6 +25,7 @@ import (
 
 	"github.com/inclusionAI/sandboxd/config"
 	"github.com/inclusionAI/sandboxd/internal/runcshim"
+	"github.com/inclusionAI/sandboxd/pkg/networkmanager"
 	runtimecore "github.com/inclusionAI/sandboxd/pkg/runtime"
 	runtimecommon "github.com/inclusionAI/sandboxd/pkg/runtime/internal/common"
 	"github.com/stretchr/testify/assert"
@@ -32,6 +35,61 @@ import (
 func TestRuncCgroupPathUsesRuntimeOwnedChild(t *testing.T) {
 	assert.Equal(t, "/sandbox/sbox-test/runc", runcCgroupPath("/sandbox/sbox-test"))
 	assert.Empty(t, runcCgroupPath(""))
+}
+
+type cancellingOciLoader struct {
+	cancel context.CancelFunc
+	called bool
+}
+
+func (l *cancellingOciLoader) GenerateOci(runtimecore.OciLoadOptions) (string, *runtimecore.Spec, error) {
+	l.called = true
+	l.cancel()
+	return "", &runtimecore.Spec{}, nil
+}
+
+func TestRuncStartAlreadyCancelledAllocatesNothing(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	root := t.TempDir()
+	loader := &cancellingOciLoader{cancel: cancel}
+	handler := &Handler{sandboxRoot: root, ociLoader: loader}
+
+	err := handler.Start(ctx, runtimecore.StartConfig{ID: "expired"})
+
+	require.ErrorIs(t, err, context.Canceled)
+	assert.False(t, loader.called)
+	entries, err := os.ReadDir(root)
+	require.NoError(t, err)
+	assert.Empty(t, entries)
+}
+
+func TestRuncStartStopsAfterPreparationCancelsContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	loader := &cancellingOciLoader{cancel: cancel}
+	handler := &Handler{sandboxRoot: t.TempDir(), ociLoader: loader}
+	config := runtimecore.StartConfig{
+		ID: "expired", CgroupPath: "/private-cgroup",
+		Network: &networkmanager.NetResource{
+			Interface: &net.Interface{Name: "pv.test"},
+			NetNSPath: "/var/run/netns/runc-sbox-expired",
+			Lifecycle: networkmanager.InterfaceLifecycleEphemeral,
+		},
+	}
+
+	err := handler.Start(ctx, config)
+
+	require.True(t, loader.called)
+	require.ErrorIs(t, err, context.Canceled)
+}
+
+func TestRuncWaitStartedRejectsCancelledReadyMarker(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	bundle := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(bundle, runcshim.InitPIDFile), []byte("42"), 0600))
+	require.ErrorIs(t, (&Handler{}).waitStarted(ctx, bundle), context.Canceled)
 }
 
 func TestValidateExecutable(t *testing.T) {
@@ -143,4 +201,114 @@ func (f *fakeRuncClient) Kill(context.Context, string, string, bool) error {
 
 func (f *fakeRuncClient) Delete(context.Context, string, bool) error {
 	return f.deleteErr
+}
+
+func TestRuncDeleteFailureRetainsRuntimeFiles(t *testing.T) {
+	for _, failure := range []string{"missing-binary", "permission", "runtime-enoent", "cancelled", "deadline"} {
+		t.Run(failure, func(t *testing.T) {
+			const id = "sbox-retained"
+			root, storage, stateRoot := t.TempDir(), t.TempDir(), t.TempDir()
+			bundle := filepath.Join(root, id)
+			markers := []string{filepath.Join(bundle, "rootfs", "data"), filepath.Join(bundle, "erofs", "content", "data"), filepath.Join(storage, id, "private-data"), filepath.Join(stateRoot, id, "state.json")}
+			for _, name := range markers {
+				require.NoError(t, os.MkdirAll(filepath.Dir(name), 0700))
+				require.NoError(t, os.WriteFile(name, []byte("keep"), 0600))
+			}
+			binary := filepath.Join(t.TempDir(), "runc")
+			if failure == "permission" {
+				require.NoError(t, os.WriteFile(binary, []byte("#!/bin/sh\nexit 1\n"), 0644))
+			}
+			if failure == "runtime-enoent" {
+				require.NoError(t, os.WriteFile(binary, []byte("#!/bin/sh\necho 'open config.json: no such file or directory' >&2\nexit 1\n"), 0755))
+			}
+			var client runcClient = NewClient(binary, stateRoot)
+			if failure == "cancelled" {
+				client = &fakeRuncClient{killErr: context.Canceled, deleteErr: context.Canceled}
+			}
+			if failure == "deadline" {
+				client = &fakeRuncClient{killErr: context.DeadlineExceeded, deleteErr: context.DeadlineExceeded}
+			}
+			oldUnmount := unmountRuncPath
+			touched := false
+			unmountRuncPath = func(string) error { touched = true; return nil }
+			defer func() { unmountRuncPath = oldUnmount }()
+			handler := &Handler{client: client, sandboxRoot: root, storageRoot: storage}
+			err := handler.Delete(context.Background(), id)
+			require.Error(t, err)
+			assert.False(t, touched, "runtime deletion must succeed before filesystem cleanup")
+			for _, name := range markers {
+				data, e := os.ReadFile(name)
+				require.NoError(t, e)
+				assert.Equal(t, "keep", string(data))
+			}
+		})
+	}
+}
+
+func TestRuncDeleteAmbiguousDiagnosticRetainsRuntimeFiles(t *testing.T) {
+	for _, script := range []string{
+		"#!/bin/sh\necho 'container does not exist' >&2\nkill -TERM $$\n",
+		"#!/bin/sh\necho 'open /tmp/container does not exist/sbox/state.json: not a directory' >&2\nexit 1\n",
+	} {
+		t.Run(script, func(t *testing.T) {
+			const id = "sbox-retained"
+			root, storage, stateRoot := t.TempDir(), t.TempDir(), t.TempDir()
+			bundle := filepath.Join(root, id)
+			state := filepath.Join(stateRoot, id)
+			require.NoError(t, os.Mkdir(state, 0700))
+			markers := []string{filepath.Join(bundle, "rootfs", "data"), filepath.Join(storage, id, "private-data")}
+			for _, name := range markers {
+				require.NoError(t, os.MkdirAll(filepath.Dir(name), 0700))
+				require.NoError(t, os.WriteFile(name, []byte("keep"), 0600))
+			}
+			binary := filepath.Join(t.TempDir(), "runc")
+			require.NoError(t, os.WriteFile(binary, []byte(script), 0755))
+			oldUnmount := unmountRuncPath
+			touched := false
+			unmountRuncPath = func(string) error { touched = true; return nil }
+			defer func() { unmountRuncPath = oldUnmount }()
+			handler := &Handler{client: NewClient(binary, stateRoot), sandboxRoot: root, storageRoot: storage}
+			require.Error(t, handler.Delete(context.Background(), id))
+			assert.False(t, touched)
+			assert.DirExists(t, state)
+			for _, name := range markers {
+				data, err := os.ReadFile(name)
+				require.NoError(t, err)
+				assert.Equal(t, "keep", string(data))
+			}
+		})
+	}
+}
+
+func TestRuncOrphanDeleteFailureRetainsPrivateStorage(t *testing.T) {
+	const id = "sbox-orphan"
+	root, storage := t.TempDir(), t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(root, id), 0700))
+	require.NoError(t, runtimecommon.WriteSandboxRuntimeMarker(filepath.Join(root, id), config.RuntimeNameRunc))
+	marker := filepath.Join(storage, id, "data")
+	require.NoError(t, os.MkdirAll(filepath.Dir(marker), 0700))
+	require.NoError(t, os.WriteFile(marker, []byte("keep"), 0600))
+	handler := &Handler{client: NewClient(filepath.Join(t.TempDir(), "missing-runc"), t.TempDir()), sandboxRoot: root, storageRoot: storage}
+	oldUnmount := unmountRuncPath
+	unmountRuncPath = func(string) error { return nil }
+	defer func() { unmountRuncPath = oldUnmount }()
+	require.Error(t, handler.reconcileOrphans())
+	assert.FileExists(t, marker)
+}
+
+func TestRuncDeleteFilesystemFailureCanBeRetried(t *testing.T) {
+	const id = "sbox-retry"
+	root, storage := t.TempDir(), t.TempDir()
+	marker := filepath.Join(storage, id, "data")
+	require.NoError(t, os.MkdirAll(filepath.Dir(marker), 0700))
+	require.NoError(t, os.WriteFile(marker, []byte("keep"), 0600))
+	handler := &Handler{client: &fakeRuncClient{killErr: assert.AnError}, sandboxRoot: root, storageRoot: storage}
+	oldUnmount := unmountRuncPath
+	defer func() { unmountRuncPath = oldUnmount }()
+	unmountRuncPath = func(string) error { return errors.New("unmount failed") }
+	require.Error(t, handler.Delete(context.Background(), id))
+	assert.FileExists(t, marker, "filesystem cleanup failure must not discard private storage")
+	unmountRuncPath = func(string) error { return nil }
+	require.NoError(t, handler.Delete(context.Background(), id))
+	assert.NoDirExists(t, filepath.Join(storage, id))
 }

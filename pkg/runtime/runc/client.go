@@ -18,10 +18,50 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
+
+	"github.com/inclusionAI/sandboxd/internal/util"
 )
+
+// commandFailure classifies only diagnostics from a normally exited runc process.
+// Launch, context and filesystem errors must never look like container absence.
+type commandFailure struct {
+	cause   error
+	detail  string
+	missing bool
+	stopped bool
+}
+
+func (e *commandFailure) Error() string { return e.cause.Error() + ": " + e.detail }
+func (e *commandFailure) Unwrap() error { return e.cause }
+
+// The default runc logger emits a single logrus text record. Match its entire
+// envelope before unquoting msg; a status phrase inside a pathname is not status.
+var runcTextDiagnostic = regexp.MustCompile(`^time=("[^"\r\n]+"|[^ \t\r\n]+) level=(error|fatal) msg=("(\\.|[^"\\\r\n])*")$`)
+
+func runcErrorMessage(stderr string) string {
+	message := strings.TrimSpace(stderr)
+	var entry struct {
+		Level   string `json:"level"`
+		Message string `json:"msg"`
+	}
+	if json.Unmarshal([]byte(message), &entry) == nil && (entry.Level == "error" || entry.Level == "fatal") {
+		return entry.Message
+	}
+	if fields := runcTextDiagnostic.FindStringSubmatch(message); fields != nil {
+		if decoded, err := strconv.Unquote(fields[3]); err == nil {
+			return decoded
+		}
+	}
+	return message
+}
 
 // State is the stable subset of `runc list --format json` used by sandboxd.
 type State struct {
@@ -60,10 +100,29 @@ func (c *Client) command(ctx context.Context, args ...string) ([]byte, error) {
 	if output := strings.TrimSpace(stderr.String()); output != "" {
 		details = append(details, output)
 	}
+	if ctx.Err() != nil {
+		return stdout.Bytes(), errors.Join(ctx.Err(), err)
+	}
 	if len(details) == 0 {
 		return stdout.Bytes(), err
 	}
-	return stdout.Bytes(), fmt.Errorf("%w: %s", err, strings.Join(details, "\n"))
+	detail := strings.Join(details, "\n")
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || !exitErr.ProcessState.Exited() || exitErr.ExitCode() <= 0 {
+		return stdout.Bytes(), fmt.Errorf("%w: %s", err, detail)
+	}
+	var missing, stopped bool
+	// Failed status commands have no stdout. Do not discard an additional
+	// diagnostic or partial result merely because stderr includes a status.
+	if strings.TrimSpace(stdout.String()) == "" {
+		switch runcErrorMessage(stderr.String()) {
+		case "container does not exist":
+			missing, stopped = true, true
+		case "container is not running", "container is stopped", "container not running":
+			stopped = true
+		}
+	}
+	return stdout.Bytes(), &commandFailure{cause: err, detail: detail, missing: missing, stopped: stopped}
 }
 
 func (c *Client) List(ctx context.Context) ([]State, error) {
@@ -101,36 +160,53 @@ func (c *Client) Kill(ctx context.Context, id, signal string, all bool) error {
 }
 
 func (c *Client) Delete(ctx context.Context, id string, force bool) error {
+	if id == "" || filepath.Base(id) != id {
+		return fmt.Errorf("invalid runc state id %q", id)
+	}
+	statePath, err := util.JoinWithinRoot(c.root, id)
+	if err != nil {
+		return err
+	}
 	args := []string{"delete"}
 	if force {
 		args = append(args, "--force")
 	}
 	args = append(args, id)
-	_, err := c.command(ctx, args...)
-	return err
+	_, err = c.command(ctx, args...)
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || !IsNotFound(err) {
+		return err
+	}
+	// A failed runc run can create its directory before writing state.json.
+	// The CLI reports that container as absent without removing the directory.
+	// Only remove an empty directory after confirmed absence; preserve state
+	// files, symlinks and unexpected entries for recovery instead of masking them.
+	info, statErr := os.Lstat(statePath)
+	if os.IsNotExist(statErr) {
+		return nil
+	}
+	if statErr != nil {
+		return fmt.Errorf("inspect runc state directory: %w", statErr)
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("runc state path is not a directory: %s", statePath)
+	}
+	if removeErr := os.Remove(statePath); removeErr != nil && !os.IsNotExist(removeErr) {
+		return fmt.Errorf("remove empty runc state directory: %w", removeErr)
+	}
+	return nil
 }
 
 // IsNotFound reports the stable class of errors produced for missing state.
 func IsNotFound(err error) bool {
-	if err == nil {
-		return false
-	}
-	message := strings.ToLower(err.Error())
-	return strings.Contains(message, "does not exist") ||
-		strings.Contains(message, "not found") ||
-		strings.Contains(message, "no such file")
+	var failure *commandFailure
+	return errors.As(err, &failure) && failure.missing
 }
 
-// IsNotRunning reports errors that are safe when converging a delete.
+// IsNotRunning reports a confirmed stopped or missing container.
 func IsNotRunning(err error) bool {
-	if err == nil {
-		return false
-	}
-	message := strings.ToLower(err.Error())
-	return IsNotFound(err) ||
-		strings.Contains(message, "not running") ||
-		strings.Contains(message, "container is stopped") ||
-		strings.Contains(message, "container not running")
+	var failure *commandFailure
+	return errors.As(err, &failure) && failure.stopped
 }
 
 // IgnoreMissing turns idempotent absence into success.
