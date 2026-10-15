@@ -18,7 +18,9 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -208,5 +210,100 @@ func TestReadTailFromWriterPipeDoesNotBlock(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("diagnostic read blocked on a pipe")
+	}
+}
+
+func TestStartupStopsWhenVMMExits(t *testing.T) {
+	for _, phase := range []string{"api", "missing-agent", "handshake", "response"} {
+		t.Run(phase, func(t *testing.T) {
+			command := exec.Command("sh", "-c", "cat >/dev/null; exit 23")
+			input, err := command.StdinPipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer input.Close()
+			if err := command.Start(); err != nil {
+				t.Fatal(err)
+			}
+			instance := &firecrackerInstance{done: make(chan struct{}), vmmExit: make(chan error, 1)}
+			instance.markDeleting()
+			go (&Handler{}).waitCommand(instance, command)
+			defer func() {
+				_ = input.Close()
+				select {
+				case <-instance.done:
+				case <-time.After(3 * time.Second):
+					t.Error("VMM waiter did not finish")
+				}
+			}()
+			parent, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			ctx, stopWatching := firecrackerStartupContext(parent, instance.vmmExit)
+			defer stopWatching()
+			socket := filepath.Join(t.TempDir(), "agent.sock")
+			ready := make(chan struct{})
+			if phase == "handshake" || phase == "response" {
+				listener, err := net.Listen("unix", socket)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer listener.Close()
+				go func() {
+					connection, err := listener.Accept()
+					if err != nil {
+						return
+					}
+					defer connection.Close()
+					_ = connection.SetDeadline(time.Now().Add(3 * time.Second))
+					var next [1]byte
+					for {
+						if _, err := io.ReadFull(connection, next[:]); err != nil {
+							return
+						}
+						if next[0] == '\n' {
+							break
+						}
+					}
+					if phase == "response" {
+						if _, err := io.WriteString(connection, "OK 123\n"); err != nil {
+							return
+						}
+						if _, _, err := firecrackerproto.ReadMessage(connection); err != nil {
+							return
+						}
+					}
+					close(ready)
+					_, _ = io.Copy(io.Discard, connection)
+				}()
+			} else {
+				close(ready)
+			}
+			result := make(chan error, 1)
+			go func() {
+				if phase == "api" {
+					result <- newFirecrackerAPI(socket).waitReady(ctx)
+				} else {
+					result <- waitForFirecrackerAgent(ctx, socket)
+				}
+			}()
+			select {
+			case <-ready:
+			case <-time.After(3 * time.Second):
+				t.Fatal("startup did not reach the expected I/O phase")
+			}
+			_ = input.Close()
+			select {
+			case err := <-result:
+				if err == nil || !strings.Contains(err.Error(), "VMM exited during startup (exit code 23)") {
+					t.Fatalf("startup error = %v, want VMM exit status", err)
+				}
+				var exitErr *exec.ExitError
+				if !errors.As(err, &exitErr) || exitErr.ExitCode() != 23 {
+					t.Fatalf("startup lost the process error: %v", err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("startup kept waiting after VMM exit")
+			}
+		})
 	}
 }

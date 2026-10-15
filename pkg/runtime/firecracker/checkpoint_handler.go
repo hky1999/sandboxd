@@ -1095,7 +1095,8 @@ func (handler *Handler) Restore(
 			Vcpus:       restoredVcpus,
 			CreatedAt:   time.Now().Format(time.RFC3339Nano),
 		},
-		done: make(chan struct{}),
+		done:    make(chan struct{}),
+		vmmExit: make(chan error, 1),
 	}
 	handler.mu.Lock()
 	handler.instances[startConfig.ID] = instance
@@ -1124,7 +1125,9 @@ func (handler *Handler) Restore(
 		return err
 	}
 
-	readyCtx, readyCancel := context.WithTimeout(ctx, firecrackerAgentTimeout)
+	startupCtx, stopWatching := firecrackerStartupContext(ctx, instance.vmmExit)
+	defer stopWatching()
+	readyCtx, readyCancel := context.WithTimeout(startupCtx, firecrackerAgentTimeout)
 	api := newFirecrackerAPI(apiPath)
 	if err := api.waitReady(readyCtx); err != nil {
 		readyCancel()
@@ -1133,7 +1136,7 @@ func (handler *Handler) Restore(
 	readyCancel()
 	tReady := time.Now()
 	if err := api.loadSnapshot(
-		ctx,
+		startupCtx,
 		checkpointFiles.State,
 		checkpointFiles.Memory,
 		filepath.Join(storageDir, firecrackerVirtioFSMemory),
@@ -1145,7 +1148,7 @@ func (handler *Handler) Restore(
 		return fmt.Errorf("load Firecracker checkpoint for %s: %w", startConfig.ID, err)
 	}
 	tLoaded := time.Now()
-	agentCtx, agentCancel := context.WithTimeout(ctx, firecrackerAgentTimeout)
+	agentCtx, agentCancel := context.WithTimeout(startupCtx, firecrackerAgentTimeout)
 	defer agentCancel()
 	if err := waitForFirecrackerAgent(agentCtx, vsockPath); err != nil {
 		return err

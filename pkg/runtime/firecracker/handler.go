@@ -114,6 +114,7 @@ type firecrackerInstance struct {
 	state       firecrackerPersistedState
 	exit        runtimecore.Exit
 	done        chan struct{}
+	vmmExit     chan error
 	doneOnce    sync.Once
 	deleting    bool
 	operationMu sync.Mutex
@@ -833,7 +834,8 @@ func (handler *Handler) Start(
 			VirtioFS:    virtioFSState,
 			CreatedAt:   time.Now().Format(time.RFC3339Nano),
 		},
-		done: make(chan struct{}),
+		done:    make(chan struct{}),
+		vmmExit: make(chan error, 1),
 	}
 	handler.mu.Lock()
 	handler.instances[startConfig.ID] = instance
@@ -866,6 +868,8 @@ func (handler *Handler) Start(
 	tBootStart := time.Now()
 	bootCtx, cancel := context.WithTimeout(ctx, firecrackerAgentTimeout)
 	defer cancel()
+	bootCtx, stopWatching := firecrackerStartupContext(bootCtx, instance.vmmExit)
+	defer stopWatching()
 	api := newFirecrackerAPI(apiPath)
 	if err := api.waitReady(bootCtx); err != nil {
 		return err
@@ -909,13 +913,13 @@ func (handler *Handler) Start(
 	}
 	tConfigured := time.Now()
 	if err := waitForFirecrackerAgent(bootCtx, vsockPath); err != nil {
-		// On a boot timeout, preserve the guest serial console and
+		// On a boot failure, preserve the guest serial console and
 		// per-phase timing so the failure can be diagnosed from the
 		// daemon log alone. The stdout/stderr files are still open and
 		// will be closed (and potentially overwritten by the next VM)
 		// after this handler returns, so this is the only chance to
-		// capture what the guest kernel printed before the timeout.
-		logFirecrackerBootTimeout(
+		// capture what the guest kernel printed before the failure.
+		logFirecrackerBootFailure(
 			startConfig.ID, err,
 			tBootStart, tAPIReady, tConfigured,
 			stdout, stderr,
@@ -960,13 +964,13 @@ func (handler *Handler) Start(
 	return nil
 }
 
-// logFirecrackerBootTimeout captures diagnostic evidence when a guest agent
-// health check times out: the per-phase timing breakdown and the tail of the
+// logFirecrackerBootFailure captures diagnostic evidence when a guest agent
+// health check fails: the per-phase timing breakdown and the tail of the
 // guest serial console. The stdout/stderr files are still open for writing
 // by the VMM process; the read uses ReadAt on a /proc/self/fd clone so the
 // VMM's file offset is never changed and no blocking can occur on non-
 // regular outputs (FIFOs are rejected by the stat check before open).
-func logFirecrackerBootTimeout(
+func logFirecrackerBootFailure(
 	sandboxID string,
 	bootErr error,
 	tStart, tAPIReady, tConfigured time.Time,
@@ -974,7 +978,7 @@ func logFirecrackerBootTimeout(
 	vmmPid int,
 ) {
 	logrus.Errorf(
-		"firecracker: boot timeout for %s (pid=%d): %v — "+
+		"firecracker: boot failed for %s (pid=%d): %v — "+
 			"phases: api_ready=%s vm_config=%s agent_wait=%s (total budget %s)",
 		sandboxID, vmmPid, bootErr,
 		tAPIReady.Sub(tStart).Round(time.Millisecond),
@@ -986,7 +990,7 @@ func logFirecrackerBootTimeout(
 	// different diagnosis than a slow guest boot.
 	if syscall.Kill(vmmPid, 0) != nil {
 		logrus.Errorf(
-			"firecracker: VMM pid=%d for %s is no longer running at timeout",
+			"firecracker: VMM pid=%d for %s is no longer running at boot failure",
 			vmmPid, sandboxID,
 		)
 	}
@@ -1245,6 +1249,14 @@ func (handler *Handler) waitCommand(
 	command *exec.Cmd,
 ) {
 	err := command.Wait()
+	if instance.vmmExit != nil {
+		exitErr := fmt.Errorf("Firecracker VMM exited during startup (exit code %d)", firecrackerHostExitCode(err))
+		if err != nil {
+			exitErr = fmt.Errorf("%w: %w", exitErr, err)
+		}
+		// Notify startup before virtio-fs cleanup or guest-exit arbitration.
+		instance.vmmExit <- exitErr
+	}
 	state := instance.snapshot()
 	if cleanupErr := cleanupFirecrackerVirtioFS(state.VirtioFS, handler.virtiofsdPath); cleanupErr != nil {
 		logrus.Warnf("firecracker: clean virtio-fs after VMM exit: %v", cleanupErr)
@@ -1762,6 +1774,20 @@ func attachFirecrackerProcess(cgroupPath string, pid int) error {
 	}
 }
 
+// firecrackerStartupContext stops all readiness/configuration I/O when the
+// child exits. Canceling the returned watcher releases it after startup too.
+func firecrackerStartupContext(ctx context.Context, exited <-chan error) (context.Context, context.CancelFunc) {
+	startupCtx, cancel := context.WithCancelCause(ctx)
+	go func() {
+		select {
+		case err := <-exited:
+			cancel(err)
+		case <-startupCtx.Done():
+		}
+	}()
+	return startupCtx, func() { cancel(nil) }
+}
+
 func waitForFirecrackerAgent(ctx context.Context, vsockPath string) error {
 	ticker := time.NewTicker(20 * time.Millisecond)
 	defer ticker.Stop()
@@ -1787,7 +1813,11 @@ func waitForFirecrackerAgent(ctx context.Context, vsockPath string) error {
 		// A deadline may have passed before Done closes. Keep the last
 		// connection or protocol failure instead of replacing it with
 		// the terminal context error.
-		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		cause := context.Cause(ctx)
+		if cause != nil {
+			err = cause
+		}
+		if cause != nil || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 			return fmt.Errorf("wait for Firecracker guest agent: %w (attempts=%d, last error: %v)", err, attempts, lastErr)
 		}
 		lastErr = err
@@ -1795,7 +1825,7 @@ func waitForFirecrackerAgent(ctx context.Context, vsockPath string) error {
 		case <-ctx.Done():
 			return fmt.Errorf(
 				"wait for Firecracker guest agent: %w (attempts=%d, last error: %v)",
-				ctx.Err(), attempts, lastErr,
+				context.Cause(ctx), attempts, lastErr,
 			)
 		case <-ticker.C:
 		}
@@ -1820,7 +1850,12 @@ func requestFirecrackerAgentWaiting(
 	messageType firecrackerproto.MessageType,
 	value any,
 	maxWait time.Duration,
-) error {
+) (resultErr error) {
+	defer func() {
+		if ctx.Err() != nil {
+			resultErr = context.Cause(ctx)
+		}
+	}()
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -1842,11 +1877,13 @@ func requestFirecrackerAgentWaiting(
 			timeout = maxWait
 		}
 	}
-	connection, err := firecrackerproto.DialAgent(vsockPath, timeout)
+	connection, err := firecrackerproto.DialAgentContext(ctx, vsockPath, timeout)
 	if err != nil {
 		return err
 	}
 	defer connection.Close()
+	stopClosing := context.AfterFunc(ctx, func() { _ = connection.Close() })
+	defer stopClosing()
 	if deadline, ok := ctx.Deadline(); ok {
 		_ = connection.SetDeadline(deadline)
 	}
