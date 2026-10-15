@@ -321,7 +321,9 @@ func (handler *Handler) Checkpoint(
 			"seal Firecracker checkpoint for %s: %w", sandboxID, err,
 		))
 	}
+	tManifest := time.Now()
 	adoptCheckpointMemory(instance, files.Memory, false)
+	tAdopted := time.Now()
 	// Persist the adopted base. A persist failure does not fail the sealed
 	// artifact, and it cannot corrupt a later generation: recovery never
 	// trusts a pre-restart lineage (recoverState marks it lost and forces
@@ -333,6 +335,7 @@ func (handler *Handler) Checkpoint(
 			sandboxID, err,
 		)
 	}
+	tPersisted := time.Now()
 	if !handler.checkpointWriteback.schedule(files.Memory) {
 		logrus.Warnf(
 			"firecracker: checkpoint memory writeback queue is full; skip %s",
@@ -347,13 +350,16 @@ func (handler *Handler) Checkpoint(
 	logrus.Infof(
 		"firecracker: checkpointed sandbox %s type=%s memory=%dMiB dir=%s "+
 			"phases: layout=%dms flush=%dms pause=%dms snapshot=%dms overlay=%dms "+
-			"resume=%dms seal=%dms total=%dms",
+			"resume=%dms seal=%dms total=%dms "+
+			"manifest=%dms adopt=%dms persist=%dms writeback_queue=%dms",
 		sandboxID, snapshotType, memoryInfo.Size()>>20, config.Directory,
 		phaseMS(tStarted, tPrepared), phaseMS(tPrepared, tFlushed),
 		phaseMS(tFlushed, tPaused), phaseMS(tOverlay, tSnapshotted),
 		phaseMS(tPaused, tOverlay),
 		phaseMS(tSnapshotted, tResumed), phaseMS(tResumed, tEnd),
 		phaseMS(tStarted, tEnd),
+		phaseMS(tResumed, tManifest), phaseMS(tManifest, tAdopted),
+		phaseMS(tAdopted, tPersisted), phaseMS(tPersisted, tEnd),
 	)
 
 	if !config.LeaveRunning {

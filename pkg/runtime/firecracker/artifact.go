@@ -25,6 +25,8 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/sirupsen/logrus"
 )
 
 const (
@@ -194,6 +196,7 @@ func finalizeFirecrackerCheckpointV2(
 	files firecrackerCheckpointFiles,
 	manifest *firecrackerCheckpointManifest,
 ) (retErr error) {
+	started := time.Now()
 	manifest.Version = firecrackerCheckpointVersion2
 	manifest.CreatedAt = time.Now().UTC()
 	if manifest.VirtioFS != (files.VirtioFSState != "") {
@@ -225,6 +228,14 @@ func finalizeFirecrackerCheckpointV2(
 		manifest.Digests[component.name] = digest
 	}
 
+	digested := time.Now()
+	defer func() {
+		logrus.WithFields(logrus.Fields{
+			"directory":  filepath.Dir(files.State),
+			"digest_us":  digested.Sub(started).Microseconds(),
+			"publish_us": time.Since(digested).Microseconds(),
+		}).Debug("firecracker: checkpoint manifest phases")
+	}()
 	manifestPath := filepath.Join(
 		filepath.Dir(files.State),
 		firecrackerCheckpointManifestName,
