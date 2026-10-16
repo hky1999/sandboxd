@@ -27,6 +27,8 @@ package errord
 import (
 	"context"
 	"errors"
+	"fmt"
+	"net"
 )
 
 // Definitions of common error types used throughout containerd. All containerd
@@ -39,6 +41,8 @@ import (
 var (
 	ErrUnknown            = errors.New("unknown") // used internally to represent a missed mapping.
 	ErrInvalidArgument    = errors.New("invalid argument")
+	ErrUnauthenticated    = errors.New("unauthenticated")
+	ErrPermissionDenied   = errors.New("permission denied")
 	ErrNotFound           = errors.New("not found")
 	ErrAlreadyExists      = errors.New("already exists")
 	ErrFailedPrecondition = errors.New("failed precondition")
@@ -91,4 +95,17 @@ func IsCanceled(err error) bool {
 // `context.DeadlineExceeded`.
 func IsDeadlineExceeded(err error) bool {
 	return errors.Is(err, context.DeadlineExceeded)
+}
+
+// WithStage preserves the cause and labels the operation that failed. Network
+// timeouts may expire before the caller context; expose those as deadlines too.
+func WithStage(stage string, err error) error {
+	if err == nil {
+		return nil
+	}
+	var timeout net.Error
+	if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) && errors.As(err, &timeout) && timeout.Timeout() {
+		err = fmt.Errorf("%w: %w", context.DeadlineExceeded, err)
+	}
+	return fmt.Errorf("%s: %w", stage, err)
 }

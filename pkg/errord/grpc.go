@@ -16,6 +16,7 @@ package errord
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -42,6 +43,12 @@ func ToGRPC(err error) error {
 	}
 
 	switch {
+	case errors.Is(err, ErrUnauthenticated):
+		return status.Error(codes.Unauthenticated, err.Error())
+	case errors.Is(err, ErrPermissionDenied):
+		return status.Error(codes.PermissionDenied, err.Error())
+	case errors.Is(err, ErrResourceExhausted):
+		return status.Error(codes.ResourceExhausted, err.Error())
 	case IsInvalidArgument(err):
 		return status.Error(codes.InvalidArgument, err.Error())
 	case IsNotFound(err):
@@ -80,6 +87,12 @@ func FromGRPC(err error) error {
 	var cls error // divide these into error classes, becomes the cause
 
 	switch code(err) {
+	case codes.Unauthenticated:
+		cls = ErrUnauthenticated
+	case codes.PermissionDenied:
+		cls = ErrPermissionDenied
+	case codes.ResourceExhausted:
+		cls = ErrResourceExhausted
 	case codes.InvalidArgument:
 		cls = ErrInvalidArgument
 	case codes.AlreadyExists:

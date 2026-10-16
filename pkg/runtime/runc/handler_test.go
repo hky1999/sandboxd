@@ -312,3 +312,12 @@ func TestRuncDeleteFilesystemFailureCanBeRetried(t *testing.T) {
 	require.NoError(t, handler.Delete(context.Background(), id))
 	assert.NoDirExists(t, filepath.Join(storage, id))
 }
+
+func TestInternalRuncStartTimeoutPreservesDeadline(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	err := (&Handler{}).waitStarted(ctx, t.TempDir())
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.NoError(t, ctx.Err())
+	require.Contains(t, err.Error(), "runc container start")
+}

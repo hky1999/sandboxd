@@ -55,6 +55,9 @@ import (
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sync/singleflight"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -1158,6 +1161,22 @@ type resourcePrepareResult struct {
 	err       error
 }
 
+// startFailure identifies an application-reported Start failure. The trailer
+// distinguishes this result from a gRPC transport timer expiring without a reply;
+// it makes no claim about completion of physical resource reconciliation.
+func startFailure(ctx context.Context, stage string, err error) error {
+	rpcErr := errord.ToGRPC(errord.WithStage(stage, err))
+	if st, ok := status.FromError(err); ok {
+		detail := st.Proto()
+		detail.Message = stage + ": " + st.Message()
+		rpcErr = status.FromProto(detail).Err()
+	}
+	if status.Code(rpcErr) == codes.DeadlineExceeded {
+		_ = grpc.SetTrailer(ctx, metadata.Pairs("sandboxd-start-failure", "true"))
+	}
+	return rpcErr
+}
+
 func (h *sandboxService) Start(ctx context.Context, request *runtime.StartRequest) (*runtime.StartResponse, error) {
 	if request == nil {
 		err := fmt.Errorf("start request is nil")
@@ -1432,7 +1451,7 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 	fsCh := make(chan fsPrepareResult, 1)
 	resourceCh := make(chan resourcePrepareResult, 1)
 	go func() {
-		preparedFS, err := h.fsMgr.Prepare(startReq)
+		preparedFS, err := h.fsMgr.Prepare(ctx, startReq)
 		fsCh <- fsPrepareResult{fs: preparedFS, err: err}
 	}()
 	go func() {
@@ -1450,7 +1469,7 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 			Code:    -1,
 			Message: fmt.Sprintf("failed to prepare sandbox: %v", err),
 			ID:      "",
-		}, err
+		}, startFailure(ctx, "filesystem preparation", err)
 	}
 	runtimeRootfs := preparedFilesystem.RootfsPath()
 	var specUpdates *svc.SpecUpdates
@@ -1494,12 +1513,12 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 	}
 	var imageProcess *imageProcessSpec
 	if startReq.InjectEntrypoint != "" {
-		resolvedImageProcess, resolveErr := preparedFilesystem.rootfs.RootFS.ResolveImageProcess()
+		resolvedImageProcess, resolveErr := preparedFilesystem.rootfs.RootFS.ResolveImageProcess(ctx)
 		if resolveErr != nil {
 			return &runtime.StartResponse{
 				Code:    -1,
 				Message: fmt.Sprintf("failed to resolve image process: %v", resolveErr),
-			}, resolveErr
+			}, startFailure(ctx, "image pull (process metadata)", resolveErr)
 		}
 		imageProcess, err = buildImageProcessSpec(resolvedImageProcess)
 		if err != nil {
@@ -1594,7 +1613,7 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 			Code:    -1,
 			Message: fmt.Sprintf("Failed to start: %v", err),
 			ID:      "",
-		}, err
+		}, startFailure(ctx, "runtime start ("+startReq.Runtime+")", err)
 	}
 	runtimeStarted = true
 

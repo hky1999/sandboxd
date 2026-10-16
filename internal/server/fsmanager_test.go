@@ -15,6 +15,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"sync"
 	"testing"
@@ -47,14 +48,14 @@ func (s *fsTestImageService) MountOSS(req *imageapi.OSSMountRequest) (*imageapi.
 
 func (s *fsTestImageService) UmountOSS(*imageapi.OSSUmountRequest) error { return nil }
 
-func (s *fsTestImageService) MountOCI(req *imageapi.OCIMountRequest) (*imageapi.OCIMountResponse, error) {
+func (s *fsTestImageService) MountOCI(ctx context.Context, req *imageapi.OCIMountRequest) (*imageapi.OCIMountResponse, error) {
 	s.mu.Lock()
 	s.ociMountCalls[req.ImageURL]++
 	s.mu.Unlock()
 	return &imageapi.OCIMountResponse{MountPath: "/mnt/oci/" + req.ImageURL}, nil
 }
 
-func (s *fsTestImageService) ImageProcess(string) (*imageconfig.Process, error) {
+func (s *fsTestImageService) ImageProcess(context.Context, string) (*imageconfig.Process, error) {
 	return &imageconfig.Process{}, nil
 }
 
@@ -114,7 +115,7 @@ func fsTestStartRequest(id string) *runtime.StartRequest {
 
 func prepareAndCommitFS(t *testing.T, manager *fsManager, sandboxID string) {
 	t.Helper()
-	prepared, err := manager.Prepare(fsTestStartRequest(sandboxID))
+	prepared, err := manager.Prepare(context.Background(), fsTestStartRequest(sandboxID))
 	if err != nil {
 		t.Fatalf("Prepare(%s) failed: %v", sandboxID, err)
 	}
@@ -126,7 +127,7 @@ func prepareAndCommitFS(t *testing.T, manager *fsManager, sandboxID string) {
 func TestFSManagerCommitRollsBackFailedPersistence(t *testing.T) {
 	stateStore := store.NewMockStore()
 	manager := newFSManager(newFSTestImageService(), stateStore)
-	prepared, err := manager.Prepare(fsTestStartRequest("sbox-failed"))
+	prepared, err := manager.Prepare(context.Background(), fsTestStartRequest("sbox-failed"))
 	if err != nil {
 		t.Fatalf("Prepare() error = %v", err)
 	}

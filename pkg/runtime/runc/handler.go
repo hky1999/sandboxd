@@ -309,7 +309,7 @@ func (r *Handler) waitStarted(ctx context.Context, bundlePath string) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-timer.C:
-			return fmt.Errorf("timed out waiting for runc container start")
+			return fmt.Errorf("waiting for runc container start after %s: %w", config.DefaultTimeout, context.DeadlineExceeded)
 		case <-ticker.C:
 		}
 	}

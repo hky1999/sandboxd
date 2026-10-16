@@ -15,10 +15,13 @@
 package runsc
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestCreateLinksAndRoutesArgsImplementsFilePayloader(t *testing.T) {
@@ -77,5 +80,23 @@ func TestMarkStateRunningPreservesStateFields(t *testing.T) {
 	}
 	if got := info.Mode().Perm(); got != 0640 {
 		t.Fatalf("mode = %o, want 0640", got)
+	}
+}
+
+type blockedTimeoutRPC struct{ done chan struct{} }
+
+func (b *blockedTimeoutRPC) Call(string, any, any) error { <-b.done; return nil }
+func (b *blockedTimeoutRPC) Close() error                { close(b.done); return nil }
+
+func TestInternalStartRPCTimeoutPreservesDeadline(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	rpc := &blockedTimeoutRPC{done: make(chan struct{})}
+	err := callContextWithTimeout(ctx, rpc, contMgrRootContainerStart, nil, nil, time.Millisecond)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("internal timeout = %v", err)
+	}
+	if ctx.Err() != nil {
+		t.Fatalf("parent deadline expired: %v", ctx.Err())
 	}
 }

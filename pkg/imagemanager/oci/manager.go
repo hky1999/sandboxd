@@ -122,7 +122,7 @@ type Manager struct {
 }
 
 type imageLockEntry struct {
-	mu   sync.Mutex
+	gate chan struct{}
 	refs int
 }
 
@@ -306,6 +306,7 @@ func (m *Manager) MountImageWithContext(ctx context.Context, imageURL string) (s
 // MountImageConfigWithContext is MountImageWithContext plus the OCI process
 // metadata needed for inherited image startup.
 func (m *Manager) MountImageConfigWithContext(ctx context.Context, imageURL string) (mountPath string, envVars []string, imageProcess *imageconfig.Process, retErr error) {
+	defer func() { retErr = imageregistry.ClassifyError(retErr) }()
 	timing, ctx := StartOCITimedOperation(ctx, "oci.MountImage", imageURL)
 	defer timing.End()
 	opStart := time.Now()
@@ -324,7 +325,10 @@ func (m *Manager) MountImageConfigWithContext(ctx context.Context, imageURL stri
 	}
 	timing.Stage("validate_request", time.Since(stageStart))
 
-	unlockImage := m.acquireImageLock(imageURL)
+	unlockImage, err := m.acquireImageLockWithContext(ctx, imageURL)
+	if err != nil {
+		return "", nil, nil, err
+	}
 	defer unlockImage()
 
 	var (
@@ -427,6 +431,9 @@ func (m *Manager) MountImageConfigWithContext(ctx context.Context, imageURL stri
 	timing.Stage("extract_layers", time.Since(stageStart))
 	reservedDigests = append(reservedDigests, layerDigests...)
 
+	if err := ctx.Err(); err != nil {
+		return "", nil, nil, err
+	}
 	stageStart = time.Now()
 	chainPaths, err := m.ensureChainLowerDirs(chainIDs, layerPaths)
 	if err != nil {
@@ -462,6 +469,9 @@ func (m *Manager) MountImageConfigWithContext(ctx context.Context, imageURL stri
 		return "", nil, nil, err
 	}
 
+	if err := ctx.Err(); err != nil {
+		return "", nil, nil, err
+	}
 	if err := m.mountFn(mountPath, lowerDirs); err != nil {
 		err = fmt.Errorf("failed to mount overlay rootfs for %s: %w", imageURL, err)
 		timing.RecordError(err)
@@ -511,11 +521,15 @@ func (m *Manager) MountImageConfigWithContext(ctx context.Context, imageURL stri
 // ImageProcessWithContext returns process metadata for a mounted image. Mount
 // records created before process metadata was introduced are upgraded lazily,
 // so ordinary cached mounts remain usable without registry access.
-func (m *Manager) ImageProcessWithContext(ctx context.Context, imageURL string) (*imageconfig.Process, error) {
+func (m *Manager) ImageProcessWithContext(ctx context.Context, imageURL string) (_ *imageconfig.Process, retErr error) {
+	defer func() { retErr = imageregistry.ClassifyError(retErr) }()
 	if imageURL == "" {
 		return nil, fmt.Errorf("imageURL is required")
 	}
-	unlockImage := m.acquireImageLock(imageURL)
+	unlockImage, err := m.acquireImageLockWithContext(ctx, imageURL)
+	if err != nil {
+		return nil, err
+	}
 	defer unlockImage()
 
 	info := m.getContainer(imageURL)
@@ -578,6 +592,7 @@ func (m *Manager) persistContainer(info *ContainerInfo) error {
 }
 
 type layerExtractJob struct {
+	ctx      context.Context
 	index    int
 	layer    v1.Layer
 	resultCh chan<- layerExtractResult
@@ -612,6 +627,7 @@ submitLoop:
 			logrus.Warnf("OCI layer extraction interrupted before submit: submitted=%d/%d cost=%s err=%v", submitted, len(layers), time.Since(batchStart), err)
 			return nil, nil, err
 		case m.layerJobs <- layerExtractJob{
+			ctx:      ctx,
 			index:    i,
 			layer:    layer,
 			resultCh: results,
@@ -681,7 +697,7 @@ func (m *Manager) ensureLayerWorkerPool() {
 					case <-m.stopCh:
 						return
 					case job := <-m.layerJobs:
-						rec, err := m.ensureLayerExtracted(job.layer)
+						rec, err := m.ensureLayerExtractedWithContext(job.ctx, job.layer)
 						job.resultCh <- layerExtractResult{
 							index: job.index,
 							rec:   rec,
@@ -859,13 +875,23 @@ func (m *Manager) fetchImage(ctx context.Context, imageURL string) (v1.Image, er
 }
 
 func (m *Manager) ensureLayerExtracted(layer v1.Layer) (*LayerRecord, error) {
+	return m.ensureLayerExtractedWithContext(context.Background(), layer)
+}
+
+func (m *Manager) ensureLayerExtractedWithContext(ctx context.Context, layer v1.Layer) (*LayerRecord, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	start := time.Now()
 	digest, err := layer.Digest()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get layer digest: %w", err)
 	}
 	digestStr := digest.String()
-	unlockLayer := m.acquireLayerLock(digestStr)
+	unlockLayer, err := m.acquireLayerLockWithContext(ctx, digestStr)
+	if err != nil {
+		return nil, err
+	}
 	defer unlockLayer()
 
 	rec, err := m.store.getLayer(digestStr)
@@ -926,13 +952,20 @@ func (m *Manager) ensureLayerExtracted(layer v1.Layer) (*LayerRecord, error) {
 		return nil, fmt.Errorf("failed to open uncompressed layer %s: %w", digestStr, err)
 	}
 	defer rc.Close()
+	// Closing the body interrupts a blocked download. Wait for the worker below
+	// before rolling back any references or its temporary extraction directory.
+	stopClose := context.AfterFunc(ctx, func() { _ = rc.Close() })
+	defer stopClose()
 
-	size, err := extractLayerTar(rc, tmpDir)
+	size, err := extractLayerTar(&contextReader{ctx: ctx, reader: rc}, tmpDir)
 	if err != nil {
 		logrus.Warnf("OCI layer extract failed: digest=%s tmp_dir=%s cost=%s err=%v", digestStr, tmpDir, time.Since(start), err)
 		return nil, fmt.Errorf("failed to extract layer %s: %w", digestStr, err)
 	}
 
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if err := os.MkdirAll(layerRoot, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create layer root %s: %w", layerRoot, err)
 	}
@@ -1968,70 +2001,77 @@ func (m *Manager) cleanupOrphanChainDirs(validChainPaths map[string]struct{}) {
 	}
 }
 
-func (m *Manager) acquireImageLock(imageURL string) func() {
+// acquireKeyLock makes contention cancellable without tying a shared image or
+// layer to any other consumer's context. The current owner finishes its own
+// rollback before the next consumer enters.
+func (m *Manager) acquireKeyLock(ctx context.Context, locks map[string]*imageLockEntry, key string) (func(), error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	m.mutex.Lock()
-	entry, exists := m.imageLocks[imageURL]
-	if !exists {
-		entry = &imageLockEntry{}
-		m.imageLocks[imageURL] = entry
+	entry, ok := locks[key]
+	if !ok {
+		entry = &imageLockEntry{gate: make(chan struct{}, 1)}
+		locks[key] = entry
 	}
 	entry.refs++
 	m.mutex.Unlock()
-
-	entry.mu.Lock()
-	return func() {
-		entry.mu.Unlock()
+	dropRef := func() {
 		m.mutex.Lock()
+		defer m.mutex.Unlock()
 		entry.refs--
 		if entry.refs == 0 {
-			delete(m.imageLocks, imageURL)
+			delete(locks, key)
 		}
-		m.mutex.Unlock()
 	}
+	select {
+	case <-ctx.Done():
+		dropRef()
+		return nil, ctx.Err()
+	case entry.gate <- struct{}{}:
+	}
+	release := func() { <-entry.gate; dropRef() }
+	if err := ctx.Err(); err != nil {
+		release()
+		return nil, err
+	}
+	return release, nil
+}
+
+func (m *Manager) acquireImageLock(imageURL string) func() {
+	unlock, _ := m.acquireImageLockWithContext(context.Background(), imageURL)
+	return unlock
+}
+
+func (m *Manager) acquireImageLockWithContext(ctx context.Context, imageURL string) (func(), error) {
+	return m.acquireKeyLock(ctx, m.imageLocks, imageURL)
 }
 
 func (m *Manager) acquireLayerLock(layerDigest string) func() {
-	m.mutex.Lock()
-	entry, exists := m.layerLocks[layerDigest]
-	if !exists {
-		entry = &imageLockEntry{}
-		m.layerLocks[layerDigest] = entry
-	}
-	entry.refs++
-	m.mutex.Unlock()
+	unlock, _ := m.acquireLayerLockWithContext(context.Background(), layerDigest)
+	return unlock
+}
 
-	entry.mu.Lock()
-	return func() {
-		entry.mu.Unlock()
-		m.mutex.Lock()
-		entry.refs--
-		if entry.refs == 0 {
-			delete(m.layerLocks, layerDigest)
-		}
-		m.mutex.Unlock()
-	}
+func (m *Manager) acquireLayerLockWithContext(ctx context.Context, digest string) (func(), error) {
+	return m.acquireKeyLock(ctx, m.layerLocks, digest)
 }
 
 func (m *Manager) acquireChainLock(chainID string) func() {
-	m.mutex.Lock()
-	entry, exists := m.chainLocks[chainID]
-	if !exists {
-		entry = &imageLockEntry{}
-		m.chainLocks[chainID] = entry
-	}
-	entry.refs++
-	m.mutex.Unlock()
+	unlock, _ := m.acquireKeyLock(context.Background(), m.chainLocks, chainID)
+	return unlock
+}
 
-	entry.mu.Lock()
-	return func() {
-		entry.mu.Unlock()
-		m.mutex.Lock()
-		entry.refs--
-		if entry.refs == 0 {
-			delete(m.chainLocks, chainID)
-		}
-		m.mutex.Unlock()
+// contextReader also bounds local extraction after the network body is cached.
+type contextReader struct {
+	ctx    context.Context
+	reader io.Reader
+}
+
+func (r *contextReader) Read(p []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
 	}
+	return r.reader.Read(p)
 }
 
 func (m *Manager) getContainer(imageURL string) *ContainerInfo {

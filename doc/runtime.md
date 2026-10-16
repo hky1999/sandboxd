@@ -86,6 +86,20 @@ In direct mode, the source path is resolved in the sandboxd process's filesystem
 
 Configure nameservers that the sandbox can actually reach from its network environment; selecting a file does not provide DNS forwarding. In particular, a node-local loopback resolver or Docker's embedded `127.0.0.11` must not be assumed reachable, and this option does not recreate Docker container-name resolution. A flat resolver file also cannot represent systemd-resolved's per-link split-DNS routing; operators using split DNS must validate a suitable resolver path and connectivity for their deployment. This setting is not a live-update mechanism: changes to its configuration or source file are not guaranteed to update existing sandboxes. Recreate a sandbox to apply a changed resolver deterministically.
 
+## Cancelled OCI preparation
+
+Start passes its request context through filesystem preparation, shared-rootfs acquisition, OCI rootfs and image-volume mounting, and inherited process metadata lookup. The registry client binds that context to manifest, config and layer requests, including body reads. Cancellation interrupts blocked OCI downloads and extraction; the preparation workers finish before Start releases its reserved ID and rolls back resources. Rollback and unmount use their cleanup contexts, independently of the cancelled Start context.
+
+A caller waiting for a shared rootfs, OCI image or layer can cancel its own wait. Cancelling one creator does not cancel another caller's context: a live rootfs waiter can retry creation, and a different image sharing a layer can acquire it after the cancelled owner finishes. Successfully cached layers retain their normal reference-count and garbage-collection policy. These guarantees cover the regular OCI path; S3/FUSE daemon startup and Nydus bootstrap lifecycle retain their existing cancellation behavior. Transport cancellation alone is not a physical-cleanup acknowledgement.
+
+## Start timeout errors
+
+Start reports image preparation failures with `image pull (rootfs)`, `image pull (volume <target>)` or `image pull (process metadata)` in the gRPC message, and runtime startup failures with `runtime start (<runtime>)`. Network timeouts preserve their original cause and also classify as `context.DeadlineExceeded`, including when the network timer expires before the Start request deadline. Runsc control-RPC timers and runc's startup wait timer preserve that same error identity.
+
+An application-reported Start timeout returns gRPC `DeadlineExceeded` with the trailer `sandboxd-start-failure: true`. Consumers can retain the backend stage and reason separately from a transport deadline that expired without a backend result. The trailer confirms an application failure response; resource rollback and reconciliation keep their existing completion semantics.
+
+Registry HTTP rejections keep their original cause and category: invalid request (400), authentication failure (401), permission denial (403), missing image/blob (404) and rate limiting (429) map to their corresponding gRPC errors. Registry request/gateway timeouts (408/504) map to `DeadlineExceeded`; connection failures and other rejections retain their own error information. This classification also applies to lazily read image config and layers.
+
 ## OOM and failed deletion
 
 A host cgroup OOM makes the entire sandbox terminal (`OOMKilled=true`, exit code 137), even when the kernel kills only a worker and the runtime's init process remains alive. Sandboxd consumes the kernel OOM notification independently of runtime Wait and drains the remaining tasks in that sandbox's allocated cgroup. The OOM lease is guarded against reset so an old notification cannot terminate a later user of the cached cgroup. Cgroup-disabled sandboxes have no host OOM notification; guest-only OOMs remain runtime-owned.

@@ -501,7 +501,7 @@ func callContextWithTimeout(ctx context.Context, conn controlRPC, method string,
 	err := callContext(callCtx, conn, method, arg, result)
 	logrus.Debugf("runsc urpc call %s finished, cost: %v, err: %v", method, time.Since(start), err)
 	if errors.Is(err, context.DeadlineExceeded) {
-		return fmt.Errorf("urpc method %q timed out after %s", method, timeout)
+		return fmt.Errorf("urpc method %q timed out after %s: %w", method, time.Since(start), err)
 	}
 	return err
 }

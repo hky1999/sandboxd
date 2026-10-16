@@ -15,6 +15,7 @@
 package server
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"sync"
@@ -229,6 +230,13 @@ func newOciMountManager(svc imgApi.Service) *ociMountManager {
 // mountOCI acquires a shared OCI image mount. If the same image is already mounted
 // by another sandbox, the existing path is returned without calling image-manager.
 func (m *ociMountManager) mountOCI(imageURL string) (string, error) {
+	return m.mountOCIWithContext(context.Background(), imageURL)
+}
+
+func (m *ociMountManager) mountOCIWithContext(ctx context.Context, imageURL string) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	if imageURL == "" {
 		return "", fmt.Errorf("image_url is empty")
 	}
@@ -245,7 +253,7 @@ func (m *ociMountManager) mountOCI(imageURL string) (string, error) {
 	m.mu.Unlock()
 
 	// First caller: mount via in-process image-manager.
-	resp, err := m.svc.MountOCI(&imgApi.OCIMountRequest{
+	resp, err := m.svc.MountOCI(ctx, &imgApi.OCIMountRequest{
 		ImageURL: imageURL,
 	})
 	if err != nil {

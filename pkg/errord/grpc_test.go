@@ -18,6 +18,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"strings"
 	"testing"
 
 	"google.golang.org/grpc/codes"
@@ -98,4 +100,24 @@ func TestGRPCRoundTrip(t *testing.T) {
 		})
 	}
 
+}
+
+func TestStagePreservesInternalTimeout(t *testing.T) {
+	for _, cause := range []error{context.DeadlineExceeded, os.ErrDeadlineExceeded} {
+		err := WithStage("image pull (rootfs)", cause)
+		if !errors.Is(err, context.DeadlineExceeded) || !errors.Is(err, cause) {
+			t.Fatalf("lost timeout cause: %v", err)
+		}
+		got := ToGRPC(err)
+		if status.Code(got) != codes.DeadlineExceeded || !strings.Contains(status.Convert(got).Message(), "image pull (rootfs)") {
+			t.Fatal(got)
+		}
+	}
+	for _, cause := range []error{context.Canceled, ErrNotFound,
+		fmt.Errorf("%w: %w", context.Canceled, os.ErrDeadlineExceeded)} {
+		err := WithStage("image pull (rootfs)", cause)
+		if !errors.Is(err, cause) || errors.Is(err, context.DeadlineExceeded) {
+			t.Fatal(err)
+		}
+	}
 }

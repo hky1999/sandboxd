@@ -16,6 +16,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -501,7 +502,7 @@ func TestHttpWorker_MountOCI_NydusMountFailureDoesNotFallback(t *testing.T) {
 		imageURL := "%%%original"
 		worker.nydusCache.Set(imageURL, true)
 
-		resp, err := worker.MountOCI(&OCIMountRequest{ImageURL: imageURL})
+		resp, err := worker.MountOCI(context.Background(), &OCIMountRequest{ImageURL: imageURL})
 		if err == nil {
 			t.Fatal("MountOCI() error = nil, want non-nil")
 		}
@@ -552,7 +553,7 @@ func TestHttpWorker_MountOCI_NydusMountFailureDoesNotFallback(t *testing.T) {
 		worker.nydusCache.Set(imageURL, false)
 		worker.nydusCache.Set(suffixedImageURL, true)
 
-		resp, err := worker.MountOCI(&OCIMountRequest{ImageURL: imageURL})
+		resp, err := worker.MountOCI(context.Background(), &OCIMountRequest{ImageURL: imageURL})
 		if err == nil {
 			t.Fatal("MountOCI() error = nil, want non-nil")
 		}

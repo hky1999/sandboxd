@@ -15,6 +15,8 @@
 package langrtmanager
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"sync"
 
@@ -45,46 +47,51 @@ type LangRTManager struct {
 }
 
 func (lm *LangRTManager) GetRootfs(cfg RootfsConfig) (*RootFS, error) {
-	lm.rfMu.Lock()
-	if entry, ok := lm.rootfsMap[cfg]; ok {
-		lm.rfMu.Unlock()
-		<-entry.ready
-		return entry.rootfs, entry.err
-	}
+	return lm.getRootfs(context.Background(), cfg)
+}
 
-	// First caller for this config: create a placeholder entry and release lock
-	// before the slow NewRootFS operation.
-	entry := &rootfsEntry{
-		ready: make(chan struct{}),
-	}
-	lm.rootfsMap[cfg] = entry
-	lm.rfMu.Unlock()
-
-	logrus.Infof("rootfs %v not exists, try to create it", cfg)
-	rootfs, err := NewRootFS(cfg, lm.mounter, func() {
+func (lm *LangRTManager) getRootfs(ctx context.Context, cfg RootfsConfig) (*RootFS, error) {
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		lm.rfMu.Lock()
-		// Only delete if it's still our entry (not replaced by a new one).
-		if lm.rootfsMap[cfg] == entry {
+		if entry, ok := lm.rootfsMap[cfg]; ok {
+			lm.rfMu.Unlock()
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-entry.ready:
+			}
+			// A canceled creator does not own the other callers' requests. They retry
+			// with their own contexts after the failed creation has rolled back.
+			if errors.Is(entry.err, context.Canceled) || errors.Is(entry.err, context.DeadlineExceeded) {
+				continue
+			}
+			return entry.rootfs, entry.err
+		}
+		entry := &rootfsEntry{ready: make(chan struct{})}
+		lm.rootfsMap[cfg] = entry
+		lm.rfMu.Unlock()
+		rootfs, err := newRootFS(ctx, cfg, lm.mounter, func() {
+			lm.rfMu.Lock()
+			defer lm.rfMu.Unlock()
+			if lm.rootfsMap[cfg] == entry {
+				delete(lm.rootfsMap, cfg)
+			}
+		})
+		lm.rfMu.Lock()
+		entry.rootfs, entry.err = rootfs, err
+		if err != nil && lm.rootfsMap[cfg] == entry {
 			delete(lm.rootfsMap, cfg)
 		}
+		close(entry.ready)
 		lm.rfMu.Unlock()
-	})
-
-	entry.rootfs = rootfs
-	entry.err = err
-	close(entry.ready)
-
-	if err != nil {
-		// Remove failed entry so future callers can retry.
-		lm.rfMu.Lock()
-		if lm.rootfsMap[cfg] == entry {
-			delete(lm.rootfsMap, cfg)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create rootfs: %w", err)
 		}
-		lm.rfMu.Unlock()
-		return nil, fmt.Errorf("failed to create rootfs with config %v: %v", cfg, err)
+		return rootfs, nil
 	}
-
-	return rootfs, nil
 }
 
 func (lm *LangRTManager) GetLangRuntime(id string) *LanguageRuntime {
@@ -115,6 +122,13 @@ func NewLanguageRuntimeManager(mounter ...ImageMounter) *LangRTManager {
 }
 
 func (lm *LangRTManager) AddLangRuntime(request *api.StartRequest, temporary bool) (*LanguageRuntime, error) {
+	return lm.AddLangRuntimeWithContext(context.Background(), request, temporary)
+}
+
+func (lm *LangRTManager) AddLangRuntimeWithContext(ctx context.Context, request *api.StartRequest, temporary bool) (*LanguageRuntime, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if request == nil {
 		return nil, fmt.Errorf("start request is nil")
 	}
@@ -181,7 +195,7 @@ func (lm *LangRTManager) AddLangRuntime(request *api.StartRequest, temporary boo
 		err    error
 	)
 	for {
-		rootfs, err = lm.GetRootfs(cfg)
+		rootfs, err = lm.getRootfs(ctx, cfg)
 		if err != nil {
 			return nil, err
 		}

@@ -15,6 +15,7 @@
 package langrtmanager
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -34,7 +35,7 @@ type mockMounter struct {
 	mountErr    error
 }
 
-func (m *mockMounter) Mount(cfg RootfsConfig) (string, []string, *imageconfig.Process, error) {
+func (m *mockMounter) Mount(ctx context.Context, cfg RootfsConfig) (string, []string, *imageconfig.Process, error) {
 	if m.mountDelay > 0 {
 		time.Sleep(m.mountDelay)
 	}
@@ -47,7 +48,7 @@ func (m *mockMounter) Mount(cfg RootfsConfig) (string, []string, *imageconfig.Pr
 	return fmt.Sprintf("/fake/rootfs/%s/%d", cfg.Path, m.mountCount), nil, nil, nil
 }
 
-func (m *mockMounter) ImageProcess(RootfsConfig) (*imageconfig.Process, error) {
+func (m *mockMounter) ImageProcess(context.Context, RootfsConfig) (*imageconfig.Process, error) {
 	return &imageconfig.Process{}, nil
 }
 

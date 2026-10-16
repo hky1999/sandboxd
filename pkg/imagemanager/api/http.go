@@ -436,7 +436,7 @@ type nydusMountAttempt struct {
 
 // tryMountNydus attempts to mount an image as Nydus format.
 // Returns mount point on success, or error if image is not Nydus or mount fails.
-func (w *HttpWorker) tryMountNydus(imageURL string) (nydusMountAttempt, error) {
+func (w *HttpWorker) tryMountNydus(ctx context.Context, imageURL string) (nydusMountAttempt, error) {
 	// Check cache first
 	if isNydus, found := w.nydusCache.Get(imageURL); found {
 		if isNydus {
@@ -467,7 +467,7 @@ func (w *HttpWorker) tryMountNydus(imageURL string) (nydusMountAttempt, error) {
 
 		// Cache miss, fetch and check.
 		logrus.Debugf("cache miss for %s, fetching from registry", imageURL)
-		img, err := w.nydusClient.FetchImage(w.ctx, imageURL, "", false)
+		img, err := w.nydusClient.FetchImage(ctx, imageURL, "", false)
 		if err != nil {
 			return nydusMountAttempt{}, fmt.Errorf("failed to fetch image: %w", err)
 		}
@@ -511,7 +511,10 @@ func (w *HttpWorker) mountNydusOnce(imageURL string, fn func() (nydusMountAttemp
 	return nydusMountAttempt{}, nil
 }
 
-func (w *HttpWorker) MountOCI(req *OCIMountRequest) (*OCIMountResponse, error) {
+func (w *HttpWorker) MountOCI(ctx context.Context, req *OCIMountRequest) (*OCIMountResponse, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if w.ociMgr == nil {
 		return nil, fmt.Errorf("oci manager is not initialized")
 	}
@@ -522,9 +525,11 @@ func (w *HttpWorker) MountOCI(req *OCIMountRequest) (*OCIMountResponse, error) {
 	// Try to detect Nydus image if nydusClient is available
 	if w.nydusClient != nil {
 		// Try original URL
-		if attempt, err := w.tryMountNydus(req.ImageURL); err == nil {
+		if attempt, err := w.tryMountNydus(ctx, req.ImageURL); err == nil {
 			w.recordMount(req.ImageURL, "nydus", req.ImageURL, attempt.mountPoint)
 			return &OCIMountResponse{MountPath: attempt.mountPoint, Env: attempt.env, ImageProcess: attempt.imageProcess}, nil
+		} else if ctx.Err() != nil {
+			return nil, ctx.Err()
 		} else if attempt.detected {
 			logrus.WithError(err).Warnf("detected Nydus image for %s but Nydus mount failed, skip OCI fallback", req.ImageURL)
 			return nil, err
@@ -534,9 +539,11 @@ func (w *HttpWorker) MountOCI(req *OCIMountRequest) (*OCIMountResponse, error) {
 		if w.nydusSuffix != "" {
 			imageWithSuffix := req.ImageURL + w.nydusSuffix
 			logrus.Infof("trying Nydus detection with suffix: %s", imageWithSuffix)
-			if attempt, err := w.tryMountNydus(imageWithSuffix); err == nil {
+			if attempt, err := w.tryMountNydus(ctx, imageWithSuffix); err == nil {
 				w.recordMount(req.ImageURL, "nydus", imageWithSuffix, attempt.mountPoint)
 				return &OCIMountResponse{MountPath: attempt.mountPoint, Env: attempt.env, ImageProcess: attempt.imageProcess}, nil
+			} else if ctx.Err() != nil {
+				return nil, ctx.Err()
 			} else if attempt.detected {
 				logrus.WithError(err).Warnf("detected Nydus image for %s via suffix %s but Nydus mount failed, skip OCI fallback", req.ImageURL, imageWithSuffix)
 				return nil, err
@@ -546,7 +553,7 @@ func (w *HttpWorker) MountOCI(req *OCIMountRequest) (*OCIMountResponse, error) {
 
 	// Fallback to regular OCI mount flow.
 	logrus.Infof("no Nydus image detected, using OCI overlay mount for %s", req.ImageURL)
-	mountPoint, envVars, imageProcess, err := w.ociMgr.MountImageConfigWithContext(w.ctx, req.ImageURL)
+	mountPoint, envVars, imageProcess, err := w.ociMgr.MountImageConfigWithContext(ctx, req.ImageURL)
 	if err != nil {
 		return nil, err
 	}
@@ -557,7 +564,7 @@ func (w *HttpWorker) MountOCI(req *OCIMountRequest) (*OCIMountResponse, error) {
 // ImageProcess resolves process metadata for an already mounted OCI or Nydus
 // image. It is separate from MountOCI so old cached mounts need registry access
 // only when a caller explicitly requests inherited image startup.
-func (w *HttpWorker) ImageProcess(imageURL string) (*imageconfig.Process, error) {
+func (w *HttpWorker) ImageProcess(ctx context.Context, imageURL string) (*imageconfig.Process, error) {
 	if imageURL == "" {
 		return nil, fmt.Errorf("image_url is required")
 	}
@@ -579,7 +586,7 @@ func (w *HttpWorker) ImageProcess(imageURL string) (*imageconfig.Process, error)
 			if d == nil {
 				return nil, fmt.Errorf("Nydus daemon for image %s is unavailable", imageURL)
 			}
-			return d.ResolveImageProcess(w.ctx)
+			return d.ResolveImageProcess(ctx)
 		}
 		if record != nil && record.MountType != "oci" {
 			return nil, fmt.Errorf("unsupported mount type %q for image %s", record.MountType, imageURL)
@@ -596,14 +603,14 @@ func (w *HttpWorker) ImageProcess(imageURL string) (*imageconfig.Process, error)
 		}
 		for _, candidate := range candidates {
 			if d := w.mgr.GetDaemon(generateNydusID(candidate)); d != nil {
-				return d.ResolveImageProcess(w.ctx)
+				return d.ResolveImageProcess(ctx)
 			}
 		}
 	}
 	if w.ociMgr == nil {
 		return nil, fmt.Errorf("oci manager is not initialized")
 	}
-	return w.ociMgr.ImageProcessWithContext(w.ctx, imageURL)
+	return w.ociMgr.ImageProcessWithContext(ctx, imageURL)
 }
 
 // recordMount persists a mount record. Errors are logged but not propagated.
@@ -827,7 +834,7 @@ func (w *HttpWorker) prepareHttp() *http.ServeMux {
 			return
 		}
 		start := time.Now()
-		resp, err := w.MountOCI(&req)
+		resp, err := w.MountOCI(request.Context(), &req)
 		logrus.Infof("do oci_mount take %.6f s, err = %v", time.Since(start).Seconds(), err)
 		if err != nil {
 			writer.WriteHeader(http.StatusInternalServerError)
@@ -1020,11 +1027,16 @@ func (c *HttpClient) UmountOSS(req *OSSUmountRequest) error {
 	return nil
 }
 
-func (c *HttpClient) MountOCI(req *OCIMountRequest) (*OCIMountResponse, error) {
+func (c *HttpClient) MountOCI(ctx context.Context, req *OCIMountRequest) (*OCIMountResponse, error) {
 	body, _ := json.Marshal(req)
-	resp, err := c.clt.Post("http://unix/oci_mount", "application/json", bytes.NewReader(body))
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://unix/oci_mount", bytes.NewReader(body))
 	if err != nil {
-		return nil, fmt.Errorf("failed to mount oci image: %s, err: %v", req, err)
+		return nil, err
+	}
+	request.Header.Set("Content-Type", "application/json")
+	resp, err := c.clt.Do(request)
+	if err != nil {
+		return nil, fmt.Errorf("failed to mount oci image: %s: %w", req, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {

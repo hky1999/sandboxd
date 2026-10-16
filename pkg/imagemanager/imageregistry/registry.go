@@ -17,6 +17,7 @@ package imageregistry
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -31,6 +32,8 @@ import (
 	"github.com/google/go-containerregistry/pkg/name"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
+	registrytransport "github.com/google/go-containerregistry/pkg/v1/remote/transport"
+	"github.com/inclusionAI/sandboxd/pkg/errord"
 	"github.com/sirupsen/logrus"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
@@ -93,6 +96,9 @@ func (c *Client) FetchImageWithFallback(ctx context.Context, imageRef string, pr
 		if err == nil {
 			return img, nil
 		}
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		logrus.Warnf("failed to fetch image %s via HTTP proxy, fallback to HTTPS: %v", imageRef, err)
 	}
 
@@ -117,7 +123,7 @@ func (c *Client) FetchImage(ctx context.Context, imageRef string, proxyURL strin
 	parseDuration := time.Since(stageStart)
 
 	stageStart = time.Now()
-	options := []remote.Option{remote.WithAuthFromKeychain(c.keychain)}
+	options := []remote.Option{remote.WithAuthFromKeychain(c.keychain), remote.WithContext(ctx)}
 	transport := c.getOrCreateTransport(proxyURL)
 	options = append(options, remote.WithTransport(transport))
 	transportDuration := time.Since(stageStart)
@@ -125,7 +131,7 @@ func (c *Client) FetchImage(ctx context.Context, imageRef string, proxyURL strin
 	stageStart = time.Now()
 	img, err := remote.Image(ref, options...)
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch image %s: %w", imageRef, err)
+		return nil, fmt.Errorf("failed to fetch image %s: %w", imageRef, ClassifyError(err))
 	}
 	fetchDuration := time.Since(stageStart)
 
@@ -208,7 +214,9 @@ func (t *registryTransport) RoundTrip(req *http.Request) (*http.Response, error)
 
 	resp, err := roundTripper.RoundTrip(req)
 	if err != nil {
-		if conn != nil {
+		// The transport cancels the request stream itself. Closing a shared
+		// HTTP/2 connection here would cancel unrelated image consumers.
+		if conn != nil && req.Context().Err() == nil {
 			_ = conn.Close()
 		}
 		return nil, err
@@ -221,8 +229,27 @@ func (t *registryTransport) RoundTrip(req *http.Request) (*http.Response, error)
 		}
 		resp.Close = true
 	}
+	resp.Body = &registryResponseBody{ReadCloser: resp.Body, ctx: req.Context()}
 
 	return resp, nil
+}
+
+// A server can finish a response body as it observes a canceled request. Keep
+// that EOF from being interpreted as a successful, potentially empty manifest.
+type registryResponseBody struct {
+	io.ReadCloser
+	ctx context.Context
+}
+
+func (b *registryResponseBody) Read(p []byte) (int, error) {
+	if err := b.ctx.Err(); err != nil {
+		return 0, err
+	}
+	n, err := b.ReadCloser.Read(p)
+	if ctxErr := b.ctx.Err(); ctxErr != nil {
+		return n, ctxErr
+	}
+	return n, err
 }
 
 func shouldCloseConnOnServerError(resp *http.Response) bool {
@@ -280,4 +307,36 @@ func (k *registryKeychain) Resolve(res authn.Resource) (authn.Authenticator, err
 	}
 
 	return authn.Anonymous, nil
+}
+
+// ClassifyError retains registry rejection causes across image preparation.
+// A registry HTTP rejection is distinct from a connection failure or deadline.
+func ClassifyError(err error) error {
+	var response *registrytransport.Error
+	if !errors.As(err, &response) {
+		return err
+	}
+	var kind error
+	switch response.StatusCode {
+	case http.StatusBadRequest:
+		kind = errord.ErrInvalidArgument
+	case http.StatusUnauthorized:
+		kind = errord.ErrUnauthenticated
+	case http.StatusForbidden:
+		kind = errord.ErrPermissionDenied
+	case http.StatusNotFound:
+		kind = errord.ErrNotFound
+	case http.StatusTooManyRequests:
+		kind = errord.ErrResourceExhausted
+	case http.StatusServiceUnavailable, http.StatusBadGateway:
+		kind = errord.ErrUnavailable
+	case http.StatusRequestTimeout, http.StatusGatewayTimeout:
+		kind = context.DeadlineExceeded
+	default:
+		return err
+	}
+	if errors.Is(err, kind) {
+		return err
+	}
+	return fmt.Errorf("%w: %w", kind, err)
 }

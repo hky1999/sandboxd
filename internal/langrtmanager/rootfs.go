@@ -15,6 +15,7 @@
 package langrtmanager
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"sync"
@@ -27,8 +28,8 @@ import (
 
 // ImageMounter abstracts rootfs mount/umount operations for testability.
 type ImageMounter interface {
-	Mount(cfg RootfsConfig) (path string, env []string, imageProcess *imageconfig.Process, err error)
-	ImageProcess(cfg RootfsConfig) (*imageconfig.Process, error)
+	Mount(ctx context.Context, cfg RootfsConfig) (path string, env []string, imageProcess *imageconfig.Process, err error)
+	ImageProcess(ctx context.Context, cfg RootfsConfig) (*imageconfig.Process, error)
 	Umount(cfg RootfsConfig) error
 }
 
@@ -86,13 +87,13 @@ func (rf *RootFS) ImageProcess() *imageconfig.Process {
 	return imageconfig.Clone(rf.imageProcess)
 }
 
-func (rf *RootFS) ResolveImageProcess() (*imageconfig.Process, error) {
+func (rf *RootFS) ResolveImageProcess(ctx context.Context) (*imageconfig.Process, error) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	if rf.imageProcess != nil {
 		return imageconfig.Clone(rf.imageProcess), nil
 	}
-	imageProcess, err := rf.mounter.ImageProcess(rf.cfg)
+	imageProcess, err := rf.mounter.ImageProcess(ctx, rf.cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -107,11 +108,11 @@ func (rf *RootFS) Config() RootfsConfig {
 	return rf.cfg
 }
 
-func (rf *RootFS) MountImage() error {
+func (rf *RootFS) MountImage(ctx context.Context) error {
 	if rf.path != "" {
 		return fmt.Errorf("already mounted")
 	}
-	path, env, imageProcess, err := rf.mounter.Mount(rf.cfg)
+	path, env, imageProcess, err := rf.mounter.Mount(ctx, rf.cfg)
 	if err != nil {
 		return err
 	}
@@ -147,7 +148,10 @@ func (d *defaultMounter) client() api.Service {
 	return d.svc
 }
 
-func (d *defaultMounter) Mount(cfg RootfsConfig) (string, []string, *imageconfig.Process, error) {
+func (d *defaultMounter) Mount(ctx context.Context, cfg RootfsConfig) (string, []string, *imageconfig.Process, error) {
+	if err := ctx.Err(); err != nil {
+		return "", nil, nil, err
+	}
 	switch cfg.SrcType {
 	case runtime_api.RootfsSrcType_S3:
 		mi, err := d.client().MountOSS(&api.OSSMountRequest{
@@ -163,7 +167,7 @@ func (d *defaultMounter) Mount(cfg RootfsConfig) (string, []string, *imageconfig
 		return mi.FilePath, mi.Env, mi.ImageProcess, nil
 
 	case runtime_api.RootfsSrcType_IMAGE:
-		resp, err := d.client().MountOCI(&api.OCIMountRequest{
+		resp, err := d.client().MountOCI(ctx, &api.OCIMountRequest{
 			ImageURL: cfg.ImageUrl,
 		})
 		if err != nil {
@@ -184,11 +188,11 @@ func (d *defaultMounter) Mount(cfg RootfsConfig) (string, []string, *imageconfig
 	}
 }
 
-func (d *defaultMounter) ImageProcess(cfg RootfsConfig) (*imageconfig.Process, error) {
+func (d *defaultMounter) ImageProcess(ctx context.Context, cfg RootfsConfig) (*imageconfig.Process, error) {
 	if cfg.SrcType != runtime_api.RootfsSrcType_IMAGE {
 		return nil, fmt.Errorf("image process config requires an image rootfs")
 	}
-	return d.client().ImageProcess(cfg.ImageUrl)
+	return d.client().ImageProcess(ctx, cfg.ImageUrl)
 }
 
 func (d *defaultMounter) Umount(cfg RootfsConfig) error {
@@ -239,13 +243,17 @@ func (rf *RootFS) DecRef() {
 }
 
 func NewRootFS(cfg RootfsConfig, mounter ImageMounter, cleanup func()) (*RootFS, error) {
+	return newRootFS(context.Background(), cfg, mounter, cleanup)
+}
+
+func newRootFS(ctx context.Context, cfg RootfsConfig, mounter ImageMounter, cleanup func()) (*RootFS, error) {
 	rootFS := &RootFS{
 		cfg:         cfg,
 		mounter:     mounter,
 		cleanupFunc: cleanup,
 	}
 
-	if err := rootFS.MountImage(); err != nil {
+	if err := rootFS.MountImage(ctx); err != nil {
 		return nil, err
 	}
 
