@@ -216,6 +216,10 @@ type ResourceConfig struct {
 	// available in this mode.
 	DisableCgroup bool `toml:"disable_cgroup" json:"disableCgroup"`
 
+	// CgroupIOAccounting requires io delegation on every cgroup v2 ancestor.
+	// It enables accounting only; it does not configure I/O throttling.
+	CgroupIOAccounting bool `toml:"cgroup_io_accounting" json:"cgroupIOAccounting"`
+
 	// CgroupRootName is the path of cgroup. Default is sandbox.
 	CgroupRootName string `toml:"cgroup_root_name" json:"cgroupRootName"`
 	// CgroupCacheSize is the size of cgroup cache. Default is same as max_instance_num.
@@ -237,6 +241,20 @@ type ResourceConfig struct {
 	MemoryShrinkHeadroomMiB int `toml:"memory_shrink_headroom_mib" json:"memoryShrinkHeadroomMiB"`
 	// InterfaceCacheSize is the size of interface cache. Default is same as max_instance_num.
 	InterfaceCacheSize int `toml:"interface_cache_size" json:"interfaceCacheSize"`
+}
+
+// ValidateCgroupIOAccounting rejects an explicitly requested but inactive pool.
+func (c ResourceConfig) ValidateCgroupIOAccounting() error {
+	if !c.CgroupIOAccounting {
+		return nil
+	}
+	if c.DisableCgroup {
+		return fmt.Errorf("cgroup_io_accounting requires enabled cgroup management")
+	}
+	if c.CgroupCacheSize <= 0 {
+		return fmt.Errorf("cgroup_io_accounting requires a positive cgroup_cache_size")
+	}
+	return nil
 }
 
 // NormalizeRunscPlatform validates the configured gVisor platform. An empty

@@ -54,7 +54,7 @@ func TestNewCgroupOpsSelectsDetectedMode(t *testing.T) {
 		{mode: cgroups.Unavailable, wantErr: true},
 	} {
 		detectCgroupMode = func() cgroups.CGMode { return test.mode }
-		ops, err := newCgroupOps(0)
+		ops, err := newCgroupOps(0, false)
 		if test.wantErr {
 			assert.Error(t, err)
 			continue

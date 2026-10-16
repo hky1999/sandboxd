@@ -46,6 +46,10 @@ disable_cgroup = false
 # limit and lets runsc, Kata, and Firecracker derive CPU topology from it.
 cpu_limit_mode = "quota"
 cgroup_cache_size = 1
+
+# Opt-in cgroup v2 I/O accounting; requires io delegation on every ancestor.
+# This does not change io.max or reserve storage bandwidth.
+cgroup_io_accounting = false
 # Maximum processes per sandbox. Omit or set to 0 for unlimited.
 # pids_max = 4096
 # cgroup v2 only: soft memory limit applied together with every per-sandbox

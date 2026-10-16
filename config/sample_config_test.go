@@ -59,6 +59,9 @@ func TestPublicSampleConfigIsComplete(t *testing.T) {
 	if cfg.CgroupCacheSize <= 0 || cfg.InterfaceCacheSize <= 0 || cfg.MaxInstanceNum <= 0 {
 		t.Fatal("sample config must enable bounded cgroup and interface pools")
 	}
+	if cfg.CgroupIOAccounting {
+		t.Fatal("sample I/O accounting must remain opt-in")
+	}
 	if cfg.CPULimitMode != CPULimitModeQuota {
 		t.Fatalf("sample cpu_limit_mode = %q, want %q", cfg.CPULimitMode, CPULimitModeQuota)
 	}

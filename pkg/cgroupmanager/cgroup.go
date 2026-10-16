@@ -451,6 +451,9 @@ func NewCgroupManager(
 	cfg config.ResourceConfig,
 	max int,
 ) (*CgroupManager, error) {
+	if err := cfg.ValidateCgroupIOAccounting(); err != nil {
+		return nil, err
+	}
 	if cfg.PidsMax < 0 {
 		return nil, fmt.Errorf("pids_max must be non-negative")
 	}
@@ -470,7 +473,7 @@ func NewCgroupManager(
 		return nil, err
 	}
 
-	ops, err := newCgroupOps(cfg.MemoryHighRatio)
+	ops, err := newCgroupOps(cfg.MemoryHighRatio, cfg.CgroupIOAccounting)
 	if err != nil {
 		return nil, err
 	}

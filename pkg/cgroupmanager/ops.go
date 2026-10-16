@@ -148,10 +148,14 @@ type CgroupIdentity struct {
 
 var detectCgroupMode = cgroups.Mode
 
-func newCgroupOps(memoryHighRatio float64) (cgroupOps, error) {
-	switch mode := detectCgroupMode(); mode {
+func newCgroupOps(memoryHighRatio float64, ioAccounting bool) (cgroupOps, error) {
+	mode := detectCgroupMode()
+	if ioAccounting && mode != cgroups.Unified {
+		return nil, errors.New("cgroup_io_accounting requires cgroup v2")
+	}
+	switch mode {
 	case cgroups.Unified:
-		return &cgroupV2{mountpoint: cgroupMountpoint, memoryHighRatio: memoryHighRatio}, nil
+		return &cgroupV2{mountpoint: cgroupMountpoint, memoryHighRatio: memoryHighRatio, ioAccounting: ioAccounting}, nil
 	case cgroups.Legacy, cgroups.Hybrid:
 		if memoryHighRatio > 0 {
 			logrus.Warnf("memory_high_ratio %.2f configured but cgroup v1 has no memory.high; ignoring", memoryHighRatio)

@@ -1051,6 +1051,9 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 		return nil, fmt.Errorf("resource configuration: %w", err)
 	}
 	cfg.CPULimitMode = cpuLimitMode
+	if err := cfg.ResourceConfig.ValidateCgroupIOAccounting(); err != nil {
+		return nil, fmt.Errorf("resource configuration: %w", err)
+	}
 
 	natBackend, err := resolveNATBackend(cfg.NatBackend)
 	if err != nil {

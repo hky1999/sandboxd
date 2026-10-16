@@ -41,6 +41,7 @@ type cgroupV2 struct {
 	// memoryHighRatio enables writing memory.high alongside every finite
 	// memory.max (see ResourceConfig.MemoryHighRatio). Zero disables.
 	memoryHighRatio float64
+	ioAccounting    bool
 }
 
 func (*cgroupV2) mode() cgroups.CGMode { return cgroups.Unified }
@@ -49,6 +50,9 @@ func (o *cgroupV2) prepareRoot(root string, pidsMax int64) error {
 	required := []string{"cpu", "memory"}
 	if pidsMax > 0 {
 		required = append(required, "pids")
+	}
+	if o.ioAccounting {
+		required = append(required, "io")
 	}
 	return o.enableControllers(root, required)
 }
