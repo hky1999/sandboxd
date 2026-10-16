@@ -183,6 +183,7 @@ func NewHandler(cfg config.Config, bin string, loader runtimecore.OciLoader) (*H
 
 	return &Handler{
 		runsc: NewClientWithOptions(bin, runscRoot, Options{
+			RetirementRoot:   root,
 			ExtraArgs:        cfg.RuntimeConfig.Runsc.ExtraArgs,
 			Platform:         platform,
 			FilestoreDir:     cfg.RuntimeConfig.FilestoreDir,

@@ -213,56 +213,72 @@ func (c *Client) publishManagedLaunch(ctx context.Context, record *managedLaunch
 	if len(entries) >= managedLaunchLimit+1 {
 		return errors.New("managed launch journal is full; unresolved ownership is retained")
 	}
+	check := func() error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if record.DeadlineUnixMs <= time.Now().UnixMilli() {
+			return errors.New("managed launch deadline expired before publication")
+		}
+		if err := verifyRuntimeIdentityDirectory(c.RootDir, original); err != nil {
+			return err
+		}
+		var current, held unix.Stat_t
+		if err := unix.Fstatat(int(root.Fd()), managedLaunchDirectory, &current, unix.AT_SYMLINK_NOFOLLOW); err != nil ||
+			current.Dev != source.Dev || current.Ino != source.Ino || current.Mode != source.Mode || current.Uid != source.Uid {
+			return errors.New("original managed launch journal directory changed")
+		}
+		if err := unix.Fstat(lockFD, &held); err != nil || !sameRuntimeInventoryStat(lockSource, held) {
+			return errors.New("original managed launch lock changed")
+		}
+		if err := unix.Fstatat(fd, ".lock", &current, unix.AT_SYMLINK_NOFOLLOW); err != nil || !sameRuntimeInventoryStat(held, current) {
+			return errors.New("original managed launch lock was replaced")
+		}
+		return nil
+	}
+	if err := check(); err != nil {
+		return err
+	}
+	retiredName := "retired-" + managedLaunchKey(record.SandboxID, record.ResourceGeneration) + ".json"
+	var archived unix.Stat_t
+	if err := unix.Fstatat(fd, retiredName, &archived, unix.AT_SYMLINK_NOFOLLOW); !errors.Is(err, unix.ENOENT) {
+		return errors.New("managed launch generation was already archived or its history is unknown")
+	}
+	receipt, _, err := c.readLaunchRetirement(ctx, record.SandboxID, record.ResourceGeneration)
+	if err != nil {
+		return err
+	}
+	if receipt != nil {
+		return errors.New("managed launch generation already has a retirement intent")
+	}
 	name := record.SandboxID + ".json"
-	var existing unix.Stat_t
-	if err := unix.Fstatat(fd, name, &existing, unix.AT_SYMLINK_NOFOLLOW); !errors.Is(err, unix.ENOENT) {
-		return errors.New("managed launch already has an unresolved original owner")
+	previous, err := privateManagedLaunchJSON(directory, name, managedLaunchRecordBytes)
+	replace := false
+	if err == nil {
+		var old managedLaunchRecord
+		if err := decodeManagedLaunchJSON(previous, &old); err != nil {
+			return err
+		}
+		if old.Version != 1 || old.SandboxID != record.SandboxID || !runtimeInventoryID(old.ResourceGeneration) ||
+			old.ResourceGeneration == record.ResourceGeneration || old.Revision != 1 || old.Stage != "dispatching" ||
+			!old.CloneIntoCgroup || !nativeDigest(old.ArgumentsSHA256) || old.Cgroup == nil ||
+			!validLaunchCgroupPath(old.Cgroup.Path) || old.Cgroup.Inode == 0 || old.Cgroup.BootID == "" ||
+			old.Cgroup.CgroupNamespaceInode == 0 || old.Cgroup.MountNamespaceInode == 0 || old.DeadlineUnixMs <= 0 {
+			return errors.New("managed launch original owner is incomplete or unchanged")
+		}
+		if _, err := uuid.Parse(old.OperationID); err != nil {
+			return errors.New("managed launch original operation is invalid")
+		}
+		if err := c.archiveRetiredManagedLaunch(ctx, directory, root, &old, previous, check); err != nil {
+			return err
+		}
+		replace = true
+	} else if !errors.Is(err, unix.ENOENT) {
+		return err
 	}
 	data, err := json.Marshal(record)
 	if err != nil {
 		return err
 	}
-	temporary := ".pending-" + record.OperationID
-	fileFD, err := unix.Openat(fd, temporary, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0600)
-	if err != nil {
-		return err
-	}
-	file := os.NewFile(uintptr(fileFD), "original managed launch intent")
-	defer file.Close()
-	defer unix.Unlinkat(fd, temporary, 0)
-	if _, err := file.Write(data); err != nil {
-		return err
-	}
-	if err := file.Sync(); err != nil {
-		return err
-	}
-	if err := file.Close(); err != nil {
-		return err
-	}
-	if err := verifyRuntimeIdentityDirectory(c.RootDir, original); err != nil {
-		return err
-	}
-	var current unix.Stat_t
-	if err := unix.Fstatat(int(root.Fd()), managedLaunchDirectory, &current, unix.AT_SYMLINK_NOFOLLOW); err != nil ||
-		current.Dev != source.Dev || current.Ino != source.Ino || current.Mode != source.Mode || current.Uid != source.Uid {
-		return errors.New("original managed launch journal directory changed")
-	}
-	if err := unix.Linkat(fd, temporary, fd, name, 0); err != nil {
-		return err
-	}
-	if err := unix.Unlinkat(fd, temporary, 0); err != nil {
-		return err
-	}
-	if err := directory.Sync(); err != nil {
-		return err
-	}
-	if err := root.Sync(); err != nil {
-		return err
-	}
-	if err := unix.Fstatat(fd, ".lock", &current, unix.AT_SYMLINK_NOFOLLOW); err != nil ||
-		current.Dev != lockSource.Dev || current.Ino != lockSource.Ino || current.Mode != lockSource.Mode ||
-		current.Uid != lockSource.Uid || current.Nlink != 1 {
-		return errors.New("original managed launch lock changed during publication")
-	}
-	return verifyRuntimeIdentityDirectory(c.RootDir, original)
+	return c.writeManagedLaunchJSON(directory, root, name, data, replace, check)
 }

@@ -44,6 +44,7 @@ func TestNewRunscHandlerUsesSharedLogFile(t *testing.T) {
 	}
 	assert.Equal(t, filepath.Join(baseDir, "logs", config.RuntimeNameRunsc, "runsc.log"), client.Options.DebugLogPath)
 	assert.Equal(t, config.RunscPlatformSystrap, client.Options.Platform)
+	assert.Equal(t, rootDir, client.Options.RetirementRoot)
 }
 
 func TestNewRunscHandlerPropagatesIgnoreCgroups(t *testing.T) {

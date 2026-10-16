@@ -57,9 +57,13 @@ type Client struct {
 	connectControl      func(string) (controlRPC, error)
 	controlPeerObserved func(map[string]any)
 	openLaunchCgroup    func(string) (*os.File, *managedLaunchCgroup, error)
+	managedLaunchSync   func(*os.File) error
 }
 
 type Options struct {
+	// RetirementRoot is the trusted daemon root containing completed
+	// scheduler-retirements receipts, never a caller-selected sandbox path.
+	RetirementRoot     string
 	ExtraArgs          []string
 	Platform           string
 	FilestoreDir       string
