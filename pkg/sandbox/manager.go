@@ -279,18 +279,18 @@ func (m *Manager) housekeeping() {
 	pollStarted := time.Now()
 	cstates, polled := m.collectRuntimeStates(10 * time.Second)
 	pollCost := time.Since(pollStarted)
-	// Process readiness measures local reconciliation. A slow runtime poll
-	// closes only that runtime's admission and cannot poison other handlers.
+	// Process readiness reflects the outcome of local reconciliation. A slow
+	// successful write must not close admission after the write has completed.
+	// Runtime poll failures close only the affected handler's admission.
 	start := time.Now()
+	ready := true
 	defer func() {
 		spent := time.Since(start)
 		logrus.Debugf("housekeeping phases: runtime_poll=%s local=%s", pollCost, spent)
 		if spent >= config.HouseKeepingMaxCostTime {
 			logrus.Warnf("housekeeping local reconciliation cost %v which is too long", spent)
-			m.healthChan <- false
-		} else {
-			m.healthChan <- true
 		}
+		m.healthChan <- ready
 	}()
 
 	for id, sb := range m.sandboxes.Items() {
@@ -305,12 +305,17 @@ func (m *Manager) housekeeping() {
 		}
 
 		// check root
-		if _, err := os.Stat(sb.PATH); err != nil && os.IsNotExist(err) {
-			logrus.Errorf("sandbox %s root %s is not exist", id, sb.PATH)
-			m.ReceiveEvent(Event{
-				Type:      EventTypeDelete,
-				SandboxID: id,
-			})
+		if _, err := os.Stat(sb.PATH); err != nil {
+			if os.IsNotExist(err) {
+				logrus.Errorf("sandbox %s root %s is not exist", id, sb.PATH)
+				m.ReceiveEvent(Event{
+					Type:      EventTypeDelete,
+					SandboxID: id,
+				})
+			} else {
+				ready = false
+				logrus.WithError(err).Errorf("stat sandbox %s root %s failed", id, sb.PATH)
+			}
 			continue
 		}
 
@@ -318,6 +323,7 @@ func (m *Manager) housekeeping() {
 			if err := sb.Status.UpdateSync(func(status Status) (Status, error) {
 				return UpdateStatusByState(cstates[id], status), nil
 			}); err != nil {
+				ready = false
 				logrus.Errorf("update sandbox %s status failed: %v", id, err)
 			}
 		}
@@ -339,8 +345,14 @@ func (m *Manager) housekeeping() {
 	dir, err := os.ReadDir(m.recyclePath)
 	if err == nil {
 		for _, d := range dir {
-			os.RemoveAll(filepath.Join(m.recyclePath, d.Name()))
+			if err := os.RemoveAll(filepath.Join(m.recyclePath, d.Name())); err != nil {
+				ready = false
+				logrus.WithError(err).Errorf("remove recycled sandbox %s failed", d.Name())
+			}
 		}
+	} else if !os.IsNotExist(err) {
+		ready = false
+		logrus.WithError(err).Error("read recycled sandboxes failed")
 	}
 
 	// 4. Complement monitoring (double check strategy)

@@ -109,9 +109,9 @@ const (
 )
 
 const (
-	// HouseKeepingMaxCostTime is the max cost time of housekeeping.
-	// If the cost time is larger than this value,
-	// a warning log will be printed and the server will set self to unhealthy.
+	// HouseKeepingMaxCostTime is the warning threshold for local housekeeping.
+	// Readiness reports reconciliation errors, not the elapsed time of an
+	// already completed successful pass.
 	HouseKeepingMaxCostTime = time.Second * 5
 
 	// LifeCycleAliveValidInterval is the valid interval of alive check before terrible.
