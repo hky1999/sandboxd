@@ -341,43 +341,55 @@ func (h *sandboxService) closeResourceOperation(state *resourceOperationState, o
 	return h.saveResourceOperationState(state)
 }
 
-// retireResourceOperationState closes and removes an incarnation's record
-// after that generation was fully retired by a successful physical delete.
-// Only the deletion itself is authority here: discovering a missing record
-// never proves anything, and an unpersistable close leaves the file behind
-// for restart reconciliation.
+// retireResourceOperationState best-effort reclaims the revision record after
+// this generation's physical delete, or a matching durable completed receipt.
+// Failure never invalidates physical retirement and leaves diagnostics for retry.
 func (h *sandboxService) retireResourceOperationState(id, generation string) {
-	state, result, err := h.loadResourceOperationState(id, generation)
-	if err != nil || result == resourceStateMissing {
-		if err != nil {
-			logrus.WithError(err).Warnf("read resource state for retired sandbox %s generation %s failed", id, generation)
+	if err := h.removeRetiredResourceOperationState(id, generation); err != nil {
+		logrus.WithError(err).Warnf("retain resource state for retired sandbox %s generation %s; cleanup will retry", id, generation)
+	}
+}
+
+// Caller holds the sandbox's physical lock and has already proved retirement.
+// No cgroup is touched and no new outcome must be published for a dead execution.
+// The completed retirement receipt remains the authority for rejecting old work.
+func (h *sandboxService) removeRetiredResourceOperationState(id, generation string) error {
+	h.resourceStateMu.Lock()
+	defer h.resourceStateMu.Unlock()
+	dir, path := h.resourceStatePath(id, generation)
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		// A prior unlink may have succeeded before its directory sync failed.
+		// Retry that sync even though the record is no longer visible.
+		if _, dirErr := os.Stat(dir); errors.Is(dirErr, os.ErrNotExist) {
+			return nil
 		}
-		return
+		return syncRetirementDirectory(dir)
 	}
-	if result == resourceStateCorrupt {
-		logrus.Warnf("retain damaged resource state for retired sandbox %s generation %s", id, generation)
-		return
+	if err != nil {
+		return err
 	}
-	if state.open() {
-		state.Stage = resourceStageIdle
-		state.FreezeOwned = false
-		state.LastOutcome = resourceOutcomeRetired
-		state.LastOutcomeMessage = "incarnation retired by a completed physical delete"
-		state.LastCompletionUnixMs = time.Now().UnixMilli()
-		state.UpdatedAtUnixMs = state.LastCompletionUnixMs
-		if err := h.saveResourceOperationState(state); err != nil {
-			logrus.WithError(err).Warnf("close resource state of retired sandbox %s generation %s failed; retaining record", id, generation)
-			return
-		}
+	if !info.Mode().IsRegular() || info.Size() > resourceStateRecordLimitBytes {
+		return fmt.Errorf("retired resource state has an unsafe type or size")
 	}
-	_, path := h.resourceStatePath(id, generation)
+	_, result, err := h.loadResourceOperationState(id, generation)
+	if err != nil {
+		return err
+	}
+	if result != resourceStateLoaded {
+		return fmt.Errorf("retired resource state identity is unverified")
+	}
+	current, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if !os.SameFile(info, current) || info.Size() != current.Size() || !info.ModTime().Equal(current.ModTime()) {
+		return fmt.Errorf("retired resource state changed before cleanup")
+	}
 	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-		logrus.WithError(err).Warnf("remove resource state of retired sandbox %s generation %s failed", id, generation)
-		return
+		return err
 	}
-	if err := syncRetirementDirectory(h.resourceStateDir()); err != nil {
-		logrus.WithError(err).Warnf("sync resource state directory after retirement failed")
-	}
+	return syncRetirementDirectory(dir)
 }
 
 // resourceStateObservation is the Stats-facing projection of the journal.

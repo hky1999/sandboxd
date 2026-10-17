@@ -166,6 +166,7 @@ func (h *sandboxService) reconcilePhysicalIntentLocked(ctx context.Context, meta
 			return err
 		}
 		if receipt != nil && receipt.Complete {
+			h.retireResourceOperationState(metadata.ID, generation)
 			return h.forgetCompletedFailedCreationIntent(metadata.ID, generation)
 		}
 		if complete, err := h.resumeRetirementCompletion(metadata.ID, generation); err != nil {

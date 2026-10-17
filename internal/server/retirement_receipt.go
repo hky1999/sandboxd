@@ -124,5 +124,11 @@ func (h *sandboxService) writeRetirement(id, generation string, complete bool) e
 	if err = os.Rename(f.Name(), path); err != nil {
 		return err
 	}
-	return syncRetirementDirectory(dir)
+	if err := syncRetirementDirectory(dir); err != nil {
+		return err
+	}
+	if complete {
+		h.retireResourceOperationState(id, generation)
+	}
+	return nil
 }

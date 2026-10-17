@@ -436,6 +436,7 @@ func (h *sandboxService) deleteSandboxRuntime(ctx context.Context, sandboxID str
 			return readErr
 		}
 		if receipt != nil && receipt.Complete {
+			h.retireResourceOperationState(sandboxID, expected)
 			return h.forgetCompletedFailedCreationIntent(sandboxID, expected)
 		}
 		// An unpublished INTENT is still a physical owner. Conditional cleanup
@@ -674,7 +675,8 @@ func (h *sandboxService) deleteSandboxRuntime(ctx context.Context, sandboxID str
 			return err
 		}
 	}
-	if deleteGeneration != "" {
+	if deleteGeneration != "" && expected == "" {
+		// Conditional deletion already reclaimed after the durable receipt.
 		// The physical delete is the authority that this incarnation — and
 		// with it any resource operation it still owned — is finished. Close
 		// and drop the revision journal only now; a missing sandbox alone

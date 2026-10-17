@@ -77,6 +77,8 @@ func decodeResourceOperationState(data []byte) (*resourceOperationState, resourc
 //     unfrozen (bounded), read back, and closed at its advanced revision with
 //     a recovered outcome. Complete is claimed only when the recorded target
 //     fully verifies against the physical readback.
+//   - A matching completed retirement receipt permits exact record cleanup,
+//     including closed records. No cgroup is touched for a retired execution.
 //   - A damaged record stays untouched and keeps the incarnation fail-closed.
 //
 // Nothing here proves a shrink released scheduler budget: only the physical
@@ -147,6 +149,15 @@ func (h *sandboxService) reconcileOpenResourceState(ctx context.Context, state *
 	}
 	if loaded != resourceStateLoaded {
 		return fmt.Errorf("resource state changed or became unavailable before recovery")
+	}
+	receipt, err := h.readRetirement(current.SandboxID, current.ResourceGeneration)
+	if err != nil {
+		return err
+	}
+	if receipt != nil && receipt.Complete {
+		// A receipt for this exact generation authorizes metadata reclamation,
+		// never an unfreeze or any action on a replacement's cgroup.
+		return h.removeRetiredResourceOperationState(current.SandboxID, current.ResourceGeneration)
 	}
 	if !current.open() || current.Revision != state.Revision || current.LastOperationID != state.LastOperationID || current.LastFingerprint != state.LastFingerprint {
 		return nil
@@ -322,6 +333,10 @@ func (h *sandboxService) healOpenResourceStates(ctx context.Context) (int, int) 
 			strings.HasPrefix(entry.Name(), ".resource-state-") {
 			continue
 		}
+		if !entry.Type().IsRegular() {
+			failures++
+			continue // never follow a journal symlink
+		}
 		data, err := os.ReadFile(filepath.Join(dir, entry.Name()))
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
@@ -336,8 +351,23 @@ func (h *sandboxService) healOpenResourceStates(ctx context.Context) (int, int) 
 			failures++
 			continue
 		}
-		if !state.open() {
+		_, canonical := h.resourceStatePath(state.SandboxID, state.ResourceGeneration)
+		if filepath.Base(canonical) != entry.Name() {
+			logrus.Errorf("resource state record %s has a foreign filename; retained", entry.Name())
+			failures++
 			continue
+		}
+		if !state.open() {
+			// Closed live records need no physical lock. A completed receipt is
+			// only a scan hint here; the locked reconciliation rechecks it.
+			receipt, err := h.readRetirement(state.SandboxID, state.ResourceGeneration)
+			if err != nil {
+				failures++
+				continue
+			}
+			if receipt == nil || !receipt.Complete {
+				continue
+			}
 		}
 		open++
 		healCtx, cancel := context.WithTimeout(ctx, resourceHealStartBudget)
