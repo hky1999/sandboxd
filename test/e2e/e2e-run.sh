@@ -2549,6 +2549,9 @@ run_runsc_checks() {
         --cpu-millicores 1000 \
         --memory-mb 128 \
         /bin/oom-hog)"
+    # Concurrent restored clones may replace the original one-entry cache.
+    # Follow this sandbox's actual lease for OOM and subsequent reuse checks.
+    cache_cgroup="$(wait_for_sandbox_cgroup "${SANDBOX_ID}")"
     wait_for_state "${SANDBOX_ID}" "SANDBOX_STATE_EXITED" 600
     assert_wait_log "${SANDBOX_ID}" true
     if [ "${CGROUP_MODE}" = "v2" ]; then
@@ -2569,7 +2572,7 @@ run_runsc_checks() {
         --memory-mb 256 \
         /bin/sleep 300)"
     local reused_cgroup
-    reused_cgroup="$(wait_for_cgroup_child)"
+    reused_cgroup="$(wait_for_sandbox_cgroup "${SANDBOX_ID}")"
     assert_eq "${reused_cgroup}" "${cache_cgroup}" "cached cgroup path"
     assert_cgroup_limits "${reused_cgroup}" 1500 256
     if [ "${CPU_LIMIT_MODE}" = "quota" ]; then
