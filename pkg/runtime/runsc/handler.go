@@ -76,6 +76,10 @@ func NewHandler(cfg config.Config, bin string, loader runtimecore.OciLoader) (*H
 	if err != nil {
 		return nil, fmt.Errorf("configure runsc: %w", err)
 	}
+	checkpointMode, err := config.NormalizeRunscCheckpointMode(cfg.RuntimeConfig.Runsc.CheckpointMode)
+	if err != nil {
+		return nil, fmt.Errorf("configure runsc: %w", err)
+	}
 	root := cfg.RootDir
 	if err := validateExtraArgs(cfg.RuntimeConfig.Runsc.ExtraArgs); err != nil {
 		return nil, fmt.Errorf("configure runsc: %w", err)
@@ -96,12 +100,13 @@ func NewHandler(cfg config.Config, bin string, loader runtimecore.OciLoader) (*H
 
 	return &Handler{
 		runsc: NewClientWithOptions(bin, runscRoot, Options{
-			ExtraArgs:        cfg.RuntimeConfig.Runsc.ExtraArgs,
-			Platform:         platform,
-			FilestoreDir:     cfg.RuntimeConfig.FilestoreDir,
-			OverlayTmpfsSize: cfg.RuntimeConfig.OverlayTmpfsSize,
-			DebugLogPath:     runscLogPath,
-			IgnoreCgroups:    cfg.DisableCgroup,
+			ExtraArgs:         cfg.RuntimeConfig.Runsc.ExtraArgs,
+			Platform:          platform,
+			FilestoreDir:      cfg.RuntimeConfig.FilestoreDir,
+			OverlayTmpfsSize:  cfg.RuntimeConfig.OverlayTmpfsSize,
+			DebugLogPath:      runscLogPath,
+			IgnoreCgroups:     cfg.DisableCgroup,
+			ReflinkFilestores: checkpointMode == "reflink",
 		}),
 		ociLoader:              loader,
 		rootfsOverlayTmpfsSize: cfg.RuntimeConfig.OverlayTmpfsSize,
@@ -212,6 +217,10 @@ func (r *Handler) Restore(
 	if config.Network == nil {
 		return fmt.Errorf("network is required")
 	}
+	adoptDir, err := filestoreRestoreDirectory(config.CheckpointDir)
+	if err != nil {
+		return fmt.Errorf("validate runsc checkpoint filestores: %w", err)
+	}
 	rootOverlay, rootOverlaySize, err := r.resolveRootOverlay(
 		config.WritableLayerLimitBytes,
 	)
@@ -261,11 +270,12 @@ func (r *Handler) Restore(
 	}
 
 	startArgs := StartArgs{
-		ID:          config.ID,
-		BundleDir:   bundlePath,
-		UserStdout:  config.Stdout,
-		UserStderr:  config.Stderr,
-		RootOverlay: rootOverlay,
+		ID:                config.ID,
+		BundleDir:         bundlePath,
+		UserStdout:        config.Stdout,
+		UserStderr:        config.Stderr,
+		RootOverlay:       rootOverlay,
+		FilestoreAdoptDir: adoptDir,
 		Network: NetworkConfig{
 			Interface:   config.Network.Interface,
 			LinkAddress: config.Network.GuestHardwareAddr(),

@@ -149,7 +149,7 @@ jobs:
   runtime-e2e:
     name: Runtime E2E (${{ matrix.name }})
     needs: runtime-e2e-build
-    runs-on: ubuntu-22.04
+    runs-on: ${{ matrix.runner || 'ubuntu-22.04' }}
     timeout-minutes: 45
     strategy:
       fail-fast: false
@@ -160,6 +160,10 @@ jobs:
             needs_kvm: false
           - name: runsc-kvm
             needs_kvm: true
+          - name: runsc-reflink
+            needs_kvm: false
+            needs_reflink: true
+            runner: ubuntu-24.04
           - name: kata
             needs_kvm: true
           - name: firecracker
@@ -213,11 +217,31 @@ jobs:
           test -w /dev/kvm
           sudo kvm-ok
 
+      - name: Prepare shared XFS fixture for filestore reflinks
+        if: matrix.needs_reflink
+        run: |
+          sudo apt-get install -y xfsprogs
+          sudo modprobe loop
+          sudo modprobe xfs
+          truncate -s 6G "${RUNNER_TEMP}/reflink-home.img"
+          sudo mkfs.xfs -f -m reflink=1 "${RUNNER_TEMP}/reflink-home.img"
+          mkdir -p "${RUNNER_TEMP}/reflink-home"
+          sudo mount -o loop "${RUNNER_TEMP}/reflink-home.img" "${RUNNER_TEMP}/reflink-home"
+          sudo chown "$(id -u):$(id -g)" "${RUNNER_TEMP}/reflink-home"
+          echo "E2E_HOME_FIXTURE_PARENT=${RUNNER_TEMP}/reflink-home" >>"${GITHUB_ENV}"
+
       - name: Run runtime E2E
         env:
           E2E_CASE: ${{ matrix.name }}
           E2E_FIRECRACKER_CHECKPOINT_MODE: ${{ matrix.checkpoint_mode }}
         run: make e2e-runtime-case
+
+      - name: Release XFS fixture
+        if: always() && matrix.needs_reflink
+        run: |
+          if mountpoint -q "${RUNNER_TEMP}/reflink-home"; then
+            sudo umount "${RUNNER_TEMP}/reflink-home"
+          fi
 
   protobuf:
     name: Generated protobuf bindings

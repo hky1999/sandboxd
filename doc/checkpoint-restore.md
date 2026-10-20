@@ -51,6 +51,20 @@ never overwrites a non-empty directory.
 The directory is the artifact boundary. Its contents are opaque and specific
 to the runtime that created them.
 
+## Runsc filestore checkpoints
+
+Runsc normally serializes application memory and writable-layer pages into its checkpoint files. Set the node-owned `[plugin.runtime.runsc] checkpoint_mode = "reflink"` to capture writable filestores with the matching gVisor bundle's `FICLONE` support instead. An unset mode or `"full"` preserves page serialization; unknown modes fail runtime initialization. This setting does not change the meaning of `snapshot_type`, which runsc ignores, or enable dirty-page incremental application-memory checkpoints.
+
+Reflink mode passes `--skip-filestore-pages` and `--filestore-snapshot-dir=<checkpoint_dir>/filestores`. Runsc clones the backing files inside its freeze window, including for `leave_running=true`, and commits a `filestores/filestores.json` manifest. Keep this entire directory together with `checkpoint.img` and any split page files. Each checkpoint requires its own fresh directory. The live filestores and the checkpoint destination must be on the same reflink-capable filesystem, such as XFS with reflink enabled. Cross-device clones and unsupported filesystems fail; sandboxd does not silently fall back after beginning a reflink checkpoint.
+
+Fresh sandboxes in reflink mode also receive `--filestore-parent-mountns=true`, so anonymous backing files and later checkpoint destinations reference the same launcher mount. This avoids older kernels' `EXDEV` rejection of reflinks between namespace copies of the same filesystem. The matching runtime bundle must provide this option. It pins the backing mount while the sandbox holds its filestore descriptors, so drain sandboxes before unmounting or replacing the node's filestore. An already running sandbox created in full mode keeps its original backing descriptors; recreate it before enabling reflink mode.
+
+Restore detects this artifact layout independently of the current save mode. Before the existing Restore control RPC, sandboxd passes the artifact directory and `--filestore-clone-on-adopt=true` to `runsc create`. Each target adopts a private, immediately unlinked CoW copy; it never consumes or mutates the saved filestores. The caller can reuse the checkpoint, and the restored target does not require the named artifact files after synchronous Start completes. Runsc verifies mount identities, sizes and sampled fingerprints. Sandboxd rejects partial manifests, symlinks and artifact names that escape the checkpoint directory. Checkpoints without the filestores directory retain the legacy restore path.
+
+Sharing applies to writable-file extents, not the independently saved application-memory pages. Logical file lengths and ordinary summed `du` output do not measure unique physical storage when extents are shared. Measure filesystem usage and shared extents, including unlinked live filestores, when evaluating savings. Host directory bind contents remain caller-owned and are not captured or rolled back by this mechanism. Only anonymous disk-backed filestores are supported; self-overlay backing must not be used for these snapshots. Private tmpfs filestores require the matching gVisor anonymous-filestore mount hints.
+
+Save and restore must use matching runtime builds. Drain sandboxes before replacing the runtime bundle; do not assume old saved state remains compatible across a gVisor upgrade. Install the complete checksum-pinned gVisor archive with its matching helpers, rather than replacing runsc alone.
+
 ## Firecracker artifacts and incremental checkpoints
 
 The Firecracker runtime writes *uncompressed* checkpoint directories (layout
@@ -167,7 +181,7 @@ artifact; checkpoint success is reported only after the manifest is published.
   requires the restore-established pagemap base and fails otherwise. An
   explicit `SoftDirty` requires a usable base.
 
-Runtimes without incremental checkpoints (runsc) ignore the field.
+Runsc ignores this field; its optional filestore reflink mode is selected by node configuration instead.
 
 Lineage-loss rules: the VMM keeps its soft-dirty ledger in process memory, and
 an armed ledger writes only the window delta regardless of which base sandboxd

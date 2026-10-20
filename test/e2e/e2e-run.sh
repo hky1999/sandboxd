@@ -29,6 +29,7 @@ EROFS_MOUNT_ROOT="${E2E_EROFS_MOUNT_ROOT:-/e2e/erofs-mount-root}"
 EROFS_MOUNT_IMAGE="${E2E_EROFS_MOUNT_IMAGE:-/e2e/data.erofs}"
 FIRECRACKER_KERNEL="${E2E_FIRECRACKER_KERNEL:-/opt/firecracker/vmlinux}"
 FIRECRACKER_CHECKPOINT_MODE="${E2E_FIRECRACKER_CHECKPOINT_MODE:-}"
+RUNSC_CHECKPOINT_MODE="${E2E_RUNSC_CHECKPOINT_MODE:-}"
 FIRECRACKER_VIRTIOFS="${E2E_FIRECRACKER_VIRTIOFS:-0}"
 FIRECRACKER_INITRD="${E2E_FIRECRACKER_INITRD:-/opt/firecracker/initrd.img}"
 OCI_ROOTFS_IMAGE="${E2E_OCI_ROOTFS_IMAGE:-docker.io/library/redis:7-alpine}"
@@ -469,6 +470,16 @@ EOF
     # Only emit the checkpoint knobs when the E2E case opts in: the plain
     # firecracker job must keep exercising the unset (default full) path.
     local e2e_fc_checkpoint_mode_cfg=""
+    local e2e_runsc_checkpoint_mode_cfg=""
+    local filestore_size_cfg='filestore_dir_size = "1G"'
+    if [ -n "${RUNSC_CHECKPOINT_MODE:-}" ]; then
+        e2e_runsc_checkpoint_mode_cfg="$(printf 'checkpoint_mode = "%s"' "${RUNSC_CHECKPOINT_MODE:-}")"
+    fi
+    if [ "${RUNSC_CHECKPOINT_MODE:-}" = "reflink" ]; then
+        # Keep live and saved filestores on the same host XFS fixture;
+        # the ordinary bounded ext4 filestore is a different filesystem.
+        filestore_size_cfg='filestore_dir_size = ""'
+    fi
     if [ -n "${FIRECRACKER_CHECKPOINT_MODE}" ]; then
         e2e_fc_checkpoint_mode_cfg="$(printf 'checkpoint_mode = "%s"' \
             "${FIRECRACKER_CHECKPOINT_MODE}")"
@@ -502,12 +513,13 @@ ${node_resource_config}
 direct_resolv_conf_path = "${CONFIG_DIR}/direct-resolv.conf"
 image_lib_dir = "/e2e/images"
 filestore_dir = "${FILESTORE}"
-filestore_dir_size = "1G"
+${filestore_size_cfg}
 loop_device_dir = "/dev"
 overlay_tmpfs_size = "64M"
 
 [plugin.runtime.runsc]
 platform = "${RUNSC_PLATFORM}"
+${e2e_runsc_checkpoint_mode_cfg}
 
 [plugin.runtime.runc]
 state_root = "/run/sandboxd/runc"
@@ -1015,6 +1027,10 @@ run_checkpoint_restore_check() {
             [ ! -s "${checkpoint_dir}/manifest.json" ]; then
             fail "${suffix} checkpoint ${checkpoint_index} artifact is missing or empty"
         fi
+        if [ "${runtime}" = "runsc" ] && [ "${RUNSC_CHECKPOINT_MODE:-}" = "reflink" ]; then
+            jq -e '.filestores | length > 0' "${checkpoint_dir}/filestores/filestores.json" >/dev/null ||
+                fail "${suffix} checkpoint lacks filestore artifacts"
+        fi
         if [ "${runtime}" = "firecracker" ] &&
             [ -s "${checkpoint_dir}/manifest.json" ]; then
             # Default (checkpoint_mode=full) keeps every generation Full;
@@ -1153,6 +1169,9 @@ run_checkpoint_restore_check() {
         run_firecracker_post_restore_chain \
             "${suffix}" "${checkpoint_root}" "${advanced}" "${request_file}"
     fi
+    if [ "${runtime}" = "runsc" ] && [ "${RUNSC_CHECKPOINT_MODE:-}" = "reflink" ]; then
+        run_runsc_filestore_clone_check "${checkpoint_dir}" "${request_file}" "${target_id}"
+    fi
 
     rm -rf -- "${checkpoint_root}"
     [ ! -e "${checkpoint_root}" ] || fail "${suffix} caller cleanup retained checkpoint"
@@ -1167,6 +1186,36 @@ run_checkpoint_restore_check() {
     fi
     sbox_cmd delete "${SANDBOX_ID}"
     SANDBOX_ID=""
+}
+
+# Verify immutable reusable artifacts, independent writable clones, and another
+# checkpoint made from a restored sandbox. The caller also deletes all named
+# artifacts and checks that the original restored target still works.
+run_runsc_filestore_clone_check() {
+    local checkpoint_dir="$1" request_file="$2" target_id="$3"
+    local clone_id="${target_id}-clone" restored_point="${checkpoint_dir}-after-restore"
+    local before_hash after_hash
+    before_hash="$(sha256sum "${checkpoint_dir}"/filestores/filestore-*)"
+    checkpoint-restore --action restore --socket "${SOCKET}" \
+        --target-id "${clone_id}" --request-file "${request_file}" \
+        --checkpoint-dir "${checkpoint_dir}" >/dev/null
+    sbox_cmd exec "${SANDBOX_ID}" /bin/sh -c 'echo original > /var/filestore-clone-isolation'
+    sbox_cmd exec "${clone_id}" /bin/sh -c 'test ! -e /var/filestore-clone-isolation'
+    sbox_cmd exec "${clone_id}" /bin/sh -c 'echo clone > /var/filestore-clone-isolation'
+    assert_eq "$(sbox_cmd exec "${SANDBOX_ID}" /bin/cat /var/filestore-clone-isolation)" \
+        "original" "runsc restored clones have private writable state"
+    after_hash="$(sha256sum "${checkpoint_dir}"/filestores/filestore-*)"
+    assert_eq "${after_hash}" "${before_hash}" "runsc restore must not mutate filestore artifacts"
+    sbox_cmd delete "${clone_id}"
+    checkpoint-restore --action checkpoint --socket "${SOCKET}" \
+        --sandbox-id "${SANDBOX_ID}" --checkpoint-dir "${restored_point}" \
+        --checkpoint-timeout-seconds 180 --leave-running=true
+    checkpoint-restore --action restore --socket "${SOCKET}" \
+        --target-id "${clone_id}" --request-file "${request_file}" \
+        --checkpoint-dir "${restored_point}" >/dev/null
+    assert_eq "$(sbox_cmd exec "${clone_id}" /bin/cat /var/filestore-clone-isolation)" \
+        "original" "runsc checkpoint after restore preserves writable state"
+    sbox_cmd delete "${clone_id}"
 }
 
 # run_firecracker_post_restore_chain exercises the checkpoint-after-restore

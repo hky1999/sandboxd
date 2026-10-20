@@ -69,6 +69,13 @@ case "${E2E_CASE}" in
         needs_kvm=1
         run_cgroup_disabled=0
         ;;
+    runsc-reflink)
+        runtime=runsc
+        platform=systrap
+        needs_kvm=0
+        run_cgroup_disabled=1
+        runsc_checkpoint_mode=reflink
+        ;;
     kata|firecracker)
         runtime="${E2E_CASE}"
         platform=systrap
@@ -148,6 +155,7 @@ SANDBOXD_E2E_IMAGE="${image}" \
     SANDBOXD_E2E_DISABLED_CONTAINER="sandboxd-e2e-${E2E_CASE}-no-cgroup" \
     E2E_RUNTIME="${runtime}" \
     E2E_RUNSC_PLATFORM="${platform}" \
+    E2E_RUNSC_CHECKPOINT_MODE="${runsc_checkpoint_mode:-}" \
     E2E_RUN_CGROUP_DISABLED="${run_cgroup_disabled}" \
     E2E_FIRECRACKER_CHECKPOINT_MODE="${fc_checkpoint_mode:-}" \
     E2E_FIRECRACKER_VIRTIOFS="${fc_virtiofs:-0}" \
