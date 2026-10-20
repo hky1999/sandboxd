@@ -22,7 +22,7 @@ The flow:
    recovery, idempotent cleanup, and cached-resource reuse;
 7. restarts sandboxd and verifies active sandbox, network endpoint, runtime
    process, and policy recovery;
-8. verifies runsc in cgroup-disabled mode with `/sys/fs/cgroup` read-only;
+8. verifies runsc in cgroup-disabled mode with `/sys/fs/cgroup` read-only, including rolling checkpoints and independent restores when filestore reflinks are enabled;
 9. verifies runc's ephemeral netns/veth lifecycle, optional KVM injection, and resolver queries against a test-only local DNS fixture before and after sandboxd restart;
 10. verifies Kata consumes the shared TAP cache without creating a private
     `ktap` lifecycle;

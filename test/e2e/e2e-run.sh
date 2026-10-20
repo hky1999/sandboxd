@@ -1170,7 +1170,7 @@ run_checkpoint_restore_check() {
             "${suffix}" "${checkpoint_root}" "${advanced}" "${request_file}"
     fi
     if [ "${runtime}" = "runsc" ] && [ "${RUNSC_CHECKPOINT_MODE:-}" = "reflink" ]; then
-        run_runsc_filestore_clone_check "${checkpoint_dir}" "${request_file}" "${target_id}"
+        run_runsc_filestore_clone_check "${checkpoint_dir}" "${request_file}"
     fi
 
     rm -rf -- "${checkpoint_root}"
@@ -1192,8 +1192,9 @@ run_checkpoint_restore_check() {
 # checkpoint made from a restored sandbox. The caller also deletes all named
 # artifacts and checks that the original restored target still works.
 run_runsc_filestore_clone_check() {
-    local checkpoint_dir="$1" request_file="$2" target_id="$3"
-    local clone_id="${target_id}-clone" restored_point="${checkpoint_dir}-after-restore"
+    local checkpoint_dir="$1" request_file="$2"
+    local clone_id="sbox-e2e-runsc-${RUNSC_PLATFORM}-filestore-clone"
+    local restored_point="${checkpoint_dir}-after-restore"
     local before_hash after_hash
     before_hash="$(sha256sum "${checkpoint_dir}"/filestores/filestore-*)"
     checkpoint-restore --action restore --socket "${SOCKET}" \
@@ -2647,6 +2648,9 @@ run_cgroup_disabled_checks() {
     SANDBOX_ID=""
 
     run_storage_quota_check
+    if [ "${RUNSC_CHECKPOINT_MODE}" = "reflink" ]; then
+        run_checkpoint_restore_check runsc "${ROOTFS}"
+    fi
 }
 
 run_e2e() {
