@@ -106,7 +106,7 @@ case "${E2E_CASE}" in
         run_cgroup_disabled=0
         ;;
     *)
-        fail "E2E_CASE must be runsc-systrap, runsc-kvm, kata, firecracker, firecracker-incremental, firecracker-virtiofs, or runc"
+        fail "E2E_CASE must be runsc-systrap, runsc-kvm, runsc-reflink, kata, firecracker, firecracker-incremental, firecracker-virtiofs, or runc"
         ;;
 esac
 
