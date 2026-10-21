@@ -36,6 +36,7 @@ const (
 	SandboxService_Start_FullMethodName                    = "/runtime.v1.SandboxService/Start"
 	SandboxService_StartOperation_FullMethodName           = "/runtime.v1.SandboxService/StartOperation"
 	SandboxService_GetStartOperation_FullMethodName        = "/runtime.v1.SandboxService/GetStartOperation"
+	SandboxService_CollectHistory_FullMethodName           = "/runtime.v1.SandboxService/CollectHistory"
 	SandboxService_Checkpoint_FullMethodName               = "/runtime.v1.SandboxService/Checkpoint"
 	SandboxService_CheckpointIfGeneration_FullMethodName   = "/runtime.v1.SandboxService/CheckpointIfGeneration"
 	SandboxService_Pause_FullMethodName                    = "/runtime.v1.SandboxService/Pause"
@@ -68,6 +69,8 @@ type SandboxServiceClient interface {
 	// Reads durable historical results. UNKNOWN is not proof of non-creation;
 	// STARTED is not a claim that the original incarnation is currently alive.
 	GetStartOperation(ctx context.Context, in *GetStartOperationRequest, opts ...grpc.CallOption) (*StartOperationResponse, error)
+	// Reclaim closed history only. This response never proves physical retirement.
+	CollectHistory(ctx context.Context, in *CollectHistoryRequest, opts ...grpc.CallOption) (*CollectHistoryResponse, error)
 	// Checkpoint saves a running sandbox and stops its source process.
 	Checkpoint(ctx context.Context, in *CheckpointRequest, opts ...grpc.CallOption) (*CheckpointResponse, error)
 	// Checkpoints only the physical incarnation identified by the nested
@@ -144,6 +147,16 @@ func (c *sandboxServiceClient) GetStartOperation(ctx context.Context, in *GetSta
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(StartOperationResponse)
 	err := c.cc.Invoke(ctx, SandboxService_GetStartOperation_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *sandboxServiceClient) CollectHistory(ctx context.Context, in *CollectHistoryRequest, opts ...grpc.CallOption) (*CollectHistoryResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CollectHistoryResponse)
+	err := c.cc.Invoke(ctx, SandboxService_CollectHistory_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -324,6 +337,8 @@ type SandboxServiceServer interface {
 	// Reads durable historical results. UNKNOWN is not proof of non-creation;
 	// STARTED is not a claim that the original incarnation is currently alive.
 	GetStartOperation(context.Context, *GetStartOperationRequest) (*StartOperationResponse, error)
+	// Reclaim closed history only. This response never proves physical retirement.
+	CollectHistory(context.Context, *CollectHistoryRequest) (*CollectHistoryResponse, error)
 	// Checkpoint saves a running sandbox and stops its source process.
 	Checkpoint(context.Context, *CheckpointRequest) (*CheckpointResponse, error)
 	// Checkpoints only the physical incarnation identified by the nested
@@ -384,6 +399,9 @@ func (UnimplementedSandboxServiceServer) StartOperation(context.Context, *StartO
 }
 func (UnimplementedSandboxServiceServer) GetStartOperation(context.Context, *GetStartOperationRequest) (*StartOperationResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetStartOperation not implemented")
+}
+func (UnimplementedSandboxServiceServer) CollectHistory(context.Context, *CollectHistoryRequest) (*CollectHistoryResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method CollectHistory not implemented")
 }
 func (UnimplementedSandboxServiceServer) Checkpoint(context.Context, *CheckpointRequest) (*CheckpointResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Checkpoint not implemented")
@@ -504,6 +522,24 @@ func _SandboxService_GetStartOperation_Handler(srv interface{}, ctx context.Cont
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(SandboxServiceServer).GetStartOperation(ctx, req.(*GetStartOperationRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SandboxService_CollectHistory_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CollectHistoryRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SandboxServiceServer).CollectHistory(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SandboxService_CollectHistory_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SandboxServiceServer).CollectHistory(ctx, req.(*CollectHistoryRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -814,6 +850,10 @@ var SandboxService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetStartOperation",
 			Handler:    _SandboxService_GetStartOperation_Handler,
+		},
+		{
+			MethodName: "CollectHistory",
+			Handler:    _SandboxService_CollectHistory_Handler,
 		},
 		{
 			MethodName: "Checkpoint",

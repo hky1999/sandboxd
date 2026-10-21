@@ -28,6 +28,8 @@ service SandboxService {
   // Reads durable historical results. UNKNOWN is not proof of non-creation;
   // STARTED is not a claim that the original incarnation is currently alive.
   rpc GetStartOperation(GetStartOperationRequest) returns (StartOperationResponse) {}
+  // Reclaim closed history only. This response never proves physical retirement.
+  rpc CollectHistory(CollectHistoryRequest) returns (CollectHistoryResponse) {}
   // Checkpoint saves a running sandbox and stops its source process.
   rpc Checkpoint(CheckpointRequest) returns (CheckpointResponse) {}
   // Checkpoints only the physical incarnation identified by the nested
@@ -79,6 +81,7 @@ message StartOperationRequest {
   // hashes the complete nested protobuf request to detect changed payloads.
   string request_fingerprint = 3;
   uint64 deadline_unix_millis = 4;
+  HistoryIdentity history_identity = 5;
 }
 
 message GetStartOperationRequest {
@@ -89,6 +92,7 @@ message GetStartOperationRequest {
   // admission index and authoritative physical checks are required. Callers
   // must not enable this for operations sent through legacy Start.
   bool seal_missing = 4;
+  HistoryIdentity history_identity = 5;
 }
 
 enum StartOperationState {
@@ -796,4 +800,44 @@ message DeleteIfGenerationResponse {
 message ResolveResourceOperationRequest {
   ResizeResourcesRequest original = 1;
   bool shrink = 2;
+}
+
+// Ordered coordinates never substitute for the complete operation identity.
+message HistoryIdentity {
+  string authority = 1;
+  string environment_id = 2;
+  string runtime_id = 3;
+  uint64 assignment_generation = 4;
+}
+message HistoryProtection {
+  string environment_id = 1;
+  uint64 assignment_generation = 2;
+  string specification_sha256 = 3;
+  uint64 minimum_runtime_revision = 4;
+  uint64 environment_revision = 5;
+}
+message HistoryBoundary {
+  string authority = 1;
+  uint64 coordinator_epoch = 2;
+  uint64 assignment_generation = 3;
+  uint64 catalog_revision = 4;
+  repeated HistoryProtection protected = 5;
+}
+message HistoryCandidate {
+  string operation_id = 1;
+  string request_fingerprint = 2;
+  uint64 deadline_unix_millis = 3;
+  HistoryIdentity identity = 4;
+  string sandbox_id = 5;
+  string resource_generation = 6;
+}
+message CollectHistoryRequest {
+  HistoryBoundary boundary = 1;
+  repeated HistoryCandidate candidates = 2;
+}
+message CollectHistoryResponse {
+  repeated string acknowledged_operation_ids = 1;
+  uint64 remaining_start_operations = 2;
+  uint64 removed_files = 3;
+  uint64 removed_bytes = 4;
 }

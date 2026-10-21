@@ -107,8 +107,10 @@ Legacy Delete retains its existing unconditional semantics.
 
 Keep `<RootDir>/scheduler-retirements` on persistent daemon-owned storage.
 Pending records are not proof of completion; crash gaps require authoritative
-reconciliation. The journal is capped at 65536 entries and has no automatic GC.
-Do not delete receipts or release controller budgets merely because they aged out.
+reconciliation. The journal is capped at 65536 entries. CollectHistory can reclaim
+exact completed generations only after the caller durably closes their allocation
+and acknowledges their original retirement. Its reply is never retirement proof.
+See doc/scheduler-history.md; elapsed time never authorizes deletion or budget release.
 
 generation. Legacy Delete retains its existing unconditional semantics.
 
@@ -199,10 +201,10 @@ leaving a pending state that must be retried or reconciled.
 
 Keep this directory on durable storage, mode0700; records are mode0600,
 file-fsynced, linked without replacing existing records, then the temporary
-name is removed before directory fsync. The append-only journal permits
-65536 directory entries and at most32KiB per record, with no automatic GC.
-Do not discard records merely to unblock a full journal. Export/history
-consumption and safe archival/reclamation still require implementation.
+name is removed before directory fsync. The journal permits 65536 directory entries and at most32KiB per record.
+CollectHistory may reclaim observations of an exactly acknowledged retired
+generation together with its completed proof. Do not discard records merely to
+unblock a full journal; observations alone never authorize reclamation.
 These observations do not measure an instantaneous whole-lifetime CPU peak;
 read memory peaks only when memory_peak_known is true.
 

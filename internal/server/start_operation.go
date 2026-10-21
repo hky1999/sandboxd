@@ -49,14 +49,17 @@ type startOperationRecord struct {
 	State              runtime.StartOperationState `json:"state"`
 	Result             *runtime.StartResponse      `json:"result,omitempty"`
 	SealedMissing      bool                        `json:"sealed_missing,omitempty"`
+	HistoryIdentity    *runtime.HistoryIdentity    `json:"history_identity,omitempty"`
 }
 
 type startOperationJournal struct {
+	root      *os.File
 	directory *os.File
 	lock      *os.File
 	index     *os.File
 	admitted  map[string]struct{}
 	path      string
+	header    string
 }
 
 func validateStartOperationIdentity(id, fingerprint string, deadline uint64) error {
@@ -77,6 +80,12 @@ func validateStartOperationIdentity(id, fingerprint string, deadline uint64) err
 func (r *startOperationRecord) validate() error {
 	if r.Version != 1 || validateStartOperationIdentity(r.OperationID, r.RequestFingerprint, r.DeadlineUnixMillis) != nil {
 		return fmt.Errorf("invalid durable start operation identity")
+	}
+	if r.HistoryIdentity != nil {
+		expected, err := historyOperationID(r.HistoryIdentity, r.RequestFingerprint)
+		if err != nil || expected != r.OperationID {
+			return fmt.Errorf("durable operation allocation binding differs")
+		}
 	}
 	digest, err := hex.DecodeString(r.PayloadFingerprint)
 	if err != nil || len(digest) != sha256.Size || hex.EncodeToString(digest) != r.PayloadFingerprint ||
@@ -106,7 +115,7 @@ func (r *startOperationRecord) sameIdentity(other *startOperationRecord) bool {
 	return r.Version == other.Version && r.OperationID == other.OperationID &&
 		r.RequestFingerprint == other.RequestFingerprint && r.PayloadFingerprint == other.PayloadFingerprint &&
 		r.DeadlineUnixMillis == other.DeadlineUnixMillis && r.SandboxID == other.SandboxID && r.Generation == other.Generation &&
-		r.SealedMissing == other.SealedMissing
+		r.SealedMissing == other.SealedMissing && proto.Equal(r.HistoryIdentity, other.HistoryIdentity)
 }
 
 func (r *startOperationRecord) response() *runtime.StartOperationResponse {
@@ -134,12 +143,23 @@ func (h *sandboxService) openStartOperationJournal() (*startOperationJournal, er
 	if err != nil {
 		return nil, err
 	}
-	lock, err := os.OpenFile(filepath.Join(path, ".lock"), os.O_CREATE|os.O_RDWR|unix.O_NOFOLLOW, 0600)
+	parentFD, err := unix.Openat(int(directory.Fd()), "..", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
 		directory.Close()
 		return nil, err
 	}
-	j := &startOperationJournal{directory: directory, lock: lock, path: path, admitted: make(map[string]struct{})}
+	rootDirectory := os.NewFile(uintptr(parentFD), filepath.Dir(path))
+	lockFlags := os.O_RDWR | unix.O_NOFOLLOW
+	if created {
+		lockFlags |= os.O_CREATE | os.O_EXCL
+	}
+	lock, err := os.OpenFile(filepath.Join(path, ".lock"), lockFlags, 0600)
+	if err != nil {
+		rootDirectory.Close()
+		directory.Close()
+		return nil, err
+	}
+	j := &startOperationJournal{root: rootDirectory, directory: directory, lock: lock, path: path, admitted: make(map[string]struct{}), header: startOperationIndexHeader}
 	info, err := lock.Stat()
 	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0600 {
 		j.close()
@@ -181,11 +201,14 @@ func (h *sandboxService) openStartOperationJournal() (*startOperationJournal, er
 		return nil, err
 	}
 	data, err := io.ReadAll(io.LimitReader(index, int64(len(startOperationIndexHeader)+37*startOperationEntryLimit+1)))
-	if err != nil || !strings.HasPrefix(string(data), startOperationIndexHeader) {
+	if strings.HasPrefix(string(data), startOperationHistoryIndexHeader) {
+		j.header = startOperationHistoryIndexHeader
+	}
+	if err != nil || !strings.HasPrefix(string(data), j.header) {
 		j.close()
 		return nil, fmt.Errorf("invalid start admission index header")
 	}
-	entries := string(data[len(startOperationIndexHeader):])
+	entries := string(data[len(j.header):])
 	if len(entries)%37 != 0 {
 		j.close()
 		return nil, fmt.Errorf("incomplete start admission index")
@@ -242,13 +265,17 @@ func (j *startOperationJournal) checkDirectory() error {
 		return err
 	}
 	if !currentIndex.Mode().IsRegular() || currentIndex.Mode().Perm() != 0600 || !os.SameFile(index, currentIndex) ||
-		currentIndex.Size() != int64(len(startOperationIndexHeader)+37*len(j.admitted)) {
+		currentIndex.Size() != int64(len(j.header)+37*len(j.admitted)) {
 		return fmt.Errorf("start admission index was removed, replaced or truncated")
 	}
-	return nil
+	_, err = j.loadHistory()
+	return err
 }
 
 func (j *startOperationJournal) close() {
+	if j.root != nil {
+		j.root.Close()
+	}
 	j.lock.Close()
 	j.directory.Close()
 	if j.index != nil {
@@ -532,6 +559,9 @@ func (h *sandboxService) GetStartOperation(ctx context.Context, request *runtime
 	if err == nil {
 		record, err = j.read(request.OperationID)
 	}
+	if err == nil && record == nil {
+		err = j.admitHistory(request.OperationID, request.RequestFingerprint, request.HistoryIdentity, nil)
+	}
 	if err == nil && record == nil && request.SealMissing &&
 		time.Now().UnixMilli() >= int64(request.DeadlineUnixMillis) {
 		record, err = h.sealMissingStartOperation(ctx, j, request)
@@ -546,13 +576,16 @@ func (h *sandboxService) GetStartOperation(ctx context.Context, request *runtime
 	}
 	h.startOperationMu.Unlock()
 	if err != nil {
+		if status.Code(err) == codes.FailedPrecondition {
+			return nil, err
+		}
 		return nil, status.Error(codes.Unavailable, "start operation journal is unavailable")
 	}
 	if record == nil {
 		return &runtime.StartOperationResponse{OperationID: request.OperationID, RequestFingerprint: request.RequestFingerprint,
 			DeadlineUnixMillis: request.DeadlineUnixMillis, State: runtime.StartOperationState_START_OPERATION_STATE_UNKNOWN}, nil
 	}
-	if record.RequestFingerprint != request.RequestFingerprint || record.DeadlineUnixMillis != request.DeadlineUnixMillis {
+	if !proto.Equal(record.HistoryIdentity, request.HistoryIdentity) || record.RequestFingerprint != request.RequestFingerprint || record.DeadlineUnixMillis != request.DeadlineUnixMillis {
 		return nil, status.Error(codes.FailedPrecondition, "start query identity mismatch")
 	}
 	return h.startOperationResult(ctx, record)
@@ -609,7 +642,7 @@ func (h *sandboxService) sealMissingStartOperation(
 	record := &startOperationRecord{Version: 1, OperationID: request.OperationID,
 		RequestFingerprint: request.RequestFingerprint, PayloadFingerprint: strings.Repeat("0", 64),
 		DeadlineUnixMillis: request.DeadlineUnixMillis, SandboxID: id, Generation: uuid.NewString(),
-		State: runtime.StartOperationState_START_OPERATION_STATE_PENDING, SealedMissing: true}
+		State: runtime.StartOperationState_START_OPERATION_STATE_PENDING, SealedMissing: true, HistoryIdentity: request.HistoryIdentity}
 	if err := j.admit(record); err != nil {
 		return nil, err
 	}
@@ -643,6 +676,9 @@ func (h *sandboxService) StartOperation(ctx context.Context, request *runtime.St
 	}
 	if err != nil {
 		h.startOperationMu.Unlock()
+		if status.Code(err) == codes.FailedPrecondition {
+			return nil, err
+		}
 		return nil, status.Error(codes.Unavailable, "start operation journal is unavailable")
 	}
 	if record != nil {
@@ -650,16 +686,20 @@ func (h *sandboxService) StartOperation(ctx context.Context, request *runtime.St
 		if record.SealedMissing {
 			return nil, status.Error(codes.FailedPrecondition, "late creation was durably sealed; query its final outcome")
 		}
-		if record.RequestFingerprint != request.RequestFingerprint || record.PayloadFingerprint != hex.EncodeToString(digest[:]) ||
+		if !proto.Equal(record.HistoryIdentity, request.HistoryIdentity) || record.RequestFingerprint != request.RequestFingerprint || record.PayloadFingerprint != hex.EncodeToString(digest[:]) ||
 			record.DeadlineUnixMillis != request.DeadlineUnixMillis {
 			return nil, status.Error(codes.FailedPrecondition, "start operation payload or identity mismatch")
 		}
 		return h.startOperationResult(ctx, record)
 	}
+	if err := j.admitHistory(request.OperationID, request.RequestFingerprint, request.HistoryIdentity, request.Start.Labels); err != nil {
+		h.startOperationMu.Unlock()
+		return nil, err
+	}
 	record = &startOperationRecord{Version: 1, OperationID: request.OperationID,
 		RequestFingerprint: request.RequestFingerprint, PayloadFingerprint: hex.EncodeToString(digest[:]),
 		DeadlineUnixMillis: request.DeadlineUnixMillis, SandboxID: "sbox-" + request.OperationID,
-		Generation: uuid.NewString(), State: runtime.StartOperationState_START_OPERATION_STATE_PENDING}
+		Generation: uuid.NewString(), State: runtime.StartOperationState_START_OPERATION_STATE_PENDING, HistoryIdentity: request.HistoryIdentity}
 	if err := j.admit(record); err != nil {
 		h.startOperationMu.Unlock()
 		return nil, status.Error(codes.Unavailable, "start intent publication failed")
@@ -729,6 +769,6 @@ func (h *sandboxService) StartOperation(ctx context.Context, request *runtime.St
 		return nil, status.FromContextError(ctx.Err()).Err()
 	case <-finished:
 		return h.GetStartOperation(ctx, &runtime.GetStartOperationRequest{OperationID: request.OperationID,
-			RequestFingerprint: request.RequestFingerprint, DeadlineUnixMillis: request.DeadlineUnixMillis})
+			RequestFingerprint: request.RequestFingerprint, DeadlineUnixMillis: request.DeadlineUnixMillis, HistoryIdentity: request.HistoryIdentity})
 	}
 }

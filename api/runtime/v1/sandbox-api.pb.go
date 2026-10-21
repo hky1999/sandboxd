@@ -464,8 +464,9 @@ type StartOperationRequest struct {
 	OperationID string                 `protobuf:"bytes,2,opt,name=operation_id,json=operationId,proto3" json:"operation_id,omitempty"`
 	// Opaque full-request SHA256 supplied by the caller. The daemon separately
 	// hashes the complete nested protobuf request to detect changed payloads.
-	RequestFingerprint string `protobuf:"bytes,3,opt,name=request_fingerprint,json=requestFingerprint,proto3" json:"request_fingerprint,omitempty"`
-	DeadlineUnixMillis uint64 `protobuf:"varint,4,opt,name=deadline_unix_millis,json=deadlineUnixMillis,proto3" json:"deadline_unix_millis,omitempty"`
+	RequestFingerprint string           `protobuf:"bytes,3,opt,name=request_fingerprint,json=requestFingerprint,proto3" json:"request_fingerprint,omitempty"`
+	DeadlineUnixMillis uint64           `protobuf:"varint,4,opt,name=deadline_unix_millis,json=deadlineUnixMillis,proto3" json:"deadline_unix_millis,omitempty"`
+	HistoryIdentity    *HistoryIdentity `protobuf:"bytes,5,opt,name=history_identity,json=historyIdentity,proto3" json:"history_identity,omitempty"`
 	unknownFields      protoimpl.UnknownFields
 	sizeCache          protoimpl.SizeCache
 }
@@ -528,6 +529,13 @@ func (x *StartOperationRequest) GetDeadlineUnixMillis() uint64 {
 	return 0
 }
 
+func (x *StartOperationRequest) GetHistoryIdentity() *HistoryIdentity {
+	if x != nil {
+		return x.HistoryIdentity
+	}
+	return nil
+}
+
 type GetStartOperationRequest struct {
 	state              protoimpl.MessageState `protogen:"open.v1"`
 	OperationID        string                 `protobuf:"bytes,1,opt,name=operation_id,json=operationId,proto3" json:"operation_id,omitempty"`
@@ -536,9 +544,10 @@ type GetStartOperationRequest struct {
 	// Explicitly fence a never-admitted operation after its deadline. A healthy
 	// admission index and authoritative physical checks are required. Callers
 	// must not enable this for operations sent through legacy Start.
-	SealMissing   bool `protobuf:"varint,4,opt,name=seal_missing,json=sealMissing,proto3" json:"seal_missing,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	SealMissing     bool             `protobuf:"varint,4,opt,name=seal_missing,json=sealMissing,proto3" json:"seal_missing,omitempty"`
+	HistoryIdentity *HistoryIdentity `protobuf:"bytes,5,opt,name=history_identity,json=historyIdentity,proto3" json:"history_identity,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *GetStartOperationRequest) Reset() {
@@ -597,6 +606,13 @@ func (x *GetStartOperationRequest) GetSealMissing() bool {
 		return x.SealMissing
 	}
 	return false
+}
+
+func (x *GetStartOperationRequest) GetHistoryIdentity() *HistoryIdentity {
+	if x != nil {
+		return x.HistoryIdentity
+	}
+	return nil
 }
 
 type StartOperationResponse struct {
@@ -4560,22 +4576,449 @@ func (x *ResolveResourceOperationRequest) GetShrink() bool {
 	return false
 }
 
+// Ordered coordinates never substitute for the complete operation identity.
+type HistoryIdentity struct {
+	state                protoimpl.MessageState `protogen:"open.v1"`
+	Authority            string                 `protobuf:"bytes,1,opt,name=authority,proto3" json:"authority,omitempty"`
+	EnvironmentID        string                 `protobuf:"bytes,2,opt,name=environment_id,json=environmentId,proto3" json:"environment_id,omitempty"`
+	RuntimeID            string                 `protobuf:"bytes,3,opt,name=runtime_id,json=runtimeId,proto3" json:"runtime_id,omitempty"`
+	AssignmentGeneration uint64                 `protobuf:"varint,4,opt,name=assignment_generation,json=assignmentGeneration,proto3" json:"assignment_generation,omitempty"`
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
+}
+
+func (x *HistoryIdentity) Reset() {
+	*x = HistoryIdentity{}
+	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[52]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *HistoryIdentity) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*HistoryIdentity) ProtoMessage() {}
+
+func (x *HistoryIdentity) ProtoReflect() protoreflect.Message {
+	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[52]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use HistoryIdentity.ProtoReflect.Descriptor instead.
+func (*HistoryIdentity) Descriptor() ([]byte, []int) {
+	return file_api_runtime_v1_sandbox_api_proto_rawDescGZIP(), []int{52}
+}
+
+func (x *HistoryIdentity) GetAuthority() string {
+	if x != nil {
+		return x.Authority
+	}
+	return ""
+}
+
+func (x *HistoryIdentity) GetEnvironmentID() string {
+	if x != nil {
+		return x.EnvironmentID
+	}
+	return ""
+}
+
+func (x *HistoryIdentity) GetRuntimeID() string {
+	if x != nil {
+		return x.RuntimeID
+	}
+	return ""
+}
+
+func (x *HistoryIdentity) GetAssignmentGeneration() uint64 {
+	if x != nil {
+		return x.AssignmentGeneration
+	}
+	return 0
+}
+
+type HistoryProtection struct {
+	state                  protoimpl.MessageState `protogen:"open.v1"`
+	EnvironmentID          string                 `protobuf:"bytes,1,opt,name=environment_id,json=environmentId,proto3" json:"environment_id,omitempty"`
+	AssignmentGeneration   uint64                 `protobuf:"varint,2,opt,name=assignment_generation,json=assignmentGeneration,proto3" json:"assignment_generation,omitempty"`
+	SpecificationSha256    string                 `protobuf:"bytes,3,opt,name=specification_sha256,json=specificationSha256,proto3" json:"specification_sha256,omitempty"`
+	MinimumRuntimeRevision uint64                 `protobuf:"varint,4,opt,name=minimum_runtime_revision,json=minimumRuntimeRevision,proto3" json:"minimum_runtime_revision,omitempty"`
+	EnvironmentRevision    uint64                 `protobuf:"varint,5,opt,name=environment_revision,json=environmentRevision,proto3" json:"environment_revision,omitempty"`
+	unknownFields          protoimpl.UnknownFields
+	sizeCache              protoimpl.SizeCache
+}
+
+func (x *HistoryProtection) Reset() {
+	*x = HistoryProtection{}
+	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[53]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *HistoryProtection) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*HistoryProtection) ProtoMessage() {}
+
+func (x *HistoryProtection) ProtoReflect() protoreflect.Message {
+	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[53]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use HistoryProtection.ProtoReflect.Descriptor instead.
+func (*HistoryProtection) Descriptor() ([]byte, []int) {
+	return file_api_runtime_v1_sandbox_api_proto_rawDescGZIP(), []int{53}
+}
+
+func (x *HistoryProtection) GetEnvironmentID() string {
+	if x != nil {
+		return x.EnvironmentID
+	}
+	return ""
+}
+
+func (x *HistoryProtection) GetAssignmentGeneration() uint64 {
+	if x != nil {
+		return x.AssignmentGeneration
+	}
+	return 0
+}
+
+func (x *HistoryProtection) GetSpecificationSha256() string {
+	if x != nil {
+		return x.SpecificationSha256
+	}
+	return ""
+}
+
+func (x *HistoryProtection) GetMinimumRuntimeRevision() uint64 {
+	if x != nil {
+		return x.MinimumRuntimeRevision
+	}
+	return 0
+}
+
+func (x *HistoryProtection) GetEnvironmentRevision() uint64 {
+	if x != nil {
+		return x.EnvironmentRevision
+	}
+	return 0
+}
+
+type HistoryBoundary struct {
+	state                protoimpl.MessageState `protogen:"open.v1"`
+	Authority            string                 `protobuf:"bytes,1,opt,name=authority,proto3" json:"authority,omitempty"`
+	CoordinatorEpoch     uint64                 `protobuf:"varint,2,opt,name=coordinator_epoch,json=coordinatorEpoch,proto3" json:"coordinator_epoch,omitempty"`
+	AssignmentGeneration uint64                 `protobuf:"varint,3,opt,name=assignment_generation,json=assignmentGeneration,proto3" json:"assignment_generation,omitempty"`
+	CatalogRevision      uint64                 `protobuf:"varint,4,opt,name=catalog_revision,json=catalogRevision,proto3" json:"catalog_revision,omitempty"`
+	Protected            []*HistoryProtection   `protobuf:"bytes,5,rep,name=protected,proto3" json:"protected,omitempty"`
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
+}
+
+func (x *HistoryBoundary) Reset() {
+	*x = HistoryBoundary{}
+	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[54]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *HistoryBoundary) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*HistoryBoundary) ProtoMessage() {}
+
+func (x *HistoryBoundary) ProtoReflect() protoreflect.Message {
+	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[54]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use HistoryBoundary.ProtoReflect.Descriptor instead.
+func (*HistoryBoundary) Descriptor() ([]byte, []int) {
+	return file_api_runtime_v1_sandbox_api_proto_rawDescGZIP(), []int{54}
+}
+
+func (x *HistoryBoundary) GetAuthority() string {
+	if x != nil {
+		return x.Authority
+	}
+	return ""
+}
+
+func (x *HistoryBoundary) GetCoordinatorEpoch() uint64 {
+	if x != nil {
+		return x.CoordinatorEpoch
+	}
+	return 0
+}
+
+func (x *HistoryBoundary) GetAssignmentGeneration() uint64 {
+	if x != nil {
+		return x.AssignmentGeneration
+	}
+	return 0
+}
+
+func (x *HistoryBoundary) GetCatalogRevision() uint64 {
+	if x != nil {
+		return x.CatalogRevision
+	}
+	return 0
+}
+
+func (x *HistoryBoundary) GetProtected() []*HistoryProtection {
+	if x != nil {
+		return x.Protected
+	}
+	return nil
+}
+
+type HistoryCandidate struct {
+	state              protoimpl.MessageState `protogen:"open.v1"`
+	OperationID        string                 `protobuf:"bytes,1,opt,name=operation_id,json=operationId,proto3" json:"operation_id,omitempty"`
+	RequestFingerprint string                 `protobuf:"bytes,2,opt,name=request_fingerprint,json=requestFingerprint,proto3" json:"request_fingerprint,omitempty"`
+	DeadlineUnixMillis uint64                 `protobuf:"varint,3,opt,name=deadline_unix_millis,json=deadlineUnixMillis,proto3" json:"deadline_unix_millis,omitempty"`
+	Identity           *HistoryIdentity       `protobuf:"bytes,4,opt,name=identity,proto3" json:"identity,omitempty"`
+	SandboxID          string                 `protobuf:"bytes,5,opt,name=sandbox_id,json=sandboxId,proto3" json:"sandbox_id,omitempty"`
+	ResourceGeneration string                 `protobuf:"bytes,6,opt,name=resource_generation,json=resourceGeneration,proto3" json:"resource_generation,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
+}
+
+func (x *HistoryCandidate) Reset() {
+	*x = HistoryCandidate{}
+	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[55]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *HistoryCandidate) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*HistoryCandidate) ProtoMessage() {}
+
+func (x *HistoryCandidate) ProtoReflect() protoreflect.Message {
+	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[55]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use HistoryCandidate.ProtoReflect.Descriptor instead.
+func (*HistoryCandidate) Descriptor() ([]byte, []int) {
+	return file_api_runtime_v1_sandbox_api_proto_rawDescGZIP(), []int{55}
+}
+
+func (x *HistoryCandidate) GetOperationID() string {
+	if x != nil {
+		return x.OperationID
+	}
+	return ""
+}
+
+func (x *HistoryCandidate) GetRequestFingerprint() string {
+	if x != nil {
+		return x.RequestFingerprint
+	}
+	return ""
+}
+
+func (x *HistoryCandidate) GetDeadlineUnixMillis() uint64 {
+	if x != nil {
+		return x.DeadlineUnixMillis
+	}
+	return 0
+}
+
+func (x *HistoryCandidate) GetIdentity() *HistoryIdentity {
+	if x != nil {
+		return x.Identity
+	}
+	return nil
+}
+
+func (x *HistoryCandidate) GetSandboxID() string {
+	if x != nil {
+		return x.SandboxID
+	}
+	return ""
+}
+
+func (x *HistoryCandidate) GetResourceGeneration() string {
+	if x != nil {
+		return x.ResourceGeneration
+	}
+	return ""
+}
+
+type CollectHistoryRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Boundary      *HistoryBoundary       `protobuf:"bytes,1,opt,name=boundary,proto3" json:"boundary,omitempty"`
+	Candidates    []*HistoryCandidate    `protobuf:"bytes,2,rep,name=candidates,proto3" json:"candidates,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CollectHistoryRequest) Reset() {
+	*x = CollectHistoryRequest{}
+	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[56]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CollectHistoryRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CollectHistoryRequest) ProtoMessage() {}
+
+func (x *CollectHistoryRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[56]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CollectHistoryRequest.ProtoReflect.Descriptor instead.
+func (*CollectHistoryRequest) Descriptor() ([]byte, []int) {
+	return file_api_runtime_v1_sandbox_api_proto_rawDescGZIP(), []int{56}
+}
+
+func (x *CollectHistoryRequest) GetBoundary() *HistoryBoundary {
+	if x != nil {
+		return x.Boundary
+	}
+	return nil
+}
+
+func (x *CollectHistoryRequest) GetCandidates() []*HistoryCandidate {
+	if x != nil {
+		return x.Candidates
+	}
+	return nil
+}
+
+type CollectHistoryResponse struct {
+	state                    protoimpl.MessageState `protogen:"open.v1"`
+	AcknowledgedOperationIds []string               `protobuf:"bytes,1,rep,name=acknowledged_operation_ids,json=acknowledgedOperationIds,proto3" json:"acknowledged_operation_ids,omitempty"`
+	RemainingStartOperations uint64                 `protobuf:"varint,2,opt,name=remaining_start_operations,json=remainingStartOperations,proto3" json:"remaining_start_operations,omitempty"`
+	RemovedFiles             uint64                 `protobuf:"varint,3,opt,name=removed_files,json=removedFiles,proto3" json:"removed_files,omitempty"`
+	RemovedBytes             uint64                 `protobuf:"varint,4,opt,name=removed_bytes,json=removedBytes,proto3" json:"removed_bytes,omitempty"`
+	unknownFields            protoimpl.UnknownFields
+	sizeCache                protoimpl.SizeCache
+}
+
+func (x *CollectHistoryResponse) Reset() {
+	*x = CollectHistoryResponse{}
+	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[57]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CollectHistoryResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CollectHistoryResponse) ProtoMessage() {}
+
+func (x *CollectHistoryResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_api_runtime_v1_sandbox_api_proto_msgTypes[57]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CollectHistoryResponse.ProtoReflect.Descriptor instead.
+func (*CollectHistoryResponse) Descriptor() ([]byte, []int) {
+	return file_api_runtime_v1_sandbox_api_proto_rawDescGZIP(), []int{57}
+}
+
+func (x *CollectHistoryResponse) GetAcknowledgedOperationIds() []string {
+	if x != nil {
+		return x.AcknowledgedOperationIds
+	}
+	return nil
+}
+
+func (x *CollectHistoryResponse) GetRemainingStartOperations() uint64 {
+	if x != nil {
+		return x.RemainingStartOperations
+	}
+	return 0
+}
+
+func (x *CollectHistoryResponse) GetRemovedFiles() uint64 {
+	if x != nil {
+		return x.RemovedFiles
+	}
+	return 0
+}
+
+func (x *CollectHistoryResponse) GetRemovedBytes() uint64 {
+	if x != nil {
+		return x.RemovedBytes
+	}
+	return 0
+}
+
 var File_api_runtime_v1_sandbox_api_proto protoreflect.FileDescriptor
 
 const file_api_runtime_v1_sandbox_api_proto_rawDesc = "" +
 	"\n" +
 	" api/runtime/v1/sandbox-api.proto\x12\n" +
-	"runtime.v1\"\xcd\x01\n" +
+	"runtime.v1\"\x95\x02\n" +
 	"\x15StartOperationRequest\x12.\n" +
 	"\x05start\x18\x01 \x01(\v2\x18.runtime.v1.StartRequestR\x05start\x12!\n" +
 	"\foperation_id\x18\x02 \x01(\tR\voperationId\x12/\n" +
 	"\x13request_fingerprint\x18\x03 \x01(\tR\x12requestFingerprint\x120\n" +
-	"\x14deadline_unix_millis\x18\x04 \x01(\x04R\x12deadlineUnixMillis\"\xc3\x01\n" +
+	"\x14deadline_unix_millis\x18\x04 \x01(\x04R\x12deadlineUnixMillis\x12F\n" +
+	"\x10history_identity\x18\x05 \x01(\v2\x1b.runtime.v1.HistoryIdentityR\x0fhistoryIdentity\"\x8b\x02\n" +
 	"\x18GetStartOperationRequest\x12!\n" +
 	"\foperation_id\x18\x01 \x01(\tR\voperationId\x12/\n" +
 	"\x13request_fingerprint\x18\x02 \x01(\tR\x12requestFingerprint\x120\n" +
 	"\x14deadline_unix_millis\x18\x03 \x01(\x04R\x12deadlineUnixMillis\x12!\n" +
-	"\fseal_missing\x18\x04 \x01(\bR\vsealMissing\"\x88\x02\n" +
+	"\fseal_missing\x18\x04 \x01(\bR\vsealMissing\x12F\n" +
+	"\x10history_identity\x18\x05 \x01(\v2\x1b.runtime.v1.HistoryIdentityR\x0fhistoryIdentity\"\x88\x02\n" +
 	"\x16StartOperationResponse\x12!\n" +
 	"\foperation_id\x18\x01 \x01(\tR\voperationId\x12/\n" +
 	"\x13request_fingerprint\x18\x02 \x01(\tR\x12requestFingerprint\x120\n" +
@@ -4918,7 +5361,43 @@ const file_api_runtime_v1_sandbox_api_proto_rawDesc = "" +
 	"\x12retired_generation\x18\x01 \x01(\tR\x11retiredGeneration\"y\n" +
 	"\x1fResolveResourceOperationRequest\x12>\n" +
 	"\boriginal\x18\x01 \x01(\v2\".runtime.v1.ResizeResourcesRequestR\boriginal\x12\x16\n" +
-	"\x06shrink\x18\x02 \x01(\bR\x06shrink*\xc8\x01\n" +
+	"\x06shrink\x18\x02 \x01(\bR\x06shrink\"\xaa\x01\n" +
+	"\x0fHistoryIdentity\x12\x1c\n" +
+	"\tauthority\x18\x01 \x01(\tR\tauthority\x12%\n" +
+	"\x0eenvironment_id\x18\x02 \x01(\tR\renvironmentId\x12\x1d\n" +
+	"\n" +
+	"runtime_id\x18\x03 \x01(\tR\truntimeId\x123\n" +
+	"\x15assignment_generation\x18\x04 \x01(\x04R\x14assignmentGeneration\"\x8f\x02\n" +
+	"\x11HistoryProtection\x12%\n" +
+	"\x0eenvironment_id\x18\x01 \x01(\tR\renvironmentId\x123\n" +
+	"\x15assignment_generation\x18\x02 \x01(\x04R\x14assignmentGeneration\x121\n" +
+	"\x14specification_sha256\x18\x03 \x01(\tR\x13specificationSha256\x128\n" +
+	"\x18minimum_runtime_revision\x18\x04 \x01(\x04R\x16minimumRuntimeRevision\x121\n" +
+	"\x14environment_revision\x18\x05 \x01(\x04R\x13environmentRevision\"\xf9\x01\n" +
+	"\x0fHistoryBoundary\x12\x1c\n" +
+	"\tauthority\x18\x01 \x01(\tR\tauthority\x12+\n" +
+	"\x11coordinator_epoch\x18\x02 \x01(\x04R\x10coordinatorEpoch\x123\n" +
+	"\x15assignment_generation\x18\x03 \x01(\x04R\x14assignmentGeneration\x12)\n" +
+	"\x10catalog_revision\x18\x04 \x01(\x04R\x0fcatalogRevision\x12;\n" +
+	"\tprotected\x18\x05 \x03(\v2\x1d.runtime.v1.HistoryProtectionR\tprotected\"\xa1\x02\n" +
+	"\x10HistoryCandidate\x12!\n" +
+	"\foperation_id\x18\x01 \x01(\tR\voperationId\x12/\n" +
+	"\x13request_fingerprint\x18\x02 \x01(\tR\x12requestFingerprint\x120\n" +
+	"\x14deadline_unix_millis\x18\x03 \x01(\x04R\x12deadlineUnixMillis\x127\n" +
+	"\bidentity\x18\x04 \x01(\v2\x1b.runtime.v1.HistoryIdentityR\bidentity\x12\x1d\n" +
+	"\n" +
+	"sandbox_id\x18\x05 \x01(\tR\tsandboxId\x12/\n" +
+	"\x13resource_generation\x18\x06 \x01(\tR\x12resourceGeneration\"\x8e\x01\n" +
+	"\x15CollectHistoryRequest\x127\n" +
+	"\bboundary\x18\x01 \x01(\v2\x1b.runtime.v1.HistoryBoundaryR\bboundary\x12<\n" +
+	"\n" +
+	"candidates\x18\x02 \x03(\v2\x1c.runtime.v1.HistoryCandidateR\n" +
+	"candidates\"\xde\x01\n" +
+	"\x16CollectHistoryResponse\x12<\n" +
+	"\x1aacknowledged_operation_ids\x18\x01 \x03(\tR\x18acknowledgedOperationIds\x12<\n" +
+	"\x1aremaining_start_operations\x18\x02 \x01(\x04R\x18remainingStartOperations\x12#\n" +
+	"\rremoved_files\x18\x03 \x01(\x04R\fremovedFiles\x12#\n" +
+	"\rremoved_bytes\x18\x04 \x01(\x04R\fremovedBytes*\xc8\x01\n" +
 	"\x13StartOperationState\x12!\n" +
 	"\x1dSTART_OPERATION_STATE_UNKNOWN\x10\x00\x12!\n" +
 	"\x1dSTART_OPERATION_STATE_PENDING\x10\x01\x12!\n" +
@@ -4955,11 +5434,12 @@ const file_api_runtime_v1_sandbox_api_proto_rawDesc = "" +
 	"\x14SandboxPhysicalPhase\x12&\n" +
 	"\"SANDBOX_PHYSICAL_PHASE_UNSPECIFIED\x10\x00\x12!\n" +
 	"\x1dSANDBOX_PHYSICAL_PHASE_INTENT\x10\x01\x12$\n" +
-	" SANDBOX_PHYSICAL_PHASE_COMMITTED\x10\x022\xdb\f\n" +
+	" SANDBOX_PHYSICAL_PHASE_COMMITTED\x10\x022\xb6\r\n" +
 	"\x0eSandboxService\x12>\n" +
 	"\x05Start\x12\x18.runtime.v1.StartRequest\x1a\x19.runtime.v1.StartResponse\"\x00\x12Y\n" +
 	"\x0eStartOperation\x12!.runtime.v1.StartOperationRequest\x1a\".runtime.v1.StartOperationResponse\"\x00\x12_\n" +
-	"\x11GetStartOperation\x12$.runtime.v1.GetStartOperationRequest\x1a\".runtime.v1.StartOperationResponse\"\x00\x12M\n" +
+	"\x11GetStartOperation\x12$.runtime.v1.GetStartOperationRequest\x1a\".runtime.v1.StartOperationResponse\"\x00\x12Y\n" +
+	"\x0eCollectHistory\x12!.runtime.v1.CollectHistoryRequest\x1a\".runtime.v1.CollectHistoryResponse\"\x00\x12M\n" +
 	"\n" +
 	"Checkpoint\x12\x1d.runtime.v1.CheckpointRequest\x1a\x1e.runtime.v1.CheckpointResponse\"\x00\x12e\n" +
 	"\x16CheckpointIfGeneration\x12).runtime.v1.CheckpointIfGenerationRequest\x1a\x1e.runtime.v1.CheckpointResponse\"\x00\x12>\n" +
@@ -4991,7 +5471,7 @@ func file_api_runtime_v1_sandbox_api_proto_rawDescGZIP() []byte {
 }
 
 var file_api_runtime_v1_sandbox_api_proto_enumTypes = make([]protoimpl.EnumInfo, 8)
-var file_api_runtime_v1_sandbox_api_proto_msgTypes = make([]protoimpl.MessageInfo, 64)
+var file_api_runtime_v1_sandbox_api_proto_msgTypes = make([]protoimpl.MessageInfo, 70)
 var file_api_runtime_v1_sandbox_api_proto_goTypes = []any{
 	(StartOperationState)(0),                // 0: runtime.v1.StartOperationState
 	(NetworkPolicyAction)(0),                // 1: runtime.v1.NetworkPolicyAction
@@ -5053,121 +5533,135 @@ var file_api_runtime_v1_sandbox_api_proto_goTypes = []any{
 	(*DeleteIfGenerationRequest)(nil),       // 57: runtime.v1.DeleteIfGenerationRequest
 	(*DeleteIfGenerationResponse)(nil),      // 58: runtime.v1.DeleteIfGenerationResponse
 	(*ResolveResourceOperationRequest)(nil), // 59: runtime.v1.ResolveResourceOperationRequest
-	nil,                                     // 60: runtime.v1.StartRequest.EnvsEntry
-	nil,                                     // 61: runtime.v1.StartRequest.ResourcesEntry
-	nil,                                     // 62: runtime.v1.StartRequest.LabelsEntry
-	nil,                                     // 63: runtime.v1.StartRequest.MetricLabelsEntry
-	nil,                                     // 64: runtime.v1.ListSandboxesRequest.SelectorEntry
-	nil,                                     // 65: runtime.v1.SandboxStatus.LabelsEntry
-	nil,                                     // 66: runtime.v1.SandboxStatus.MetricLabelsEntry
-	nil,                                     // 67: runtime.v1.LinuxSandboxResources.UnifiedEntry
-	nil,                                     // 68: runtime.v1.SandboxMetadata.LabelsEntry
-	nil,                                     // 69: runtime.v1.SandboxMetadata.MetricLabelsEntry
-	nil,                                     // 70: runtime.v1.SandboxMetadata.ResourceFactsEntry
-	nil,                                     // 71: runtime.v1.SandboxMetadataList.SandboxesEntry
+	(*HistoryIdentity)(nil),                 // 60: runtime.v1.HistoryIdentity
+	(*HistoryProtection)(nil),               // 61: runtime.v1.HistoryProtection
+	(*HistoryBoundary)(nil),                 // 62: runtime.v1.HistoryBoundary
+	(*HistoryCandidate)(nil),                // 63: runtime.v1.HistoryCandidate
+	(*CollectHistoryRequest)(nil),           // 64: runtime.v1.CollectHistoryRequest
+	(*CollectHistoryResponse)(nil),          // 65: runtime.v1.CollectHistoryResponse
+	nil,                                     // 66: runtime.v1.StartRequest.EnvsEntry
+	nil,                                     // 67: runtime.v1.StartRequest.ResourcesEntry
+	nil,                                     // 68: runtime.v1.StartRequest.LabelsEntry
+	nil,                                     // 69: runtime.v1.StartRequest.MetricLabelsEntry
+	nil,                                     // 70: runtime.v1.ListSandboxesRequest.SelectorEntry
+	nil,                                     // 71: runtime.v1.SandboxStatus.LabelsEntry
+	nil,                                     // 72: runtime.v1.SandboxStatus.MetricLabelsEntry
+	nil,                                     // 73: runtime.v1.LinuxSandboxResources.UnifiedEntry
+	nil,                                     // 74: runtime.v1.SandboxMetadata.LabelsEntry
+	nil,                                     // 75: runtime.v1.SandboxMetadata.MetricLabelsEntry
+	nil,                                     // 76: runtime.v1.SandboxMetadata.ResourceFactsEntry
+	nil,                                     // 77: runtime.v1.SandboxMetadataList.SandboxesEntry
 }
 var file_api_runtime_v1_sandbox_api_proto_depIdxs = []int32{
 	25, // 0: runtime.v1.StartOperationRequest.start:type_name -> runtime.v1.StartRequest
-	0,  // 1: runtime.v1.StartOperationResponse.state:type_name -> runtime.v1.StartOperationState
-	26, // 2: runtime.v1.StartOperationResponse.result:type_name -> runtime.v1.StartResponse
-	12, // 3: runtime.v1.NetworkEndpoint.port_range:type_name -> runtime.v1.PortRange
-	1,  // 4: runtime.v1.TrafficRule.action:type_name -> runtime.v1.NetworkPolicyAction
-	2,  // 5: runtime.v1.TrafficRule.direction:type_name -> runtime.v1.NetworkDirection
-	3,  // 6: runtime.v1.TrafficRule.protocol:type_name -> runtime.v1.NetworkProtocol
-	11, // 7: runtime.v1.TrafficRule.peer:type_name -> runtime.v1.NetworkEndpoint
-	12, // 8: runtime.v1.TrafficRule.sandbox_port_range:type_name -> runtime.v1.PortRange
-	1,  // 9: runtime.v1.TrafficPolicy.default_action:type_name -> runtime.v1.NetworkPolicyAction
-	13, // 10: runtime.v1.TrafficPolicy.rules:type_name -> runtime.v1.TrafficRule
-	4,  // 11: runtime.v1.TrafficPolicy.mode:type_name -> runtime.v1.TrafficPolicyMode
-	1,  // 12: runtime.v1.TrafficPolicy.ingress_default_action:type_name -> runtime.v1.NetworkPolicyAction
-	1,  // 13: runtime.v1.TrafficPolicy.egress_default_action:type_name -> runtime.v1.NetworkPolicyAction
-	1,  // 14: runtime.v1.DNSRule.action:type_name -> runtime.v1.NetworkPolicyAction
-	1,  // 15: runtime.v1.DNSPolicy.default_action:type_name -> runtime.v1.NetworkPolicyAction
-	15, // 16: runtime.v1.DNSPolicy.rules:type_name -> runtime.v1.DNSRule
-	14, // 17: runtime.v1.NetworkPolicy.traffic:type_name -> runtime.v1.TrafficPolicy
-	16, // 18: runtime.v1.NetworkPolicy.dns:type_name -> runtime.v1.DNSPolicy
-	17, // 19: runtime.v1.SetNetworkPolicyRequest.network_policy:type_name -> runtime.v1.NetworkPolicy
-	5,  // 20: runtime.v1.RootfsConfig.type:type_name -> runtime.v1.RootfsSrcType
-	20, // 21: runtime.v1.RootfsConfig.s3_config:type_name -> runtime.v1.S3Config
-	20, // 22: runtime.v1.Mount.s3_config:type_name -> runtime.v1.S3Config
-	21, // 23: runtime.v1.StartRequest.rootfs:type_name -> runtime.v1.RootfsConfig
-	60, // 24: runtime.v1.StartRequest.envs:type_name -> runtime.v1.StartRequest.EnvsEntry
-	22, // 25: runtime.v1.StartRequest.mounts:type_name -> runtime.v1.Mount
-	61, // 26: runtime.v1.StartRequest.resources:type_name -> runtime.v1.StartRequest.ResourcesEntry
-	62, // 27: runtime.v1.StartRequest.labels:type_name -> runtime.v1.StartRequest.LabelsEntry
-	63, // 28: runtime.v1.StartRequest.metric_labels:type_name -> runtime.v1.StartRequest.MetricLabelsEntry
-	23, // 29: runtime.v1.StartRequest.xpu_allocations:type_name -> runtime.v1.XpuAllocation
-	17, // 30: runtime.v1.StartRequest.network_policy:type_name -> runtime.v1.NetworkPolicy
-	24, // 31: runtime.v1.StartRequest.checkpoint_info:type_name -> runtime.v1.CheckpointInfo
-	27, // 32: runtime.v1.CheckpointIfGenerationRequest.checkpoint:type_name -> runtime.v1.CheckpointRequest
-	25, // 33: runtime.v1.RestoreRequest.config:type_name -> runtime.v1.StartRequest
-	64, // 34: runtime.v1.ListSandboxesRequest.selector:type_name -> runtime.v1.ListSandboxesRequest.SelectorEntry
-	41, // 35: runtime.v1.ListSandboxesResponse.sandboxes:type_name -> runtime.v1.SandboxStatus
-	6,  // 36: runtime.v1.SandboxStatus.state:type_name -> runtime.v1.SandboxState
-	65, // 37: runtime.v1.SandboxStatus.labels:type_name -> runtime.v1.SandboxStatus.LabelsEntry
-	22, // 38: runtime.v1.SandboxStatus.mounts:type_name -> runtime.v1.Mount
-	42, // 39: runtime.v1.SandboxStatus.envs:type_name -> runtime.v1.KeyValue
-	43, // 40: runtime.v1.SandboxStatus.resources:type_name -> runtime.v1.LinuxSandboxResources
-	66, // 41: runtime.v1.SandboxStatus.metric_labels:type_name -> runtime.v1.SandboxStatus.MetricLabelsEntry
-	44, // 42: runtime.v1.LinuxSandboxResources.hugepage_limits:type_name -> runtime.v1.HugepageLimit
-	67, // 43: runtime.v1.LinuxSandboxResources.unified:type_name -> runtime.v1.LinuxSandboxResources.UnifiedEntry
-	68, // 44: runtime.v1.SandboxMetadata.labels:type_name -> runtime.v1.SandboxMetadata.LabelsEntry
-	69, // 45: runtime.v1.SandboxMetadata.metric_labels:type_name -> runtime.v1.SandboxMetadata.MetricLabelsEntry
-	7,  // 46: runtime.v1.SandboxMetadata.physical_phase:type_name -> runtime.v1.SandboxPhysicalPhase
-	52, // 47: runtime.v1.SandboxMetadata.restore_identity:type_name -> runtime.v1.RestoreIdentity
-	70, // 48: runtime.v1.SandboxMetadata.resource_facts:type_name -> runtime.v1.SandboxMetadata.ResourceFactsEntry
-	71, // 49: runtime.v1.SandboxMetadataList.sandboxes:type_name -> runtime.v1.SandboxMetadataList.SandboxesEntry
-	50, // 50: runtime.v1.ListAvailableRuntimesResponse.runtimes:type_name -> runtime.v1.RuntimeInfo
-	53, // 51: runtime.v1.ResizeResourcesRequest.expected:type_name -> runtime.v1.ResourceLimits
-	53, // 52: runtime.v1.ResizeResourcesRequest.target:type_name -> runtime.v1.ResourceLimits
-	53, // 53: runtime.v1.ShrinkResourcesRequest.expected:type_name -> runtime.v1.ResourceLimits
-	53, // 54: runtime.v1.ShrinkResourcesRequest.target:type_name -> runtime.v1.ResourceLimits
-	48, // 55: runtime.v1.ResizeResourcesResponse.actual:type_name -> runtime.v1.StatsResponse
-	54, // 56: runtime.v1.ResolveResourceOperationRequest.original:type_name -> runtime.v1.ResizeResourcesRequest
-	45, // 57: runtime.v1.SandboxMetadataList.SandboxesEntry.value:type_name -> runtime.v1.SandboxMetadata
-	25, // 58: runtime.v1.SandboxService.Start:input_type -> runtime.v1.StartRequest
-	8,  // 59: runtime.v1.SandboxService.StartOperation:input_type -> runtime.v1.StartOperationRequest
-	9,  // 60: runtime.v1.SandboxService.GetStartOperation:input_type -> runtime.v1.GetStartOperationRequest
-	27, // 61: runtime.v1.SandboxService.Checkpoint:input_type -> runtime.v1.CheckpointRequest
-	29, // 62: runtime.v1.SandboxService.CheckpointIfGeneration:input_type -> runtime.v1.CheckpointIfGenerationRequest
-	30, // 63: runtime.v1.SandboxService.Pause:input_type -> runtime.v1.PauseRequest
-	30, // 64: runtime.v1.SandboxService.Resume:input_type -> runtime.v1.PauseRequest
-	34, // 65: runtime.v1.SandboxService.Restore:input_type -> runtime.v1.RestoreRequest
-	32, // 66: runtime.v1.SandboxService.DeleteCheckpoint:input_type -> runtime.v1.DeleteCheckpointRequest
-	35, // 67: runtime.v1.SandboxService.Delete:input_type -> runtime.v1.DeleteRequest
-	57, // 68: runtime.v1.SandboxService.DeleteIfGeneration:input_type -> runtime.v1.DeleteIfGenerationRequest
-	37, // 69: runtime.v1.SandboxService.Wait:input_type -> runtime.v1.WaitRequest
-	39, // 70: runtime.v1.SandboxService.List:input_type -> runtime.v1.ListSandboxesRequest
-	47, // 71: runtime.v1.SandboxService.Stats:input_type -> runtime.v1.StatsRequest
-	54, // 72: runtime.v1.SandboxService.ResizeResources:input_type -> runtime.v1.ResizeResourcesRequest
-	55, // 73: runtime.v1.SandboxService.ShrinkResources:input_type -> runtime.v1.ShrinkResourcesRequest
-	59, // 74: runtime.v1.SandboxService.ResolveResourceOperation:input_type -> runtime.v1.ResolveResourceOperationRequest
-	49, // 75: runtime.v1.SandboxService.ListAvailableRuntimes:input_type -> runtime.v1.ListAvailableRuntimesRequest
-	18, // 76: runtime.v1.SandboxService.SetNetworkPolicy:input_type -> runtime.v1.SetNetworkPolicyRequest
-	26, // 77: runtime.v1.SandboxService.Start:output_type -> runtime.v1.StartResponse
-	10, // 78: runtime.v1.SandboxService.StartOperation:output_type -> runtime.v1.StartOperationResponse
-	10, // 79: runtime.v1.SandboxService.GetStartOperation:output_type -> runtime.v1.StartOperationResponse
-	28, // 80: runtime.v1.SandboxService.Checkpoint:output_type -> runtime.v1.CheckpointResponse
-	28, // 81: runtime.v1.SandboxService.CheckpointIfGeneration:output_type -> runtime.v1.CheckpointResponse
-	31, // 82: runtime.v1.SandboxService.Pause:output_type -> runtime.v1.PauseResponse
-	31, // 83: runtime.v1.SandboxService.Resume:output_type -> runtime.v1.PauseResponse
-	26, // 84: runtime.v1.SandboxService.Restore:output_type -> runtime.v1.StartResponse
-	33, // 85: runtime.v1.SandboxService.DeleteCheckpoint:output_type -> runtime.v1.DeleteCheckpointResponse
-	36, // 86: runtime.v1.SandboxService.Delete:output_type -> runtime.v1.DeleteResponse
-	58, // 87: runtime.v1.SandboxService.DeleteIfGeneration:output_type -> runtime.v1.DeleteIfGenerationResponse
-	38, // 88: runtime.v1.SandboxService.Wait:output_type -> runtime.v1.WaitResponse
-	40, // 89: runtime.v1.SandboxService.List:output_type -> runtime.v1.ListSandboxesResponse
-	48, // 90: runtime.v1.SandboxService.Stats:output_type -> runtime.v1.StatsResponse
-	56, // 91: runtime.v1.SandboxService.ResizeResources:output_type -> runtime.v1.ResizeResourcesResponse
-	56, // 92: runtime.v1.SandboxService.ShrinkResources:output_type -> runtime.v1.ResizeResourcesResponse
-	56, // 93: runtime.v1.SandboxService.ResolveResourceOperation:output_type -> runtime.v1.ResizeResourcesResponse
-	51, // 94: runtime.v1.SandboxService.ListAvailableRuntimes:output_type -> runtime.v1.ListAvailableRuntimesResponse
-	19, // 95: runtime.v1.SandboxService.SetNetworkPolicy:output_type -> runtime.v1.SetNetworkPolicyResponse
-	77, // [77:96] is the sub-list for method output_type
-	58, // [58:77] is the sub-list for method input_type
-	58, // [58:58] is the sub-list for extension type_name
-	58, // [58:58] is the sub-list for extension extendee
-	0,  // [0:58] is the sub-list for field type_name
+	60, // 1: runtime.v1.StartOperationRequest.history_identity:type_name -> runtime.v1.HistoryIdentity
+	60, // 2: runtime.v1.GetStartOperationRequest.history_identity:type_name -> runtime.v1.HistoryIdentity
+	0,  // 3: runtime.v1.StartOperationResponse.state:type_name -> runtime.v1.StartOperationState
+	26, // 4: runtime.v1.StartOperationResponse.result:type_name -> runtime.v1.StartResponse
+	12, // 5: runtime.v1.NetworkEndpoint.port_range:type_name -> runtime.v1.PortRange
+	1,  // 6: runtime.v1.TrafficRule.action:type_name -> runtime.v1.NetworkPolicyAction
+	2,  // 7: runtime.v1.TrafficRule.direction:type_name -> runtime.v1.NetworkDirection
+	3,  // 8: runtime.v1.TrafficRule.protocol:type_name -> runtime.v1.NetworkProtocol
+	11, // 9: runtime.v1.TrafficRule.peer:type_name -> runtime.v1.NetworkEndpoint
+	12, // 10: runtime.v1.TrafficRule.sandbox_port_range:type_name -> runtime.v1.PortRange
+	1,  // 11: runtime.v1.TrafficPolicy.default_action:type_name -> runtime.v1.NetworkPolicyAction
+	13, // 12: runtime.v1.TrafficPolicy.rules:type_name -> runtime.v1.TrafficRule
+	4,  // 13: runtime.v1.TrafficPolicy.mode:type_name -> runtime.v1.TrafficPolicyMode
+	1,  // 14: runtime.v1.TrafficPolicy.ingress_default_action:type_name -> runtime.v1.NetworkPolicyAction
+	1,  // 15: runtime.v1.TrafficPolicy.egress_default_action:type_name -> runtime.v1.NetworkPolicyAction
+	1,  // 16: runtime.v1.DNSRule.action:type_name -> runtime.v1.NetworkPolicyAction
+	1,  // 17: runtime.v1.DNSPolicy.default_action:type_name -> runtime.v1.NetworkPolicyAction
+	15, // 18: runtime.v1.DNSPolicy.rules:type_name -> runtime.v1.DNSRule
+	14, // 19: runtime.v1.NetworkPolicy.traffic:type_name -> runtime.v1.TrafficPolicy
+	16, // 20: runtime.v1.NetworkPolicy.dns:type_name -> runtime.v1.DNSPolicy
+	17, // 21: runtime.v1.SetNetworkPolicyRequest.network_policy:type_name -> runtime.v1.NetworkPolicy
+	5,  // 22: runtime.v1.RootfsConfig.type:type_name -> runtime.v1.RootfsSrcType
+	20, // 23: runtime.v1.RootfsConfig.s3_config:type_name -> runtime.v1.S3Config
+	20, // 24: runtime.v1.Mount.s3_config:type_name -> runtime.v1.S3Config
+	21, // 25: runtime.v1.StartRequest.rootfs:type_name -> runtime.v1.RootfsConfig
+	66, // 26: runtime.v1.StartRequest.envs:type_name -> runtime.v1.StartRequest.EnvsEntry
+	22, // 27: runtime.v1.StartRequest.mounts:type_name -> runtime.v1.Mount
+	67, // 28: runtime.v1.StartRequest.resources:type_name -> runtime.v1.StartRequest.ResourcesEntry
+	68, // 29: runtime.v1.StartRequest.labels:type_name -> runtime.v1.StartRequest.LabelsEntry
+	69, // 30: runtime.v1.StartRequest.metric_labels:type_name -> runtime.v1.StartRequest.MetricLabelsEntry
+	23, // 31: runtime.v1.StartRequest.xpu_allocations:type_name -> runtime.v1.XpuAllocation
+	17, // 32: runtime.v1.StartRequest.network_policy:type_name -> runtime.v1.NetworkPolicy
+	24, // 33: runtime.v1.StartRequest.checkpoint_info:type_name -> runtime.v1.CheckpointInfo
+	27, // 34: runtime.v1.CheckpointIfGenerationRequest.checkpoint:type_name -> runtime.v1.CheckpointRequest
+	25, // 35: runtime.v1.RestoreRequest.config:type_name -> runtime.v1.StartRequest
+	70, // 36: runtime.v1.ListSandboxesRequest.selector:type_name -> runtime.v1.ListSandboxesRequest.SelectorEntry
+	41, // 37: runtime.v1.ListSandboxesResponse.sandboxes:type_name -> runtime.v1.SandboxStatus
+	6,  // 38: runtime.v1.SandboxStatus.state:type_name -> runtime.v1.SandboxState
+	71, // 39: runtime.v1.SandboxStatus.labels:type_name -> runtime.v1.SandboxStatus.LabelsEntry
+	22, // 40: runtime.v1.SandboxStatus.mounts:type_name -> runtime.v1.Mount
+	42, // 41: runtime.v1.SandboxStatus.envs:type_name -> runtime.v1.KeyValue
+	43, // 42: runtime.v1.SandboxStatus.resources:type_name -> runtime.v1.LinuxSandboxResources
+	72, // 43: runtime.v1.SandboxStatus.metric_labels:type_name -> runtime.v1.SandboxStatus.MetricLabelsEntry
+	44, // 44: runtime.v1.LinuxSandboxResources.hugepage_limits:type_name -> runtime.v1.HugepageLimit
+	73, // 45: runtime.v1.LinuxSandboxResources.unified:type_name -> runtime.v1.LinuxSandboxResources.UnifiedEntry
+	74, // 46: runtime.v1.SandboxMetadata.labels:type_name -> runtime.v1.SandboxMetadata.LabelsEntry
+	75, // 47: runtime.v1.SandboxMetadata.metric_labels:type_name -> runtime.v1.SandboxMetadata.MetricLabelsEntry
+	7,  // 48: runtime.v1.SandboxMetadata.physical_phase:type_name -> runtime.v1.SandboxPhysicalPhase
+	52, // 49: runtime.v1.SandboxMetadata.restore_identity:type_name -> runtime.v1.RestoreIdentity
+	76, // 50: runtime.v1.SandboxMetadata.resource_facts:type_name -> runtime.v1.SandboxMetadata.ResourceFactsEntry
+	77, // 51: runtime.v1.SandboxMetadataList.sandboxes:type_name -> runtime.v1.SandboxMetadataList.SandboxesEntry
+	50, // 52: runtime.v1.ListAvailableRuntimesResponse.runtimes:type_name -> runtime.v1.RuntimeInfo
+	53, // 53: runtime.v1.ResizeResourcesRequest.expected:type_name -> runtime.v1.ResourceLimits
+	53, // 54: runtime.v1.ResizeResourcesRequest.target:type_name -> runtime.v1.ResourceLimits
+	53, // 55: runtime.v1.ShrinkResourcesRequest.expected:type_name -> runtime.v1.ResourceLimits
+	53, // 56: runtime.v1.ShrinkResourcesRequest.target:type_name -> runtime.v1.ResourceLimits
+	48, // 57: runtime.v1.ResizeResourcesResponse.actual:type_name -> runtime.v1.StatsResponse
+	54, // 58: runtime.v1.ResolveResourceOperationRequest.original:type_name -> runtime.v1.ResizeResourcesRequest
+	61, // 59: runtime.v1.HistoryBoundary.protected:type_name -> runtime.v1.HistoryProtection
+	60, // 60: runtime.v1.HistoryCandidate.identity:type_name -> runtime.v1.HistoryIdentity
+	62, // 61: runtime.v1.CollectHistoryRequest.boundary:type_name -> runtime.v1.HistoryBoundary
+	63, // 62: runtime.v1.CollectHistoryRequest.candidates:type_name -> runtime.v1.HistoryCandidate
+	45, // 63: runtime.v1.SandboxMetadataList.SandboxesEntry.value:type_name -> runtime.v1.SandboxMetadata
+	25, // 64: runtime.v1.SandboxService.Start:input_type -> runtime.v1.StartRequest
+	8,  // 65: runtime.v1.SandboxService.StartOperation:input_type -> runtime.v1.StartOperationRequest
+	9,  // 66: runtime.v1.SandboxService.GetStartOperation:input_type -> runtime.v1.GetStartOperationRequest
+	64, // 67: runtime.v1.SandboxService.CollectHistory:input_type -> runtime.v1.CollectHistoryRequest
+	27, // 68: runtime.v1.SandboxService.Checkpoint:input_type -> runtime.v1.CheckpointRequest
+	29, // 69: runtime.v1.SandboxService.CheckpointIfGeneration:input_type -> runtime.v1.CheckpointIfGenerationRequest
+	30, // 70: runtime.v1.SandboxService.Pause:input_type -> runtime.v1.PauseRequest
+	30, // 71: runtime.v1.SandboxService.Resume:input_type -> runtime.v1.PauseRequest
+	34, // 72: runtime.v1.SandboxService.Restore:input_type -> runtime.v1.RestoreRequest
+	32, // 73: runtime.v1.SandboxService.DeleteCheckpoint:input_type -> runtime.v1.DeleteCheckpointRequest
+	35, // 74: runtime.v1.SandboxService.Delete:input_type -> runtime.v1.DeleteRequest
+	57, // 75: runtime.v1.SandboxService.DeleteIfGeneration:input_type -> runtime.v1.DeleteIfGenerationRequest
+	37, // 76: runtime.v1.SandboxService.Wait:input_type -> runtime.v1.WaitRequest
+	39, // 77: runtime.v1.SandboxService.List:input_type -> runtime.v1.ListSandboxesRequest
+	47, // 78: runtime.v1.SandboxService.Stats:input_type -> runtime.v1.StatsRequest
+	54, // 79: runtime.v1.SandboxService.ResizeResources:input_type -> runtime.v1.ResizeResourcesRequest
+	55, // 80: runtime.v1.SandboxService.ShrinkResources:input_type -> runtime.v1.ShrinkResourcesRequest
+	59, // 81: runtime.v1.SandboxService.ResolveResourceOperation:input_type -> runtime.v1.ResolveResourceOperationRequest
+	49, // 82: runtime.v1.SandboxService.ListAvailableRuntimes:input_type -> runtime.v1.ListAvailableRuntimesRequest
+	18, // 83: runtime.v1.SandboxService.SetNetworkPolicy:input_type -> runtime.v1.SetNetworkPolicyRequest
+	26, // 84: runtime.v1.SandboxService.Start:output_type -> runtime.v1.StartResponse
+	10, // 85: runtime.v1.SandboxService.StartOperation:output_type -> runtime.v1.StartOperationResponse
+	10, // 86: runtime.v1.SandboxService.GetStartOperation:output_type -> runtime.v1.StartOperationResponse
+	65, // 87: runtime.v1.SandboxService.CollectHistory:output_type -> runtime.v1.CollectHistoryResponse
+	28, // 88: runtime.v1.SandboxService.Checkpoint:output_type -> runtime.v1.CheckpointResponse
+	28, // 89: runtime.v1.SandboxService.CheckpointIfGeneration:output_type -> runtime.v1.CheckpointResponse
+	31, // 90: runtime.v1.SandboxService.Pause:output_type -> runtime.v1.PauseResponse
+	31, // 91: runtime.v1.SandboxService.Resume:output_type -> runtime.v1.PauseResponse
+	26, // 92: runtime.v1.SandboxService.Restore:output_type -> runtime.v1.StartResponse
+	33, // 93: runtime.v1.SandboxService.DeleteCheckpoint:output_type -> runtime.v1.DeleteCheckpointResponse
+	36, // 94: runtime.v1.SandboxService.Delete:output_type -> runtime.v1.DeleteResponse
+	58, // 95: runtime.v1.SandboxService.DeleteIfGeneration:output_type -> runtime.v1.DeleteIfGenerationResponse
+	38, // 96: runtime.v1.SandboxService.Wait:output_type -> runtime.v1.WaitResponse
+	40, // 97: runtime.v1.SandboxService.List:output_type -> runtime.v1.ListSandboxesResponse
+	48, // 98: runtime.v1.SandboxService.Stats:output_type -> runtime.v1.StatsResponse
+	56, // 99: runtime.v1.SandboxService.ResizeResources:output_type -> runtime.v1.ResizeResourcesResponse
+	56, // 100: runtime.v1.SandboxService.ShrinkResources:output_type -> runtime.v1.ResizeResourcesResponse
+	56, // 101: runtime.v1.SandboxService.ResolveResourceOperation:output_type -> runtime.v1.ResizeResourcesResponse
+	51, // 102: runtime.v1.SandboxService.ListAvailableRuntimes:output_type -> runtime.v1.ListAvailableRuntimesResponse
+	19, // 103: runtime.v1.SandboxService.SetNetworkPolicy:output_type -> runtime.v1.SetNetworkPolicyResponse
+	84, // [84:104] is the sub-list for method output_type
+	64, // [64:84] is the sub-list for method input_type
+	64, // [64:64] is the sub-list for extension type_name
+	64, // [64:64] is the sub-list for extension extendee
+	0,  // [0:64] is the sub-list for field type_name
 }
 
 func init() { file_api_runtime_v1_sandbox_api_proto_init() }
@@ -5191,7 +5685,7 @@ func file_api_runtime_v1_sandbox_api_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_api_runtime_v1_sandbox_api_proto_rawDesc), len(file_api_runtime_v1_sandbox_api_proto_rawDesc)),
 			NumEnums:      8,
-			NumMessages:   64,
+			NumMessages:   70,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
