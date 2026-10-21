@@ -220,6 +220,7 @@ type Manager struct {
 	mu sync.RWMutex
 
 	store         store.DbStore
+	linkIndex     func(string) (int, error)
 	bridgeIP      net.IP
 	objects       bpfObjects
 	entries       map[string]persistedEntry
@@ -387,24 +388,37 @@ func (m *Manager) persistLocked() error {
 	return m.store.StoreRaw(stateStoreKey, data)
 }
 
-func (m *Manager) Restore(active map[string]Binding) error {
+func (m *Manager) Restore(active map[string]Binding, protectedMaps ...map[string]ProtectedBinding) error {
+	var protected map[string]ProtectedBinding
+	if len(protectedMaps) > 0 {
+		protected = protectedMaps[0]
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	retained, err := m.verifyProtectedLocked(active, protected)
+	if err != nil {
+		return err
+	}
 	resolved := make(map[string]persistedEntry, len(active))
 	entryRestoreOld := make(map[string]persistedEntry, len(active))
 	for sandboxID, binding := range active {
+		if _, isProtected := protected[sandboxID]; isProtected {
+			// Verified and retained above; an unknown start outcome is never
+			// promoted to a normal active restore.
+			continue
+		}
 		entry, ok := m.entries[sandboxID]
 		if !ok {
 			return fmt.Errorf("active sandbox %s has no managed network ACL state; drain the node before enabling ACL", sandboxID)
 		}
-		link, err := netlink.LinkByName(binding.HostVeth)
+		ifIndex, err := m.linkIndexByName(binding.HostVeth)
 		if err != nil {
 			return fmt.Errorf("restore network ACL for %s: find host endpoint %s: %w", sandboxID, binding.HostVeth, err)
 		}
 		oldEntry := entry
 		entry.IP = binding.IP.String()
 		entry.HostVeth = binding.HostVeth
-		entry.IfIndex = link.Attrs().Index
+		entry.IfIndex = ifIndex
 		entry.Orphaned = false
 		if !entry.Policy.Empty() {
 			if m.iptables == nil {
@@ -437,6 +451,9 @@ func (m *Manager) Restore(active map[string]Binding) error {
 		if _, ok := resolved[sandboxID]; ok {
 			continue
 		}
+		if _, ok := retained[sandboxID]; ok {
+			continue
+		}
 		inactive[sandboxID] = entry
 	}
 	if err := m.reconcileOrphansLocked(inactive); err != nil {
@@ -451,6 +468,13 @@ func (m *Manager) Restore(active map[string]Binding) error {
 				m.persistLocked(),
 			)
 		}
+		m.sourceIndex[entry.IP] = sandboxID
+	}
+	// A retained entry keeps enforcing the policy it was registered with (an
+	// entry with a durable cleanup intent never reaches retention — that
+	// uncertainty fails verification), so the DNS proxy must keep authorizing
+	// it exactly as before the restart.
+	for sandboxID, entry := range retained {
 		m.sourceIndex[entry.IP] = sandboxID
 	}
 	if err := m.persistLocked(); err != nil {
@@ -1652,4 +1676,105 @@ func networkPort(port uint16) uint16 {
 	var encoded [2]byte
 	binary.BigEndian.PutUint16(encoded[:], port)
 	return binary.LittleEndian.Uint16(encoded[:])
+}
+
+type ProtectedBinding struct {
+	Binding
+	IfIndex int
+}
+
+func (m *Manager) verifyProtectedLocked(
+	active map[string]Binding,
+	protected map[string]ProtectedBinding,
+) (map[string]persistedEntry, error) {
+	retained := make(map[string]persistedEntry, len(protected))
+	for sandboxID, owner := range protected {
+		if owner.SandboxID != sandboxID || owner.IP.To4() == nil || owner.HostVeth == "" || owner.IfIndex == 0 {
+			return nil, fmt.Errorf(
+				"protected network ACL owner for %s requires a sandbox ID, IPv4 address, host endpoint, and recorded ifindex",
+				sandboxID,
+			)
+		}
+		entry, ok := m.entries[sandboxID]
+		if !ok {
+			return nil, fmt.Errorf(
+				"pending start intent %s owns network endpoint %s/%s (ifindex %d) but has no managed network ACL state; "+
+					"reconcile the retained start (or drain the node) before enabling or restarting with ACL",
+				sandboxID, owner.IP, owner.HostVeth, owner.IfIndex,
+			)
+		}
+		if entry.Orphaned {
+			// A durable cleanup intent means deletion was already authorized
+			// and possibly partially executed before the restart; how much
+			// kernel state survives is unknowable from the persisted record.
+			// That is uncertainty, not a proof either way, so it fails.
+			return nil, fmt.Errorf(
+				"network ACL state for pending start intent %s already carries a durable cleanup intent; "+
+					"its outcome is uncertain — reconcile the retained start before restarting with ACL",
+				sandboxID,
+			)
+		}
+		if entry.IP != owner.IP.String() || entry.HostVeth != owner.HostVeth || entry.IfIndex != owner.IfIndex {
+			return nil, fmt.Errorf(
+				"network ACL state for pending start intent %s (ip %s, host endpoint %s, ifindex %d) contradicts its recorded network resource (ip %s, host endpoint %s, ifindex %d)",
+				sandboxID, entry.IP, entry.HostVeth, entry.IfIndex, owner.IP, owner.HostVeth, owner.IfIndex,
+			)
+		}
+		if binding, alsoActive := active[sandboxID]; alsoActive &&
+			(binding.HostVeth != owner.HostVeth || !binding.IP.Equal(owner.IP)) {
+			return nil, fmt.Errorf(
+				"active network resource for sandbox %s (ip %s, host endpoint %s) contradicts its pending start intent (ip %s, host endpoint %s)",
+				sandboxID, binding.IP, binding.HostVeth, owner.IP, owner.HostVeth,
+			)
+		}
+		ifIndex, err := m.linkIndexByName(owner.HostVeth)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"verify pending start intent %s: find host endpoint %s: %w",
+				sandboxID, owner.HostVeth, err,
+			)
+		}
+		if ifIndex != owner.IfIndex {
+			return nil, fmt.Errorf(
+				"host endpoint %s for pending start intent %s has ifindex %d, expected the recorded %d; "+
+					"a reused ifindex or renamed endpoint is not a takeover proof",
+				owner.HostVeth, sandboxID, ifIndex, owner.IfIndex,
+			)
+		}
+		for otherID, other := range m.entries {
+			if otherID == sandboxID {
+				continue
+			}
+			if other.IP == entry.IP || other.HostVeth == entry.HostVeth || other.IfIndex == entry.IfIndex {
+				return nil, fmt.Errorf(
+					"network ACL state for pending start intent %s conflicts with the entry owned by %s (ip %s, host endpoint %s, ifindex %d)",
+					sandboxID, otherID, other.IP, other.HostVeth, other.IfIndex,
+				)
+			}
+		}
+		for otherID, binding := range active {
+			if otherID == sandboxID {
+				continue
+			}
+			if binding.IP.Equal(owner.IP) || binding.HostVeth == owner.HostVeth {
+				return nil, fmt.Errorf(
+					"active sandbox %s claims the network endpoint (ip %s, host endpoint %s) owned by pending start intent %s",
+					otherID, binding.IP, binding.HostVeth, sandboxID,
+				)
+			}
+		}
+		retained[sandboxID] = entry
+	}
+	return retained, nil
+}
+
+func (m *Manager) linkIndexByName(name string) (int, error) {
+	if m.linkIndex != nil {
+		return m.linkIndex(name)
+	}
+	link, err := netlink.LinkByName(name)
+	if err != nil {
+		return 0, err
+	}
+	return link.Attrs().Index, nil
 }

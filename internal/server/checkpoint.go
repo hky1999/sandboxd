@@ -52,6 +52,29 @@ func (h *sandboxService) Checkpoint(
 		)
 	}
 
+	if !h.beginCheckpoint(request.ID) {
+		return nil, errord.ToGRPCf(
+			errord.ErrFailedPrecondition,
+			"checkpoint is already in progress for sandbox %s",
+			request.ID,
+		)
+	}
+	defer h.finishCheckpoint(request.ID)
+	checkpointCtx, cancel := context.WithTimeout(
+		ctx,
+		time.Duration(request.TimeoutSeconds)*time.Second,
+	)
+	defer cancel()
+	unlock, lockErr := h.resourceLocks.acquire(checkpointCtx, request.ID)
+	if lockErr != nil {
+		return nil, errord.ToGRPC(lockErr)
+	}
+	defer unlock()
+	if h.startIntents.Pending(request.ID) {
+		return nil, errord.ToGRPCf(errord.ErrFailedPrecondition,
+			"sandbox %s is protected by a pending start intent; reconcile the retained start before checkpoint", request.ID)
+	}
+
 	sandbox, err := h.sandboxManager.Get(request.ID)
 	if err != nil {
 		return nil, errord.ToGRPC(err)
@@ -83,25 +106,12 @@ func (h *sandboxService) Checkpoint(
 			sandbox.Metadata.RuntimeHandler,
 		)
 	}
-	if !h.beginCheckpoint(request.ID) {
-		return nil, errord.ToGRPCf(
-			errord.ErrFailedPrecondition,
-			"checkpoint is already in progress for sandbox %s",
-			request.ID,
-		)
-	}
-	defer h.finishCheckpoint(request.ID)
 
 	directory, err := prepareCheckpointOutputDirectory(request.CheckpointDir)
 	if err != nil {
 		return nil, errord.ToGRPC(err)
 	}
 
-	checkpointCtx, cancel := context.WithTimeout(
-		ctx,
-		time.Duration(request.TimeoutSeconds)*time.Second,
-	)
-	defer cancel()
 	cgroupPath := ""
 	var resources *runtime.LinuxSandboxResources
 	if sandbox.Metadata.RuntimeHandler == config.RuntimeNameFirecracker {
@@ -153,7 +163,86 @@ func (h *sandboxService) Checkpoint(
 		}
 		return nil, errord.ToGRPC(operationErr)
 	}
+	if h.config.PluginConfig.RuntimeConfig.CheckpointSync.SyncOutput {
+		if err := syncCheckpointOutput(directory.path); err != nil {
+			operationErr := fmt.Errorf(
+				"checkpoint sandbox %s output persistence barrier failed: %w",
+				request.ID,
+				err,
+			)
+			if cleanupErr := directory.cleanup(); cleanupErr != nil {
+				operationErr = errors.Join(operationErr, fmt.Errorf(
+					"clean checkpoint residuals in %s: %w",
+					directory.path,
+					cleanupErr,
+				))
+			}
+			return nil, errord.ToGRPCf(errord.ErrUnavailable, "%v", operationErr)
+		}
+	}
 	return &runtime.CheckpointResponse{}, nil
+}
+
+// syncCheckpointOutput walks the checkpoint output directory and fsyncs every
+// regular file and directory so an acknowledged READY implies the bytes were
+// handed to the backing filesystem. Symlinks and special entries are refused:
+// a persistence barrier must not bless output it cannot sync.
+func syncCheckpointOutput(root string) error {
+	info, err := os.Lstat(root)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("checkpoint output %s is not a directory", root)
+	}
+	return syncDirRecursive(root)
+}
+
+func syncDirRecursive(dir string) error {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		path := filepath.Join(dir, entry.Name())
+		info, err := os.Lstat(path)
+		if err != nil {
+			return err
+		}
+		switch {
+		case info.Mode()&os.ModeSymlink != 0:
+			return fmt.Errorf("checkpoint output %s is a symbolic link", path)
+		case info.IsDir():
+			if err := syncDirRecursive(path); err != nil {
+				return err
+			}
+		case info.Mode().IsRegular():
+			file, err := os.Open(path)
+			if err != nil {
+				return err
+			}
+			syncErr := file.Sync()
+			closeErr := file.Close()
+			if syncErr != nil {
+				return syncErr
+			}
+			if closeErr != nil {
+				return closeErr
+			}
+		default:
+			return fmt.Errorf("checkpoint output %s is a special file", path)
+		}
+	}
+	handle, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	syncErr := handle.Sync()
+	closeErr := handle.Close()
+	if syncErr != nil {
+		return syncErr
+	}
+	return closeErr
 }
 
 // checkpointGuestMemoryResources returns the guest-visible limit persisted in

@@ -1,0 +1,496 @@
+// Copyright (c) 2026 Ant Group Corporation.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Package checkpointchunks describes a Firecracker checkpoint's memory file
+// as fixed-size content-addressed chunks. The chunk manifest is the unit of
+// incremental distribution: a generation publishes only the chunks whose
+// digests are new, a consumer fetches by digest, and every transfer is
+// verifiable end to end. The manifest is a sidecar (chunks.json) written
+// after the artifact is sealed; it never participates in the seal.
+package checkpointchunks
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strconv"
+	"sync"
+)
+
+// ManifestName is the sidecar file written next to the memory artifact.
+const ManifestName = "chunks.json"
+
+// DefaultChunkBytes matches the uffd handler's fetch granularity: large
+// enough for bulk transfer efficiency, small enough that incremental
+// generations re-publish little.
+const DefaultChunkBytes = 256 << 10
+
+// File digest modes. Sha256 is the plain sequential whole-file hash;
+// Chunks derives the file digest as the sha256 of the concatenated chunk
+// digests (offset order) — fully parallelizable, and equivalent for
+// corruption detection because every chunk digest is checked on its own.
+const (
+	FileDigestSha256 = "sha256"
+	FileDigestChunks = "chunks"
+)
+
+// CompressionZstd marks (on a transport sidecar) that standalone memory
+// chunk objects were published compressed: the object lives at the
+// content key with a ".z" suffix and holds a zstd stream whose decoded
+// bytes hash to the chunk digest. The digest itself always names the
+// UNCOMPRESSED content — compression changes only the transport body,
+// never the addressing or verification semantics. Sealed sidecars never
+// carry the field; only publisher-built transport views do.
+const CompressionZstd = "zstd"
+
+// Chunk is one content-addressed slice of the memory file.
+type Chunk struct {
+	Offset int64  `json:"offset"`
+	Digest string `json:"digest"`
+	// Inherited marks a chunk whose bytes are not present in the local
+	// sparse artifact: its content still lives under the parent
+	// generation's object (same digest, content-addressed store). Readers
+	// must fetch it by digest instead of reading the local file at this
+	// offset; a hole in the file is exactly the bytes of the parent chunk.
+	Inherited bool `json:"inherited,omitempty"`
+}
+
+// Manifest is the chunk description of one memory file.
+type Manifest struct {
+	Version    int    `json:"version"`
+	File       string `json:"file"`
+	FileSize   int64  `json:"file_size"`
+	FileDigest string `json:"file_digest"`
+	// FileDigestMode names how FileDigest was derived: "sha256"
+	// (sequential whole-file hash, the default for pre-existing sidecars)
+	// or "chunks" (sha256 over the concatenated chunk digests).
+	FileDigestMode string                   `json:"file_digest_mode,omitempty"`
+	ChunkBytes     int                      `json:"chunk_bytes"`
+	ChunkCount     int                      `json:"chunk_count"`
+	Entries        []Chunk                  `json:"entries"`
+	Packs          map[string]PackReference `json:"packs,omitempty"`
+	// InheritedFromRoot names the parent generation's file digest whose
+	// manifest the inherited entries were copied from (audit trail for
+	// digest-inheritance sealing; absent on ordinary generations).
+	InheritedFromRoot string `json:"inherited_from_root,omitempty"`
+	// Compression names the transport body encoding of standalone chunk
+	// objects (see CompressionZstd). Empty means uncompressed objects.
+	// It is transport metadata: sealed sidecars never set it, and every
+	// digest still names uncompressed bytes.
+	Compression string `json:"compression,omitempty"`
+}
+
+// RootDigest derives the "chunks"-mode file digest from ordered chunk
+// digests: sha256 over their hex concatenation.
+func RootDigest(entries []Chunk) string {
+	h := sha256.New()
+	for i := range entries {
+		h.Write([]byte(entries[i].Digest))
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// ChunkBytesFromEnv returns the chunk size for standalone tools,
+// overridable with CHUNK_BYTES for object-store backends where 1MiB
+// objects halve the request count (the seal-side size stays fixed at
+// DefaultChunkBytes so manifests never disagree with their artifacts).
+func ChunkBytesFromEnv() int {
+	if v := os.Getenv("CHUNK_BYTES"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err == nil && n >= 4096 && n <= 4<<20 {
+			return n
+		}
+	}
+	return DefaultChunkBytes
+}
+
+// Compute chunks the checkpoint's memory file and writes the sidecar
+// manifest next to it. The whole-file digest doubles as a cross-check: a
+// consumer that fetches every chunk and re-hashes the concatenation must
+// arrive at it. The memory file is read once, sequentially.
+func Compute(ctx context.Context, dir string, chunkBytes int) (*Manifest, error) {
+	if chunkBytes <= 0 {
+		chunkBytes = DefaultChunkBytes
+	}
+	path := filepath.Join(dir, "memory")
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("open memory artifact: %w", err)
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+
+	manifest := &Manifest{
+		Version:    1,
+		File:       "memory",
+		FileSize:   info.Size(),
+		ChunkBytes: chunkBytes,
+	}
+	fileHash := sha256.New()
+	buf := make([]byte, chunkBytes)
+	var offset int64
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		n, err := io.ReadFull(f, buf)
+		if n > 0 {
+			chunkHash := sha256.New()
+			chunkHash.Write(buf[:n])
+			fileHash.Write(buf[:n])
+			manifest.Entries = append(manifest.Entries, Chunk{
+				Offset: offset,
+				Digest: hex.EncodeToString(chunkHash.Sum(nil)),
+			})
+			offset += int64(n)
+		}
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("read memory artifact: %w", err)
+		}
+	}
+	manifest.ChunkCount = len(manifest.Entries)
+	manifest.FileDigest = hex.EncodeToString(fileHash.Sum(nil))
+	manifest.FileDigestMode = FileDigestSha256
+
+	if err := Write(dir, manifest); err != nil {
+		return nil, fmt.Errorf("write chunk manifest: %w", err)
+	}
+	return manifest, nil
+}
+
+// Write stores the manifest as the sidecar file. The checkpoint finalize
+// path uses it to persist chunk digests computed in its own single pass
+// over the memory file (one-pass dual-hash); Compute is the standalone
+// equivalent for artifacts that predate it.
+func Write(dir string, manifest *Manifest) error {
+	encoded, err := json.MarshalIndent(manifest, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(dir, ManifestName), append(encoded, '\n'), 0o600)
+}
+
+// WriteNamed stores the manifest under an explicit sidecar file name,
+// used for secondary scans (the overlay's overlay.ext4.chunks.json).
+func WriteNamed(dir, name string, manifest *Manifest) error {
+	encoded, err := json.MarshalIndent(manifest, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(dir, name), append(encoded, '\n'), 0o600)
+}
+
+// MaxManifestBytes bounds one sidecar read. A 16 GiB memory file chunks into
+// ~65k entries of ~100 encoded bytes, so 32 MiB is far beyond any legitimate
+// sidecar while still rejecting unbounded input before it is buffered.
+const MaxManifestBytes = 32 << 20
+
+// LoadNamedBounded reads a sidecar under an explicit file name with its size
+// checked before any byte is buffered: a non-regular entry or a declared size
+// beyond the limit is rejected from the stat alone, and the read is bounded
+// by the stat so a file growing between the check and the read cannot force
+// an unbounded allocation.
+func LoadNamedBounded(dir, name string, limit int64) (*Manifest, error) {
+	return loadNamedBounded(dir, name, limit, false)
+}
+
+func loadNamedBounded(dir, name string, limit int64, transport bool) (*Manifest, error) {
+	path := filepath.Join(dir, name)
+	info, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+		return nil, fmt.Errorf("chunk manifest %s is not a regular file", name)
+	}
+	if info.Size() > limit {
+		return nil, fmt.Errorf("chunk manifest %s is %d bytes, exceeds the %d-byte bound", name, info.Size(), limit)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	raw, err := io.ReadAll(io.LimitReader(f, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(raw)) > limit {
+		return nil, fmt.Errorf("chunk manifest %s exceeds the %d-byte bound while reading", name, limit)
+	}
+	return decodeManifest(raw, transport)
+}
+
+// LoadNamed reads a sidecar under an explicit file name (the overlay's
+// overlay.ext4.chunks.json), bounded by MaxManifestBytes.
+func LoadNamed(dir, name string) (*Manifest, error) {
+	return LoadNamedBounded(dir, name, MaxManifestBytes)
+}
+
+// EntryAt returns the parent manifest's entry covering [offset, offset+length)
+// on the same chunk grid, for digest-inheritance sealing of holes.
+func (m *Manifest) EntryAt(offset int64, length int) (Chunk, bool) {
+	if m == nil || m.ChunkBytes <= 0 {
+		return Chunk{}, false
+	}
+	idx := int(offset / int64(m.ChunkBytes))
+	if idx < 0 || idx >= len(m.Entries) {
+		return Chunk{}, false
+	}
+	e := m.Entries[idx]
+	if e.Offset != offset {
+		return Chunk{}, false
+	}
+	if int64(length) > int64(m.ChunkBytes) {
+		return Chunk{}, false
+	}
+	return e, true
+}
+
+// SidecarName is the chunk sidecar file name for an artifact file.
+func SidecarName(file string) string { return file + "." + ManifestName }
+
+// Load reads the sidecar manifest from a checkpoint directory. A checkpoint
+// without one predates chunked distribution.
+func Load(dir string) (*Manifest, error) {
+	return LoadNamedBounded(dir, ManifestName, MaxManifestBytes)
+}
+
+// validateManifest enforces the structural invariants every consumer
+// indexes on: positive chunk size, entries matching the declared count,
+// offsets laid out as i*ChunkBytes, and a FileSize consistent with the
+// final (possibly short) chunk. A manifest failing any of these would
+// otherwise divide by zero, read out of bounds, or silently describe a
+// different file (C6).
+func validateManifest(manifest *Manifest) error {
+	if manifest.ChunkBytes <= 0 {
+		return fmt.Errorf("chunk manifest has non-positive chunk_bytes %d", manifest.ChunkBytes)
+	}
+	if manifest.ChunkCount != len(manifest.Entries) {
+		return fmt.Errorf("chunk manifest declares %d chunks but carries %d entries",
+			manifest.ChunkCount, len(manifest.Entries))
+	}
+	if manifest.File == "" {
+		return fmt.Errorf("chunk manifest has an empty file name")
+	}
+	for i := range manifest.Entries {
+		if want := int64(i) * int64(manifest.ChunkBytes); manifest.Entries[i].Offset != want {
+			return fmt.Errorf("chunk manifest entry %d offset %d breaks the %d-byte grid (want %d)",
+				i, manifest.Entries[i].Offset, manifest.ChunkBytes, want)
+		}
+	}
+	if n := len(manifest.Entries); n > 0 {
+		last := manifest.Entries[n-1].Offset
+		if manifest.FileSize <= last || manifest.FileSize > last+int64(manifest.ChunkBytes) {
+			return fmt.Errorf("chunk manifest file_size %d inconsistent with %d entries of %d bytes (tail must be in (%d, %d])",
+				manifest.FileSize, n, manifest.ChunkBytes, last, last+int64(manifest.ChunkBytes))
+		}
+	} else if manifest.FileSize != 0 {
+		return fmt.Errorf("chunk manifest with no entries must have file_size 0, got %d", manifest.FileSize)
+	}
+	switch manifest.Compression {
+	case "", CompressionZstd:
+	default:
+		return fmt.Errorf("chunk manifest names unsupported compression %q", manifest.Compression)
+	}
+	return nil
+}
+
+// ValidDigest reports whether digest is a valid content key: exactly 64
+// lowercase ASCII hexadecimal bytes. It is the shared admission check for
+// anything that addresses cache or store entries by chunk digest.
+func ValidDigest(digest string) bool { return validDigest(digest) }
+
+// validDigest accepts exactly 64 lowercase ASCII hexadecimal bytes.
+// Check bytes rather than runes: non-ASCII and malformed UTF-8 are invalid.
+func validDigest(digest string) bool {
+	if len(digest) != sha256.Size*2 {
+		return false
+	}
+	for i := 0; i < len(digest); i++ {
+		c := digest[i]
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// zeroChunkDigestCache publishes initialization before hashing, so concurrent
+// cold callers do not each allocate and hash the same all-zero chunk.
+var zeroChunkDigestCache sync.Map
+
+type zeroChunkDigestEntry struct {
+	once   sync.Once
+	digest string
+}
+
+// ZeroChunkDigest returns the sha256 of n zero bytes. Initialization uses a
+// fixed scratch buffer; the hot path retains only one digest per length.
+func ZeroChunkDigest(n int) string {
+	if n < 0 {
+		panic("negative zero chunk length")
+	}
+	value, ok := zeroChunkDigestCache.Load(n)
+	if !ok {
+		value, _ = zeroChunkDigestCache.LoadOrStore(n, &zeroChunkDigestEntry{})
+	}
+	entry := value.(*zeroChunkDigestEntry)
+	entry.once.Do(func() {
+		var block [32 << 10]byte
+		hash := sha256.New()
+		for left := n; left > 0; {
+			count := min(left, len(block))
+			hash.Write(block[:count])
+			left -= count
+		}
+		entry.digest = hex.EncodeToString(hash.Sum(nil))
+	})
+	return entry.digest
+}
+
+// Verify re-hashes the memory file chunk by chunk against the manifest.
+// It proves the sidecar still describes the artifact on disk.
+func Verify(ctx context.Context, dir string) error {
+	manifest, err := Load(dir)
+	if err != nil {
+		return err
+	}
+	f, err := os.Open(filepath.Join(dir, manifest.File))
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() || info.Size() != manifest.FileSize {
+		return fmt.Errorf("memory file size/type does not match manifest: size %d, want %d", info.Size(), manifest.FileSize)
+	}
+	return verifyContents(ctx, f, manifest)
+}
+
+// verifyContents consumes exactly the manifest's logical bytes. Callers must
+// check the backing's exact size and, for reusable proofs, its stable identity.
+func verifyContents(ctx context.Context, reader io.Reader, manifest *Manifest) error {
+	if manifest.FileDigestMode == FileDigestChunks {
+		if workers := parallelVerificationWorkers(manifest); workers > 1 {
+			return verifyContentsParallel(ctx, reader, manifest, workers)
+		}
+	}
+	buf := make([]byte, manifest.ChunkBytes)
+	fileHash := sha256.New()
+	for i, chunk := range manifest.Entries {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		length := expectedChunkLen(manifest, i)
+		if chunk.Inherited {
+			// Hole-chunk entry by construction (digest inheritance): its
+			// bytes live in the content-addressed store under this very
+			// digest, not in the local sparse artifact — reading them here
+			// yields zeros and would false-fail. Consumers verify inherited
+			// chunks per fetch; the root below still binds them in order.
+			// Discard the range so the stream stays aligned.
+			if _, err := io.CopyN(io.Discard, reader, length); err != nil {
+				return fmt.Errorf("skip inherited chunk %d: %w", i, err)
+			}
+			continue
+		}
+		if manifest.FileDigestMode == FileDigestChunks && chunk.Digest == ZeroChunkDigest(int(length)) {
+			if holes, ok := reader.(interface{ skipZeroHole(int64) (bool, error) }); ok {
+				skipped, err := holes.skipZeroHole(length)
+				if err != nil {
+					return err
+				}
+				if skipped {
+					continue
+				}
+			}
+		}
+		n, err := io.ReadFull(reader, buf)
+		if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+			return err
+		}
+		if int64(n) != expectedChunkLen(manifest, i) {
+			return fmt.Errorf("chunk %d short: %d bytes", i, n)
+		}
+		var got string
+		if chunk.Digest == ZeroChunkDigest(n) && verifiedZeroBytes(buf[:n]) {
+			// The bytes were read and checked, not inferred from sparse allocation.
+			// Reuse the known digest instead of hashing every zero block again.
+			got = chunk.Digest
+		} else {
+			sum := sha256.Sum256(buf[:n])
+			got = hex.EncodeToString(sum[:])
+		}
+		if manifest.FileDigestMode != FileDigestChunks {
+			fileHash.Write(buf[:n])
+		}
+		if got != chunk.Digest {
+			return fmt.Errorf("chunk %d (offset %d) digest mismatch: manifest %s on disk %s",
+				i, chunk.Offset, chunk.Digest, got)
+		}
+	}
+	switch manifest.FileDigestMode {
+	case "", FileDigestSha256:
+		if got := hex.EncodeToString(fileHash.Sum(nil)); got != manifest.FileDigest {
+			return fmt.Errorf("file digest mismatch: manifest %s on disk %s", manifest.FileDigest, got)
+		}
+	case FileDigestChunks:
+		// Every chunk digest was checked above; the root binds them in
+		// order, so no second whole-file pass is needed.
+		if got := RootDigest(manifest.Entries); got != manifest.FileDigest {
+			return fmt.Errorf("chunk root digest mismatch: manifest %s on disk %s", manifest.FileDigest, got)
+		}
+	default:
+		return fmt.Errorf("unknown file digest mode %q", manifest.FileDigestMode)
+	}
+	return nil
+}
+
+// A bounded immutable comparison block avoids allocating a second full chunk.
+var verificationZeroBlock [32 << 10]byte
+
+func verifiedZeroBytes(buf []byte) bool {
+	for len(buf) > 0 {
+		n := min(len(buf), len(verificationZeroBlock))
+		if !bytes.Equal(buf[:n], verificationZeroBlock[:n]) {
+			return false
+		}
+		buf = buf[n:]
+	}
+	return true
+}
+
+func expectedChunkLen(m *Manifest, i int) int64 {
+	if last := m.ChunkBytes * (m.ChunkCount - 1); int64(i) == int64(m.ChunkCount-1) && m.ChunkCount > 0 {
+		return m.FileSize - int64(last)
+	}
+	return int64(m.ChunkBytes)
+}

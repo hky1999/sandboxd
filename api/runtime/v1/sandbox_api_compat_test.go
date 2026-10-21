@@ -35,10 +35,12 @@ func TestV010WireContract(t *testing.T) {
 		t.Fatal(err)
 	}
 	sum := sha256.Sum256(wire)
-	// Rolled for StartResponse.sandbox_ip (field 4), required for YuanRong
-	// Node Proxy route registration; existing response fields are unchanged.
+	// Rolled for additive ADX identified-start/retirement RPCs and generation
+	// fields. StartResponse.sandbox_ip stays field 4; resource_generation is
+	// field 5. The three- and four-field client tests below pin compatibility.
+	// Also includes the additive node-local DescribeCheckpointArtifacts RPC.
 	// Recompute after any proto change: run this test, copy the got hash.
-	const want = "21eb701d4c16828d5f4ac42d6a50d6f644e038b6b967b4c5165a9dd025aed67b"
+	const want = "e09bc417920d032b0e067b50a0116dfd667aa6d59dcf6954b8a5b1ec8f95314e"
 	if got := hex.EncodeToString(sum[:]); got != want {
 		t.Fatalf("sandbox API descriptor hash = %s, want %s", got, want)
 	}
@@ -84,5 +86,56 @@ func TestStartResponseLegacyWireCompatibility(t *testing.T) {
 	}
 	if decoded.ID != response.ID || decoded.Message != response.Message || decoded.SandboxIp != "" {
 		t.Fatalf("legacy server response did not retain its original fields: %s", &decoded)
+	}
+}
+
+// The actually deployed ADX A0 client already reads field 4 (sandbox_ip).
+// Adding resource_generation must preserve that routing field in both directions.
+func TestStartResponseA0FourFieldWireCompatibility(t *testing.T) {
+	response := &StartResponse{
+		Code: 0, Message: "Succeed", ID: "sbox-a0-wire",
+		SandboxIp: "10.88.0.3", ResourceGeneration: "new-generation",
+	}
+	message := protodesc.ToDescriptorProto(response.ProtoReflect().Descriptor())
+	if len(message.Field) != 5 || message.Field[3].GetName() != "sandbox_ip" ||
+		message.Field[3].GetNumber() != 4 || message.Field[4].GetName() != "resource_generation" ||
+		message.Field[4].GetNumber() != 5 {
+		t.Fatalf("additive StartResponse layout changed: %s", message)
+	}
+	message.Field = message.Field[:4]
+	file, err := protodesc.NewFile(&descriptorpb.FileDescriptorProto{
+		Name:    proto.String("a0-four-field-start-response.proto"),
+		Package: proto.String("legacy_a0"), Syntax: proto.String("proto3"),
+		MessageType: []*descriptorpb.DescriptorProto{message},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wire, err := proto.Marshal(response)
+	if err != nil {
+		t.Fatal(err)
+	}
+	older := dynamicpb.NewMessage(file.Messages().Get(0))
+	if err := (proto.UnmarshalOptions{DiscardUnknown: true}).Unmarshal(wire, older); err != nil {
+		t.Fatal(err)
+	}
+	fields := older.Descriptor().Fields()
+	if older.Get(fields.ByNumber(1)).Int() != 0 ||
+		older.Get(fields.ByNumber(2)).String() != response.Message ||
+		older.Get(fields.ByNumber(3)).String() != response.ID ||
+		older.Get(fields.ByNumber(4)).String() != response.SandboxIp {
+		t.Fatalf("A0 routing fields changed: %s", older)
+	}
+	olderWire, err := proto.Marshal(older)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded StartResponse
+	if err := proto.Unmarshal(olderWire, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.ID != response.ID || decoded.Message != response.Message ||
+		decoded.SandboxIp != response.SandboxIp || decoded.ResourceGeneration != "" {
+		t.Fatalf("A0 response round trip lost routing fields: %s", &decoded)
 	}
 }

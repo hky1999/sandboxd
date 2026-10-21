@@ -25,6 +25,9 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/inclusionAI/sandboxd/pkg/checkpointroot"
+	"github.com/sirupsen/logrus"
 )
 
 const (
@@ -87,6 +90,8 @@ type firecrackerCheckpointArtifact struct {
 	Layout firecrackerCheckpointLayout
 	// Manifest is set for v2 directories only.
 	Manifest *firecrackerCheckpointManifest
+	// Exact bounded manifest bytes decoded above; root checks consume this view.
+	ManifestRaw []byte
 	// Files holds the in-directory component paths for v2 directories only.
 	Files firecrackerCheckpointFiles
 }
@@ -193,17 +198,20 @@ func finalizeFirecrackerCheckpointV2(
 		}
 		manifest.MemorySize = info.Size()
 	}
-	// Only the small VM and optional virtio-fs state components are digested.
-	// Hashing guest memory or the writable overlay costs seconds per GiB of CPU
-	// and cache reads, which can dominate checkpoint latency. Their integrity
-	// rests on local reflink copy-on-write and Firecracker's own writes.
-	manifest.Digests = make(map[string]string, 2)
+	// Every payload must be covered before publishing the logical seal. Local
+	// reflink ownership alone is not a portable content identity: admission
+	// and the opened restore view must bind memory AND the writable overlay.
+	// The handler invokes this tail after resume for leave-running snapshots;
+	// publication's existing durability barrier remains a separate step.
+	manifest.Digests = make(map[string]string, len(firecrackerCheckpointComponents(files)))
 	for _, component := range firecrackerCheckpointComponents(files) {
-		if component.name == firecrackerCheckpointMemoryName ||
-			component.name == firecrackerCheckpointOverlayName {
-			continue
-		}
+		started := time.Now()
 		digest, err := digestFirecrackerCheckpointComponent(ctx, component.name, component.path)
+		logrus.WithFields(logrus.Fields{
+			"timing_phase": "seal_component_digest", "checkpoint_dir": filepath.Dir(files.State),
+			"component": component.name, "component_path": component.path,
+			"elapsed_ns": time.Since(started).Nanoseconds(), "success": err == nil,
+		}).Info("firecracker: checkpoint phase timing")
 		if err != nil {
 			return err
 		}
@@ -214,6 +222,14 @@ func finalizeFirecrackerCheckpointV2(
 		filepath.Dir(files.State),
 		firecrackerCheckpointManifestName,
 	)
+	manifestStarted := time.Now()
+	defer func() {
+		logrus.WithFields(logrus.Fields{
+			"timing_phase": "seal_manifest_write", "checkpoint_dir": filepath.Dir(files.State),
+			"component": firecrackerCheckpointManifestName, "component_path": manifestPath,
+			"elapsed_ns": time.Since(manifestStarted).Nanoseconds(), "success": retErr == nil,
+		}).Info("firecracker: checkpoint phase timing")
+	}()
 	encoded, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {
 		return fmt.Errorf("encode Firecracker checkpoint manifest: %w", err)
@@ -253,13 +269,14 @@ func openFirecrackerCheckpoint(dir string) (*firecrackerCheckpointArtifact, erro
 		return nil, fmt.Errorf("inspect Firecracker checkpoint directory: %w", err)
 	}
 
-	manifest, err := readFirecrackerCheckpointManifest(dir)
+	manifest, manifestRaw, err := readFirecrackerCheckpointManifestView(dir)
 	if err != nil {
 		return nil, err
 	}
 	artifact := &firecrackerCheckpointArtifact{
-		Layout:   firecrackerCheckpointLayoutV2Directory,
-		Manifest: manifest,
+		Layout:      firecrackerCheckpointLayoutV2Directory,
+		Manifest:    manifest,
+		ManifestRaw: manifestRaw,
 		Files: firecrackerCheckpointFiles{
 			State:   filepath.Join(dir, firecrackerCheckpointStateName),
 			Memory:  filepath.Join(dir, firecrackerCheckpointMemoryName),
@@ -304,17 +321,21 @@ func openFirecrackerCheckpoint(dir string) (*firecrackerCheckpointArtifact, erro
 // readFirecrackerCheckpointManifest parses and validates the manifest of a v2
 // checkpoint directory.
 func readFirecrackerCheckpointManifest(dir string) (*firecrackerCheckpointManifest, error) {
-	path := filepath.Join(dir, firecrackerCheckpointManifestName)
-	encoded, err := os.ReadFile(path)
+	manifest, _, err := readFirecrackerCheckpointManifestView(dir)
+	return manifest, err
+}
+
+func readFirecrackerCheckpointManifestView(dir string) (*firecrackerCheckpointManifest, []byte, error) {
+	encoded, err := checkpointroot.ReadManifestBounded(dir)
 	if err != nil {
-		return nil, fmt.Errorf("read Firecracker checkpoint manifest: %w", err)
+		return nil, nil, fmt.Errorf("read Firecracker checkpoint manifest: %w", err)
 	}
 	var manifest firecrackerCheckpointManifest
 	if err := json.Unmarshal(encoded, &manifest); err != nil {
-		return nil, fmt.Errorf("decode Firecracker checkpoint manifest: %w", err)
+		return nil, nil, fmt.Errorf("decode Firecracker checkpoint manifest: %w", err)
 	}
 	if manifest.Version != firecrackerCheckpointVersion2 {
-		return nil, fmt.Errorf(
+		return nil, nil, fmt.Errorf(
 			"unsupported Firecracker checkpoint manifest version %d",
 			manifest.Version,
 		)
@@ -324,13 +345,13 @@ func readFirecrackerCheckpointManifest(dir string) (*firecrackerCheckpointManife
 		firecrackerSnapshotTypeIncremental,
 		firecrackerSnapshotTypeSoftDirty:
 	default:
-		return nil, fmt.Errorf(
+		return nil, nil, fmt.Errorf(
 			"invalid Firecracker checkpoint snapshot type %q",
 			manifest.SnapshotType,
 		)
 	}
 	if manifest.MemorySize <= 0 || manifest.MemorySize > firecrackerCheckpointMaxComponent {
-		return nil, fmt.Errorf(
+		return nil, nil, fmt.Errorf(
 			"Firecracker checkpoint manifest has unbounded memory size %d",
 			manifest.MemorySize,
 		)
@@ -343,14 +364,14 @@ func readFirecrackerCheckpointManifest(dir string) (*firecrackerCheckpointManife
 			"initrd":      manifest.Compat.Initrd,
 		} {
 			if digest != "" && !isFirecrackerCompatDigest(digest) {
-				return nil, fmt.Errorf(
+				return nil, nil, fmt.Errorf(
 					"Firecracker checkpoint compat %s digest %q is not a sha256 hex string",
 					name, digest,
 				)
 			}
 		}
 	}
-	return &manifest, nil
+	return &manifest, encoded, nil
 }
 
 func isFirecrackerCompatDigest(digest string) bool {
@@ -407,6 +428,7 @@ func (cache *checkpointDigestCache) verifyFirecrackerCheckpointDigests(
 		if !recorded || expected == "" {
 			continue
 		}
+		componentStarted := time.Now()
 		info, err := os.Lstat(component.path)
 		if err != nil {
 			return fmt.Errorf(
@@ -415,17 +437,30 @@ func (cache *checkpointDigestCache) verifyFirecrackerCheckpointDigests(
 			)
 		}
 		digest, cached := cache.lookup(component.path, info)
+		hashElapsed := time.Duration(0)
+		recordTiming := func(success bool) {
+			logrus.WithFields(logrus.Fields{
+				"timing_phase": "verify_component_digest", "checkpoint_dir": filepath.Dir(artifact.Files.State),
+				"component": component.name, "component_path": component.path,
+				"cache_hit": cached, "hash_elapsed_ns": hashElapsed.Nanoseconds(),
+				"elapsed_ns": time.Since(componentStarted).Nanoseconds(), "success": success,
+			}).Info("firecracker: checkpoint phase timing")
+		}
 		if !cached {
+			hashStarted := time.Now()
 			digest, err = digestFirecrackerCheckpointComponent(
 				ctx,
 				component.name,
 				component.path,
 			)
+			hashElapsed = time.Since(hashStarted)
 			if err != nil {
+				recordTiming(false)
 				return err
 			}
 			cache.remember(component.path, info, digest)
 		}
+		recordTiming(digest == expected)
 		if digest != expected {
 			return fmt.Errorf(
 				"Firecracker checkpoint component %s digest mismatch: manifest %s, on disk %s",

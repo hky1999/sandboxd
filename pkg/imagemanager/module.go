@@ -155,15 +155,7 @@ func (m *Module) ReconcileRecoveredDaemons() error {
 // to mount_records.db) and the OCI manager (releases overlay mounts). It
 // is safe to call multiple times; only the first call performs work.
 func (m *Module) Stop() {
-	m.closedOnce.Do(func() {
-		m.healthy.Store(false)
-		if m.worker != nil {
-			m.worker.Close()
-		}
-		if m.ociMgr != nil {
-			m.ociMgr.Close()
-		}
-	})
+	m.StopPreserving(nil)
 }
 
 // Healthy returns true while the module is constructed and not yet
@@ -213,4 +205,18 @@ func parseMemorySize(s string) (int64, error) {
 		multiplier = 1000 * 1000 * 1000 * 1000
 	}
 	return int64(val * multiplier), nil
+}
+
+func (m *Module) StopPreserving(preserveImages map[string]bool) {
+	m.closedOnce.Do(func() {
+		m.healthy.Store(false)
+		if m.worker != nil {
+			m.worker.Close()
+		}
+		if m.ociMgr != nil {
+			if err := m.ociMgr.ClosePreserving(preserveImages); err != nil {
+				logrus.Warnf("oci manager shutdown: %v", err)
+			}
+		}
+	})
 }

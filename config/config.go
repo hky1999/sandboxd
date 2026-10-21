@@ -93,6 +93,9 @@ type RuntimeConfig struct {
 	// Runsc configures the gVisor runtime adapter.
 	Runsc RunscConfig `toml:"runsc" json:"runsc"`
 
+	// CheckpointSync configures checkpoint output persistence semantics.
+	CheckpointSync CheckpointSyncConfig `toml:"checkpoint_sync" json:"checkpointSync"`
+
 	// Kata configures the optional Kata Containers runtime adapter. Kata is
 	// loaded only when runtime_binary contains a "kata" entry.
 	Kata KataConfig `toml:"kata" json:"kata"`
@@ -145,6 +148,25 @@ type RunscConfig struct {
 	// ExtraArgs supplies operator-owned runsc flags. Nil preserves --net-raw;
 	// an explicitly empty list disables that default.
 	ExtraArgs []string `toml:"extra_args" json:"extraArgs"`
+	// BackgroundRestore restores runsc sandboxes with background page
+	// loading: the restore completes once the pages needed to resume are
+	// available and the remaining pages load asynchronously with fault
+	// priority. The default false keeps fully synchronous restores.
+	BackgroundRestore bool `toml:"background_restore" json:"backgroundRestore"`
+}
+
+// CheckpointSyncConfig gates the final persistence barrier for checkpoint
+// output directories.
+type CheckpointSyncConfig struct {
+	// SyncOutput fsyncs every regular file and directory below the checkpoint
+	// output directory before the Checkpoint RPC acknowledges success. It
+	// exists for backends whose durability must be established before READY
+	// (for example a shared filesystem used for cross-node recovery); the
+	// default false preserves the historical local-only contract that does
+	// not force writeback. A barrier failure fails the checkpoint: READY is
+	// never acknowledged over output we cannot persist. Special entries
+	// (symlinks, devices, sockets) are rejected rather than synced.
+	SyncOutput bool `toml:"sync_output" json:"syncOutput"`
 }
 
 // KataConfig contains the host paths and storage settings used by Kata.
@@ -164,6 +186,10 @@ type RuncConfig struct {
 
 // FirecrackerConfig contains immutable guest boot artifacts and VM defaults.
 type FirecrackerConfig struct {
+	// StorageDir selects private writable-disk and live-memory storage.
+	// Empty preserves filestore_dir/.firecracker; it is not a checkpoint
+	// publication root or a shared application volume.
+	StorageDir string `toml:"storage_dir" json:"storageDir"`
 	// WritableIOEngine selects Sync, Async, SyncDirect, or AsyncDirect for
 	// the private ext4 disk. Direct engines require a compatible VMM.
 	// The host must provide STATX_DIOALIGN for direct engines and io_uring

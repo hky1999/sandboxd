@@ -358,6 +358,16 @@ func cleanupFirecrackerVirtioFS(state *firecrackerVirtioFSState, binary string) 
 		return nil
 	}
 	stopFirecrackerVirtioFS(state, binary)
+	return cleanupFirecrackerVirtioFSArtifacts(state)
+}
+
+// cleanupFirecrackerVirtioFSArtifacts performs only filesystem cleanup. A
+// retirement caller first proves process exit through its pinned pidfd and
+// must not re-probe or signal a numerically reused PID during cleanup.
+func cleanupFirecrackerVirtioFSArtifacts(state *firecrackerVirtioFSState) error {
+	if state == nil {
+		return nil
+	}
 	unmountErr := unmountFirecrackerVirtioFSShared(state.SharedDir)
 	var removeErr error
 	if unmountErr == nil {

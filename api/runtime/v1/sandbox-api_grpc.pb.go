@@ -33,14 +33,19 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	SandboxService_Start_FullMethodName                 = "/runtime.v1.SandboxService/Start"
-	SandboxService_Checkpoint_FullMethodName            = "/runtime.v1.SandboxService/Checkpoint"
-	SandboxService_Delete_FullMethodName                = "/runtime.v1.SandboxService/Delete"
-	SandboxService_Wait_FullMethodName                  = "/runtime.v1.SandboxService/Wait"
-	SandboxService_List_FullMethodName                  = "/runtime.v1.SandboxService/List"
-	SandboxService_Stats_FullMethodName                 = "/runtime.v1.SandboxService/Stats"
-	SandboxService_ListAvailableRuntimes_FullMethodName = "/runtime.v1.SandboxService/ListAvailableRuntimes"
-	SandboxService_SetNetworkPolicy_FullMethodName      = "/runtime.v1.SandboxService/SetNetworkPolicy"
+	SandboxService_Start_FullMethodName                       = "/runtime.v1.SandboxService/Start"
+	SandboxService_StartWithOperation_FullMethodName          = "/runtime.v1.SandboxService/StartWithOperation"
+	SandboxService_GetStartOperation_FullMethodName           = "/runtime.v1.SandboxService/GetStartOperation"
+	SandboxService_RetireStartOperation_FullMethodName        = "/runtime.v1.SandboxService/RetireStartOperation"
+	SandboxService_DeleteIfGeneration_FullMethodName          = "/runtime.v1.SandboxService/DeleteIfGeneration"
+	SandboxService_Checkpoint_FullMethodName                  = "/runtime.v1.SandboxService/Checkpoint"
+	SandboxService_DescribeCheckpointArtifacts_FullMethodName = "/runtime.v1.SandboxService/DescribeCheckpointArtifacts"
+	SandboxService_Delete_FullMethodName                      = "/runtime.v1.SandboxService/Delete"
+	SandboxService_Wait_FullMethodName                        = "/runtime.v1.SandboxService/Wait"
+	SandboxService_List_FullMethodName                        = "/runtime.v1.SandboxService/List"
+	SandboxService_Stats_FullMethodName                       = "/runtime.v1.SandboxService/Stats"
+	SandboxService_ListAvailableRuntimes_FullMethodName       = "/runtime.v1.SandboxService/ListAvailableRuntimes"
+	SandboxService_SetNetworkPolicy_FullMethodName            = "/runtime.v1.SandboxService/SetNetworkPolicy"
 )
 
 // SandboxServiceClient is the client API for SandboxService service.
@@ -51,8 +56,16 @@ const (
 type SandboxServiceClient interface {
 	// Start creates and starts a sandbox.
 	Start(ctx context.Context, in *StartRequest, opts ...grpc.CallOption) (*StartResponse, error)
+	StartWithOperation(ctx context.Context, in *StartWithOperationRequest, opts ...grpc.CallOption) (*StartOperationStatus, error)
+	GetStartOperation(ctx context.Context, in *GetStartOperationRequest, opts ...grpc.CallOption) (*StartOperationStatus, error)
+	// Persist no-future-start before waiting for and retiring this operation.
+	RetireStartOperation(ctx context.Context, in *RetireStartOperationRequest, opts ...grpc.CallOption) (*RetireStartOperationResponse, error)
+	DeleteIfGeneration(ctx context.Context, in *DeleteIfGenerationRequest, opts ...grpc.CallOption) (*DeleteIfGenerationResponse, error)
 	// Checkpoint saves a running sandbox into a caller-owned directory.
 	Checkpoint(ctx context.Context, in *CheckpointRequest, opts ...grpc.CallOption) (*CheckpointResponse, error)
+	// DescribeCheckpointArtifacts reads the sealed metadata identity for a
+	// caller-protected immutable checkpoint; it does not lease or publish it.
+	DescribeCheckpointArtifacts(ctx context.Context, in *DescribeCheckpointArtifactsRequest, opts ...grpc.CallOption) (*RestoreArtifactIdentity, error)
 	// Delete force-deletes a sandbox.
 	Delete(ctx context.Context, in *DeleteRequest, opts ...grpc.CallOption) (*DeleteResponse, error)
 	// Wait waits for a sandbox to exit.
@@ -85,10 +98,60 @@ func (c *sandboxServiceClient) Start(ctx context.Context, in *StartRequest, opts
 	return out, nil
 }
 
+func (c *sandboxServiceClient) StartWithOperation(ctx context.Context, in *StartWithOperationRequest, opts ...grpc.CallOption) (*StartOperationStatus, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(StartOperationStatus)
+	err := c.cc.Invoke(ctx, SandboxService_StartWithOperation_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *sandboxServiceClient) GetStartOperation(ctx context.Context, in *GetStartOperationRequest, opts ...grpc.CallOption) (*StartOperationStatus, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(StartOperationStatus)
+	err := c.cc.Invoke(ctx, SandboxService_GetStartOperation_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *sandboxServiceClient) RetireStartOperation(ctx context.Context, in *RetireStartOperationRequest, opts ...grpc.CallOption) (*RetireStartOperationResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RetireStartOperationResponse)
+	err := c.cc.Invoke(ctx, SandboxService_RetireStartOperation_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *sandboxServiceClient) DeleteIfGeneration(ctx context.Context, in *DeleteIfGenerationRequest, opts ...grpc.CallOption) (*DeleteIfGenerationResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DeleteIfGenerationResponse)
+	err := c.cc.Invoke(ctx, SandboxService_DeleteIfGeneration_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *sandboxServiceClient) Checkpoint(ctx context.Context, in *CheckpointRequest, opts ...grpc.CallOption) (*CheckpointResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(CheckpointResponse)
 	err := c.cc.Invoke(ctx, SandboxService_Checkpoint_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *sandboxServiceClient) DescribeCheckpointArtifacts(ctx context.Context, in *DescribeCheckpointArtifactsRequest, opts ...grpc.CallOption) (*RestoreArtifactIdentity, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RestoreArtifactIdentity)
+	err := c.cc.Invoke(ctx, SandboxService_DescribeCheckpointArtifacts_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -163,8 +226,16 @@ func (c *sandboxServiceClient) SetNetworkPolicy(ctx context.Context, in *SetNetw
 type SandboxServiceServer interface {
 	// Start creates and starts a sandbox.
 	Start(context.Context, *StartRequest) (*StartResponse, error)
+	StartWithOperation(context.Context, *StartWithOperationRequest) (*StartOperationStatus, error)
+	GetStartOperation(context.Context, *GetStartOperationRequest) (*StartOperationStatus, error)
+	// Persist no-future-start before waiting for and retiring this operation.
+	RetireStartOperation(context.Context, *RetireStartOperationRequest) (*RetireStartOperationResponse, error)
+	DeleteIfGeneration(context.Context, *DeleteIfGenerationRequest) (*DeleteIfGenerationResponse, error)
 	// Checkpoint saves a running sandbox into a caller-owned directory.
 	Checkpoint(context.Context, *CheckpointRequest) (*CheckpointResponse, error)
+	// DescribeCheckpointArtifacts reads the sealed metadata identity for a
+	// caller-protected immutable checkpoint; it does not lease or publish it.
+	DescribeCheckpointArtifacts(context.Context, *DescribeCheckpointArtifactsRequest) (*RestoreArtifactIdentity, error)
 	// Delete force-deletes a sandbox.
 	Delete(context.Context, *DeleteRequest) (*DeleteResponse, error)
 	// Wait waits for a sandbox to exit.
@@ -190,8 +261,23 @@ type UnimplementedSandboxServiceServer struct{}
 func (UnimplementedSandboxServiceServer) Start(context.Context, *StartRequest) (*StartResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Start not implemented")
 }
+func (UnimplementedSandboxServiceServer) StartWithOperation(context.Context, *StartWithOperationRequest) (*StartOperationStatus, error) {
+	return nil, status.Error(codes.Unimplemented, "method StartWithOperation not implemented")
+}
+func (UnimplementedSandboxServiceServer) GetStartOperation(context.Context, *GetStartOperationRequest) (*StartOperationStatus, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetStartOperation not implemented")
+}
+func (UnimplementedSandboxServiceServer) RetireStartOperation(context.Context, *RetireStartOperationRequest) (*RetireStartOperationResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method RetireStartOperation not implemented")
+}
+func (UnimplementedSandboxServiceServer) DeleteIfGeneration(context.Context, *DeleteIfGenerationRequest) (*DeleteIfGenerationResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method DeleteIfGeneration not implemented")
+}
 func (UnimplementedSandboxServiceServer) Checkpoint(context.Context, *CheckpointRequest) (*CheckpointResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Checkpoint not implemented")
+}
+func (UnimplementedSandboxServiceServer) DescribeCheckpointArtifacts(context.Context, *DescribeCheckpointArtifactsRequest) (*RestoreArtifactIdentity, error) {
+	return nil, status.Error(codes.Unimplemented, "method DescribeCheckpointArtifacts not implemented")
 }
 func (UnimplementedSandboxServiceServer) Delete(context.Context, *DeleteRequest) (*DeleteResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Delete not implemented")
@@ -250,6 +336,78 @@ func _SandboxService_Start_Handler(srv interface{}, ctx context.Context, dec fun
 	return interceptor(ctx, in, info, handler)
 }
 
+func _SandboxService_StartWithOperation_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(StartWithOperationRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SandboxServiceServer).StartWithOperation(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SandboxService_StartWithOperation_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SandboxServiceServer).StartWithOperation(ctx, req.(*StartWithOperationRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SandboxService_GetStartOperation_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetStartOperationRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SandboxServiceServer).GetStartOperation(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SandboxService_GetStartOperation_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SandboxServiceServer).GetStartOperation(ctx, req.(*GetStartOperationRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SandboxService_RetireStartOperation_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RetireStartOperationRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SandboxServiceServer).RetireStartOperation(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SandboxService_RetireStartOperation_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SandboxServiceServer).RetireStartOperation(ctx, req.(*RetireStartOperationRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SandboxService_DeleteIfGeneration_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DeleteIfGenerationRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SandboxServiceServer).DeleteIfGeneration(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SandboxService_DeleteIfGeneration_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SandboxServiceServer).DeleteIfGeneration(ctx, req.(*DeleteIfGenerationRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _SandboxService_Checkpoint_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(CheckpointRequest)
 	if err := dec(in); err != nil {
@@ -264,6 +422,24 @@ func _SandboxService_Checkpoint_Handler(srv interface{}, ctx context.Context, de
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(SandboxServiceServer).Checkpoint(ctx, req.(*CheckpointRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SandboxService_DescribeCheckpointArtifacts_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DescribeCheckpointArtifactsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SandboxServiceServer).DescribeCheckpointArtifacts(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SandboxService_DescribeCheckpointArtifacts_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SandboxServiceServer).DescribeCheckpointArtifacts(ctx, req.(*DescribeCheckpointArtifactsRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -388,8 +564,28 @@ var SandboxService_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _SandboxService_Start_Handler,
 		},
 		{
+			MethodName: "StartWithOperation",
+			Handler:    _SandboxService_StartWithOperation_Handler,
+		},
+		{
+			MethodName: "GetStartOperation",
+			Handler:    _SandboxService_GetStartOperation_Handler,
+		},
+		{
+			MethodName: "RetireStartOperation",
+			Handler:    _SandboxService_RetireStartOperation_Handler,
+		},
+		{
+			MethodName: "DeleteIfGeneration",
+			Handler:    _SandboxService_DeleteIfGeneration_Handler,
+		},
+		{
 			MethodName: "Checkpoint",
 			Handler:    _SandboxService_Checkpoint_Handler,
+		},
+		{
+			MethodName: "DescribeCheckpointArtifacts",
+			Handler:    _SandboxService_DescribeCheckpointArtifacts_Handler,
 		},
 		{
 			MethodName: "Delete",

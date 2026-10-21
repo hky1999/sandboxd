@@ -96,12 +96,13 @@ func NewHandler(cfg config.Config, bin string, loader runtimecore.OciLoader) (*H
 
 	return &Handler{
 		runsc: NewClientWithOptions(bin, runscRoot, Options{
-			ExtraArgs:        cfg.RuntimeConfig.Runsc.ExtraArgs,
-			Platform:         platform,
-			FilestoreDir:     cfg.RuntimeConfig.FilestoreDir,
-			OverlayTmpfsSize: cfg.RuntimeConfig.OverlayTmpfsSize,
-			DebugLogPath:     runscLogPath,
-			IgnoreCgroups:    cfg.DisableCgroup,
+			ExtraArgs:         cfg.RuntimeConfig.Runsc.ExtraArgs,
+			Platform:          platform,
+			FilestoreDir:      cfg.RuntimeConfig.FilestoreDir,
+			OverlayTmpfsSize:  cfg.RuntimeConfig.OverlayTmpfsSize,
+			DebugLogPath:      runscLogPath,
+			IgnoreCgroups:     cfg.DisableCgroup,
+			BackgroundRestore: cfg.RuntimeConfig.Runsc.BackgroundRestore,
 		}),
 		ociLoader:              loader,
 		rootfsOverlayTmpfsSize: cfg.RuntimeConfig.OverlayTmpfsSize,
@@ -195,19 +196,19 @@ func (r *Handler) Start(ctx context.Context, config runtimecore.StartConfig) err
 }
 
 func (r *Handler) Checkpoint(ctx context.Context, config runtimecore.CheckpointConfig) error {
-	return r.runsc.Checkpoint(
-		ctx,
-		config.ID,
-		config.Directory,
-		config.Compress,
-		config.LeaveRunning,
-	)
+	if err := r.runsc.Checkpoint(ctx, config.ID, config.Directory, config.Compress, config.LeaveRunning); err != nil {
+		return err
+	}
+	return sealRunscCheckpoint(ctx, config.Directory)
 }
 
 func (r *Handler) Restore(
 	ctx context.Context,
 	config runtimecore.StartConfig,
 ) (retErr error) {
+	if err := r.verifyExpectedCheckpointRoot(ctx, config); err != nil {
+		return err
+	}
 	traceID, _ := trace.GetContextID(ctx)
 	if config.Network == nil {
 		return fmt.Errorf("network is required")
@@ -261,11 +262,12 @@ func (r *Handler) Restore(
 	}
 
 	startArgs := StartArgs{
-		ID:          config.ID,
-		BundleDir:   bundlePath,
-		UserStdout:  config.Stdout,
-		UserStderr:  config.Stderr,
-		RootOverlay: rootOverlay,
+		ID:                     config.ID,
+		BundleDir:              bundlePath,
+		UserStdout:             config.Stdout,
+		UserStderr:             config.Stderr,
+		RootOverlay:            rootOverlay,
+		ExpectedCheckpointRoot: config.ExpectedCheckpointRoot,
 		Network: NetworkConfig{
 			Interface:   config.Network.Interface,
 			LinkAddress: config.Network.GuestHardwareAddr(),

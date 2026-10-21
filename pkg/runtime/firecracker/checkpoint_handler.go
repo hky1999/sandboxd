@@ -660,7 +660,16 @@ func instantiateFirecrackerCheckpoint(
 		}
 		return files, info.Size(), nil
 	case firecrackerCheckpointLayoutV2Directory:
-		if err := digests.verifyFirecrackerCheckpointDigests(ctx, artifact); err != nil {
+		instantiateStarted := time.Now()
+		verifyStarted := time.Now()
+		err := digests.verifyFirecrackerCheckpointDigests(ctx, artifact)
+		verifyElapsed := time.Since(verifyStarted)
+		logrus.WithFields(logrus.Fields{
+			"timing_phase": "instantiate_verify", "checkpoint_dir": checkpointDir,
+			"state_dir": stateDir, "elapsed_ns": verifyElapsed.Nanoseconds(),
+			"success": err == nil,
+		}).Info("firecracker: checkpoint phase timing")
+		if err != nil {
 			return files, 0, fmt.Errorf(
 				"verify Firecracker checkpoint %s: %w",
 				checkpointDir, err,
@@ -672,12 +681,29 @@ func instantiateFirecrackerCheckpoint(
 		// The cloned overlay is a live runtime file, not a durable artifact.
 		// FICLONE makes it immediately usable by Firecracker; syncing here can
 		// force unrelated deferred checkpoint writeback onto restore latency.
-		if _, err := cloneFileNoSync(artifact.Files.Overlay, files.Overlay); err != nil {
+		cloneStarted := time.Now()
+		_, err = cloneFileNoSync(artifact.Files.Overlay, files.Overlay)
+		cloneElapsed := time.Since(cloneStarted)
+		logrus.WithFields(logrus.Fields{
+			"timing_phase": "instantiate_overlay_clone_call", "checkpoint_dir": checkpointDir,
+			"state_dir": stateDir, "elapsed_ns": cloneElapsed.Nanoseconds(),
+			"success": err == nil,
+		}).Info("firecracker: checkpoint phase timing")
+		if err != nil {
 			return files, 0, fmt.Errorf("instantiate Firecracker writable layer: %w", err)
 		}
 		if err := checkRestoredMemorySize(artifact.Manifest.MemorySize); err != nil {
 			return files, 0, err
 		}
+		totalElapsed := time.Since(instantiateStarted)
+		logrus.WithFields(logrus.Fields{
+			"timing_phase": "instantiate_v2_total", "checkpoint_dir": checkpointDir,
+			"state_dir": stateDir, "elapsed_ns": totalElapsed.Nanoseconds(),
+			"verify_elapsed_ns":             verifyElapsed.Nanoseconds(),
+			"overlay_clone_call_elapsed_ns": cloneElapsed.Nanoseconds(),
+			"remainder_elapsed_ns":          (totalElapsed - verifyElapsed - cloneElapsed).Nanoseconds(),
+			"success":                       true,
+		}).Info("firecracker: checkpoint phase timing")
 		return files, artifact.Manifest.MemorySize, nil
 	}
 	return files, 0, fmt.Errorf(
@@ -717,6 +743,9 @@ func (handler *Handler) Restore(
 			"refuse Firecracker restore from %s: %w",
 			startConfig.CheckpointDir, err,
 		)
+	}
+	if err := verifyFirecrackerExpectedRoot(startConfig, artifact); err != nil {
+		return err
 	}
 	if startConfig.DisableCgroup || startConfig.CgroupPath == "" {
 		return errors.New("Firecracker requires a managed cgroup")
@@ -774,6 +803,12 @@ func (handler *Handler) Restore(
 	stateDir := filepath.Join(bundlePath, firecrackerArtifactsDir)
 	if err := os.Mkdir(stateDir, 0700); err != nil {
 		return fmt.Errorf("create Firecracker restore state directory: %w", err)
+	}
+	if err := syncFirecrackerIdentityDirectory(bundlePath); err != nil {
+		return err
+	}
+	if err := syncFirecrackerIdentityDirectory(filepath.Dir(bundlePath)); err != nil {
+		return err
 	}
 	runtimeDir := handler.runtimeDirectory(startConfig.ID)
 	runtimeCreated := false
@@ -853,12 +888,20 @@ func (handler *Handler) Restore(
 	if err != nil {
 		return err
 	}
+	tInstantiateReturned := time.Now()
 	if err := os.Symlink(checkpointFiles.Overlay, filepath.Join(
 		stateDir, firecrackerCheckpointOverlayName,
 	)); err != nil {
 		return fmt.Errorf("link restored Firecracker writable layer: %w", err)
 	}
 	tInstantiated := time.Now()
+	logrus.WithFields(logrus.Fields{
+		"timing_phase": "restore_instantiate_window", "sandbox_id": startConfig.ID,
+		"checkpoint_dir": startConfig.CheckpointDir, "state_dir": stateDir,
+		"elapsed_ns":              tInstantiated.Sub(tPrepared).Nanoseconds(),
+		"overlay_link_elapsed_ns": tInstantiated.Sub(tInstantiateReturned).Nanoseconds(),
+		"success":                 true,
+	}).Info("firecracker: checkpoint phase timing")
 
 	stdout, err := openFirecrackerOutput(startConfig.Stdout)
 	if err != nil {
@@ -911,6 +954,7 @@ func (handler *Handler) Restore(
 	instance := &firecrackerInstance{
 		state: firecrackerPersistedState{
 			ID:          startConfig.ID,
+			Generation:  startConfig.ResourceGeneration,
 			PID:         command.Process.Pid,
 			BundlePath:  bundlePath,
 			APIPath:     apiPath,

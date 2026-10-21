@@ -128,6 +128,20 @@ func (m *InterfaceManager) load(ips sets.Set[string]) error {
 				logrus.Warnf("retain invalid ephemeral lease %s: %v", id, idErr)
 				continue
 			}
+			if m.preserveEphemeral != nil && m.preserveEphemeral(sandboxID) {
+				// A pending start intent owns this lease: absent metadata is
+				// exactly the state a retained start leaves, not evidence the
+				// endpoint is orphaned. Keep the device and namespace exactly
+				// as the metadata-exists path does.
+				logrus.Warnf(
+					"retain ephemeral lease %s for pending start intent %s without metadata",
+					id, sandboxID,
+				)
+				ephemeralByIP[ip] = id
+				knownNetNS.Insert(filepath.Clean(resource.NetNSPath))
+				ips.Delete(ip)
+				continue
+			}
 			metadataPath := filepath.Join(m.sandboxRoot, sandboxID, config.SandboxMetaFile)
 			if _, statErr := os.Stat(metadataPath); os.IsNotExist(statErr) {
 				if destroyErr := m.destroyDevice(*resource.Interface); destroyErr != nil {

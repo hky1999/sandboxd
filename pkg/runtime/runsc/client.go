@@ -66,6 +66,8 @@ type Options struct {
 	DebugLogPath       string
 	IgnoreCgroups      bool
 	PlatformDevicePath string
+	// BackgroundRestore restores with runsc background page loading.
+	BackgroundRestore bool
 }
 
 type StartArgs struct {
@@ -74,7 +76,9 @@ type StartArgs struct {
 	UserStdout  string
 	UserStderr  string
 	RootOverlay string
-	Network     NetworkConfig
+	// ExpectedCheckpointRoot binds the actual opened restore files to admission.
+	ExpectedCheckpointRoot string
+	Network                NetworkConfig
 }
 
 func NewClient(binary, rootDir string) *Client {
@@ -337,6 +341,16 @@ func (c *Client) Restore(ctx context.Context, args StartArgs, imagePath string) 
 	if imagePath == "" {
 		return fmt.Errorf("checkpoint image path is empty for %s", args.ID)
 	}
+	var files []*os.File
+	var havePagesFile bool
+	var err error
+	if args.ExpectedCheckpointRoot != "" {
+		files, havePagesFile, err = openVerifiedRestoreFiles(ctx, imagePath, args.ExpectedCheckpointRoot)
+		if err != nil {
+			return fmt.Errorf("verify opened checkpoint files for %s: %w", args.ID, err)
+		}
+		defer closeFiles(files)
+	}
 	if args.Network.Interface == nil {
 		return fmt.Errorf("network interface is nil for %s", args.ID)
 	}
@@ -364,15 +378,18 @@ func (c *Client) Restore(ctx context.Context, args StartArgs, imagePath string) 
 	if err := callContextWithTimeout(ctx, conn, contMgrSetNetworkArgs, networkArgs, nil, 30*time.Second); err != nil {
 		return fmt.Errorf("set network arguments for %s: %w", args.ID, err)
 	}
-	files, havePagesFile, err := openRestoreFiles(imagePath)
-	if err != nil {
-		return fmt.Errorf("open checkpoint files for %s: %w", args.ID, err)
+	if files == nil {
+		files, havePagesFile, err = openVerifiedRestoreFiles(ctx, imagePath, "")
+		if err != nil {
+			return fmt.Errorf("open checkpoint files for %s: %w", args.ID, err)
+		}
+		defer closeFiles(files)
 	}
-	defer closeFiles(files)
 
 	opts := &restoreOpts{
 		payload:       filePayload{Files: files},
 		HavePagesFile: havePagesFile,
+		Background:    c.Options.BackgroundRestore,
 	}
 	device, err := c.openPlatformDevice()
 	if err != nil {

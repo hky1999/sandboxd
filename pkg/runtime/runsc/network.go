@@ -132,6 +132,12 @@ func OpenTAP(iface net.Interface) (_ *os.File, retErr error) {
 	if err := unix.IoctlIfreq(fd, unix.TUNSETIFF, ifreq); err != nil {
 		return nil, fmt.Errorf("attach runsc to TAP %s: %w", iface.Name, err)
 	}
+	// A persistent TAP can retain checksum/GSO offloads from another backend.
+	// Plain Ethernet frames have no vnet header to carry partial-checksum or
+	// segmentation metadata, so let the kernel finish that work before read.
+	if err := unix.IoctlSetInt(fd, unix.TUNSETOFFLOAD, 0); err != nil {
+		return nil, fmt.Errorf("disable offloads for raw runsc TAP %s: %w", iface.Name, err)
+	}
 	if err := unix.SetNonblock(fd, true); err != nil {
 		return nil, fmt.Errorf("set runsc TAP %s non-blocking: %w", iface.Name, err)
 	}

@@ -81,6 +81,8 @@ type StartRequestValidator interface {
 }
 
 type StartConfig struct {
+	ResourceGeneration      string
+	ExpectedCheckpointRoot  string
 	ID                      string
 	Hostname                string
 	Command                 []string
@@ -149,3 +151,19 @@ func getErrorFromContext(ctx context.Context) error {
 }
 
 var _ Handler = &FakeRuntimeHandler{}
+
+var ErrStartCleanupPending = errors.New("start cleanup pending")
+
+type StrictDeleteHandler interface {
+	DeleteStrict(ctx context.Context, sandboxID, expectedGeneration string) error
+}
+
+type StartFailureCleanupProver interface {
+	StartFailureCleanupProven() bool
+}
+
+type CheckpointRootVerifier interface {
+	// SupportsCheckpointRootVerification reports whether the runtime verifies
+	// StartConfig.ExpectedCheckpointRoot when restoring.
+	SupportsCheckpointRootVerification() bool
+}

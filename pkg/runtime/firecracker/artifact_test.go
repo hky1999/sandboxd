@@ -16,11 +16,15 @@ package firecracker
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/inclusionAI/sandboxd/pkg/checkpointroot"
 )
 
 func writeArtifactComponent(t *testing.T, path string, size int) {
@@ -222,28 +226,30 @@ func TestOpenCheckpointV2AndVerifyDigests(t *testing.T) {
 	if err := verifyArtifactDigests(context.Background(), artifact); err != nil {
 		t.Fatalf("verify untouched artifact digests: %v", err)
 	}
-	if _, recorded := artifact.Manifest.Digests[firecrackerCheckpointMemoryName]; recorded {
-		t.Fatal("memory digest was computed despite the synchronous-cost policy")
+	if artifact.Manifest.Digests[firecrackerCheckpointMemoryName] == "" {
+		t.Fatal("memory lacks the portable content proof")
 	}
-	if _, recorded := artifact.Manifest.Digests[firecrackerCheckpointOverlayName]; recorded {
-		t.Fatal("overlay digest was computed despite the synchronous-cost policy")
+	if artifact.Manifest.Digests[firecrackerCheckpointOverlayName] == "" {
+		t.Fatal("overlay lacks the portable content proof")
 	}
 
-	// The memory and overlay files carry no digest by design: changing them
-	// must not fail verification, while tampering with VM state must.
-	writeArtifactComponent(t, artifact.Files.Memory, 16<<10)
-	if err := verifyArtifactDigests(context.Background(), artifact); err != nil {
-		t.Fatalf("undigested memory component failed verification: %v", err)
-	}
-	writeArtifactComponent(t, artifact.Files.Overlay, 16<<10)
-	if err := verifyArtifactDigests(context.Background(), artifact); err != nil {
-		t.Fatalf("undigested overlay component failed verification: %v", err)
-	}
-	writeArtifactComponent(t, artifact.Files.State, 16<<10)
-	if err := verifyArtifactDigests(
-		context.Background(), artifact,
-	); err == nil || !strings.Contains(err.Error(), "digest mismatch") {
-		t.Fatalf("tampered component not detected: %v", err)
+	// Every payload is covered, even a same-size change to memory or overlay.
+	for _, component := range firecrackerCheckpointComponents(artifact.Files) {
+		original, err := os.ReadFile(component.path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		changed := append([]byte(nil), original...)
+		changed[0] ^= 1
+		if err := os.WriteFile(component.path, changed, 0600); err != nil {
+			t.Fatal(err)
+		}
+		if err := verifyArtifactDigests(context.Background(), artifact); err == nil || !strings.Contains(err.Error(), "digest mismatch") {
+			t.Fatalf("tampered %s not detected: %v", component.name, err)
+		}
+		if err := os.WriteFile(component.path, original, 0600); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 
@@ -282,9 +288,10 @@ func TestVerifyCheckpointDigestsMemoized(t *testing.T) {
 			t.Fatalf("verify artifact digests (round %d): %v", i, err)
 		}
 	}
-	// Only vmstate is hashed, exactly once; later rounds hit the cache.
-	if cache.hashes != 1 {
-		t.Fatalf("component hashes = %d, want 1", cache.hashes)
+	// Every recorded component is hashed once; later rounds hit the cache.
+	components := len(firecrackerCheckpointComponents(artifact.Files))
+	if cache.hashes != components {
+		t.Fatalf("component hashes = %d, want %d", cache.hashes, components)
 	}
 
 	// A same-stat rewrite is invisible by design (documented tradeoff), but
@@ -299,8 +306,8 @@ func TestVerifyCheckpointDigestsMemoized(t *testing.T) {
 	); err == nil || !strings.Contains(err.Error(), "digest mismatch") {
 		t.Fatalf("stale cache entry survived an mtime change: %v", err)
 	}
-	if cache.hashes != 2 {
-		t.Fatalf("component hashes after invalidation = %d, want 2", cache.hashes)
+	if cache.hashes != components+1 {
+		t.Fatalf("component hashes after invalidation = %d, want %d", cache.hashes, components+1)
 	}
 }
 
@@ -362,7 +369,7 @@ func TestOpenCheckpointV2RejectsMissingComponent(t *testing.T) {
 	}
 }
 
-func TestFinalizeCheckpointV2SkipsLargeComponentDigests(t *testing.T) {
+func TestFinalizeCheckpointV2CoversLargeComponentDigests(t *testing.T) {
 	dir := t.TempDir()
 	files := sealArtifactFixture(t, dir)
 	manifest := &firecrackerCheckpointManifest{
@@ -372,16 +379,16 @@ func TestFinalizeCheckpointV2SkipsLargeComponentDigests(t *testing.T) {
 	if err := finalizeFirecrackerCheckpointV2(context.Background(), files, manifest); err != nil {
 		t.Fatalf("finalize v2 checkpoint: %v", err)
 	}
-	if _, recorded := manifest.Digests[firecrackerCheckpointOverlayName]; recorded {
-		t.Fatal("Full generation digested the overlay")
+	if manifest.Digests[firecrackerCheckpointOverlayName] == "" {
+		t.Fatal("Full generation lacks the overlay content digest")
 	}
-	if _, recorded := manifest.Digests[firecrackerCheckpointMemoryName]; recorded {
-		t.Fatal("Full generation digested guest memory")
+	if manifest.Digests[firecrackerCheckpointMemoryName] == "" {
+		t.Fatal("Full generation lacks the guest memory content digest")
 	}
 	if _, recorded := manifest.Digests[firecrackerCheckpointStateName]; !recorded {
 		t.Fatal("Full generation lost the vmstate digest")
 	}
-	// A manifest without an overlay digest must still open and verify.
+	// New full generations satisfy both the legacy and identified consumers.
 	artifact, err := openFirecrackerCheckpoint(dir)
 	if err != nil {
 		t.Fatalf("open Full v2 checkpoint: %v", err)
@@ -389,6 +396,31 @@ func TestFinalizeCheckpointV2SkipsLargeComponentDigests(t *testing.T) {
 	var cache checkpointDigestCache
 	if err := cache.verifyFirecrackerCheckpointDigests(context.Background(), artifact); err != nil {
 		t.Fatalf("verify Full artifact digests: %v", err)
+	}
+	if _, err := checkpointroot.Bind(dir); err != nil {
+		t.Fatalf("new Full checkpoint is not content-bound: %v", err)
+	}
+
+	// An explicit historical fixture keeps the old unpinned local behavior.
+	// It must not be mistaken for an admissible identified restore artifact.
+	delete(manifest.Digests, firecrackerCheckpointMemoryName)
+	delete(manifest.Digests, firecrackerCheckpointOverlayName)
+	legacy, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, firecrackerCheckpointManifestName), legacy, 0600); err != nil {
+		t.Fatal(err)
+	}
+	old, err := openFirecrackerCheckpoint(dir)
+	if err != nil {
+		t.Fatalf("open historical unpinned fixture: %v", err)
+	}
+	if err := verifyArtifactDigests(context.Background(), old); err != nil {
+		t.Fatalf("legacy digest compatibility: %v", err)
+	}
+	if _, err := checkpointroot.Bind(dir); !errors.Is(err, checkpointroot.ErrUnverifiable) {
+		t.Fatalf("historical fixture without proof became an admissible restore: %v", err)
 	}
 }
 

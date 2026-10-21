@@ -36,11 +36,15 @@ func (h *sandboxService) prepareStartResources(runtimeName, sandboxID string) (*
 	if err != nil {
 		return nil, err
 	}
+	allocate := h.allocateStartResourceFn
+	if allocate == nil {
+		allocate = h.allocateStartResource
+	}
 	return prepareRequiredStartResources(
 		sandboxID,
 		required,
 		func(name string) (string, *networkmanager.NetResource, error) {
-			return h.allocateStartResource(runtimeName, sandboxID, name)
+			return allocate(runtimeName, sandboxID, name)
 		},
 		h.releaseStartResources,
 	)
@@ -162,6 +166,10 @@ func (h *sandboxService) deactivateStartNetwork(resources sandbox.OccupiedResour
 func (h *sandboxService) releaseStartResources(resources sandbox.OccupiedResource) error {
 	var errs []error
 	for name, value := range resources.Resources {
+		if value == "" {
+			// An empty value never identified a lease; nothing to release.
+			continue
+		}
 		if err := h.releaseStartResource(name, value); err != nil {
 			errs = append(errs, fmt.Errorf("release resource %s[%s] failed: %w", name, value, err))
 			continue
@@ -187,3 +195,5 @@ func (h *sandboxService) releaseStartResource(name, value string) error {
 		return fmt.Errorf("resource %s is not registered", name)
 	}
 }
+
+type allocateStartResourceFunc func(runtimeName, sandboxID, name string) (string, *networkmanager.NetResource, error)

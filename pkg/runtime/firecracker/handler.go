@@ -70,6 +70,7 @@ var (
 )
 
 type firecrackerPersistedState struct {
+	Generation  string                    `json:"generation,omitempty"`
 	ID          string                    `json:"id"`
 	PID         int                       `json:"pid"`
 	BundlePath  string                    `json:"bundle_path"`
@@ -108,6 +109,7 @@ type firecrackerPersistedState struct {
 }
 
 type firecrackerInstance struct {
+	persistMu   sync.Mutex
 	mu          sync.RWMutex
 	state       firecrackerPersistedState
 	exit        runtimecore.Exit
@@ -357,7 +359,18 @@ func NewHandler(
 		return nil, fmt.Errorf("Firecracker requires mkfs.ext4: %w", err)
 	}
 	sandboxRoot := filepath.Join(cfg.RootDir, "containers")
-	storageRoot := filepath.Join(cfg.RuntimeConfig.FilestoreDir, ".firecracker")
+	storageRoot, err := selectFirecrackerPrivateStorageRoot(
+		cfg.RuntimeConfig.FilestoreDir, firecrackerConfig.StorageDir,
+		sandboxRoot, firecrackerproto.HostRuntimeRoot,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if firecrackerConfig.StorageDir != "" {
+		if err := validateFirecrackerPrivateStorageLocation(sandboxRoot, storageRoot); err != nil {
+			return nil, err
+		}
+	}
 	for path, mode := range map[string]os.FileMode{
 		firecrackerproto.HostRuntimeRoot: 0700,
 		sandboxRoot:                      0755,
@@ -570,6 +583,12 @@ func (handler *Handler) Start(
 			err,
 		)
 	}
+	if err := syncFirecrackerIdentityDirectory(bundlePath); err != nil {
+		return err
+	}
+	if err := syncFirecrackerIdentityDirectory(filepath.Dir(bundlePath)); err != nil {
+		return err
+	}
 	runtimeDir := handler.runtimeDirectory(startConfig.ID)
 	runtimeCreated := false
 	keepRuntimeArtifacts := false
@@ -680,6 +699,7 @@ func (handler *Handler) Start(
 	instance := &firecrackerInstance{
 		state: firecrackerPersistedState{
 			ID:          startConfig.ID,
+			Generation:  startConfig.ResourceGeneration,
 			PID:         command.Process.Pid,
 			BundlePath:  bundlePath,
 			APIPath:     apiPath,
@@ -850,17 +870,39 @@ func (handler *Handler) machineSize(
 }
 
 func (handler *Handler) Delete(ctx context.Context, sandboxID string) error {
-	instance, err := handler.lookupInstance(sandboxID)
+	return handler.delete(ctx, sandboxID, "", false)
+}
+
+func (handler *Handler) DeleteStrict(ctx context.Context, sandboxID, expectedGeneration string) error {
+	return handler.delete(ctx, sandboxID, expectedGeneration, true)
+}
+
+func (handler *Handler) delete(ctx context.Context, sandboxID, expectedGeneration string, strict bool) error {
+	var instance *firecrackerInstance
+	var err error
+	if strict {
+		instance, err = handler.lookupStrictInstance(sandboxID, expectedGeneration)
+	} else {
+		instance, err = handler.lookupInstance(sandboxID)
+	}
 	if err != nil {
 		if os.IsNotExist(err) {
+			if strict {
+				return missingFirecrackerRetirementState(sandboxID)
+			}
 			return nil
 		}
 		return err
 	}
 	instance.operationMu.Lock()
 	defer instance.operationMu.Unlock()
-	instance.markDeleting()
 	state := instance.snapshot()
+	if strict {
+		if err := verifyFirecrackerGeneration(state, expectedGeneration); err != nil {
+			return err
+		}
+	}
+	instance.markDeleting()
 	if firecrackerProcessMatches(state.PID, handler.binary, state.APIPath, state.ID) {
 		shutdownCtx, cancel := context.WithTimeout(
 			context.WithoutCancel(ctx),
@@ -877,7 +919,21 @@ func (handler *Handler) Delete(ctx context.Context, sandboxID string) error {
 			logrus.Debugf("firecracker: guest shutdown %s: %v", sandboxID, err)
 		}
 	}
-	handler.stopInstance(instance, false)
+	// Retiring the state and writable layer requires the kernel's exit
+	// notification, not a best-effort signal or an unavailable argv identity.
+	// A failure keeps the instance and every artifact available for retry.
+	if err := stopFirecrackerProcessConfirmed(state, handler.binary); err != nil {
+		return fmt.Errorf("confirm Firecracker sandbox %s exit for delete: %w", sandboxID, err)
+	}
+	// virtiofsd can still hold files after the VMM exits. It is a separate
+	// reader and must exit before its exports or the instance are removed.
+	if err := stopFirecrackerVirtioFSConfirmed(state.VirtioFS, handler.virtiofsdPath); err != nil {
+		return fmt.Errorf("confirm Firecracker sandbox %s virtio-fs exit for delete: %w", sandboxID, err)
+	}
+	if err := cleanupFirecrackerVirtioFSArtifacts(state.VirtioFS); err != nil {
+		return fmt.Errorf("clean Firecracker sandbox %s virtio-fs artifacts: %w", sandboxID, err)
+	}
+	instance.finish(runtimecore.Exit{ExitedAt: time.Now(), ExitCode: state.ExitCode})
 	handler.mu.Lock()
 	delete(handler.instances, sandboxID)
 	handler.mu.Unlock()
@@ -1159,23 +1215,10 @@ func firecrackerHostExitCode(err error) int {
 	return 255
 }
 
-func (handler *Handler) persistInstance(
-	instance *firecrackerInstance,
-) error {
-	state := instance.snapshot()
-	data, err := json.MarshalIndent(state, "", "  ")
-	if err != nil {
-		return err
-	}
-	path := filepath.Join(
-		state.BundlePath,
-		firecrackerArtifactsDir,
-		firecrackerStateFilename,
-	)
-	if err := util.AtomicWriteFile(path, data, 0600); err != nil {
-		return fmt.Errorf("persist Firecracker state %s: %w", path, err)
-	}
-	return nil
+func (handler *Handler) persistInstance(instance *firecrackerInstance) error {
+	instance.persistMu.Lock()
+	defer instance.persistMu.Unlock()
+	return writeFirecrackerIdentityState(instance.snapshot())
 }
 
 func readFirecrackerState(bundlePath string) (firecrackerPersistedState, error) {

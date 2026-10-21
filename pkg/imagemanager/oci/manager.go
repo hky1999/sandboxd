@@ -827,27 +827,7 @@ func (m *Manager) UnmountImageWithContext(ctx context.Context, imageURL string) 
 
 // Close stops background workers and releases resources.
 func (m *Manager) Close() error {
-	m.layerPoolMu.Lock()
-	m.stopOnce.Do(func() {
-		close(m.stopCh)
-	})
-	m.layerPoolWG.Wait()
-	m.layerPoolMu.Unlock()
-
-	m.mutex.Lock()
-	images := make([]string, 0, len(m.containers))
-	for imageURL := range m.containers {
-		images = append(images, imageURL)
-	}
-	m.mutex.Unlock()
-
-	for _, imageURL := range images {
-		if err := m.UnmountImage(imageURL); err != nil {
-			logrus.Warnf("failed to unmount image %s during shutdown: %v", imageURL, err)
-		}
-	}
-
-	return m.store.close()
+	return m.ClosePreserving(nil)
 }
 
 func (m *Manager) fetchImage(ctx context.Context, imageURL string) (v1.Image, error) {
@@ -2407,4 +2387,32 @@ func isNotMountedError(err error) bool {
 		return true
 	}
 	return false
+}
+
+func (m *Manager) ClosePreserving(preserveImages map[string]bool) error {
+	m.layerPoolMu.Lock()
+	m.stopOnce.Do(func() {
+		close(m.stopCh)
+	})
+	m.layerPoolWG.Wait()
+	m.layerPoolMu.Unlock()
+
+	m.mutex.Lock()
+	images := make([]string, 0, len(m.containers))
+	for imageURL := range m.containers {
+		images = append(images, imageURL)
+	}
+	m.mutex.Unlock()
+
+	for _, imageURL := range images {
+		if preserveImages[imageURL] {
+			logrus.Infof("oci manager: preserve retained-start image mount %s", imageURL)
+			continue
+		}
+		if err := m.UnmountImage(imageURL); err != nil {
+			logrus.Warnf("failed to unmount image %s during shutdown: %v", imageURL, err)
+		}
+	}
+
+	return m.store.close()
 }

@@ -198,16 +198,37 @@ func (m *fsManager) Release(sandboxID string) error {
 	return m.release(sandboxID, true)
 }
 
-func (m *fsManager) Shutdown() {
+func (m *fsManager) Shutdown(preserves ...func(string) bool) {
+	var preserve func(string) bool
+	if len(preserves) > 0 {
+		preserve = preserves[0]
+	}
 	m.mu.Lock()
 	rootfsRefs := make([]*langrtmanager.LanguageRuntime, 0, len(m.sandboxRootfs))
-	for _, rootfs := range m.sandboxRootfs {
-		rootfsRefs = append(rootfsRefs, rootfs)
+	preservedS3Keys := make(map[string]bool)
+	preservedOCIKeys := make(map[string]bool)
+	keptState := make(map[string]sandboxFSState)
+	for id, state := range m.sandboxState {
+		if preserve != nil && preserve(id) {
+			keptState[id] = state
+			for _, cfg := range m.sandboxS3Mount[id] {
+				if cfg != nil {
+					preservedS3Keys[s3MountKey(cfg)] = true
+				}
+			}
+			for _, url := range m.sandboxOCIMount[id] {
+				preservedOCIKeys[url] = true
+			}
+			continue
+		}
+		if rootfs := m.sandboxRootfs[id]; rootfs != nil {
+			rootfsRefs = append(rootfsRefs, rootfs)
+		}
 	}
 	m.sandboxRootfs = make(map[string]*langrtmanager.LanguageRuntime)
 	m.sandboxS3Mount = make(map[string][]*runtime.S3Config)
 	m.sandboxOCIMount = make(map[string][]string)
-	m.sandboxState = make(map[string]sandboxFSState)
+	m.sandboxState = keptState
 	m.mu.Unlock()
 
 	for _, rootfs := range rootfsRefs {
@@ -215,8 +236,8 @@ func (m *fsManager) Shutdown() {
 			rootfs.DecRef()
 		}
 	}
-	m.s3.cleanupAllS3Unmounts()
-	m.oci.cleanupAllOciUnmounts()
+	m.s3.cleanupAllS3Unmounts(preservedS3Keys)
+	m.oci.cleanupAllOciUnmounts(preservedOCIKeys)
 	if err := m.persistState(); err != nil {
 		logrus.Warnf("persist filesystem shutdown state: %v", err)
 	}

@@ -101,20 +101,7 @@ func (m *Module) Start() error {
 
 // Stop tears down a bounded filestore. Ordinary directories are preserved.
 func (m *Module) Stop() error {
-	if !m.started.Load() {
-		return nil
-	}
-	m.healthy.Store(false)
-	if m.Size == "" {
-		m.started.Store(false)
-		return nil
-	}
-	err := m.cleanupMount(m.FilestoreDir, m.XFSEnabled, m.loopDevice)
-	if err == nil {
-		m.loopDevice = nil
-		m.started.Store(false)
-	}
-	return err
+	return m.StopPreserving(false)
 }
 
 // Healthy reports whether Start established the selected filestore mode.
@@ -164,4 +151,29 @@ func scaleStorageBytes(physicalBytes uint64, ratio float64) (uint64, error) {
 		)
 	}
 	return uint64(scaled), nil
+}
+
+func (m *Module) StopPreserving(preserve bool) error {
+	if !m.started.Load() {
+		return nil
+	}
+	m.healthy.Store(false)
+	if m.Size == "" {
+		m.started.Store(false)
+		return nil
+	}
+	if preserve {
+		logrus.Warnf(
+			"volumemanager: keep filestore %s mounted and its image intact for retained start(s)",
+			m.FilestoreDir,
+		)
+		m.started.Store(false)
+		return nil
+	}
+	err := m.cleanupMount(m.FilestoreDir, m.XFSEnabled, m.loopDevice)
+	if err == nil {
+		m.loopDevice = nil
+		m.started.Store(false)
+	}
+	return err
 }
