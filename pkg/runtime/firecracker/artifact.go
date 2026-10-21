@@ -179,10 +179,93 @@ func checkFirecrackerCheckpointDirVacant(dir string) error {
 // written its components: it records the small component digests and lands
 // the manifest last as the logical commit marker. O_EXCL makes finalizing an
 // already sealed directory an error.
+const firecrackerCheckpointDigestConcurrency = 2
+
+// Shared by seal and verify, including sequential cache fallbacks. Acquire
+// before the original digester opens a file or allocates its copy buffer.
+var firecrackerCheckpointDigestSlots = make(chan struct{}, firecrackerCheckpointDigestConcurrency)
+
+type firecrackerCheckpointDigestFunc func(context.Context, string, string) (string, error)
+
+type firecrackerCheckpointDigestResult struct {
+	digest       string
+	err          error
+	elapsed      time.Duration
+	wait         time.Duration
+	hashElapsed  time.Duration
+	hashStarted  time.Time
+	hashFinished time.Time
+}
+
+// Workers own only their result slot. All started workers are joined even on
+// failure; an ordinary component error never cancels a sibling or external ctx.
+func firecrackerCheckpointDigestBatch(
+	ctx context.Context,
+	components []struct{ name, path string },
+	digester firecrackerCheckpointDigestFunc,
+) []firecrackerCheckpointDigestResult {
+	results := make([]firecrackerCheckpointDigestResult, len(components))
+	var workers sync.WaitGroup
+	for i, component := range components {
+		workers.Add(1)
+		go func(i int, component struct{ name, path string }) {
+			defer workers.Done()
+			queued := time.Now()
+			var result firecrackerCheckpointDigestResult
+			defer func() {
+				result.elapsed = time.Since(queued)
+				results[i] = result
+			}()
+			select {
+			case firecrackerCheckpointDigestSlots <- struct{}{}:
+				defer func() { <-firecrackerCheckpointDigestSlots }()
+			case <-ctx.Done():
+				result.wait = time.Since(queued)
+				result.err = fmt.Errorf("digest Firecracker checkpoint component %s: %w", component.name, ctx.Err())
+				return
+			}
+			result.wait = time.Since(queued)
+			if err := ctx.Err(); err != nil {
+				result.err = fmt.Errorf("digest Firecracker checkpoint component %s: %w", component.name, err)
+				return
+			}
+			result.hashStarted = time.Now()
+			result.digest, result.err = digester(ctx, component.name, component.path)
+			result.hashFinished = time.Now()
+			result.hashElapsed = result.hashFinished.Sub(result.hashStarted)
+		}(i, component)
+	}
+	workers.Wait()
+	return results
+}
+
+func firecrackerCheckpointDigestTiming(result firecrackerCheckpointDigestResult) logrus.Fields {
+	fields := logrus.Fields{
+		"digest_concurrency_limit": firecrackerCheckpointDigestConcurrency,
+		"budget_wait_ns":           result.wait.Nanoseconds(),
+	}
+	if !result.hashStarted.IsZero() {
+		fields["hash_started_unix_ns"] = result.hashStarted.UnixNano()
+		fields["hash_finished_unix_ns"] = result.hashFinished.UnixNano()
+	}
+	return fields
+}
+
 func finalizeFirecrackerCheckpointV2(
 	ctx context.Context,
 	files firecrackerCheckpointFiles,
 	manifest *firecrackerCheckpointManifest,
+) error {
+	return finalizeFirecrackerCheckpointV2WithDigester(ctx, files, manifest, digestFirecrackerCheckpointComponent)
+}
+
+// The private dependency parameter permits deterministic I/O/error tests;
+// production always uses the original digester and copy implementation.
+func finalizeFirecrackerCheckpointV2WithDigester(
+	ctx context.Context,
+	files firecrackerCheckpointFiles,
+	manifest *firecrackerCheckpointManifest,
+	digester firecrackerCheckpointDigestFunc,
 ) (retErr error) {
 	manifest.Version = firecrackerCheckpointVersion2
 	manifest.CreatedAt = time.Now().UTC()
@@ -203,19 +286,23 @@ func finalizeFirecrackerCheckpointV2(
 	// and the opened restore view must bind memory AND the writable overlay.
 	// The handler invokes this tail after resume for leave-running snapshots;
 	// publication's existing durability barrier remains a separate step.
-	manifest.Digests = make(map[string]string, len(firecrackerCheckpointComponents(files)))
-	for _, component := range firecrackerCheckpointComponents(files) {
-		started := time.Now()
-		digest, err := digestFirecrackerCheckpointComponent(ctx, component.name, component.path)
+	components := firecrackerCheckpointComponents(files)
+	manifest.Digests = make(map[string]string, len(components))
+	results := firecrackerCheckpointDigestBatch(ctx, components, digester)
+	// Emit and commit in the original order after every worker has stopped.
+	// Component timers overlap; they must not be summed as seal wall time.
+	for i, component := range components {
+		result := results[i]
 		logrus.WithFields(logrus.Fields{
 			"timing_phase": "seal_component_digest", "checkpoint_dir": filepath.Dir(files.State),
 			"component": component.name, "component_path": component.path,
-			"elapsed_ns": time.Since(started).Nanoseconds(), "success": err == nil,
-		}).Info("firecracker: checkpoint phase timing")
-		if err != nil {
-			return err
+			"elapsed_ns": result.elapsed.Nanoseconds(), "success": result.err == nil,
+			"hash_elapsed_ns": result.hashElapsed.Nanoseconds(),
+		}).WithFields(firecrackerCheckpointDigestTiming(result)).Info("firecracker: checkpoint phase timing")
+		if result.err != nil {
+			return result.err
 		}
-		manifest.Digests[component.name] = digest
+		manifest.Digests[component.name] = result.digest
 	}
 
 	manifestPath := filepath.Join(
@@ -406,8 +493,8 @@ type cachedCheckpointDigest struct {
 type checkpointDigestCache struct {
 	mu      sync.Mutex
 	entries map[string]cachedCheckpointDigest
-	// hashes counts component hashes performed; it exists so tests can
-	// observe cache hits without timing.
+	// hashes preserves the legacy remember counter, including a mismatching
+	// digest. It does not count uncommitted speculative worker results.
 	hashes int
 }
 
@@ -421,8 +508,19 @@ func (cache *checkpointDigestCache) verifyFirecrackerCheckpointDigests(
 	ctx context.Context,
 	artifact *firecrackerCheckpointArtifact,
 ) error {
+	return cache.verifyFirecrackerCheckpointDigestsWithDigester(ctx, artifact, digestFirecrackerCheckpointComponent)
+}
+
+func (cache *checkpointDigestCache) verifyFirecrackerCheckpointDigestsWithDigester(
+	ctx context.Context,
+	artifact *firecrackerCheckpointArtifact,
+	digester firecrackerCheckpointDigestFunc,
+) error {
 	cache.mu.Lock()
 	defer cache.mu.Unlock()
+	if parallel, err := cache.verifyColdFirecrackerCheckpointDigests(ctx, artifact, digester); parallel {
+		return err
+	}
 	for _, component := range firecrackerCheckpointComponents(artifact.Files) {
 		expected, recorded := artifact.Manifest.Digests[component.name]
 		if !recorded || expected == "" {
@@ -447,13 +545,9 @@ func (cache *checkpointDigestCache) verifyFirecrackerCheckpointDigests(
 			}).Info("firecracker: checkpoint phase timing")
 		}
 		if !cached {
-			hashStarted := time.Now()
-			digest, err = digestFirecrackerCheckpointComponent(
-				ctx,
-				component.name,
-				component.path,
-			)
-			hashElapsed = time.Since(hashStarted)
+			result := firecrackerCheckpointDigestBatch(ctx, []struct{ name, path string }{component}, digester)[0]
+			digest, err = result.digest, result.err
+			hashElapsed = result.hashElapsed
 			if err != nil {
 				recordTiming(false)
 				return err
@@ -469,6 +563,69 @@ func (cache *checkpointDigestCache) verifyFirecrackerCheckpointDigests(
 		}
 	}
 	return nil
+}
+
+// verifyColdFirecrackerCheckpointDigests runs with cache.mu held. Restrict the
+// fast path to all misses, distinct paths and sufficient cache capacity.
+// Mixed hits, aliases, failed inspection and capacity rollover retain the
+// original sequential lookup/remember order (still using the shared budget).
+func (cache *checkpointDigestCache) verifyColdFirecrackerCheckpointDigests(
+	ctx context.Context,
+	artifact *firecrackerCheckpointArtifact,
+	digester firecrackerCheckpointDigestFunc,
+) (bool, error) {
+	var components []struct{ name, path string }
+	var infos []os.FileInfo
+	var expected []string
+	seen := make(map[string]bool)
+	for _, component := range firecrackerCheckpointComponents(artifact.Files) {
+		want, recorded := artifact.Manifest.Digests[component.name]
+		if !recorded || want == "" {
+			continue
+		}
+		path := filepath.Clean(component.path)
+		if seen[path] {
+			return false, nil
+		}
+		seen[path] = true
+		info, err := os.Lstat(component.path)
+		if err != nil || !info.Mode().IsRegular() {
+			return false, nil
+		}
+		if _, cached := cache.lookup(component.path, info); cached {
+			return false, nil
+		}
+		components = append(components, component)
+		infos = append(infos, info)
+		expected = append(expected, want)
+	}
+	if len(cache.entries)+len(components) > checkpointDigestCacheMaxEntries {
+		return false, nil
+	}
+	results := firecrackerCheckpointDigestBatch(ctx, components, digester)
+	for i, component := range components {
+		result := results[i]
+		success := result.err == nil && result.digest == expected[i]
+		logrus.WithFields(logrus.Fields{
+			"timing_phase": "verify_component_digest", "checkpoint_dir": filepath.Dir(artifact.Files.State),
+			"component": component.name, "component_path": component.path,
+			"cache_hit": false, "hash_elapsed_ns": result.hashElapsed.Nanoseconds(),
+			"elapsed_ns": result.elapsed.Nanoseconds(), "success": success,
+		}).WithFields(firecrackerCheckpointDigestTiming(result)).Info("firecracker: checkpoint phase timing")
+		if result.err != nil {
+			return true, result.err
+		}
+		// Preserve the old failure contract: remember the actual digest even
+		// when it mismatches, but never commit a later speculative result.
+		cache.remember(component.path, infos[i], result.digest)
+		if !success {
+			return true, fmt.Errorf(
+				"Firecracker checkpoint component %s digest mismatch: manifest %s, on disk %s",
+				component.name, expected[i], result.digest,
+			)
+		}
+	}
+	return true, nil
 }
 
 func (cache *checkpointDigestCache) lookup(
