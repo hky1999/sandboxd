@@ -329,6 +329,10 @@ durability work asynchronously or in the remote publication layer.
 
 ### Guest flush before pause
 
+The writable disk is copied after the VMM memory/device snapshot completes, while vCPUs remain paused. Pausing vCPUs does not drain already-submitted asynchronous block operations; the VMM snapshot preparation drains them and records their completions in saved memory/device state. Copying the disk before that preparation can omit a write whose completion the restored guest already observes. The snapshot and overlay timing fields follow this order. This ordering change can increase copy latency when memory writeback and disk cloning share a filesystem; performance measurements must include that cost.
+
+If disk capture fails after the memory snapshot consumed its dirty-page window, sandboxd invalidates the memory lineage and discards the incomplete generation. Keeping the previous memory file is not sufficient to reuse that window; the next checkpoint falls back to Full. Existing source-resume cleanup and remote durability/commit requirements still apply. This ordering does not turn VMM-internal I/O error logging into error propagation; storage failure behavior remains a separate validation requirement.
+
 Before pausing the source for a checkpoint, sandboxd asks the guest agent (over
 the existing vsock control channel, protocol message type 8) to `sync()` its
 writable layer, so the cloned `overlay.ext4` captures guest-buffered writes

@@ -220,20 +220,6 @@ func (handler *Handler) Checkpoint(
 		handoffReleased = true
 	}()
 	tPaused := time.Now()
-	// Clone the writable layer BEFORE the memory snapshot: the snapshot writes
-	// the whole guest memory into the page cache inside the window, and an
-	// overlay FICLONE after it can stall for seconds on the same filesystem's
-	// writeback of that fresh dirty data (measured 12.8s at a 2GiB layer after
-	// a 4GiB snapshot). Cloning first runs with a cache that does not yet hold
-	// the snapshot, removing the interaction. No in-clone fsync is needed because
-	// checkpoint artifacts deliberately remain in the page cache.
-	if _, err := cloneFileNoSync(state.OverlayPath, files.Overlay); err != nil {
-		discardUnsealedFirecrackerCheckpoint(files)
-		// The deferred handoff cleanup above resumes the guest and sends
-		// the error outcome; an explicit resume here would race with it.
-		return fmt.Errorf("snapshot Firecracker writable layer for %s: %w", sandboxID, err)
-	}
-	tOverlay := time.Now()
 	snapshotAttempted := false
 	snapshotErr := handler.withCheckpointSnapshotMemoryCharge(
 		config.CgroupPath,
@@ -266,6 +252,18 @@ func (handler *Handler) Checkpoint(
 	// The snapshot succeeded: files.Memory is now the complete guest memory
 	// image and the baseline the Firecracker ledger tracks.
 	tSnapshotted := time.Now()
+	// Saving VMM state drains submitted block I/O and records completions in
+	// guest memory/device state. Pausing vCPUs alone does not drain that I/O.
+	// Clone after this point, while still paused, so the disk cannot omit
+	// writes already completed in the saved state.
+	if _, err := cloneFileNoSync(state.OverlayPath, files.Overlay); err != nil {
+		// The memory snapshot consumed the dirty-page window. Losing its disk
+		// invalidates the generation even though the old base still exists.
+		instance.markBaseMemoryLineageLost()
+		discardUnsealedFirecrackerCheckpoint(files)
+		return fmt.Errorf("snapshot Firecracker writable layer for %s: %w", sandboxID, err)
+	}
+	tOverlay := time.Now()
 
 	resumeErr := error(nil)
 	if config.LeaveRunning {
@@ -351,9 +349,9 @@ func (handler *Handler) Checkpoint(
 			"resume=%dms seal=%dms total=%dms",
 		sandboxID, snapshotType, memoryInfo.Size()>>20, config.Directory,
 		phaseMS(tStarted, tPrepared), phaseMS(tPrepared, tFlushed),
-		phaseMS(tFlushed, tPaused), phaseMS(tOverlay, tSnapshotted),
-		phaseMS(tPaused, tOverlay),
-		phaseMS(tSnapshotted, tResumed), phaseMS(tResumed, tEnd),
+		phaseMS(tFlushed, tPaused), phaseMS(tPaused, tSnapshotted),
+		phaseMS(tSnapshotted, tOverlay),
+		phaseMS(tOverlay, tResumed), phaseMS(tResumed, tEnd),
 		phaseMS(tStarted, tEnd),
 	)
 
