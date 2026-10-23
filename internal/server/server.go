@@ -1592,6 +1592,7 @@ func (h *sandboxService) createSandbox(
 	if startReq.Labels == nil {
 		startReq.Labels = make(map[string]string)
 	}
+	delete(startReq.Labels, checkpointReadDirectoryLabel)
 	startReq.Labels[resourceGenerationLabel] = uuid.NewString()
 	if options.resourceGeneration != "" {
 		startReq.Labels[resourceGenerationLabel] = options.resourceGeneration
@@ -1769,6 +1770,24 @@ func (h *sandboxService) createSandbox(
 		}
 	}
 
+	// Both managed Restore and legacy Start/Restore retain a durable reader pin.
+	// The pin is derived here, never from caller labels, and persists even while
+	// a failed physical intent is awaiting exact retirement after a restart.
+	readDirectory := checkpointDir
+	if options.checkpointImage != "" {
+		readDirectory = filepath.Dir(options.checkpointImage)
+	}
+	if readDirectory != "" {
+		if h.checkpointState == nil {
+			return nil, errord.ToGRPC(fmt.Errorf("checkpoint reader authority unavailable: %w", errord.ErrUnavailable))
+		}
+		release, err := h.checkpointState.PinArtifact(filepath.Base(readDirectory))
+		if err != nil {
+			return nil, checkpointGRPCError(err)
+		}
+		defer release()
+		startReq.Labels[checkpointReadDirectoryLabel] = readDirectory
+	}
 	sandboxID, err := h.sandboxManager.ReserveID(startReq.SandboxID)
 	if err != nil {
 		return &runtime.StartResponse{

@@ -45,10 +45,11 @@ const (
 // DeleteIdentity binds cleanup to one committed checkpoint artifact. Callers
 // must obtain these fields from the durable manifest/CheckpointResponse.
 type DeleteIdentity struct {
-	CheckpointID string
-	SourceID     string
-	ImageSize    int64
-	ImageSHA256  string
+	SourceGeneration string
+	CheckpointID     string
+	SourceID         string
+	ImageSize        int64
+	ImageSHA256      string
 }
 
 // CleanupStaging removes checkpoint directories left before the atomic
@@ -229,12 +230,17 @@ func DeleteAt(directory string, expected DeleteIdentity) error {
 	if err != nil {
 		return err
 	}
-	if fact.Manifest.SourceID != expected.SourceID || fact.Manifest.ImageSize != expected.ImageSize ||
+	if fact.Manifest.SourceID != expected.SourceID || (expected.SourceGeneration != "" && fact.Manifest.SourceGeneration != expected.SourceGeneration) || fact.Manifest.ImageSize != expected.ImageSize ||
 		!strings.EqualFold(fact.Manifest.ImageSHA256, expected.ImageSHA256) {
 		return fmt.Errorf("checkpoint delete identity differs from committed artifact: %w",
 			errord.ErrFailedPrecondition)
 	}
 	parent := filepath.Dir(cleaned)
+	if _, err := os.Lstat(trash); err == nil {
+		return fmt.Errorf("checkpoint delete destination already exists: %w", errord.ErrFailedPrecondition)
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return classifyIOError(err)
+	}
 	if err := os.Rename(cleaned, trash); err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return deleteIsolatedAt(trash, expected)
@@ -245,28 +251,6 @@ func DeleteAt(directory string, expected DeleteIdentity) error {
 		return classifyIOError(fmt.Errorf("persist checkpoint artifact isolation: %w", err))
 	}
 	return deleteIsolatedAt(trash, expected)
-}
-
-func deleteIsolatedAt(trash string, expected DeleteIdentity) error {
-	if _, err := os.Lstat(trash); errors.Is(err, fs.ErrNotExist) {
-		return nil
-	} else if err != nil {
-		return classifyIOError(fmt.Errorf("inspect isolated checkpoint artifact: %w", err))
-	}
-	fact, err := InspectAt(trash, expected.CheckpointID)
-	if err != nil || fact.Manifest.SourceID != expected.SourceID ||
-		fact.Manifest.ImageSize != expected.ImageSize ||
-		!strings.EqualFold(fact.Manifest.ImageSHA256, expected.ImageSHA256) {
-		return fmt.Errorf("isolated checkpoint delete identity differs from committed artifact: %w",
-			errord.ErrFailedPrecondition)
-	}
-	if err := os.RemoveAll(trash); err != nil {
-		return classifyIOError(fmt.Errorf("remove checkpoint artifact: %w", err))
-	}
-	if err := syncPath(filepath.Dir(trash)); err != nil {
-		return classifyIOError(fmt.Errorf("persist checkpoint artifact delete: %w", err))
-	}
-	return nil
 }
 
 // MatchSource verifies that a committed artifact belongs to the exact source

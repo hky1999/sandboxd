@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"github.com/inclusionAI/sandboxd/internal/checkpointstate"
 	"os"
 	"path/filepath"
 	"testing"
@@ -195,6 +196,7 @@ func TestCreateSandboxDropsCallerSuppliedBirthEvidence(t *testing.T) {
 	for name, restoring := range map[string]bool{"start": false, "restore": true} {
 		t.Run(name, func(t *testing.T) {
 			h, _, _ := newResizeService(t)
+			h.checkpointState = checkpointstate.NewCoordinator()
 			request := elasticTestRequest(t)
 			request.SandboxID = "sbox-birth-inject"
 			request.Rootfs = &runtime.RootfsConfig{}

@@ -416,6 +416,8 @@ message DeleteCheckpointRequest {
   string source_sandbox_id = 3;
   int64 expected_size = 4;
   string expected_sha256 = 5;
+  // Optional scheduler extension; exact physical source incarnation.
+  string expected_source_generation = 6;
 }
 
 // DeleteCheckpointResponse is empty after an exact or already-complete delete.

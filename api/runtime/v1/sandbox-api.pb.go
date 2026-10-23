@@ -2393,8 +2393,10 @@ type DeleteCheckpointRequest struct {
 	SourceSandboxID string                 `protobuf:"bytes,3,opt,name=source_sandbox_id,json=sourceSandboxId,proto3" json:"source_sandbox_id,omitempty"`
 	ExpectedSize    int64                  `protobuf:"varint,4,opt,name=expected_size,json=expectedSize,proto3" json:"expected_size,omitempty"`
 	ExpectedSha256  string                 `protobuf:"bytes,5,opt,name=expected_sha256,json=expectedSha256,proto3" json:"expected_sha256,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// Optional scheduler extension; exact physical source incarnation.
+	ExpectedSourceGeneration string `protobuf:"bytes,6,opt,name=expected_source_generation,json=expectedSourceGeneration,proto3" json:"expected_source_generation,omitempty"`
+	unknownFields            protoimpl.UnknownFields
+	sizeCache                protoimpl.SizeCache
 }
 
 func (x *DeleteCheckpointRequest) Reset() {
@@ -2458,6 +2460,13 @@ func (x *DeleteCheckpointRequest) GetExpectedSize() int64 {
 func (x *DeleteCheckpointRequest) GetExpectedSha256() string {
 	if x != nil {
 		return x.ExpectedSha256
+	}
+	return ""
+}
+
+func (x *DeleteCheckpointRequest) GetExpectedSourceGeneration() string {
+	if x != nil {
+		return x.ExpectedSourceGeneration
 	}
 	return ""
 }
@@ -5166,13 +5175,14 @@ const file_api_runtime_v1_sandbox_api_proto_rawDesc = "" +
 	"\fPauseRequest\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x19\n" +
 	"\btrace_id\x18\x02 \x01(\tR\atraceId\"\x0f\n" +
-	"\rPauseResponse\"\xdf\x01\n" +
+	"\rPauseResponse\"\x9d\x02\n" +
 	"\x17DeleteCheckpointRequest\x12%\n" +
 	"\x0echeckpoint_dir\x18\x01 \x01(\tR\rcheckpointDir\x12#\n" +
 	"\rcheckpoint_id\x18\x02 \x01(\tR\fcheckpointId\x12*\n" +
 	"\x11source_sandbox_id\x18\x03 \x01(\tR\x0fsourceSandboxId\x12#\n" +
 	"\rexpected_size\x18\x04 \x01(\x03R\fexpectedSize\x12'\n" +
-	"\x0fexpected_sha256\x18\x05 \x01(\tR\x0eexpectedSha256\"\x1a\n" +
+	"\x0fexpected_sha256\x18\x05 \x01(\tR\x0eexpectedSha256\x12<\n" +
+	"\x1aexpected_source_generation\x18\x06 \x01(\tR\x18expectedSourceGeneration\"\x1a\n" +
 	"\x18DeleteCheckpointResponse\"\xdc\x01\n" +
 	"\x0eRestoreRequest\x120\n" +
 	"\x06config\x18\x01 \x01(\v2\x18.runtime.v1.StartRequestR\x06config\x12%\n" +

@@ -69,17 +69,21 @@ func (a *Attempt) WaitResult(ctx context.Context) ([]byte, error) {
 }
 
 type Coordinator struct {
-	mu         sync.Mutex
-	operations map[string]*Attempt
-	locks      map[string]*Attempt
-	deleting   map[string]struct{}
+	mu               sync.Mutex
+	operations       map[string]*Attempt
+	locks            map[string]*Attempt
+	deleting         map[string]struct{}
+	artifactReaders  map[string]uint64
+	artifactDeleting map[string]bool
 }
 
 func NewCoordinator() *Coordinator {
 	return &Coordinator{
-		operations: make(map[string]*Attempt),
-		locks:      make(map[string]*Attempt),
-		deleting:   make(map[string]struct{}),
+		operations:       make(map[string]*Attempt),
+		locks:            make(map[string]*Attempt),
+		deleting:         make(map[string]struct{}),
+		artifactReaders:  make(map[string]uint64),
+		artifactDeleting: make(map[string]bool),
 	}
 }
 
@@ -135,6 +139,9 @@ func (c *Coordinator) begin(
 			"sandbox %q is being deleted", sandboxID)
 	}
 	for _, key := range lockKeys {
+		if c.artifactDeleting[key] {
+			return nil, false, status.Error(codes.FailedPrecondition, "checkpoint artifact is being collected")
+		}
 		if owner := c.locks[key]; owner != nil {
 			return nil, false, status.Errorf(codes.FailedPrecondition,
 				"physical operation lock %q is already held", key)
@@ -210,4 +217,57 @@ func (c *Coordinator) EndDelete(sandboxID string) {
 	c.mu.Lock()
 	delete(c.deleting, sandboxID)
 	c.mu.Unlock()
+}
+
+// PinArtifact protects all manifest/image reads before the asynchronous restore
+// attempt is registered. The attempt retains its own artifact lock after an RPC
+// waiter disconnects; published restore metadata pins readers after completion.
+func (c *Coordinator) PinArtifact(id string) (func(), error) {
+	if id == "" {
+		return nil, status.Error(codes.InvalidArgument, "checkpoint ID required")
+	}
+	key := "artifact:" + id
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.artifactDeleting[key] {
+		return nil, status.Error(codes.FailedPrecondition, "artifact is being collected")
+	}
+	c.artifactReaders[key]++
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			c.mu.Lock()
+			defer c.mu.Unlock()
+			c.artifactReaders[key]--
+			if c.artifactReaders[key] == 0 {
+				delete(c.artifactReaders, key)
+			}
+		})
+	}, nil
+}
+
+// BeginRestoreArtifact keeps the original target-operation replay semantics and
+// also excludes deletion throughout the background physical restore.
+func (c *Coordinator) BeginRestoreArtifact(target, artifact, fingerprint string) (*Attempt, bool, error) {
+	if target == "" || artifact == "" {
+		return nil, false, status.Error(codes.InvalidArgument, "restore target and artifact required")
+	}
+	return c.begin("restore:"+target, []string{"sandbox:" + target, "artifact:" + artifact}, target, fingerprint)
+}
+
+// BeginArtifactDelete is a bounded refusal while any producer or reader owns
+// the artifact. An old HTTP timeout or absence observation cannot bypass it.
+func (c *Coordinator) BeginArtifactDelete(id string) (func(), error) {
+	if id == "" {
+		return nil, status.Error(codes.InvalidArgument, "checkpoint ID required")
+	}
+	key := "artifact:" + id
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.artifactDeleting[key] || c.artifactReaders[key] > 0 || c.locks[key] != nil {
+		return nil, status.Error(codes.FailedPrecondition, "checkpoint producer or restore still owns artifact")
+	}
+	c.artifactDeleting[key] = true
+	var once sync.Once
+	return func() { once.Do(func() { c.mu.Lock(); delete(c.artifactDeleting, key); c.mu.Unlock() }) }, nil
 }

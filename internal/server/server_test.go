@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/inclusionAI/sandboxd/internal/checkpointstate"
 	"net"
 	"os"
 	"path/filepath"
@@ -590,6 +591,7 @@ func TestCreateSandboxDeferRetainsIntentForDeadlineCleanupIncomplete(t *testing.
 	s := newTestService(t, map[string]svc.Handler{
 		config.RuntimeNameRunsc: svc.NewFakeRuntimeHandler(),
 	})
+	s.checkpointState = checkpointstate.NewCoordinator()
 	const sandboxID = "sbox-create-cleanup-incomplete"
 	rootfsDir := filepath.Join(t.TempDir(), "rootfs")
 	assert.NoError(t, os.MkdirAll(rootfsDir, 0755))

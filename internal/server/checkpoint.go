@@ -382,6 +382,8 @@ func checkpointResponse(fact checkpoint.Fact) *runtime.CheckpointResponse {
 	}
 }
 
+const checkpointReadDirectoryLabel = "akernel.scheduler/checkpoint-read-directory"
+
 func (h *sandboxService) DeleteCheckpoint(
 	_ context.Context,
 	request *runtime.DeleteCheckpointRequest,
@@ -396,11 +398,44 @@ func (h *sandboxService) DeleteCheckpoint(
 	if err != nil {
 		return nil, checkpointGRPCError(err)
 	}
+	if h.checkpointState == nil {
+		return nil, checkpointGRPCError(fmt.Errorf("checkpoint ownership is unavailable: %w", errord.ErrUnavailable))
+	}
+	release, err := h.checkpointState.BeginArtifactDelete(request.CheckpointID)
+	if err != nil {
+		return nil, checkpointGRPCError(err)
+	}
+	defer release()
+	// A completed Restore may keep its memory/state files mapped. Metadata and
+	// physical intents remain an ownership pin until that exact execution retires.
+	for _, sandbox := range h.sandboxManager.List() {
+		if sandbox == nil || sandbox.Metadata == nil {
+			return nil, checkpointGRPCError(fmt.Errorf("checkpoint references unknown: %w", errord.ErrFailedPrecondition))
+		}
+		if sandbox.Metadata.Labels[checkpointReadDirectoryLabel] == checkpointDir {
+			return nil, checkpointGRPCError(fmt.Errorf("checkpoint is pinned by a legacy reader: %w", errord.ErrFailedPrecondition))
+		}
+		if pin := sandbox.Metadata.RestoreIdentity; pin != nil && pin.CheckpointID == request.CheckpointID {
+			return nil, checkpointGRPCError(fmt.Errorf("checkpoint is referenced by an execution: %w", errord.ErrFailedPrecondition))
+		}
+	}
+	for _, metadata := range h.sandboxManager.ListPhysicalIntents() {
+		if metadata == nil {
+			return nil, checkpointGRPCError(fmt.Errorf("checkpoint physical intent unknown: %w", errord.ErrFailedPrecondition))
+		}
+		if metadata.Labels[checkpointReadDirectoryLabel] == checkpointDir {
+			return nil, checkpointGRPCError(fmt.Errorf("checkpoint is pinned by a legacy physical intent: %w", errord.ErrFailedPrecondition))
+		}
+		if pin := metadata.RestoreIdentity; pin != nil && pin.CheckpointID == request.CheckpointID {
+			return nil, checkpointGRPCError(fmt.Errorf("checkpoint is referenced by a physical intent: %w", errord.ErrFailedPrecondition))
+		}
+	}
 	err = checkpoint.DeleteAt(checkpointDir, checkpoint.DeleteIdentity{
-		CheckpointID: request.CheckpointID,
-		SourceID:     request.SourceSandboxID,
-		ImageSize:    request.ExpectedSize,
-		ImageSHA256:  request.ExpectedSha256,
+		CheckpointID:     request.CheckpointID,
+		SourceID:         request.SourceSandboxID,
+		SourceGeneration: request.ExpectedSourceGeneration,
+		ImageSize:        request.ExpectedSize,
+		ImageSHA256:      request.ExpectedSha256,
 	})
 	if err != nil {
 		return nil, checkpointGRPCError(err)
@@ -496,6 +531,11 @@ func (h *sandboxService) restoreCheckpoint(
 	} else if found {
 		return existing, nil
 	}
+	releaseArtifact, err := h.checkpointState.PinArtifact(request.CheckpointID)
+	if err != nil {
+		return nil, checkpointGRPCError(err)
+	}
+	defer releaseArtifact()
 	imagePath, err := verifyExternalCheckpoint(checkpointDir, request.ExpectedSize, request.ExpectedSha256)
 	if err != nil {
 		return nil, checkpointGRPCError(err)
@@ -524,7 +564,7 @@ func (h *sandboxService) restoreCheckpoint(
 			return nil, checkpointGRPCError(err)
 		}
 	}
-	attempt, execute, err := h.checkpointState.BeginRestore(startConfig.SandboxID, fingerprint)
+	attempt, execute, err := h.checkpointState.BeginRestoreArtifact(startConfig.SandboxID, request.CheckpointID, fingerprint)
 	if err != nil {
 		releaseOperation()
 		return nil, checkpointGRPCError(err)

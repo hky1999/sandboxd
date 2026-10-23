@@ -550,3 +550,19 @@ runsc 适配层在启动前将原生启动意图持久保存在 `<RootDir>/runsc
 交接在原私有启动日志锁内进行：先核对原启动意图与完整退役回执，将原启动字段、原字节摘要、回执身份和回执摘要发布为不可变的 `retired-<SHA256>.json`，完成文件与目录同步，再原子替换当前启动意图。旧资源代际不能重新登记，原生启动历史也不因标识复用而删除。新代际已有待处理或完成退役记录时同样拒绝启动；缺失、损坏、错误归属或替换的日志均保守拒绝。
 
 归档同步失败不得替换原意图；当前意图替换后的同步失败仍返回未知并保留新意图，不能再次派发同一代际。该契约同时适用于复用创建入口的检查点恢复，不把启动历史当成检查点完整性、进程出生或预算归还证明。目录仍保留 65536 项上限，满额时拒绝新启动，不自动丢弃旧记录；安全归档回收与主机掉电验收另行完成。
+
+
+## Scheduler-owned exact collection
+
+DeleteCheckpoint excludes an in-flight producer, a background Restore and the
+manifest-read handoff through one artifact ownership barrier. Completed or
+incomplete physical restore metadata retains the artifact reference until the
+execution is retired; legacy Start/Restore readers carry a daemon-derived
+checkpoint directory label, which callers cannot supply. A live or uncertain
+reader refuses collection. Optional expected_source_generation field 6 binds
+the delete and isolated-delete replay to the original manifest generation;
+fields 1 through 5 retain their public wire identity. The private controller
+must additionally persist terminal intent and prove that no Environment or
+restore-queue reference still authorizes this artifact. Timeout and TTL alone
+never authorize deletion or budget release. Results lost after exact deletion
+replay the same request; another generation or digest cannot be substituted.
