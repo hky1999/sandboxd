@@ -285,6 +285,9 @@ func TestCheckpointArguments(t *testing.T) {
 				t.Fatal(err)
 			}
 			arguments := string(data)
+			if strings.Contains(arguments, "--skip-filestore-pages") || strings.Contains(arguments, "--filestore-snapshot-dir") {
+				t.Fatalf("default checkpoint must retain full serialization: %q", arguments)
+			}
 			if !strings.Contains(
 				arguments,
 				"--compression="+test.compression+"\n",

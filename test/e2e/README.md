@@ -2,7 +2,7 @@
 
 The privileged E2E flows validate the public runsc, runc, Kata Containers, and
 Firecracker adapters without an AKernel node image. CI compiles the
-project-owned binaries once and passes them to seven matrix jobs. Each job
+project-owned binaries once and passes them to eight matrix jobs. Each job
 downloads its checksum-pinned runtime payload, builds a targeted image, and
 runs runsc-systrap, runsc-kvm, Kata, Firecracker (full, incremental, and virtio-fs), or runc independently.
 
@@ -22,7 +22,7 @@ The flow:
    recovery, idempotent cleanup, and cached-resource reuse;
 7. restarts sandboxd and verifies active sandbox, network endpoint, runtime
    process, and policy recovery;
-8. verifies runsc in cgroup-disabled mode with `/sys/fs/cgroup` read-only;
+8. verifies runsc in cgroup-disabled mode with `/sys/fs/cgroup` read-only, including rolling checkpoints and independent restores when filestore reflinks are enabled;
 9. verifies runc's ephemeral netns/veth lifecycle, optional KVM injection, and resolver queries against a test-only local DNS fixture before and after sandboxd restart;
 10. verifies Kata consumes the shared TAP cache without creating a private
     `ktap` lifecycle;
@@ -65,7 +65,7 @@ make e2e
 Build the binaries once and run every targeted image locally:
 
 ```bash
-make e2e-runtime-suite
+E2E_HOME_FIXTURE_PARENT=/path/on/reflink-capable-xfs make e2e-runtime-suite
 ```
 
 The suite and binary builder honor `GOCACHE` and `GOMODCACHE`; if unset, they retain the `/tmp/go-build` and `/tmp/go-mod-official` defaults. Set both variables to the development host's persistent data disk when building outside CI.
@@ -79,6 +79,9 @@ RUNTIME_VERSIONS_FILE=/tmp/runtime-versions.env make e2e-runtime-suite
 
 The alternate manifest must define every runtime artifact, not only gVisor.
 The complete suite requires KVM even though its first case uses systrap.
+The `runsc-reflink` case also requires live filestores and checkpoints on the same reflink-capable filesystem. Use `E2E_HOME_FIXTURE_PARENT` to select an XFS directory with reflink enabled. The runtime's mount namespaces must permit FICLONE between its backing-file and snapshot descriptors; some older kernels return `EXDEV` even for the same underlying filesystem. CI runs this case on Ubuntu 24.04 with a dedicated XFS fixture and fails on unsupported clones rather than skipping the test.
+
+`runsc-reflink` repeats running checkpoints, restores the saved writable state and process, restores an independent second target from the same artifact, verifies writes do not leak between targets or modify the saved filestores, checkpoints a restored target, and checks that a restored target survives deletion of its checkpoint directory. Ordinary runsc cases keep testing the default full serialization path.
 Targeted images download only the runtime payload selected by each case.
 
 Build the project-owned artifacts or run one matrix-equivalent case with:
@@ -195,7 +198,7 @@ artifacts. This avoids both tmpfs-only checkpoint behavior and nested private
 overlays in Docker's writable layer. The harness rejects a tmpfs-backed source
 and verifies the mount again inside the container.
 
-GitHub Actions builds the project-owned E2E binaries once and uploads them as a short-lived artifact. Seven dependent matrix jobs build targeted images for runsc with systrap, runsc with KVM, Kata, Firecracker (full, incremental, and virtio-fs), and runc. KVM-dependent jobs fail immediately when nested KVM is unavailable. Each case has its own runner VM, so cgroups, loop devices, TAPs, and network state cannot leak between runtimes.
+GitHub Actions builds the project-owned E2E binaries once and uploads them as a short-lived artifact. Eight dependent matrix jobs build targeted images for runsc with systrap, runsc with KVM, runsc with filestore reflinks, Kata, Firecracker (full, incremental, and virtio-fs), and runc. KVM-dependent jobs fail immediately when nested KVM is unavailable. The reflink job runs on Ubuntu 24.04 with XFS; other runtime jobs retain their existing runners. Each case has its own runner VM, so cgroups, loop devices, TAPs, and network state cannot leak between runtimes.
 
 ## GPU debug image
 

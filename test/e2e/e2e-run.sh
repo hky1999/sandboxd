@@ -29,6 +29,7 @@ EROFS_MOUNT_ROOT="${E2E_EROFS_MOUNT_ROOT:-/e2e/erofs-mount-root}"
 EROFS_MOUNT_IMAGE="${E2E_EROFS_MOUNT_IMAGE:-/e2e/data.erofs}"
 FIRECRACKER_KERNEL="${E2E_FIRECRACKER_KERNEL:-/opt/firecracker/vmlinux}"
 FIRECRACKER_CHECKPOINT_MODE="${E2E_FIRECRACKER_CHECKPOINT_MODE:-}"
+RUNSC_CHECKPOINT_MODE="${E2E_RUNSC_CHECKPOINT_MODE:-}"
 FIRECRACKER_VIRTIOFS="${E2E_FIRECRACKER_VIRTIOFS:-0}"
 FIRECRACKER_INITRD="${E2E_FIRECRACKER_INITRD:-/opt/firecracker/initrd.img}"
 OCI_ROOTFS_IMAGE="${E2E_OCI_ROOTFS_IMAGE:-docker.io/library/redis:7-alpine}"
@@ -473,6 +474,16 @@ EOF
     # Only emit the checkpoint knobs when the E2E case opts in: the plain
     # firecracker job must keep exercising the unset (default full) path.
     local e2e_fc_checkpoint_mode_cfg=""
+    local e2e_runsc_checkpoint_mode_cfg=""
+    local filestore_size_cfg='filestore_dir_size = "1G"'
+    if [ -n "${RUNSC_CHECKPOINT_MODE:-}" ]; then
+        e2e_runsc_checkpoint_mode_cfg="$(printf 'checkpoint_mode = "%s"' "${RUNSC_CHECKPOINT_MODE:-}")"
+    fi
+    if [ "${RUNSC_CHECKPOINT_MODE:-}" = "reflink" ]; then
+        # Keep live and saved filestores on the same host XFS fixture;
+        # the ordinary bounded ext4 filestore is a different filesystem.
+        filestore_size_cfg='filestore_dir_size = ""'
+    fi
     if [ -n "${FIRECRACKER_CHECKPOINT_MODE}" ]; then
         e2e_fc_checkpoint_mode_cfg="$(printf 'checkpoint_mode = "%s"' \
             "${FIRECRACKER_CHECKPOINT_MODE}")"
@@ -506,12 +517,13 @@ ${node_resource_config}
 direct_resolv_conf_path = "${CONFIG_DIR}/direct-resolv.conf"
 image_lib_dir = "/e2e/images"
 filestore_dir = "${FILESTORE}"
-filestore_dir_size = "1G"
+${filestore_size_cfg}
 loop_device_dir = "/dev"
 overlay_tmpfs_size = "64M"
 
 [plugin.runtime.runsc]
 platform = "${RUNSC_PLATFORM}"
+${e2e_runsc_checkpoint_mode_cfg}
 
 [plugin.runtime.runc]
 state_root = "/run/sandboxd/runc"
@@ -1031,6 +1043,10 @@ run_checkpoint_restore_check() {
             [ ! -s "${checkpoint_dir}/manifest.json" ]; then
             fail "${suffix} checkpoint ${checkpoint_index} artifact is missing or empty"
         fi
+        if [ "${runtime}" = "runsc" ] && [ "${RUNSC_CHECKPOINT_MODE:-}" = "reflink" ]; then
+            jq -e '.filestores | length > 0' "${checkpoint_dir}/filestores/filestores.json" >/dev/null ||
+                fail "${suffix} checkpoint lacks filestore artifacts"
+        fi
         if { [ "${runtime}" = "firecracker" ] || [ "${runtime}" = "firecracker-pvm" ]; } &&
             [ -s "${checkpoint_dir}/manifest.json" ]; then
             # Default (checkpoint_mode=full) keeps every generation Full;
@@ -1169,6 +1185,9 @@ run_checkpoint_restore_check() {
         run_firecracker_post_restore_chain \
             "${suffix}" "${checkpoint_root}" "${advanced}" "${request_file}"
     fi
+    if [ "${runtime}" = "runsc" ] && [ "${RUNSC_CHECKPOINT_MODE:-}" = "reflink" ]; then
+        run_runsc_filestore_clone_check "${checkpoint_dir}" "${request_file}"
+    fi
 
     rm -rf -- "${checkpoint_root}"
     [ ! -e "${checkpoint_root}" ] || fail "${suffix} caller cleanup retained checkpoint"
@@ -1183,6 +1202,37 @@ run_checkpoint_restore_check() {
     fi
     sbox_cmd delete "${SANDBOX_ID}"
     SANDBOX_ID=""
+}
+
+# Verify immutable reusable artifacts, independent writable clones, and another
+# checkpoint made from a restored sandbox. The caller also deletes all named
+# artifacts and checks that the original restored target still works.
+run_runsc_filestore_clone_check() {
+    local checkpoint_dir="$1" request_file="$2"
+    local clone_id="sbox-e2e-runsc-${RUNSC_PLATFORM}-filestore-clone"
+    local restored_point="${checkpoint_dir}-after-restore"
+    local before_hash after_hash
+    before_hash="$(sha256sum "${checkpoint_dir}"/filestores/filestore-*)"
+    checkpoint-restore --action restore --socket "${SOCKET}" \
+        --target-id "${clone_id}" --request-file "${request_file}" \
+        --checkpoint-dir "${checkpoint_dir}" >/dev/null
+    sbox_cmd exec "${SANDBOX_ID}" /bin/sh -c 'echo original > /var/filestore-clone-isolation'
+    sbox_cmd exec "${clone_id}" /bin/sh -c 'test ! -e /var/filestore-clone-isolation'
+    sbox_cmd exec "${clone_id}" /bin/sh -c 'echo clone > /var/filestore-clone-isolation'
+    assert_eq "$(sbox_cmd exec "${SANDBOX_ID}" /bin/cat /var/filestore-clone-isolation)" \
+        "original" "runsc restored clones have private writable state"
+    after_hash="$(sha256sum "${checkpoint_dir}"/filestores/filestore-*)"
+    assert_eq "${after_hash}" "${before_hash}" "runsc restore must not mutate filestore artifacts"
+    sbox_cmd delete "${clone_id}"
+    checkpoint-restore --action checkpoint --socket "${SOCKET}" \
+        --sandbox-id "${SANDBOX_ID}" --checkpoint-dir "${restored_point}" \
+        --checkpoint-timeout-seconds 180 --leave-running=true
+    checkpoint-restore --action restore --socket "${SOCKET}" \
+        --target-id "${clone_id}" --request-file "${request_file}" \
+        --checkpoint-dir "${restored_point}" >/dev/null
+    assert_eq "$(sbox_cmd exec "${clone_id}" /bin/cat /var/filestore-clone-isolation)" \
+        "original" "runsc checkpoint after restore preserves writable state"
+    sbox_cmd delete "${clone_id}"
 }
 
 # run_firecracker_post_restore_chain exercises the checkpoint-after-restore
@@ -2329,6 +2379,8 @@ run_firecracker_checks() {
 
 run_runsc_direct_dns_checks() {
     log "testing runsc direct DNS with network ACLs disabled"
+    local memory_mb
+    memory_mb="$(runsc_fixture_memory_mb)"
     # Change DNS mode on a drained node after shutdown flushes resource leases.
     # Keep the store across mode changes and crash recovery.
     local remaining
@@ -2345,7 +2397,7 @@ run_runsc_direct_dns_checks() {
         --sandbox-id sbox-e2e-runsc-direct-dns \
         --rootfs "${ROOTFS}" \
         --cpu-millicores 1000 \
-        --memory-mb 128 \
+        --memory-mb "${memory_mb}" \
         /bin/sleep 300)"
     [ -n "${SANDBOX_ID}" ] || fail "direct DNS start returned empty sandbox id"
     wait_for_state "${SANDBOX_ID}" "SANDBOX_STATE_RUNNING"
@@ -2375,19 +2427,32 @@ run_runsc_direct_dns_checks() {
     log "runsc direct DNS checks passed"
 }
 
+runsc_fixture_memory_mb() {
+    # Functional fixtures need to fit runtime startup before any explicit OOM
+    # injection. KVM's cgroup-v1 charges include memslot metadata and helper
+    # runtimes; 128MiB can kill them before the intended workload is ready.
+    if [ "${RUNSC_PLATFORM}" = kvm ]; then
+        printf '256\n'
+    else
+        printf '128\n'
+    fi
+}
+
 run_partial_oom_check() {
     log "testing OOM of one host task while sandbox init remains alive"
+    local memory_mb
+    memory_mb="$(runsc_fixture_memory_mb)"
     # Keep another sandbox alive so this cannot accidentally pass by picking
     # the first directory in a one-entry cache. It must survive the target OOM.
     PARTIAL_OOM_GUARD_ID="$(sbox_cmd start --quiet --runtime runsc \
         --sandbox-id sbox-e2e-oom-guard --rootfs "${ROOTFS}" \
-        --cpu-millicores 1000 --memory-mb 128 /bin/sleep 300)"
+        --cpu-millicores 1000 --memory-mb "${memory_mb}" /bin/sleep 300)"
     SANDBOX_ID="$(sbox_cmd start --quiet --runtime runsc \
         --sandbox-id sbox-e2e-partial-oom --rootfs "${ROOTFS}" \
-        --cpu-millicores 1000 --memory-mb 128 /bin/sleep 300)"
+        --cpu-millicores 1000 --memory-mb "${memory_mb}" /bin/sleep 300)"
     local child
     child="$(wait_for_sandbox_cgroup "${SANDBOX_ID}")"
-    assert_cgroup_limits "${child}" 1000 128
+    assert_cgroup_limits "${child}" 1000 "${memory_mb}"
     local guard_child
     guard_child="$(wait_for_sandbox_cgroup "${PARTIAL_OOM_GUARD_ID}")"
     [ "${child}" != "${guard_child}" ] || fail "OOM target and guard share a cgroup"
@@ -2452,6 +2517,8 @@ run_partial_oom_check() {
 
 run_runsc_checks() {
     log "starting sandbox"
+    local memory_mb
+    memory_mb="$(runsc_fixture_memory_mb)"
     SANDBOX_ID="$(sbox_cmd start \
         --quiet \
         --runtime runsc \
@@ -2461,13 +2528,13 @@ run_runsc_checks() {
         --env E2E_MARKER=start-env-ok \
         --mount "${HOST_MOUNT}:/mnt/host" \
         --cpu-millicores 100 \
-        --memory-mb 128 \
+        --memory-mb "${memory_mb}" \
         /bin/sh -c 'echo "$E2E_MARKER" > /tmp/start-env && sleep 300')"
     [ -n "${SANDBOX_ID}" ] || fail "start returned empty sandbox id"
     log "sandbox started: ${SANDBOX_ID}"
     local cache_cgroup
     cache_cgroup="$(wait_for_cgroup_child)"
-    assert_cgroup_limits "${cache_cgroup}" 100 128
+    assert_cgroup_limits "${cache_cgroup}" 100 "${memory_mb}"
 
     local list_line
     list_line="$(sbox_cmd list | grep "${SANDBOX_ID}")" || fail "sandbox not found in list"
@@ -2505,7 +2572,7 @@ run_runsc_checks() {
         fail "sandbox still inspectable after delete"
     fi
 
-    run_dnat_check runsc "runsc" "${ROOTFS}" 128
+    run_dnat_check runsc "runsc" "${ROOTFS}" "${memory_mb}"
     run_checkpoint_restore_check runsc "${ROOTFS}"
     run_host_mount_rw_check runsc "${ROOTFS}" "runsc-${RUNSC_PLATFORM}"
     run_storage_quota_check
@@ -2513,14 +2580,21 @@ run_runsc_checks() {
     run_partial_oom_check
 
     log "starting immediate OOM sandbox"
+    local oom_memory_mb
+    local reused_memory_mb
+    oom_memory_mb="$(runsc_fixture_memory_mb)"
+    reused_memory_mb="$((oom_memory_mb * 2))"
     SANDBOX_ID="$(sbox_cmd start \
         --quiet \
         --runtime runsc \
         --sandbox-id sbox-e2e-oom \
         --rootfs "${ROOTFS}" \
         --cpu-millicores 1000 \
-        --memory-mb 128 \
+        --memory-mb "${oom_memory_mb}" \
         /bin/oom-hog)"
+    # Concurrent restored clones may replace the original one-entry cache.
+    # Follow this sandbox's actual lease for OOM and subsequent reuse checks.
+    cache_cgroup="$(wait_for_sandbox_cgroup "${SANDBOX_ID}")"
     wait_for_state "${SANDBOX_ID}" "SANDBOX_STATE_EXITED" 600
     assert_wait_log "${SANDBOX_ID}" true
     if [ "${CGROUP_MODE}" = "v2" ]; then
@@ -2538,12 +2612,12 @@ run_runsc_checks() {
         --sandbox-id sbox-e2e-reuse \
         --rootfs "${ROOTFS}" \
         --cpu-millicores 1500 \
-        --memory-mb 256 \
+        --memory-mb "${reused_memory_mb}" \
         /bin/sleep 300)"
     local reused_cgroup
-    reused_cgroup="$(wait_for_cgroup_child)"
+    reused_cgroup="$(wait_for_sandbox_cgroup "${SANDBOX_ID}")"
     assert_eq "${reused_cgroup}" "${cache_cgroup}" "cached cgroup path"
-    assert_cgroup_limits "${reused_cgroup}" 1500 256
+    assert_cgroup_limits "${reused_cgroup}" 1500 "${reused_memory_mb}"
     if [ "${CPU_LIMIT_MODE}" = "quota" ]; then
         got="$(sbox_cmd exec "${SANDBOX_ID}" /bin/nproc)"
         assert_eq "${got}" "2" "runsc guest CPU count"
@@ -2576,7 +2650,7 @@ run_runsc_checks() {
         --rootfs "${ROOTFS}" \
         --mount "${HOST_MOUNT}:/mnt/host" \
         --cpu-millicores 1000 \
-        --memory-mb 128 \
+        --memory-mb "${oom_memory_mb}" \
         /bin/oom-hog --wait-file /mnt/host/oom-trigger)"
     wait_for_state "${SANDBOX_ID}" "SANDBOX_STATE_RUNNING"
     sleep 6
@@ -2620,6 +2694,9 @@ run_cgroup_disabled_checks() {
     SANDBOX_ID=""
 
     run_storage_quota_check
+    if [ "${RUNSC_CHECKPOINT_MODE}" = "reflink" ]; then
+        run_checkpoint_restore_check runsc "${ROOTFS}"
+    fi
 }
 
 run_e2e() {

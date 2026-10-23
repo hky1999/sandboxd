@@ -160,6 +160,10 @@ type RunscConfig struct {
 	// BackgroundRestore lets runsc load remaining memory pages after restore
 	// returns. False preserves synchronous loading.
 	BackgroundRestore bool `toml:"background_restore" json:"backgroundRestore"`
+	// CheckpointMode selects full page serialization (the default) or reflink
+	// snapshots of writable filestores. Reflink requires a matching runsc bundle
+	// and a shared reflink-capable filesystem for live and saved filestores.
+	CheckpointMode string `toml:"checkpoint_mode" json:"checkpointMode"`
 }
 
 // CheckpointSyncConfig controls the final filesystem persistence barrier.
@@ -278,6 +282,18 @@ func NormalizeRunscPlatform(value string) (string, error) {
 			RunscPlatformKVM,
 			value,
 		)
+	}
+}
+
+// NormalizeRunscCheckpointMode validates the node-owned checkpoint policy.
+func NormalizeRunscCheckpointMode(value string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", "full":
+		return "full", nil
+	case "reflink":
+		return "reflink", nil
+	default:
+		return "", fmt.Errorf("runsc checkpoint_mode must be full or reflink, got %q", value)
 	}
 }
 

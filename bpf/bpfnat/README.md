@@ -68,6 +68,8 @@ project target, which builds a tool image containing the pinned Clang 14 and
 make bpf
 ```
 
+The Linux UAPI package pin matches the headers already installed in the digest-pinned Go build image. The Docker build verifies the installed package version after installing the compiler. Keep the base-image digest and this header pin synchronized when updating the toolchain; rebuilding does not require an older security package to remain in the current APT index.
+
 Run `make bpf-format` before regeneration when editing C or header files.
 `make check-bpf` checks C formatting and regenerates the files with the same
 image, then fails if the checked-in artifacts are stale. Generation does not

@@ -175,6 +175,7 @@ func TestIsMountpoint(t *testing.T) {
 	assert.False(t, m)
 
 	// Test mountpoint false
+	// /tmp may itself be a mount point on hosted runners.
 	m, err = IsMountpoint(tmpDir)
 	assert.NoError(t, err)
 	assert.False(t, m)

@@ -182,7 +182,21 @@ func (*cgroupV1) kill(name string) error {
 }
 
 func (*cgroupV1) delete(name string) error {
-	group, err := cg.Load(cg.StaticPath(name), cg.WithHiearchy(cg.Default))
+	subsystems, err := cg.Default()
+	if err != nil {
+		return err
+	}
+	subsystems, err = v1DeleteSubsystems(name, subsystems)
+	if err != nil || len(subsystems) == 0 {
+		return err
+	}
+	// Delete checks membership and removes each registered hierarchy. Co-mounted
+	// controllers are aliases of one directory: removing both makes its second
+	// membership scan fail with ENOENT before the remaining controllers are
+	// removed. Use one subsystem per existing directory for deletion only.
+	group, err := cg.Load(cg.StaticPath(name), cg.WithHiearchy(func() ([]cg.Subsystem, error) {
+		return subsystems, nil
+	}))
 	if errors.Is(err, cg.ErrCgroupDeleted) {
 		return nil
 	}
@@ -190,4 +204,39 @@ func (*cgroupV1) delete(name string) error {
 		return err
 	}
 	return group.Delete()
+}
+
+func v1DeleteSubsystems(name string, subsystems []cg.Subsystem) ([]cg.Subsystem, error) {
+	var result []cg.Subsystem
+	var directories []os.FileInfo
+	for _, subsystem := range subsystems {
+		pather, ok := subsystem.(interface{ Path(string) string })
+		if !ok {
+			result = append(result, subsystem)
+			continue
+		}
+		info, err := os.Stat(pather.Path(name))
+		if os.IsNotExist(err) {
+			// A previous partial deletion may already have removed this path.
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("stat cgroup %s controller %s: %w", name, subsystem.Name(), err)
+		}
+		if !info.IsDir() {
+			return nil, fmt.Errorf("cgroup %s controller %s is not a directory", name, subsystem.Name())
+		}
+		duplicate := false
+		for _, previous := range directories {
+			if os.SameFile(previous, info) {
+				duplicate = true
+				break
+			}
+		}
+		if !duplicate {
+			directories = append(directories, info)
+			result = append(result, subsystem)
+		}
+	}
+	return result, nil
 }
