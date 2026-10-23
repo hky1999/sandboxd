@@ -358,6 +358,8 @@ After a successful checkpoint with `leave_running=false`, the caller still
 deletes the source through the normal sandbox API to release its metadata and
 resources.
 
+On cgroup-v1 hosts, source deletion removes each physical controller hierarchy once, including when controllers such as `net_cls` and `net_prio` share a mount. Already removed controller paths are skipped on retry, while the cgroup library still rejects removal of groups containing live processes. This prevents partial controller cleanup from leaving stale memory-controller entries that break later daemon recovery when their `pids.max` is absent.
+
 On failure, sandboxd returns an error and does not force-delete, stop, or
 resume the source. The caller decides how to handle the source sandbox.
 sandboxd only cleans partial checkpoint output: it removes a leaf directory it
