@@ -49,7 +49,6 @@ jobs:
     env:
       DOCKER_HOST: unix:///run/pvm-ci-docker.sock
       PVM_SOURCE_SHA: ${{ needs.request.outputs.source_sha }}
-      PVM_HOST_PROFILE: ${{ runner.temp }}/pvm-host-profile.json
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -70,6 +69,8 @@ jobs:
           EXPECTED_DIGEST: ${{ needs.request.outputs.profile_digest }}
         run: |
           set -euo pipefail
+          export PVM_HOST_PROFILE="${RUNNER_TEMP}/pvm-host-profile.json"
+          printf 'PVM_HOST_PROFILE=%s\n' "${PVM_HOST_PROFILE}" >> "${GITHUB_ENV}"
           cp .pvm-host-profile/deploy/pvm/host-profile.json "${PVM_HOST_PROFILE}"
           printf '%s  %s\n' "${EXPECTED_DIGEST}" "${PVM_HOST_PROFILE}" | sha256sum -c -
           rm -rf .pvm-host-profile
