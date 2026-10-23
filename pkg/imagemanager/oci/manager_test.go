@@ -1057,28 +1057,71 @@ func TestExtractLayersWithWorkers_ConcurrentAndOrdered(t *testing.T) {
 	mgr.layerWorkers = 2
 
 	const layerCount = 4
-	const delay = 200 * time.Millisecond
+	firstGate := make(chan struct{})
+	otherGate := make(chan struct{})
+	close(otherGate)
+	var release sync.Once
+	releaseFirst := func() { release.Do(func() { close(firstGate) }) }
 
 	layers := make([]v1.Layer, 0, layerCount)
 	wantDigests := make([]string, 0, layerCount)
+	started := make([]chan struct{}, layerCount)
 	for i := 0; i < layerCount; i++ {
 		hash, err := v1.NewHash(fmt.Sprintf("sha256:%064x", i+1))
 		if err != nil {
 			t.Fatalf("new hash %d: %v", i, err)
 		}
-		layers = append(layers, sleepLayer{
-			digest: hash,
-			delay:  delay,
+		started[i] = make(chan struct{}, 1)
+		gate := otherGate
+		if i == 0 {
+			gate = firstGate
+		}
+		layers = append(layers, blockLayer{
+			digest:  hash,
+			started: started[i],
+			unblock: gate,
 		})
 		wantDigests = append(wantDigests, hash.String())
 	}
 
-	start := time.Now()
-	gotDigests, gotPaths, err := mgr.extractLayersWithWorkers(context.Background(), layers)
-	elapsed := time.Since(start)
-	if err != nil {
-		t.Fatalf("extractLayersWithWorkers() error: %v", err)
+	type extractionResult struct {
+		digests []string
+		paths   []string
+		err     error
 	}
+	results := make(chan extractionResult, 1)
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		digests, paths, err := mgr.extractLayersWithWorkers(context.Background(), layers)
+		results <- extractionResult{digests: digests, paths: paths, err: err}
+	}()
+	defer func() {
+		releaseFirst()
+		<-finished
+	}()
+
+	// Keep layer zero blocked until a second worker has completed layer one
+	// and begun layer two. This proves overlap and out-of-order completion
+	// without treating CPU scheduling or metadata fsync time as a speed gate.
+	for _, i := range []int{0, 2} {
+		select {
+		case <-started[i]:
+		case <-time.After(10 * time.Second):
+			t.Fatalf("layer %d did not start while layer zero was blocked", i)
+		}
+	}
+	releaseFirst()
+	var result extractionResult
+	select {
+	case result = <-results:
+	case <-time.After(10 * time.Second):
+		t.Fatal("layer extraction did not finish after release")
+	}
+	if result.err != nil {
+		t.Fatalf("extractLayersWithWorkers() error: %v", result.err)
+	}
+	gotDigests, gotPaths := result.digests, result.paths
 
 	for i := 0; i < layerCount; i++ {
 		if gotDigests[i] != wantDigests[i] {
@@ -1094,12 +1137,6 @@ func TestExtractLayersWithWorkers_ConcurrentAndOrdered(t *testing.T) {
 		if len(layerDir) > 8 || layerDir == "" || layerDir[0] != 'l' {
 			t.Fatalf("expected compact mapped layer dir, got %s", layerDir)
 		}
-	}
-
-	// Serial execution would be roughly layerCount*delay (~800ms).
-	// With 2 workers it should be around 2*delay (~400ms) plus overhead.
-	if elapsed >= 700*time.Millisecond {
-		t.Fatalf("expected concurrent extraction, elapsed=%v", elapsed)
 	}
 }
 
