@@ -41,13 +41,21 @@ class RedisStageTest(unittest.TestCase):
                 "TEST_MODE": mode,
                 "E2E_REDIS_STAGE_TIMEOUT_SECONDS": str(seconds),
             }
+            # Test polling and deadline decisions with logical clock ticks.
+            # Real sleep and process scheduling are exercised by runtime E2E.
+            # Unsetting SECONDS removes Bash's automatic wall-clock updates.
+            script = (
+                "source "
+                + shlex.quote(str(LIBRARY))
+                + "; unset SECONDS; SECONDS=0; "
+                + "sleep() { SECONDS=$((SECONDS + 1)); }; "
+                + "wait_for_redis_soak_stage"
+            )
             result = subprocess.run(
                 [
                     "bash",
                     "-ec",
-                    "source "
-                    + shlex.quote(str(LIBRARY))
-                    + "; wait_for_redis_soak_stage",
+                    script,
                 ],
                 env=env,
                 capture_output=True,

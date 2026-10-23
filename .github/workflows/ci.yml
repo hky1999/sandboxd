@@ -32,10 +32,11 @@ jobs:
       - name: Run unit tests
         run: make test
 
-      - name: Verify offline PVM qualification guards
+      - name: Verify offline PVM qualification and stage guards
         run: |
           python3 test/e2e/test_pvm_l1.py -v
           python3 test/e2e/test_pvm_request.py -v
+          python3 test/e2e/test_redis_stage.py -v
 
       - name: Verify gVisor archive installer
         run: |
