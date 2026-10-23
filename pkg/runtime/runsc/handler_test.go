@@ -45,6 +45,21 @@ func TestNewRunscHandlerUsesSharedLogFile(t *testing.T) {
 	assert.Equal(t, config.RunscPlatformSystrap, client.Options.Platform)
 }
 
+func TestNewRunscHandlerPropagatesBackgroundRestore(t *testing.T) {
+	for _, background := range []bool{false, true} {
+		base := t.TempDir()
+		cfg := config.Config{RootDir: filepath.Join(base, "sandboxd", "root")}
+		cfg.RuntimeConfig.FilestoreDir = filepath.Join(base, "filestore")
+		cfg.RuntimeConfig.Runsc.BackgroundRestore = background
+		handler, err := NewHandler(cfg, "/usr/local/bin/runsc", nil)
+		if !assert.NoError(t, err) {
+			continue
+		}
+		client := handler.runsc.(*Client)
+		assert.Equal(t, background, client.Options.BackgroundRestore)
+	}
+}
+
 func TestNewRunscHandlerPropagatesIgnoreCgroups(t *testing.T) {
 	rootDir := filepath.Join(t.TempDir(), "sandboxd", "root")
 	cfg := config.Config{RootDir: rootDir}

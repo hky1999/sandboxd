@@ -51,6 +51,23 @@ never overwrites a non-empty directory.
 The directory is the artifact boundary. Its contents are opaque and specific
 to the runtime that created them.
 
+## Checkpoint output synchronization
+
+`plugin.runtime.checkpoint_sync.sync_output` defaults to `false`, preserving the existing page-cache completion contract. Set it to `true` when successful checkpoint publication must include the backing filesystem's synchronization guarantee:
+
+```toml
+[plugin.runtime.checkpoint_sync]
+sync_output = true
+```
+
+The server synchronizes every regular file and directory, including the capture root's parent directory entry, after the runtime finishes capture and before acknowledging the Checkpoint RPC. Symlinks and special files are rejected. A synchronization failure fails the RPC and cleans partial output without deleting the source sandbox; it does not roll back the runtime's checkpoint operation, so callers must reconcile source state. The request deadline and cancellation are checked between filesystem operations; an in-flight operating-system `fsync` cannot be interrupted. This option relies on the configured filesystem's persistence contract and does not configure storage replication.
+
+## runsc background restore
+
+`plugin.runtime.runsc.background_restore` defaults to `false`. Setting it to `true` forwards runsc's background page-loading option through the Restore RPC. Restore can then return before the entire memory image has been loaded. Callers must retain immutable checkpoint inputs while the runtime can still access them and measure full memory availability separately from RPC completion. This setting does not change checkpoint publication or output synchronization.
+
+The following Firecracker performance and durability descriptions assume the default `sync_output=false` profile. With synchronization enabled, the server adds its barrier after the runtime completes its capture, outside the runtime's guest pause window.
+
 ## Firecracker artifacts and incremental checkpoints
 
 The Firecracker runtime writes *uncompressed* checkpoint directories (layout

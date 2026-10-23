@@ -153,7 +153,93 @@ func (h *sandboxService) Checkpoint(
 		}
 		return nil, errord.ToGRPC(operationErr)
 	}
+	if h.config.PluginConfig.RuntimeConfig.CheckpointSync.SyncOutput {
+		if err := syncCheckpointOutput(checkpointCtx, directory.path); err != nil {
+			operationErr := fmt.Errorf(
+				"checkpoint sandbox %s output persistence barrier failed; source sandbox state is not guaranteed: %w",
+				request.ID, err,
+			)
+			if cleanupErr := directory.cleanup(); cleanupErr != nil {
+				operationErr = errors.Join(operationErr, fmt.Errorf("clean checkpoint residuals in %s: %w", directory.path, cleanupErr))
+			}
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return nil, errord.ToGRPC(operationErr)
+			}
+			return nil, errord.ToGRPCf(errord.ErrUnavailable, "%v", operationErr)
+		}
+	}
 	return &runtime.CheckpointResponse{}, nil
+}
+
+// syncCheckpointOutput applies the backing filesystem's synchronization
+// guarantee after the runtime finishes capture. Only regular files and
+// directories are accepted.
+func syncCheckpointOutput(ctx context.Context, root string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	info, err := os.Lstat(root)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("checkpoint output %s is not a directory", root)
+	}
+	if err := syncCheckpointDirectory(ctx, root); err != nil {
+		return err
+	}
+	// The parent contains the entry for a newly created capture directory.
+	if err := syncCheckpointFile(filepath.Dir(root)); err != nil {
+		return err
+	}
+	return ctx.Err()
+}
+
+func syncCheckpointDirectory(ctx context.Context, dir string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		path := filepath.Join(dir, entry.Name())
+		info, err := os.Lstat(path)
+		if err != nil {
+			return err
+		}
+		switch {
+		case info.IsDir():
+			if err := syncCheckpointDirectory(ctx, path); err != nil {
+				return err
+			}
+		case info.Mode().IsRegular():
+			if err := syncCheckpointFile(path); err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("checkpoint output %s is not a regular file or directory", path)
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := syncCheckpointFile(dir); err != nil {
+		return err
+	}
+	return ctx.Err()
+}
+
+func syncCheckpointFile(path string) error {
+	file, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	return errors.Join(file.Sync(), file.Close())
 }
 
 // checkpointGuestMemoryResources returns the guest-visible limit persisted in

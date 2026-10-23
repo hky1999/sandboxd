@@ -82,9 +82,15 @@ filestore_overcommit_ratio = 1.0
 loop_device_dir = "/dev"
 overlay_tmpfs_size = "256M"
 
+# Opt in when checkpoint publication requires the filesystem's fsync guarantee.
+[plugin.runtime.checkpoint_sync]
+sync_output = false
+
 # Systrap is the default. Select kvm only when /dev/kvm is usable.
 [plugin.runtime.runsc]
 platform = "systrap"
+# Return before all checkpoint memory has loaded; retain restore input files.
+background_restore = false
 # Operator-owned create flags; omit to keep ["--net-raw=true"], or use [] for none.
 # Use --name=value for every flag, including booleans; sandboxd-managed flags cannot be overridden.
 # Docker 28+ bridge networking also needs --allow-packet-socket-write,

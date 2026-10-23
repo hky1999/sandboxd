@@ -93,6 +93,9 @@ type RuntimeConfig struct {
 	// Runsc configures the gVisor runtime adapter.
 	Runsc RunscConfig `toml:"runsc" json:"runsc"`
 
+	// CheckpointSync optionally synchronizes completed checkpoint output.
+	CheckpointSync CheckpointSyncConfig `toml:"checkpoint_sync" json:"checkpointSync"`
+
 	// Kata configures the optional Kata Containers runtime adapter. Kata is
 	// loaded only when runtime_binary contains a "kata" entry.
 	Kata KataConfig `toml:"kata" json:"kata"`
@@ -154,6 +157,16 @@ type RunscConfig struct {
 	// ExtraArgs supplies operator-owned runsc flags. Nil preserves --net-raw;
 	// an explicitly empty list disables that default.
 	ExtraArgs []string `toml:"extra_args" json:"extraArgs"`
+	// BackgroundRestore lets runsc load remaining memory pages after restore
+	// returns. False preserves synchronous loading.
+	BackgroundRestore bool `toml:"background_restore" json:"backgroundRestore"`
+}
+
+// CheckpointSyncConfig controls the final filesystem persistence barrier.
+type CheckpointSyncConfig struct {
+	// SyncOutput fsyncs regular files and directories before acknowledging a
+	// completed checkpoint. False preserves the existing page-cache contract.
+	SyncOutput bool `toml:"sync_output" json:"syncOutput"`
 }
 
 // KataConfig contains the host paths and storage settings used by Kata.
