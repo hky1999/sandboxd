@@ -2357,6 +2357,8 @@ run_firecracker_checks() {
 
 run_runsc_direct_dns_checks() {
     log "testing runsc direct DNS with network ACLs disabled"
+    local memory_mb
+    memory_mb="$(runsc_fixture_memory_mb)"
     # Change DNS mode on a drained node after shutdown flushes resource leases.
     # Keep the store across mode changes and crash recovery.
     local remaining
@@ -2373,7 +2375,7 @@ run_runsc_direct_dns_checks() {
         --sandbox-id sbox-e2e-runsc-direct-dns \
         --rootfs "${ROOTFS}" \
         --cpu-millicores 1000 \
-        --memory-mb 128 \
+        --memory-mb "${memory_mb}" \
         /bin/sleep 300)"
     [ -n "${SANDBOX_ID}" ] || fail "direct DNS start returned empty sandbox id"
     wait_for_state "${SANDBOX_ID}" "SANDBOX_STATE_RUNNING"
@@ -2403,10 +2405,10 @@ run_runsc_direct_dns_checks() {
     log "runsc direct DNS checks passed"
 }
 
-runsc_oom_memory_mb() {
-    # The init must be stable before an explicit OOM injection. On cgroup-v1,
-    # KVM startup charges include memslot metadata and helper runtimes; 128MiB
-    # can kill a helper before the intended workload or OOM observer is ready.
+runsc_fixture_memory_mb() {
+    # Functional fixtures need to fit runtime startup before any explicit OOM
+    # injection. KVM's cgroup-v1 charges include memslot metadata and helper
+    # runtimes; 128MiB can kill them before the intended workload is ready.
     if [ "${RUNSC_PLATFORM}" = kvm ]; then
         printf '256\n'
     else
@@ -2417,7 +2419,7 @@ runsc_oom_memory_mb() {
 run_partial_oom_check() {
     log "testing OOM of one host task while sandbox init remains alive"
     local memory_mb
-    memory_mb="$(runsc_oom_memory_mb)"
+    memory_mb="$(runsc_fixture_memory_mb)"
     # Keep another sandbox alive so this cannot accidentally pass by picking
     # the first directory in a one-entry cache. It must survive the target OOM.
     PARTIAL_OOM_GUARD_ID="$(sbox_cmd start --quiet --runtime runsc \
@@ -2493,6 +2495,8 @@ run_partial_oom_check() {
 
 run_runsc_checks() {
     log "starting sandbox"
+    local memory_mb
+    memory_mb="$(runsc_fixture_memory_mb)"
     SANDBOX_ID="$(sbox_cmd start \
         --quiet \
         --runtime runsc \
@@ -2502,13 +2506,13 @@ run_runsc_checks() {
         --env E2E_MARKER=start-env-ok \
         --mount "${HOST_MOUNT}:/mnt/host" \
         --cpu-millicores 100 \
-        --memory-mb 128 \
+        --memory-mb "${memory_mb}" \
         /bin/sh -c 'echo "$E2E_MARKER" > /tmp/start-env && sleep 300')"
     [ -n "${SANDBOX_ID}" ] || fail "start returned empty sandbox id"
     log "sandbox started: ${SANDBOX_ID}"
     local cache_cgroup
     cache_cgroup="$(wait_for_cgroup_child)"
-    assert_cgroup_limits "${cache_cgroup}" 100 128
+    assert_cgroup_limits "${cache_cgroup}" 100 "${memory_mb}"
 
     local list_line
     list_line="$(sbox_cmd list | grep "${SANDBOX_ID}")" || fail "sandbox not found in list"
@@ -2546,7 +2550,7 @@ run_runsc_checks() {
         fail "sandbox still inspectable after delete"
     fi
 
-    run_dnat_check runsc "runsc" "${ROOTFS}" 128
+    run_dnat_check runsc "runsc" "${ROOTFS}" "${memory_mb}"
     run_checkpoint_restore_check runsc "${ROOTFS}"
     run_host_mount_rw_check runsc "${ROOTFS}" "runsc-${RUNSC_PLATFORM}"
     run_storage_quota_check
@@ -2556,7 +2560,7 @@ run_runsc_checks() {
     log "starting immediate OOM sandbox"
     local oom_memory_mb
     local reused_memory_mb
-    oom_memory_mb="$(runsc_oom_memory_mb)"
+    oom_memory_mb="$(runsc_fixture_memory_mb)"
     reused_memory_mb="$((oom_memory_mb * 2))"
     SANDBOX_ID="$(sbox_cmd start \
         --quiet \
