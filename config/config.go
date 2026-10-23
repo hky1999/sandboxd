@@ -177,6 +177,13 @@ type RuncConfig struct {
 
 // FirecrackerConfig contains immutable guest boot artifacts and VM defaults.
 type FirecrackerConfig struct {
+	// WritableStorageDir optionally places only the private ext4 disk in a
+	// pre-existing directory. Runtime state, virtio-fs staging, and shared live
+	// memory retain their normal local locations. WritableStorageFilesystem
+	// must name the mounted filesystem (for example fuse.juicefs); a missing
+	// or replaced mount is an error, never a fallback to local storage.
+	WritableStorageDir        string `toml:"writable_storage_dir" json:"writableStorageDir"`
+	WritableStorageFilesystem string `toml:"writable_storage_filesystem" json:"writableStorageFilesystem"`
 	// WritableIOEngine selects Sync, Async, SyncDirect, or AsyncDirect for
 	// the private ext4 disk. Direct engines require a compatible VMM.
 	// The host must provide STATX_DIOALIGN for direct engines and io_uring

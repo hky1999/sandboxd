@@ -889,6 +889,9 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 
 	var interfaceMgr *networkmanager.InterfaceManager
 	if cfg.InterfaceCacheSize > 0 {
+		if err := s.retireStoppedNetworkLeases(sandboxRoot); err != nil {
+			return nil, fmt.Errorf("reconcile stopped sandbox network leases: %w", err)
+		}
 		interfaceMgr, err = networkmanager.NewInterfaceManager(
 			s.store,
 			cfg.IPRange,
@@ -1014,6 +1017,10 @@ func (h *sandboxService) activeACLBindings() (map[string]networkacl.Binding, err
 		}
 		encoded, ok := resources.Resources[config.ResourceNameInterface]
 		if !ok {
+			if h.confirmNetworkOwnerStopped(networkLeaseOwner{id: sandboxID, runtime: current.Metadata.RuntimeHandler, group: resources.Resources[config.ResourceNameCgroup]}) {
+				logrus.Infof("skipped network ACL binding for stopped sandbox %s after kernel exit proof", sandboxID)
+				continue
+			}
 			return nil, fmt.Errorf("sandbox %s has no network resource", sandboxID)
 		}
 		network, err := networkmanager.NewNetResource(encoded)

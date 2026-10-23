@@ -70,14 +70,15 @@ var (
 )
 
 type firecrackerPersistedState struct {
-	ID          string                    `json:"id"`
-	PID         int                       `json:"pid"`
-	BundlePath  string                    `json:"bundle_path"`
-	APIPath     string                    `json:"api_path"`
-	VsockPath   string                    `json:"vsock_path"`
-	OverlayPath string                    `json:"overlay_path"`
-	VirtioFS    *firecrackerVirtioFSState `json:"virtio_fs,omitempty"`
-	CreatedAt   string                    `json:"created_at"`
+	ID            string                    `json:"id"`
+	PID           int                       `json:"pid"`
+	BundlePath    string                    `json:"bundle_path"`
+	APIPath       string                    `json:"api_path"`
+	VsockPath     string                    `json:"vsock_path"`
+	OverlayPath   string                    `json:"overlay_path"`
+	WritableOwner string                    `json:"writable_owner,omitempty"`
+	VirtioFS      *firecrackerVirtioFSState `json:"virtio_fs,omitempty"`
+	CreatedAt     string                    `json:"created_at"`
 	// MemoryMiB is the guest memory size in MiB, recorded so incremental
 	// checkpoints can preallocate or clone a full-size base memory file.
 	MemoryMiB uint32 `json:"memory_mib,omitempty"`
@@ -215,6 +216,7 @@ type Handler struct {
 	binary            string
 	sandboxRoot       string
 	storageRoot       string
+	writableRoot      *firecrackerWritableRoot
 	runtimeRoot       string
 	kernelPath        string
 	initrdPath        string
@@ -367,10 +369,15 @@ func NewHandler(
 			return nil, fmt.Errorf("create Firecracker directory %s: %w", path, err)
 		}
 	}
+	writableRoot, err := openFirecrackerWritableRoot(firecrackerConfig.WritableStorageDir, firecrackerConfig.WritableStorageFilesystem)
+	if err != nil {
+		return nil, err
+	}
 	handler := &Handler{
 		binary:                 binary,
 		sandboxRoot:            sandboxRoot,
 		storageRoot:            storageRoot,
+		writableRoot:           writableRoot,
 		runtimeRoot:            firecrackerproto.HostRuntimeRoot,
 		writableIOEngine:       firecrackerConfig.WritableIOEngine,
 		writableCacheType:      firecrackerConfig.WritableCacheType,
@@ -389,7 +396,12 @@ func NewHandler(
 		virtioFSEnabled:        firecrackerConfig.VirtioFSEnabled,
 		instances:              make(map[string]*firecrackerInstance),
 	}
-	handler.recoverInstances()
+	if err := handler.recoverInstances(); err != nil {
+		if writableRoot != nil {
+			writableRoot.dir.Close()
+		}
+		return nil, err
+	}
 	return handler, nil
 }
 
@@ -550,9 +562,18 @@ func (handler *Handler) Start(
 	if overlaySize == 0 {
 		overlaySize = handler.defaultDisk
 	}
-	overlayPath, err := createFirecrackerOverlay(
-		handler.storageRoot,
-		startConfig.ID,
+	overlayIOPath, overlayPath, writableOwner, err := handler.prepareWritableOverlay(startConfig.ID, storageDir)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if !keepStorage {
+			retErr = errors.Join(retErr, handler.cleanupWritableOverlay(startConfig.ID, writableOwner))
+		}
+	}()
+	_, err = createFirecrackerOverlay(
+		filepath.Dir(filepath.Dir(overlayIOPath)),
+		filepath.Base(filepath.Dir(overlayIOPath)),
 		overlaySize,
 	)
 	if err != nil {
@@ -679,14 +700,15 @@ func (handler *Handler) Start(
 	}
 	instance := &firecrackerInstance{
 		state: firecrackerPersistedState{
-			ID:          startConfig.ID,
-			PID:         command.Process.Pid,
-			BundlePath:  bundlePath,
-			APIPath:     apiPath,
-			VsockPath:   vsockPath,
-			OverlayPath: overlayPath,
-			VirtioFS:    virtioFSState,
-			CreatedAt:   time.Now().Format(time.RFC3339Nano),
+			ID:            startConfig.ID,
+			PID:           command.Process.Pid,
+			BundlePath:    bundlePath,
+			APIPath:       apiPath,
+			VsockPath:     vsockPath,
+			OverlayPath:   overlayPath,
+			WritableOwner: writableOwner,
+			VirtioFS:      virtioFSState,
+			CreatedAt:     time.Now().Format(time.RFC3339Nano),
 		},
 		done: make(chan struct{}),
 	}
@@ -706,6 +728,11 @@ func (handler *Handler) Start(
 		}
 		instance.markDeleting()
 		handler.stopInstance(instance, true)
+		if err := handler.preserveRunningWritable(instance); err != nil {
+			keepStorage, keepRuntimeArtifacts = true, true
+			retErr = errors.Join(retErr, err)
+			return
+		}
 		handler.mu.Lock()
 		delete(handler.instances, startConfig.ID)
 		handler.mu.Unlock()
@@ -744,6 +771,11 @@ func (handler *Handler) Start(
 		},
 	)
 	drives = append(drives, plan.mountDrives...)
+	if writableOwner != "" {
+		if err := handler.writableRoot.verify(); err != nil {
+			return err
+		}
+	}
 	if err := configureFirecrackerVM(
 		bootCtx,
 		api,
@@ -878,6 +910,16 @@ func (handler *Handler) Delete(ctx context.Context, sandboxID string) error {
 		}
 	}
 	handler.stopInstance(instance, false)
+	if state.WritableOwner != "" {
+		if handler.writableProcessesRunning(state) {
+			return fmt.Errorf("Firecracker processes for %s still hold writable storage", sandboxID)
+		}
+		// Keep persistent ownership and the in-memory entry until external
+		// cleanup succeeds, so a mount failure remains retryable after restart.
+		if err := handler.cleanupWritableOverlay(sandboxID, state.WritableOwner); err != nil {
+			return err
+		}
+	}
 	handler.mu.Lock()
 	delete(handler.instances, sandboxID)
 	handler.mu.Unlock()
@@ -1212,6 +1254,16 @@ func (handler *Handler) validatePersistedState(
 	if err != nil {
 		return err
 	}
+	expectedOverlay := filepath.Join(storageDirectory, "overlay.ext4")
+	if state.WritableOwner != "" {
+		if handler.writableRoot == nil {
+			return errors.New("Firecracker state requires configured writable storage")
+		}
+		expectedOverlay, err = handler.writableRoot.overlayPath(sandboxID, state.WritableOwner)
+		if err != nil {
+			return err
+		}
+	}
 	expected := map[string][2]string{
 		"bundle": {
 			filepath.Clean(state.BundlePath),
@@ -1227,7 +1279,7 @@ func (handler *Handler) validatePersistedState(
 		},
 		"overlay": {
 			filepath.Clean(state.OverlayPath),
-			filepath.Join(storageDirectory, "overlay.ext4"),
+			expectedOverlay,
 		},
 	}
 	if state.VirtioFS != nil {
@@ -1256,11 +1308,11 @@ func (handler *Handler) validatePersistedState(
 	return nil
 }
 
-func (handler *Handler) recoverInstances() {
+func (handler *Handler) recoverInstances() error {
 	entries, err := os.ReadDir(handler.sandboxRoot)
 	if err != nil {
 		logrus.Warnf("firecracker: scan runtime state: %v", err)
-		return
+		return err
 	}
 	for _, entry := range entries {
 		if !entry.IsDir() || !config.IsValidSandboxID(entry.Name()) {
@@ -1278,11 +1330,15 @@ func (handler *Handler) recoverInstances() {
 			continue
 		}
 		if err := handler.validatePersistedState(entry.Name(), bundlePath, state); err != nil {
+			if state.WritableOwner != "" {
+				return fmt.Errorf("recover Firecracker writable storage for %s: %w", entry.Name(), err)
+			}
 			logrus.Warnf("firecracker: ignore inconsistent state for %s: %v", entry.Name(), err)
 			continue
 		}
 		handler.instances[state.ID] = handler.recoverState(state)
 	}
+	return nil
 }
 
 func (handler *Handler) recoverState(

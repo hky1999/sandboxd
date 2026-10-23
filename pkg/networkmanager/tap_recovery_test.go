@@ -101,6 +101,22 @@ func TestRecoveryRejectsExternallyReplacedActiveTap(t *testing.T) {
 		"a replaced endpoint must not be adopted (no LinkSetUp)")
 }
 
+// A lost device alone is not retirement proof. Any higher-level recovery of
+// an exited owner must leave this guard intact for live or unknown owners.
+func TestRecoveryRejectsMissingActiveTapWithoutRetirementProof(t *testing.T) {
+	f := newTapRecoveryFixture(t, convergedTap(t, 13))
+	f.manager.listLinks = func() ([]net.Interface, error) { return nil, nil }
+	lease := activeLeaseWithIfindex(t, 13)
+	f.manager.usingInterfaces.Set(lease, struct{}{})
+
+	err := f.manager.load(sets.New[string]("10.88.0.5"))
+	require.ErrorContains(t, err, "active pooled TAP for 10.88.0.5 is missing")
+	assert.True(t, f.manager.usingInterfaces.Has(lease))
+	assert.Zero(t, f.linkOps.setUpCount)
+	assert.Zero(t, f.linkOps.setDownCount)
+	assert.Zero(t, f.manager.interfaces.Length())
+}
+
 // TestRecoveryRepairsIdleOrphanMacAndBridgeDrift is the other half of the
 // reviewer-requested pair: an orphan tap with no lease — e.g. left by a
 // predecessor that died inside the createTapDevice window (random MAC, no

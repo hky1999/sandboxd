@@ -64,6 +64,13 @@ func (handler *Handler) Checkpoint(
 	instance.operationMu.Lock()
 	defer instance.operationMu.Unlock()
 	state := instance.snapshot()
+	overlaySource, writableDir, err := handler.writableOverlay(state)
+	if err != nil {
+		return fmt.Errorf("validate Firecracker writable storage: %w", err)
+	}
+	if writableDir != nil {
+		defer writableDir.Close()
+	}
 	if state.Exited || !state.Configured ||
 		!firecrackerProcessMatches(state.PID, handler.binary, state.APIPath, state.ID) {
 		return fmt.Errorf("Firecracker sandbox %s is not running", sandboxID)
@@ -256,7 +263,14 @@ func (handler *Handler) Checkpoint(
 	// guest memory/device state. Pausing vCPUs alone does not drain that I/O.
 	// Clone after this point, while still paused, so the disk cannot omit
 	// writes already completed in the saved state.
-	if _, err := cloneFileNoSync(state.OverlayPath, files.Overlay); err != nil {
+	if writableDir != nil {
+		if err := handler.writableRoot.verify(); err != nil {
+			instance.markBaseMemoryLineageLost()
+			discardUnsealedFirecrackerCheckpoint(files)
+			return err
+		}
+	}
+	if _, err := cloneFileNoSync(overlaySource, files.Overlay); err != nil {
 		// The memory snapshot consumed the dirty-page window. Losing its disk
 		// invalidates the generation even though the old base still exists.
 		instance.markBaseMemoryLineageLost()
@@ -768,6 +782,15 @@ func (handler *Handler) Restore(
 			)
 		}
 	}()
+	overlayIOPath, overlayPath, writableOwner, err := handler.prepareWritableOverlay(startConfig.ID, storageDir)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if !keepStorage {
+			retErr = errors.Join(retErr, handler.cleanupWritableOverlay(startConfig.ID, writableOwner))
+		}
+	}()
 
 	stateDir := filepath.Join(bundlePath, firecrackerArtifactsDir)
 	if err := os.Mkdir(stateDir, 0700); err != nil {
@@ -846,11 +869,12 @@ func (handler *Handler) Restore(
 		&handler.digestCache,
 		startConfig.CheckpointDir,
 		stateDir,
-		filepath.Join(storageDir, "overlay.ext4"),
+		overlayIOPath,
 	)
 	if err != nil {
 		return err
 	}
+	checkpointFiles.Overlay = overlayPath
 	if err := os.Symlink(checkpointFiles.Overlay, filepath.Join(
 		stateDir, firecrackerCheckpointOverlayName,
 	)); err != nil {
@@ -908,16 +932,17 @@ func (handler *Handler) Restore(
 	}
 	instance := &firecrackerInstance{
 		state: firecrackerPersistedState{
-			ID:          startConfig.ID,
-			PID:         command.Process.Pid,
-			BundlePath:  bundlePath,
-			APIPath:     apiPath,
-			VsockPath:   vsockPath,
-			OverlayPath: checkpointFiles.Overlay,
-			VirtioFS:    virtioFSState,
-			MemoryMiB:   uint32(memorySize >> 20),
-			Vcpus:       restoredVcpus,
-			CreatedAt:   time.Now().Format(time.RFC3339Nano),
+			ID:            startConfig.ID,
+			PID:           command.Process.Pid,
+			BundlePath:    bundlePath,
+			APIPath:       apiPath,
+			VsockPath:     vsockPath,
+			OverlayPath:   checkpointFiles.Overlay,
+			WritableOwner: writableOwner,
+			VirtioFS:      virtioFSState,
+			MemoryMiB:     uint32(memorySize >> 20),
+			Vcpus:         restoredVcpus,
+			CreatedAt:     time.Now().Format(time.RFC3339Nano),
 		},
 		done: make(chan struct{}),
 	}
@@ -937,6 +962,11 @@ func (handler *Handler) Restore(
 		}
 		instance.markDeleting()
 		handler.stopInstance(instance, true)
+		if err := handler.preserveRunningWritable(instance); err != nil {
+			keepStorage, keepRuntimeArtifacts = true, true
+			retErr = errors.Join(retErr, err)
+			return
+		}
 		handler.mu.Lock()
 		delete(handler.instances, startConfig.ID)
 		handler.mu.Unlock()
@@ -956,6 +986,11 @@ func (handler *Handler) Restore(
 	}
 	readyCancel()
 	tReady := time.Now()
+	if writableOwner != "" {
+		if err := handler.writableRoot.verify(); err != nil {
+			return err
+		}
+	}
 	if err := api.loadSnapshot(
 		ctx,
 		checkpointFiles.State,
