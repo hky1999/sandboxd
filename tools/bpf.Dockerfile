@@ -10,7 +10,8 @@ ARG BPF_CLANG_VERSION=14.0.6
 ARG BPF_CLANG_PACKAGE_VERSION=1:14.0.6-12
 ARG BPF_CLANG_FORMAT_PACKAGE_VERSION=1:14.0.6-12
 ARG BPF_LIBBPF_PACKAGE_VERSION=1:1.1.2-0+deb12u1
-ARG BPF_LINUX_UAPI_PACKAGE_VERSION=6.1.187-1
+# Keep this in sync with the headers in GO_BUILD_IMAGE and the Makefile.
+ARG BPF_LINUX_UAPI_PACKAGE_VERSION=6.1.159-1
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
@@ -20,6 +21,7 @@ RUN apt-get update && \
         linux-libc-dev="${BPF_LINUX_UAPI_PACKAGE_VERSION}" \
         llvm-14="${BPF_CLANG_PACKAGE_VERSION}" && \
     rm -rf /var/lib/apt/lists/* && \
+    test "$(dpkg-query -W -f='${Version}' linux-libc-dev)" = "${BPF_LINUX_UAPI_PACKAGE_VERSION}" && \
     test "$(clang-14 -dumpversion)" = "${BPF_CLANG_VERSION}" && \
     clang-format-14 --version | grep -F "version ${BPF_CLANG_VERSION}" && \
     llvm-strip-14 --version | grep -F "LLVM version ${BPF_CLANG_VERSION}"
