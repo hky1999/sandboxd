@@ -17,6 +17,7 @@ package runsc
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -45,18 +46,24 @@ func TestNewRunscHandlerUsesSharedLogFile(t *testing.T) {
 	assert.Equal(t, config.RunscPlatformSystrap, client.Options.Platform)
 }
 
-func TestNewRunscHandlerPropagatesBackgroundRestore(t *testing.T) {
-	for _, background := range []bool{false, true} {
-		base := t.TempDir()
-		cfg := config.Config{RootDir: filepath.Join(base, "sandboxd", "root")}
-		cfg.RuntimeConfig.FilestoreDir = filepath.Join(base, "filestore")
-		cfg.RuntimeConfig.Runsc.BackgroundRestore = background
-		handler, err := NewHandler(cfg, "/usr/local/bin/runsc", nil)
-		if !assert.NoError(t, err) {
-			continue
+func TestNewRunscHandlerPropagatesCheckpointOptions(t *testing.T) {
+	for _, mode := range []string{"full", "reflink"} {
+		for _, background := range []bool{false, true} {
+			t.Run(fmt.Sprintf("mode=%s/background=%t", mode, background), func(t *testing.T) {
+				base := t.TempDir()
+				cfg := config.Config{RootDir: filepath.Join(base, "sandboxd", "root")}
+				cfg.RuntimeConfig.FilestoreDir = filepath.Join(base, "filestore")
+				cfg.RuntimeConfig.Runsc.CheckpointMode = mode
+				cfg.RuntimeConfig.Runsc.BackgroundRestore = background
+				handler, err := NewHandler(cfg, "/usr/local/bin/runsc", nil)
+				if !assert.NoError(t, err) {
+					return
+				}
+				client := handler.runsc.(*Client)
+				assert.Equal(t, background, client.Options.BackgroundRestore)
+				assert.Equal(t, mode == "reflink", client.Options.ReflinkFilestores)
+			})
 		}
-		client := handler.runsc.(*Client)
-		assert.Equal(t, background, client.Options.BackgroundRestore)
 	}
 }
 

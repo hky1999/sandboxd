@@ -15,18 +15,24 @@ func TestCheckpointOptionsDefaultOff(t *testing.T) {
 	cfg := DefaultConfig()
 	require.False(t, cfg.RuntimeConfig.Runsc.BackgroundRestore)
 	require.False(t, cfg.RuntimeConfig.CheckpointSync.SyncOutput)
+	mode, err := NormalizeRunscCheckpointMode(cfg.RuntimeConfig.Runsc.CheckpointMode)
+	require.NoError(t, err)
+	require.Equal(t, "full", mode)
 }
 
 func TestCheckpointOptionsTOML(t *testing.T) {
-	for _, background := range []bool{false, true} {
-		for _, syncOutput := range []bool{false, true} {
-			t.Run(fmt.Sprintf("background=%t/sync=%t", background, syncOutput), func(t *testing.T) {
-				cfg := DefaultConfig()
-				input := fmt.Sprintf("[plugin.runtime.runsc]\nbackground_restore=%t\n[plugin.runtime.checkpoint_sync]\nsync_output=%t\n", background, syncOutput)
-				require.NoError(t, toml.Unmarshal([]byte(input), &cfg))
-				require.Equal(t, background, cfg.RuntimeConfig.Runsc.BackgroundRestore)
-				require.Equal(t, syncOutput, cfg.RuntimeConfig.CheckpointSync.SyncOutput)
-			})
+	for _, mode := range []string{"full", "reflink"} {
+		for _, background := range []bool{false, true} {
+			for _, syncOutput := range []bool{false, true} {
+				t.Run(fmt.Sprintf("mode=%s/background=%t/sync=%t", mode, background, syncOutput), func(t *testing.T) {
+					cfg := DefaultConfig()
+					input := fmt.Sprintf("[plugin.runtime.runsc]\ncheckpoint_mode=%q\nbackground_restore=%t\n[plugin.runtime.checkpoint_sync]\nsync_output=%t\n", mode, background, syncOutput)
+					require.NoError(t, toml.Unmarshal([]byte(input), &cfg))
+					require.Equal(t, mode, cfg.RuntimeConfig.Runsc.CheckpointMode)
+					require.Equal(t, background, cfg.RuntimeConfig.Runsc.BackgroundRestore)
+					require.Equal(t, syncOutput, cfg.RuntimeConfig.CheckpointSync.SyncOutput)
+				})
+			}
 		}
 	}
 }

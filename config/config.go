@@ -157,13 +157,13 @@ type RunscConfig struct {
 	// ExtraArgs supplies operator-owned runsc flags. Nil preserves --net-raw;
 	// an explicitly empty list disables that default.
 	ExtraArgs []string `toml:"extra_args" json:"extraArgs"`
-	// BackgroundRestore lets runsc load remaining memory pages after restore
-	// returns. False preserves synchronous loading.
-	BackgroundRestore bool `toml:"background_restore" json:"backgroundRestore"`
 	// CheckpointMode selects full page serialization (the default) or reflink
 	// snapshots of writable filestores. Reflink requires a matching runsc bundle
 	// and a shared reflink-capable filesystem for live and saved filestores.
 	CheckpointMode string `toml:"checkpoint_mode" json:"checkpointMode"`
+	// BackgroundRestore lets runsc load remaining memory pages after restore
+	// returns. False preserves synchronous loading.
+	BackgroundRestore bool `toml:"background_restore" json:"backgroundRestore"`
 }
 
 // CheckpointSyncConfig controls the final filesystem persistence barrier.
