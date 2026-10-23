@@ -132,6 +132,11 @@ func OpenTAP(iface net.Interface) (_ *os.File, retErr error) {
 	if err := unix.IoctlIfreq(fd, unix.TUNSETIFF, ifreq); err != nil {
 		return nil, fmt.Errorf("attach runsc to TAP %s: %w", iface.Name, err)
 	}
+	// Persistent TAP offloads survive the previous queue's close. Raw Ethernet
+	// consumers cannot accept unchecked packets from a preceding vnet consumer.
+	if err := unix.IoctlSetInt(fd, unix.TUNSETOFFLOAD, 0); err != nil {
+		return nil, fmt.Errorf("disable runsc TAP %s checksum offloads: %w", iface.Name, err)
+	}
 	if err := unix.SetNonblock(fd, true); err != nil {
 		return nil, fmt.Errorf("set runsc TAP %s non-blocking: %w", iface.Name, err)
 	}
