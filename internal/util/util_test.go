@@ -17,6 +17,7 @@ package util
 import (
 	"errors"
 	"os"
+	"path/filepath"
 	"syscall"
 	"testing"
 	"time"
@@ -129,8 +130,9 @@ func (fs *fakeFileStat) ModTime() time.Time { return time.Now() }
 func (fs *fakeFileStat) Sys() any           { return "wrong type" }
 
 func TestIsMountpoint(t *testing.T) {
+	tmpDir := t.TempDir()
 	// Mock error of "can't get info of target"
-	m, err := IsMountpoint("/tmp/xxxx/never-exist-abcdddff")
+	m, err := IsMountpoint(filepath.Join(tmpDir, "never-exist-abcdddff"))
 	assert.ErrorContains(t, err, "can't get info of target dir")
 	assert.False(t, m)
 
@@ -138,13 +140,13 @@ func TestIsMountpoint(t *testing.T) {
 	osStatPatches := gomonkey.ApplyFunc(os.Stat, func(string) (os.FileInfo, error) {
 		return &fakeFileStat{}, nil
 	})
-	m, err = IsMountpoint("/tmp")
+	m, err = IsMountpoint(tmpDir)
 	osStatPatches.Reset()
 	assert.ErrorContains(t, err, "can't get dev NO. of target dir")
 	assert.False(t, m)
 
 	// Mock error of "can't get info of parent dir"
-	realStatResult, _ := os.Stat("/tmp")
+	realStatResult, _ := os.Stat(tmpDir)
 	times := 0
 	osStatPatches = gomonkey.ApplyFunc(os.Stat, func(name string) (os.FileInfo, error) {
 		times++
@@ -153,7 +155,7 @@ func TestIsMountpoint(t *testing.T) {
 		}
 		return &fakeFileStat{}, errors.New("mock error")
 	})
-	m, err = IsMountpoint("/tmp")
+	m, err = IsMountpoint(tmpDir)
 	osStatPatches.Reset()
 	assert.ErrorContains(t, err, "can't get info of parent dir")
 	assert.False(t, m)
@@ -167,23 +169,23 @@ func TestIsMountpoint(t *testing.T) {
 		}
 		return &fakeFileStat{}, nil
 	})
-	m, err = IsMountpoint("/tmp")
+	m, err = IsMountpoint(tmpDir)
 	osStatPatches.Reset()
 	assert.ErrorContains(t, err, "can't get dev NO. of parent dir")
 	assert.False(t, m)
 
 	// Test mountpoint false
-	m, err = IsMountpoint("/tmp")
+	m, err = IsMountpoint(tmpDir)
 	assert.NoError(t, err)
 	assert.False(t, m)
 
 	// Test mountpoint true
-	realStatResult2, _ := os.Stat("/tmp")
+	realStatResult2, _ := os.Stat(tmpDir)
 	stat, ok := realStatResult2.Sys().(*syscall.Stat_t)
 	if !ok {
 		assert.Fail(t, "can't get stat for mock data")
 	}
-	stat.Dev = 996
+	stat.Dev ^= 1
 
 	times = 0
 	osStatPatches = gomonkey.ApplyFunc(os.Stat, func(name string) (os.FileInfo, error) {
@@ -193,7 +195,7 @@ func TestIsMountpoint(t *testing.T) {
 		}
 		return realStatResult2, nil
 	})
-	m, err = IsMountpoint("/tmp")
+	m, err = IsMountpoint(tmpDir)
 	osStatPatches.Reset()
 
 	assert.NoError(t, err)
