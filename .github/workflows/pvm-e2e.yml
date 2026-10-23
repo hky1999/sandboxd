@@ -1,25 +1,78 @@
 name: PVM isolated L1 E2E
 "on":
+  # Register the entry point when it lands on the maintained branch. Only an
+  # explicit maintainer dispatch assigns a disposable privileged runner.
   push:
-    branches: [feat/pvm-candidate-adx]
+    branches: [main]
   workflow_dispatch:
+    inputs:
+      source_ref:
+        description: 'Empty selects the dispatch SHA; otherwise main or refs/pull/N/head'
+        required: false
+        default: ''
+        type: string
+      host_profile_ref:
+        description: 'AKernel develop or refs/pull/N/head containing the expected host profile'
+        required: true
+        default: develop
+        type: string
 permissions:
   contents: read
+  pull-requests: read
 concurrency:
   group: pvm-isolated-l1
   cancel-in-progress: false
 jobs:
+  request:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    outputs:
+      source_sha: ${{ steps.resolve.outputs.source_sha }}
+      profile_repository: ${{ steps.resolve.outputs.profile_repository }}
+      profile_sha: ${{ steps.resolve.outputs.profile_sha }}
+      profile_digest: ${{ steps.resolve.outputs.profile_digest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Resolve allowed refs to immutable qualification inputs
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PVM_SOURCE_REF: ${{ inputs.source_ref }}
+          PVM_HOST_PROFILE_REF: ${{ inputs.host_profile_ref }}
+        run: python3 test/e2e/pvm-request.py --kind runtime
   pvm:
-    if: github.repository == 'hky1999/sandboxd' && github.ref_name == 'feat/pvm-candidate-adx'
+    needs: request
     runs-on: [self-hosted, linux, x64, pvm-l1-ubuntu7]
     timeout-minutes: 180
     env:
       DOCKER_HOST: unix:///run/pvm-ci-docker.sock
+      PVM_SOURCE_SHA: ${{ needs.request.outputs.source_sha }}
+      PVM_HOST_PROFILE: ${{ runner.temp }}/pvm-host-profile.json
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
+          ref: ${{ needs.request.outputs.source_sha }}
+      - name: Check out caller-owned expected host profile
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: ${{ needs.request.outputs.profile_repository }}
+          ref: ${{ needs.request.outputs.profile_sha }}
+          path: .pvm-host-profile
+          persist-credentials: false
+          sparse-checkout: deploy/pvm/host-profile.json
+          sparse-checkout-cone-mode: false
+      - name: Bind expected profile to the resolved consumer commit
+        env:
+          EXPECTED_DIGEST: ${{ needs.request.outputs.profile_digest }}
+        run: |
+          set -euo pipefail
+          cp .pvm-host-profile/deploy/pvm/host-profile.json "${PVM_HOST_PROFILE}"
+          printf '%s  %s\n' "${EXPECTED_DIGEST}" "${PVM_HOST_PROFILE}" | sha256sum -c -
+          rm -rf .pvm-host-profile
       - name: Verify disposable L1 boundary
         run: |
           echo "PVM_CI_OUTPUT=${RUNNER_TEMP}/pvm-ci" >>"${GITHUB_ENV}"
@@ -46,7 +99,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 test/e2e/pvm-l1.py
+          python3 test/e2e/pvm-l1.py --boundary-only
           for runtime in firecracker-pvm firecracker-pvm-incremental firecracker-pvm-virtiofs; do
             for suffix in "" -no-cgroup; do
               name="pvm-ci-${GITHUB_RUN_ID}-${runtime}${suffix}"
@@ -69,6 +122,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 test/e2e/pvm-l1.py
+          python3 test/e2e/pvm-l1.py --boundary-only
+          [[ -f "${PVM_CI_OUTPUT}/module-load-intent.json" ]] || exit 0
+          python3 - <<'OWNED_MODULES'
+          import json,os
+          from pathlib import Path
+          intent=json.loads((Path(os.environ['PVM_CI_OUTPUT'])/'module-load-intent.json').read_text())
+          marker=json.loads(Path('/etc/akernel-pvm-ci.json').read_text())
+          assert intent['lab_id']==marker['lab_id']
+          OWNED_MODULES
           if [[ -d /sys/module/kvm_pvm ]]; then rmmod kvm_pvm; fi
           if [[ -d /sys/module/kvm ]]; then rmmod kvm; fi
