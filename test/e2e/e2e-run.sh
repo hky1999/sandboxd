@@ -2403,19 +2403,32 @@ run_runsc_direct_dns_checks() {
     log "runsc direct DNS checks passed"
 }
 
+runsc_oom_memory_mb() {
+    # The init must be stable before an explicit OOM injection. On cgroup-v1,
+    # KVM startup charges include memslot metadata and helper runtimes; 128MiB
+    # can kill a helper before the intended workload or OOM observer is ready.
+    if [ "${RUNSC_PLATFORM}" = kvm ]; then
+        printf '256\n'
+    else
+        printf '128\n'
+    fi
+}
+
 run_partial_oom_check() {
     log "testing OOM of one host task while sandbox init remains alive"
+    local memory_mb
+    memory_mb="$(runsc_oom_memory_mb)"
     # Keep another sandbox alive so this cannot accidentally pass by picking
     # the first directory in a one-entry cache. It must survive the target OOM.
     PARTIAL_OOM_GUARD_ID="$(sbox_cmd start --quiet --runtime runsc \
         --sandbox-id sbox-e2e-oom-guard --rootfs "${ROOTFS}" \
-        --cpu-millicores 1000 --memory-mb 128 /bin/sleep 300)"
+        --cpu-millicores 1000 --memory-mb "${memory_mb}" /bin/sleep 300)"
     SANDBOX_ID="$(sbox_cmd start --quiet --runtime runsc \
         --sandbox-id sbox-e2e-partial-oom --rootfs "${ROOTFS}" \
-        --cpu-millicores 1000 --memory-mb 128 /bin/sleep 300)"
+        --cpu-millicores 1000 --memory-mb "${memory_mb}" /bin/sleep 300)"
     local child
     child="$(wait_for_sandbox_cgroup "${SANDBOX_ID}")"
-    assert_cgroup_limits "${child}" 1000 128
+    assert_cgroup_limits "${child}" 1000 "${memory_mb}"
     local guard_child
     guard_child="$(wait_for_sandbox_cgroup "${PARTIAL_OOM_GUARD_ID}")"
     [ "${child}" != "${guard_child}" ] || fail "OOM target and guard share a cgroup"
@@ -2541,13 +2554,17 @@ run_runsc_checks() {
     run_partial_oom_check
 
     log "starting immediate OOM sandbox"
+    local oom_memory_mb
+    local reused_memory_mb
+    oom_memory_mb="$(runsc_oom_memory_mb)"
+    reused_memory_mb="$((oom_memory_mb * 2))"
     SANDBOX_ID="$(sbox_cmd start \
         --quiet \
         --runtime runsc \
         --sandbox-id sbox-e2e-oom \
         --rootfs "${ROOTFS}" \
         --cpu-millicores 1000 \
-        --memory-mb 128 \
+        --memory-mb "${oom_memory_mb}" \
         /bin/oom-hog)"
     # Concurrent restored clones may replace the original one-entry cache.
     # Follow this sandbox's actual lease for OOM and subsequent reuse checks.
@@ -2569,12 +2586,12 @@ run_runsc_checks() {
         --sandbox-id sbox-e2e-reuse \
         --rootfs "${ROOTFS}" \
         --cpu-millicores 1500 \
-        --memory-mb 256 \
+        --memory-mb "${reused_memory_mb}" \
         /bin/sleep 300)"
     local reused_cgroup
     reused_cgroup="$(wait_for_sandbox_cgroup "${SANDBOX_ID}")"
     assert_eq "${reused_cgroup}" "${cache_cgroup}" "cached cgroup path"
-    assert_cgroup_limits "${reused_cgroup}" 1500 256
+    assert_cgroup_limits "${reused_cgroup}" 1500 "${reused_memory_mb}"
     if [ "${CPU_LIMIT_MODE}" = "quota" ]; then
         got="$(sbox_cmd exec "${SANDBOX_ID}" /bin/nproc)"
         assert_eq "${got}" "2" "runsc guest CPU count"
@@ -2607,7 +2624,7 @@ run_runsc_checks() {
         --rootfs "${ROOTFS}" \
         --mount "${HOST_MOUNT}:/mnt/host" \
         --cpu-millicores 1000 \
-        --memory-mb 128 \
+        --memory-mb "${oom_memory_mb}" \
         /bin/oom-hog --wait-file /mnt/host/oom-trigger)"
     wait_for_state "${SANDBOX_ID}" "SANDBOX_STATE_RUNNING"
     sleep 6
