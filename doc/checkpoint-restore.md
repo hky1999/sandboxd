@@ -63,6 +63,8 @@ Restore detects this artifact layout independently of the current save mode. Bef
 
 Sharing applies to writable-file extents, not the independently saved application-memory pages. Logical file lengths and ordinary summed `du` output do not measure unique physical storage when extents are shared. Measure filesystem usage and shared extents, including unlinked live filestores, when evaluating savings. Host directory bind contents remain caller-owned and are not captured or rolled back by this mechanism. Only anonymous disk-backed filestores are supported; self-overlay backing must not be used for these snapshots. Private tmpfs filestores require the matching gVisor anonymous-filestore mount hints.
 
+Concurrent runsc restore holds the loader lock while loading kernel state. The pinned gVisor bundle returns a temporary state-query error while that lock is busy, allowing inventory to use its existing process-liveness check and retain the last known container status. A restoring sandbox therefore does not stall node-wide inventory or become dead solely because this state query is busy. Runtime availability checks and checkpoint/restore timeouts remain enforced.
+
 Save and restore must use matching runtime builds. Drain sandboxes before replacing the runtime bundle; do not assume old saved state remains compatible across a gVisor upgrade. Install the complete checksum-pinned gVisor archive with its matching helpers, rather than replacing runsc alone.
 
 ## Checkpoint output synchronization
