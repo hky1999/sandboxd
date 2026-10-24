@@ -68,6 +68,9 @@ type CgroupManager struct {
 
 	db         store.DbStore
 	storeDirty atomic.Bool
+	// storeMu covers snapshot capture and commit, preventing older periodic
+	// snapshots from overwriting synchronous allocation ownership.
+	storeMu sync.Mutex
 
 	gcQueue *util.Queue[string]
 	gcWake  chan struct{}
@@ -252,9 +255,7 @@ func (c *CgroupManager) Allocate() (string, error) {
 		return "", errCgroupManagerStopped
 	}
 	if id := c.idleID.Pop(); id != "" {
-		c.usingID.Set(id, struct{}{})
-		c.storeDirty.Store(true)
-		return id, nil
+		return c.activate(id)
 	}
 
 	c.mu.Lock()
@@ -280,12 +281,33 @@ func (c *CgroupManager) Allocate() (string, error) {
 		if res.err != nil {
 			return "", res.err
 		}
-		c.usingID.Set(res.id, struct{}{})
-		c.storeDirty.Store(true)
-		return res.id, nil
+		return c.activate(res.id)
 	case <-c.stopCh:
 		return "", errCgroupManagerStopped
 	}
+}
+
+// activate commits ownership before any caller can start a process in the group.
+// A failed commit cannot admit a sandbox. The still-empty group can safely be
+// returned to the pool; a possibly stale persisted entry only retains it.
+func (c *CgroupManager) activate(id string) (string, error) {
+	c.usingID.Set(id, struct{}{})
+	c.storeDirty.Store(true)
+	if err := c.store(); err != nil {
+		c.usingID.Remove(id)
+		c.storeDirty.Store(true)
+		c.mu.Lock()
+		if !c.stopped.Load() && c.idleID.Length() < c.cacheSize {
+			c.idleID.Push(id)
+			c.mu.Unlock()
+		} else {
+			c.total--
+			c.mu.Unlock()
+			c.deleteCgroup(id)
+		}
+		return "", fmt.Errorf("persist cgroup allocation %s: %w", id, err)
+	}
+	return id, nil
 }
 
 func (c *CgroupManager) run() {
@@ -468,15 +490,9 @@ func NewCgroupManager(
 		logrus.Infof("load existing cgroup num: %d", cgroups.Count())
 	}
 
-	usingIDs := cmap.New[struct{}]()
-	recoveryDirty := false
-	for _, id := range persisted.Items {
-		if !belongsToRoot(id, rootName) || !cgroups.Has(id) {
-			logrus.Warnf("drop stale persisted cgroup id %s during recovery", id)
-			recoveryDirty = true
-			continue
-		}
-		usingIDs.Set(id, struct{}{})
+	usingIDs, recoveryDirty, err := recoverUsingIDs(ops, rootName, cgroups, persisted.Items)
+	if err != nil {
+		return nil, err
 	}
 
 	c := &CgroupManager{
@@ -497,6 +513,15 @@ func NewCgroupManager(
 		ops:            ops,
 		oom:            oom,
 		stopCh:         make(chan struct{}),
+	}
+
+	// Repair old/missing ownership before any cleanup or public admission. An
+	// occupied owned group is not disposable merely because the last daemon died
+	// before its periodic lease write.
+	if recoveryDirty {
+		if err := c.store(); err != nil {
+			return nil, fmt.Errorf("persist recovered cgroup ownership: %w", err)
+		}
 	}
 
 	for id := range cgroups.Items() {
@@ -558,6 +583,8 @@ func (c *CgroupManager) keepStoring() {
 }
 
 func (c *CgroupManager) store() error {
+	c.storeMu.Lock()
+	defer c.storeMu.Unlock()
 	start := time.Now()
 	defer func() {
 		logrus.Debugf(
@@ -574,6 +601,37 @@ func (c *CgroupManager) store() error {
 		return fmt.Errorf("store cgroup using IDs: %w", err)
 	}
 	return nil
+}
+
+// recoverUsingIDs classifies groups before any destructive reuse. Occupied
+// groups missing from an older lease snapshot are retained for normal sandbox
+// metadata reconciliation. An unreadable occupancy state aborts recovery.
+func recoverUsingIDs(ops cgroupOps, root string, groups cmap.ConcurrentMap[string, struct{}], persisted []string) (cmap.ConcurrentMap[string, struct{}], bool, error) {
+	using := cmap.New[struct{}]()
+	dirty := false
+	for _, id := range persisted {
+		if !belongsToRoot(id, root) || !groups.Has(id) {
+			logrus.Warnf("drop stale persisted cgroup id %s during recovery", id)
+			dirty = true
+			continue
+		}
+		using.Set(id, struct{}{})
+	}
+	for id := range groups.Items() {
+		if using.Has(id) {
+			continue
+		}
+		occupied, err := ops.populated(id)
+		if err != nil {
+			return using, dirty, fmt.Errorf("inspect recovered cgroup %s: %w", id, err)
+		}
+		if occupied {
+			using.Set(id, struct{}{})
+			dirty = true
+			logrus.Warnf("retain populated cgroup %s missing from persisted ownership", id)
+		}
+	}
+	return using, dirty, nil
 }
 
 func loadAllCgroups(

@@ -72,6 +72,18 @@ func (*cgroupV1) list(root string) ([]string, error) {
 	return result, nil
 }
 
+func (*cgroupV1) populated(name string) (bool, error) {
+	group, err := cg.Load(cg.StaticPath(name), cg.WithHiearchy(cg.Default))
+	if err != nil {
+		return false, err
+	}
+	processes, err := group.Processes(cg.Memory, true)
+	if err != nil {
+		return false, err
+	}
+	return len(processes) != 0, nil
+}
+
 func (*cgroupV1) create(name string, resources *specs.LinuxResources) error {
 	_, err := cg.New(cg.StaticPath(name), resources, cg.WithHiearchy(cg.Default))
 	return err

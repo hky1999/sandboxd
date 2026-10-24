@@ -258,7 +258,8 @@ func (f *fakeCgroupOps) prepareRoot(string, int64) error {
 	f.calls = append(f.calls, "prepare-root")
 	return nil
 }
-func (f *fakeCgroupOps) list(string) ([]string, error) { return nil, nil }
+func (f *fakeCgroupOps) list(string) ([]string, error)  { return nil, nil }
+func (f *fakeCgroupOps) populated(string) (bool, error) { return false, nil }
 func (f *fakeCgroupOps) create(_ string, resources *specs.LinuxResources) error {
 	f.calls = append(f.calls, "create")
 	f.createdResources = resources

@@ -113,6 +113,30 @@ func (o *cgroupV2) list(root string) ([]string, error) {
 	return result, nil
 }
 
+func (o *cgroupV2) populated(name string) (bool, error) {
+	data, err := os.ReadFile(filepath.Join(o.mountpoint, name, "cgroup.events"))
+	if err != nil {
+		return false, err
+	}
+	found := false
+	occupied := false
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 0 || fields[0] != "populated" {
+			continue
+		}
+		if found || len(fields) != 2 || (fields[1] != "0" && fields[1] != "1") {
+			return false, fmt.Errorf("invalid populated state for cgroup %s", name)
+		}
+		found = true
+		occupied = fields[1] == "1"
+	}
+	if !found {
+		return false, fmt.Errorf("missing populated state for cgroup %s", name)
+	}
+	return occupied, nil
+}
+
 func (o *cgroupV2) create(name string, resources *specs.LinuxResources) error {
 	_, err := cgroup2.NewManager(o.mountpoint, name, cgroup2.ToResources(resources))
 	return err

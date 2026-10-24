@@ -77,6 +77,7 @@ type cgroupOps interface {
 	mode() cgroups.CGMode
 	prepareRoot(root string, pidsMax int64) error
 	list(root string) ([]string, error)
+	populated(name string) (bool, error)
 	create(name string, resources *specs.LinuxResources) error
 	reset(name string) error
 	setPidsLimit(name string, limit int64) error
