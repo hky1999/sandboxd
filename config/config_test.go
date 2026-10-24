@@ -57,6 +57,29 @@ func TestDefaultConfigUsesRunscSystrap(t *testing.T) {
 	}
 }
 
+func TestRunscCheckpointMode(t *testing.T) {
+	for _, tc := range []struct{ input, want string }{
+		{"", "full"}, {"full", "full"}, {" Reflink ", "reflink"},
+	} {
+		got, err := NormalizeRunscCheckpointMode(tc.input)
+		if err != nil || got != tc.want {
+			t.Fatalf("mode %q: got %q, %v; want %q", tc.input, got, err, tc.want)
+		}
+	}
+	for _, input := range []string{"incremental", "softdirty", "unknown"} {
+		if _, err := NormalizeRunscCheckpointMode(input); err == nil {
+			t.Fatalf("accepted invalid runsc mode %q", input)
+		}
+	}
+	var cfg Config
+	if err := toml.Unmarshal([]byte("[plugin.runtime.runsc]\ncheckpoint_mode = \"reflink\"\n"), &cfg); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.RuntimeConfig.Runsc.CheckpointMode != "reflink" {
+		t.Fatal("runsc checkpoint mode was not decoded")
+	}
+}
+
 func TestRunscPlatformTOML(t *testing.T) {
 	var cfg Config
 	if err := toml.Unmarshal([]byte(
@@ -66,6 +89,16 @@ func TestRunscPlatformTOML(t *testing.T) {
 	}
 	if got := cfg.RuntimeConfig.Runsc.Platform; got != RunscPlatformKVM {
 		t.Fatalf("configured runsc platform = %q, want %q", got, RunscPlatformKVM)
+	}
+}
+
+func TestRunscWritableStorageTOML(t *testing.T) {
+	var cfg Config
+	if err := toml.Unmarshal([]byte("[plugin.runtime]\nfilestore_dir = \"/local/common\"\n[plugin.runtime.runsc]\nwritable_storage_dir = \"/shared/private\"\nwritable_storage_filesystem = \"fuse.juicefs\"\n"), &cfg); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.RuntimeConfig.Runsc.WritableStorageDir != "/shared/private" || cfg.RuntimeConfig.Runsc.WritableStorageFilesystem != "fuse.juicefs" || cfg.RuntimeConfig.FilestoreDir != "/local/common" || cfg.RuntimeConfig.Firecracker.WritableStorageDir != "" {
+		t.Fatal("runsc writable storage options changed another runtime or were not decoded")
 	}
 }
 

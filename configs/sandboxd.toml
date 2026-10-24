@@ -91,6 +91,14 @@ sync_output = false
 platform = "systrap"
 # Return before all checkpoint memory has loaded; retain restore input files.
 background_restore = false
+# Use "reflink" only when live filestores and checkpoints share a filesystem
+# supporting the qualified runtime's native clone path. See checkpoint-restore.md.
+checkpoint_mode = "full"
+# Optional private writable filestore override; both values are required.
+# The directory must already exist on the expected mount. This does not move
+# the common filestore, Firecracker memory, or another runtime's state.
+# writable_storage_dir = "/mnt/shared/runsc-private"
+# writable_storage_filesystem = "fuse.juicefs"
 # Operator-owned create flags; omit to keep ["--net-raw=true"], or use [] for none.
 # Use --name=value for every flag, including booleans; sandboxd-managed flags cannot be overridden.
 # Docker 28+ bridge networking also needs --allow-packet-socket-write,

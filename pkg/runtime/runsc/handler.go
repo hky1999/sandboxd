@@ -76,9 +76,17 @@ func NewHandler(cfg config.Config, bin string, loader runtimecore.OciLoader) (*H
 	if err != nil {
 		return nil, fmt.Errorf("configure runsc: %w", err)
 	}
+	checkpointMode, err := config.NormalizeRunscCheckpointMode(cfg.RuntimeConfig.Runsc.CheckpointMode)
+	if err != nil {
+		return nil, fmt.Errorf("configure runsc: %w", err)
+	}
 	root := cfg.RootDir
 	if err := validateExtraArgs(cfg.RuntimeConfig.Runsc.ExtraArgs); err != nil {
 		return nil, fmt.Errorf("configure runsc: %w", err)
+	}
+	filestoreDir := cfg.RuntimeConfig.FilestoreDir
+	if cfg.RuntimeConfig.Runsc.WritableStorageDir != "" {
+		filestoreDir = cfg.RuntimeConfig.Runsc.WritableStorageDir
 	}
 	runscRoot := filepath.Join(root, config.RuntimeNameRunsc)
 	if err := os.MkdirAll(runscRoot, 0711); err != nil {
@@ -93,20 +101,26 @@ func NewHandler(cfg config.Config, bin string, loader runtimecore.OciLoader) (*H
 	if err != nil {
 		return nil, fmt.Errorf("initialize EROFS loop manager: %w", err)
 	}
+	writableRoot, err := openRunscWritableRoot(cfg.RuntimeConfig.Runsc.WritableStorageDir, cfg.RuntimeConfig.Runsc.WritableStorageFilesystem)
+	if err != nil {
+		return nil, fmt.Errorf("configure runsc writable storage: %w", err)
+	}
 
 	return &Handler{
 		runsc: NewClientWithOptions(bin, runscRoot, Options{
 			ExtraArgs:         cfg.RuntimeConfig.Runsc.ExtraArgs,
 			Platform:          platform,
-			FilestoreDir:      cfg.RuntimeConfig.FilestoreDir,
+			FilestoreDir:      filestoreDir,
 			OverlayTmpfsSize:  cfg.RuntimeConfig.OverlayTmpfsSize,
 			DebugLogPath:      runscLogPath,
 			IgnoreCgroups:     cfg.DisableCgroup,
 			BackgroundRestore: cfg.RuntimeConfig.Runsc.BackgroundRestore,
+			ReflinkFilestores: checkpointMode == "reflink",
+			writableRoot:      writableRoot,
 		}),
 		ociLoader:              loader,
 		rootfsOverlayTmpfsSize: cfg.RuntimeConfig.OverlayTmpfsSize,
-		filestoreDir:           cfg.RuntimeConfig.FilestoreDir,
+		filestoreDir:           filestoreDir,
 		sandboxRoot:            filepath.Join(root, "containers"),
 		mountEROFS:             mountEROFS,
 	}, nil
@@ -213,6 +227,10 @@ func (r *Handler) Restore(
 	if config.Network == nil {
 		return fmt.Errorf("network is required")
 	}
+	adoptDir, err := filestoreRestoreDirectory(config.CheckpointDir)
+	if err != nil {
+		return fmt.Errorf("validate runsc checkpoint filestores: %w", err)
+	}
 	rootOverlay, rootOverlaySize, err := r.resolveRootOverlay(
 		config.WritableLayerLimitBytes,
 	)
@@ -262,11 +280,12 @@ func (r *Handler) Restore(
 	}
 
 	startArgs := StartArgs{
-		ID:          config.ID,
-		BundleDir:   bundlePath,
-		UserStdout:  config.Stdout,
-		UserStderr:  config.Stderr,
-		RootOverlay: rootOverlay,
+		ID:                config.ID,
+		BundleDir:         bundlePath,
+		UserStdout:        config.Stdout,
+		UserStderr:        config.Stderr,
+		RootOverlay:       rootOverlay,
+		FilestoreAdoptDir: adoptDir,
 		Network: NetworkConfig{
 			Interface:   config.Network.Interface,
 			LinkAddress: config.Network.GuestHardwareAddr(),

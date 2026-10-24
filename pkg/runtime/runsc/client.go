@@ -67,6 +67,8 @@ type Options struct {
 	IgnoreCgroups      bool
 	PlatformDevicePath string
 	BackgroundRestore  bool
+	ReflinkFilestores  bool
+	writableRoot       *runscWritableRoot
 }
 
 type StartArgs struct {
@@ -75,7 +77,9 @@ type StartArgs struct {
 	UserStdout  string
 	UserStderr  string
 	RootOverlay string
-	Network     NetworkConfig
+	// FilestoreAdoptDir is per-restore state, never a persistent global option.
+	FilestoreAdoptDir string
+	Network           NetworkConfig
 }
 
 func NewClient(binary, rootDir string) *Client {
@@ -100,6 +104,11 @@ func NewClientWithOptions(binary, rootDir string, options Options) *Client {
 // regular files for stdio so the boot/gofer processes do not inherit pipes held
 // by exec.Cmd, which can otherwise make create appear to hang.
 func (c *Client) Create(ctx context.Context, args StartArgs) error {
+	if c.Options.writableRoot != nil {
+		if err := c.Options.writableRoot.verify(); err != nil {
+			return fmt.Errorf("runsc writable storage: %w", err)
+		}
+	}
 	if args.ID == "" {
 		return fmt.Errorf("container id is empty")
 	}
@@ -143,6 +152,17 @@ func (c *Client) Create(ctx context.Context, args StartArgs) error {
 		rootOverlay = RootFileOverlay(c.Options.FilestoreDir, c.Options.OverlayTmpfsSize)
 	}
 	cmdArgs = append(cmdArgs, "--overlay2="+rootOverlay)
+	if c.Options.ReflinkFilestores || c.Options.writableRoot != nil {
+		// Older kernels require identical mount objects for FICLONE. Fresh
+		// backing files must use the launcher's mount, like checkpoint files.
+		cmdArgs = append(cmdArgs, "--filestore-parent-mountns=true")
+	}
+	if args.FilestoreAdoptDir != "" {
+		cmdArgs = append(cmdArgs,
+			"--filestore-adopt-dir="+args.FilestoreAdoptDir,
+			"--filestore-clone-on-adopt=true",
+		)
+	}
 	cmdArgs = append(cmdArgs, "create")
 	cmdArgs = append(cmdArgs,
 		"--bundle", args.BundleDir,
@@ -165,6 +185,13 @@ func (c *Client) Create(ctx context.Context, args StartArgs) error {
 		return fmt.Errorf("runsc create %s failed: %w", args.ID, err)
 	}
 	logrus.Debugf("runsc create command finished, id: %s, cost: %v", args.ID, time.Since(start))
+	if c.Options.writableRoot != nil {
+		if err := c.verifyCreatedFilestores(args); err != nil {
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), runscRestoreCleanupTimeout)
+			defer cancel()
+			return errors.Join(fmt.Errorf("verify created runsc writable storage: %w", err), c.Delete(cleanupCtx, args.ID, true))
+		}
+	}
 	return nil
 }
 
@@ -186,7 +213,7 @@ func validateExtraArgs(args []string) error {
 			return fmt.Errorf("invalid extra_args entry %q: use --name=value (including booleans)", arg)
 		}
 		switch name {
-		case "--root", "--platform", "--network", "--overlay2", "--ignore-cgroups", "--debug-log", "--bundle":
+		case "--root", "--platform", "--network", "--overlay2", "--ignore-cgroups", "--debug-log", "--bundle", "--filestore-adopt-dir", "--filestore-clone-on-adopt", "--filestore-parent-mountns":
 			return fmt.Errorf("extra_args cannot override sandboxd-managed flag %s", name)
 		}
 	}
@@ -293,6 +320,12 @@ func (c *Client) Checkpoint(
 	if leaveRunning {
 		args = append(args, "--leave-running")
 	}
+	if c.Options.ReflinkFilestores {
+		args = append(args,
+			"--skip-filestore-pages",
+			"--filestore-snapshot-dir="+filepath.Join(imageDir, filestoreDirectoryName),
+		)
+	}
 	args = append(args, "--image-path", imageDir, id)
 	cmd := exec.CommandContext(ctx, c.Binary, args...)
 	output, err := cmd.CombinedOutput()
@@ -301,6 +334,15 @@ func (c *Client) Checkpoint(
 			return ctxErr
 		}
 		return fmt.Errorf("runsc checkpoint %s failed: %w: %s", id, err, strings.TrimSpace(string(output)))
+	}
+	if c.Options.ReflinkFilestores {
+		directory, err := filestoreRestoreDirectory(imageDir)
+		if err != nil {
+			return fmt.Errorf("validate runsc filestore checkpoint: %w", err)
+		}
+		if directory == "" {
+			return fmt.Errorf("runsc checkpoint did not produce a filestore manifest")
+		}
 	}
 	return nil
 }
