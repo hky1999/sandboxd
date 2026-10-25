@@ -546,8 +546,11 @@ type GetStartOperationRequest struct {
 	// must not enable this for operations sent through legacy Start.
 	SealMissing     bool             `protobuf:"varint,4,opt,name=seal_missing,json=sealMissing,proto3" json:"seal_missing,omitempty"`
 	HistoryIdentity *HistoryIdentity `protobuf:"bytes,5,opt,name=history_identity,json=historyIdentity,proto3" json:"history_identity,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// Requires seal_missing and a complete identity. Refuses every later
+	// creation fingerprint for this Runtime, after checking all admitted facts.
+	SealRuntime   bool `protobuf:"varint,6,opt,name=seal_runtime,json=sealRuntime,proto3" json:"seal_runtime,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *GetStartOperationRequest) Reset() {
@@ -615,6 +618,13 @@ func (x *GetStartOperationRequest) GetHistoryIdentity() *HistoryIdentity {
 	return nil
 }
 
+func (x *GetStartOperationRequest) GetSealRuntime() bool {
+	if x != nil {
+		return x.SealRuntime
+	}
+	return false
+}
+
 type StartOperationResponse struct {
 	state              protoimpl.MessageState `protogen:"open.v1"`
 	OperationID        string                 `protobuf:"bytes,1,opt,name=operation_id,json=operationId,proto3" json:"operation_id,omitempty"`
@@ -623,7 +633,9 @@ type StartOperationResponse struct {
 	State              StartOperationState    `protobuf:"varint,4,opt,name=state,proto3,enum=runtime.v1.StartOperationState" json:"state,omitempty"`
 	// Original bound sandbox ID and generation, including for PENDING/RETIRED.
 	// A successful result also retains its original IP and ports.
-	Result        *StartResponse `protobuf:"bytes,5,opt,name=result,proto3" json:"result,omitempty"`
+	Result *StartResponse `protobuf:"bytes,5,opt,name=result,proto3" json:"result,omitempty"`
+	// Durable Runtime-wide fence, distinct from sealing one operation ID.
+	RuntimeFenced bool `protobuf:"varint,6,opt,name=runtime_fenced,json=runtimeFenced,proto3" json:"runtime_fenced,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -691,6 +703,13 @@ func (x *StartOperationResponse) GetResult() *StartResponse {
 		return x.Result
 	}
 	return nil
+}
+
+func (x *StartOperationResponse) GetRuntimeFenced() bool {
+	if x != nil {
+		return x.RuntimeFenced
+	}
+	return false
 }
 
 // NetworkEndpoint identifies the remote peer matched by a traffic rule.
@@ -5021,19 +5040,21 @@ const file_api_runtime_v1_sandbox_api_proto_rawDesc = "" +
 	"\foperation_id\x18\x02 \x01(\tR\voperationId\x12/\n" +
 	"\x13request_fingerprint\x18\x03 \x01(\tR\x12requestFingerprint\x120\n" +
 	"\x14deadline_unix_millis\x18\x04 \x01(\x04R\x12deadlineUnixMillis\x12F\n" +
-	"\x10history_identity\x18\x05 \x01(\v2\x1b.runtime.v1.HistoryIdentityR\x0fhistoryIdentity\"\x8b\x02\n" +
+	"\x10history_identity\x18\x05 \x01(\v2\x1b.runtime.v1.HistoryIdentityR\x0fhistoryIdentity\"\xae\x02\n" +
 	"\x18GetStartOperationRequest\x12!\n" +
 	"\foperation_id\x18\x01 \x01(\tR\voperationId\x12/\n" +
 	"\x13request_fingerprint\x18\x02 \x01(\tR\x12requestFingerprint\x120\n" +
 	"\x14deadline_unix_millis\x18\x03 \x01(\x04R\x12deadlineUnixMillis\x12!\n" +
 	"\fseal_missing\x18\x04 \x01(\bR\vsealMissing\x12F\n" +
-	"\x10history_identity\x18\x05 \x01(\v2\x1b.runtime.v1.HistoryIdentityR\x0fhistoryIdentity\"\x88\x02\n" +
+	"\x10history_identity\x18\x05 \x01(\v2\x1b.runtime.v1.HistoryIdentityR\x0fhistoryIdentity\x12!\n" +
+	"\fseal_runtime\x18\x06 \x01(\bR\vsealRuntime\"\xaf\x02\n" +
 	"\x16StartOperationResponse\x12!\n" +
 	"\foperation_id\x18\x01 \x01(\tR\voperationId\x12/\n" +
 	"\x13request_fingerprint\x18\x02 \x01(\tR\x12requestFingerprint\x120\n" +
 	"\x14deadline_unix_millis\x18\x03 \x01(\x04R\x12deadlineUnixMillis\x125\n" +
 	"\x05state\x18\x04 \x01(\x0e2\x1f.runtime.v1.StartOperationStateR\x05state\x121\n" +
-	"\x06result\x18\x05 \x01(\v2\x19.runtime.v1.StartResponseR\x06result\"\xa1\x01\n" +
+	"\x06result\x18\x05 \x01(\v2\x19.runtime.v1.StartResponseR\x06result\x12%\n" +
+	"\x0eruntime_fenced\x18\x06 \x01(\bR\rruntimeFenced\"\xa1\x01\n" +
 	"\x0fNetworkEndpoint\x12\x18\n" +
 	"\aaddress\x18\x01 \x01(\tR\aaddress\x12\x12\n" +
 	"\x04port\x18\x02 \x01(\rR\x04port\x12\x12\n" +

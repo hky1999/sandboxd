@@ -413,10 +413,13 @@ func (w *HttpWorker) mountNydus(req *NydusMountRequest, bind mountBinding) (*Mou
 	stageStart = time.Now()
 	d := w.mgr.GetDaemon(id)
 	if d != nil {
-		if bind != nil {
-			if err := w.prepareDaemonForMount(&distillfs.DaemonCreateOpt{ID: id, SourceType: "nydus", ImageURL: req.ImageURL}, bind); err != nil {
-				return nil, err
-			}
+		if err := w.prepareDaemonForMount(&distillfs.DaemonCreateOpt{ID: id, Name: req.ImageURL, SourceType: "nydus", ImageURL: req.ImageURL}, bind); err != nil {
+			return nil, err
+		}
+		// A fully retired cache entry may now own a fresh preparation.
+		d = w.mgr.GetDaemon(id)
+		if d == nil {
+			return nil, fmt.Errorf("prepared Nydus daemon is unavailable")
 		}
 		logrus.Infof("daemon %s for image %s already exists, reusing it", id, req.ImageURL)
 

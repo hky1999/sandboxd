@@ -601,6 +601,9 @@ func (j *startOperationJournal) admitHistory(id, fingerprint string, identity *r
 	} else if identity == nil {
 		return status.Error(codes.FailedPrecondition, "legacy operation admission is closed")
 	}
+	if err := j.checkRuntimeFence(context.Background(), id, identity, false); err != nil {
+		return err
+	}
 	expected, err := historyOperationID(identity, fingerprint)
 	if err != nil || expected != id {
 		return status.Error(codes.FailedPrecondition, "operation is not bound to its complete allocation")
@@ -695,4 +698,32 @@ func (h *sandboxService) CollectHistory(ctx context.Context, request *runtime.Co
 	response.RemovedBytes += size
 	response.RemainingStartOperations = uint64(len(j.admitted))
 	return response, nil
+}
+
+// The admission mutex serializes this bounded inspection with every start and
+// negative fence. Missing/corrupt admitted facts retain uncertainty. No existing
+// operation is reclassified or overwritten to manufacture a negative result.
+func (j *startOperationJournal) checkRuntimeFence(ctx context.Context, id string, identity *runtime.HistoryIdentity, requireAbsent bool) error {
+	if identity == nil {
+		return nil
+	}
+	if len(j.admitted) > 4096 {
+		return fmt.Errorf("runtime fence inspection bound exceeded")
+	}
+	for operation := range j.admitted {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if operation == id {
+			continue
+		}
+		record, err := j.read(operation)
+		if err != nil || record == nil {
+			return fmt.Errorf("admitted runtime ownership is unknown")
+		}
+		if proto.Equal(record.HistoryIdentity, identity) && (requireAbsent || record.RuntimeSealed) {
+			return status.Error(codes.FailedPrecondition, "runtime already admitted or durably fenced")
+		}
+	}
+	return nil
 }

@@ -1550,11 +1550,12 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 }
 
 type createOptions struct {
-	checkpointImage    string
-	onReserved         func(*runtime.StartRequest, string) error
-	restoreIdentity    *runtime.RestoreIdentity
-	resourceGeneration string
-	beforeSideEffects  func() error
+	durableStartAdmission bool
+	checkpointImage       string
+	onReserved            func(*runtime.StartRequest, string) error
+	restoreIdentity       *runtime.RestoreIdentity
+	resourceGeneration    string
+	beforeSideEffects     func() error
 }
 
 func (h *sandboxService) createSandbox(
@@ -1569,6 +1570,24 @@ func (h *sandboxService) createSandbox(
 	if !h.recoveryReady.Load() {
 		err := errord.ToGRPCf(errord.ErrUnavailable, "distillfs recovery is incomplete")
 		return &runtime.StartResponse{Code: -1, Message: err.Error()}, err
+	}
+	// Runtime-labelled legacy creation cannot bypass an installed persistent
+	// admission fence. Managed StartOperation has already registered its intent
+	// under the same admission mutex before this private path is entered.
+	if request.Labels["adx.runtime_id"] != "" && !options.durableStartAdmission {
+		h.startOperationMu.Lock()
+		journal, err := h.openStartOperationJournal()
+		var installed *historyState
+		if err == nil {
+			installed, err = journal.loadHistory()
+		}
+		h.startOperationMu.Unlock()
+		if err != nil {
+			return nil, errord.ToGRPCf(errord.ErrUnavailable, "persistent creation admission is unavailable")
+		}
+		if installed != nil {
+			return nil, errord.ToGRPCf(errord.ErrFailedPrecondition, "Runtime-labelled creation requires durable StartOperation")
+		}
 	}
 	startReq := proto.Clone(request).(*runtime.StartRequest)
 	checkpointDir := ""

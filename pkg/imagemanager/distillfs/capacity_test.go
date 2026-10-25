@@ -89,15 +89,10 @@ func TestChunkDBCapacityIntegration(t *testing.T) {
 		NydusCfgPath: createTestConfigFile(t, root, "nydus.json", BackendConfig{BackendType: "registry"}),
 		OSSAuthsPath: createTestOSSAuthsFile(t, root), RegistryAuthsPath: createTestRegistryAuthsFile(t, root),
 	}
-	// Prepare without periodic workers so every test-owned process has a bounded lifetime.
-	size, err := normalizeChunkDBSize(cfg.ChunkDBSize)
-	if err != nil {
-		t.Fatal(err)
-	}
-	mgr := &manager{ctx: context.Background(), root: cfg.Root, binPath: bin, chunkDBSize: size, daemons: map[string]*Daemon{}, recovered: map[string]bool{}}
-	if err := mgr.prepare(cfg.OSSCfgPath, cfg.NydusCfgPath, cfg.OSSAuthsPath, cfg.RegistryAuthsPath); err != nil {
-		t.Fatal(err)
-	}
+	// Exercise the production root owner and original managed producer, rather
+	// than constructing an ownerless legacy manager that cannot bind a launch.
+	cfg.Context = context.Background()
+	mgr := ownedManager(t, cfg)
 	checkStats := func() {
 		t.Helper()
 		stats, err := mgr.checkChunkDBStats()
@@ -109,7 +104,7 @@ func TestChunkDBCapacityIntegration(t *testing.T) {
 		}
 	}
 	checkStats()
-	if err := mgr.CreateDaemon(&DaemonCreateOpt{ID: "capacity", Name: "root.erofs"}); err != nil {
+	if err := mgr.PrepareDaemon(&DaemonCreateOpt{ID: "capacity", Name: "root.erofs"}, preparationOwner(), func(string, string) error { return nil }); err != nil {
 		t.Fatal(err)
 	}
 	d := mgr.GetDaemon("capacity")
@@ -138,13 +133,21 @@ func TestChunkDBCapacityIntegration(t *testing.T) {
 	if err := d.Unmount(); err != nil {
 		t.Fatal(err)
 	}
-	recovered := &manager{ctx: context.Background(), root: cfg.Root, binPath: bin, chunkDBSize: size, daemons: map[string]*Daemon{}, recovered: map[string]bool{}}
-	if err := recovered.loadExistedDaemons(); err != nil {
+	originalGeneration := d.originalPhysicalIdentity().Generation
+	if err := mgr.Close(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	d = recovered.GetDaemon("capacity")
-	if d == nil || d.chunkDBSize != size {
+	mgr = ownedManager(t, cfg)
+	d = mgr.GetDaemon("capacity")
+	if d == nil || d.chunkDBSize != "8388608" {
 		t.Fatal("capacity lost during recovery")
+	}
+	if err := mgr.PrepareDaemon(&DaemonCreateOpt{ID: "capacity", Name: "root.erofs"}, PreparationOwner{OperationID: strings.Repeat("1", 64), RequestFingerprint: strings.Repeat("2", 64)}, func(g, target string) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	d = mgr.GetDaemon("capacity")
+	if d.originalPreparation().Generation == originalGeneration {
+		t.Fatal("released original generation reused")
 	}
 	if err := d.Mount(); err != nil {
 		t.Fatal(err)

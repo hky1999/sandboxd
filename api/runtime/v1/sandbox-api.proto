@@ -93,6 +93,9 @@ message GetStartOperationRequest {
   // must not enable this for operations sent through legacy Start.
   bool seal_missing = 4;
   HistoryIdentity history_identity = 5;
+  // Requires seal_missing and a complete identity. Refuses every later
+  // creation fingerprint for this Runtime, after checking all admitted facts.
+  bool seal_runtime = 6;
 }
 
 enum StartOperationState {
@@ -115,6 +118,8 @@ message StartOperationResponse {
   // Original bound sandbox ID and generation, including for PENDING/RETIRED.
   // A successful result also retains its original IP and ports.
   StartResponse result = 5;
+  // Durable Runtime-wide fence, distinct from sealing one operation ID.
+  bool runtime_fenced = 6;
 }
 
 // NetworkPolicyAction is the action selected by a network policy rule.

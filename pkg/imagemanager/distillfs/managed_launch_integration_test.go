@@ -184,9 +184,36 @@ func TestDaemonManagedLaunchPhysicalOriginalMountRetirementAndReopen(t *testing.
 	require.Equal(t, released, original.originalPhysicalIdentity())
 	require.Equal(t, neighborBirth, neighbor.originalPhysicalIdentity())
 	require.NoError(t, original.UnmountIfPhysicalGeneration(birth.Generation))
+
+	old := original
+	var nextGeneration string
+	require.NoError(t, mgr.PrepareDaemon(&DaemonCreateOpt{ID: old.meta.ID, Name: "root.erofs"}, PreparationOwner{OperationID: strings.Repeat("1", 64), RequestFingerprint: strings.Repeat("2", 64)}, func(g, target string) error {
+		nextGeneration = g
+		require.NotEqual(t, birth.Generation, g)
+		require.NotEqual(t, birth.Target, target)
+		return nil
+	}))
+	original = mgr.GetDaemon(old.meta.ID)
+	originalGenerations[original.meta.ID] = nextGeneration
+	require.NotSame(t, old, original)
+	require.NoError(t, original.Mount())
+	nextBirth := original.originalPhysicalIdentity()
+	require.Equal(t, nextGeneration, nextBirth.Generation)
+	require.Equal(t, "running", nextBirth.Phase)
+	require.Error(t, old.Mount())
+	require.Error(t, old.persistDaemonMetadata())
+	require.NoError(t, old.UnmountIfPhysicalGeneration(birth.Generation))
+	require.Equal(t, nextBirth, original.originalPhysicalIdentity())
+	nextContents, nextReadError := os.ReadFile(filepath.Join(original.MountPoint(), "root.erofs"))
+	require.NoError(t, nextReadError)
+	require.Equal(t, expected, nextContents)
+	writeEvidence("same-source-fresh-allocation-after-reopen", nextBirth)
+	checks["released_cache_replaced_with_fresh_generation_and_old_object_fenced"] = true
+	require.NoError(t, original.UnmountIfPhysicalGeneration(nextGeneration))
 	require.NoError(t, mgr.CleanupDaemon(original.meta.ID))
 	require.NoFileExists(t, original.savedPath)
 	require.NoDirExists(t, original.originalPreparation().Directory)
+
 	process, err = neighbor.observeOriginalProcess(neighborBirth.Process.PID)
 	require.NoError(t, err)
 	require.Equal(t, neighborBirth.Process, process)

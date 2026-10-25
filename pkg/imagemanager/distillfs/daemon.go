@@ -215,6 +215,7 @@ type DaemonInfo struct {
 
 type Daemon struct {
 	ownership                     *managerOwnership
+	retiredByManager              atomic.Bool
 	physicalMu                    sync.Mutex
 	managedChild                  *managedLaunchChild // Protected by physicalMu.
 	physicalPublicationPending    bool
@@ -635,6 +636,9 @@ func (d *Daemon) mountLocked(userInitiated bool) error {
 }
 
 func (d *Daemon) mountLockedWithBinding(userInitiated bool, bind func(generation, target string) error) error {
+	if d.retiredByManager.Load() {
+		return fmt.Errorf("original daemon allocation was retired")
+	}
 	// Start timing operation
 	timing, _ := StartTimedOperation(d.ctx, "daemon.Mount", d.meta.ID)
 	defer timing.End()
@@ -1131,6 +1135,13 @@ func (d *Daemon) unmountForGC() bool {
 
 // unmountLocked performs the actual unmount. Caller must hold d.mu.
 func (d *Daemon) unmountLocked() (retErr error) {
+	if d.retiredByManager.Load() {
+		physical, preparation := d.originalPhysicalIdentity(), d.originalPreparation()
+		if physical != nil && physical.Phase == "released" || physical == nil && preparation != nil && preparation.Phase == "released" {
+			return nil
+		}
+		return fmt.Errorf("retired original daemon has no release proof")
+	}
 	// Start timing operation
 	timing, _ := StartTimedOperation(d.ctx, "daemon.Unmount", d.meta.ID)
 	defer timing.End()

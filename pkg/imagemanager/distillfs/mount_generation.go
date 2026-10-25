@@ -78,6 +78,12 @@ func (d *Daemon) inspectPhysicalGeneration(generation string, retirement bool) (
 	preparation := clonePreparation(d.meta.Preparation)
 	pending := d.preparationPublicationPending
 	d.physicalMu.Unlock()
+	if d.retiredByManager.Load() {
+		if p != nil && p.Generation == generation && p.Phase == "released" || p == nil && preparation != nil && preparation.Generation == generation && preparation.Phase == "released" {
+			return "released", nil
+		}
+		return "", fmt.Errorf("retired original generation does not match")
+	}
 	if p == nil {
 		if generation == "" || preparation == nil || preparation.Generation != generation {
 			return "", fmt.Errorf("original mount generation is missing or changed")

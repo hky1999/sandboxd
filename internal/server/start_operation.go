@@ -48,6 +48,7 @@ type startOperationRecord struct {
 	Generation         string                      `json:"generation"`
 	State              runtime.StartOperationState `json:"state"`
 	Result             *runtime.StartResponse      `json:"result,omitempty"`
+	RuntimeSealed      bool                        `json:"runtime_sealed,omitempty"`
 	SealedMissing      bool                        `json:"sealed_missing,omitempty"`
 	HistoryIdentity    *runtime.HistoryIdentity    `json:"history_identity,omitempty"`
 }
@@ -80,6 +81,9 @@ func validateStartOperationIdentity(id, fingerprint string, deadline uint64) err
 func (r *startOperationRecord) validate() error {
 	if r.Version != 1 || validateStartOperationIdentity(r.OperationID, r.RequestFingerprint, r.DeadlineUnixMillis) != nil {
 		return fmt.Errorf("invalid durable start operation identity")
+	}
+	if r.RuntimeSealed && (!r.SealedMissing || r.HistoryIdentity == nil) {
+		return fmt.Errorf("runtime fence has no complete allocation")
 	}
 	if r.HistoryIdentity != nil {
 		expected, err := historyOperationID(r.HistoryIdentity, r.RequestFingerprint)
@@ -115,7 +119,7 @@ func (r *startOperationRecord) sameIdentity(other *startOperationRecord) bool {
 	return r.Version == other.Version && r.OperationID == other.OperationID &&
 		r.RequestFingerprint == other.RequestFingerprint && r.PayloadFingerprint == other.PayloadFingerprint &&
 		r.DeadlineUnixMillis == other.DeadlineUnixMillis && r.SandboxID == other.SandboxID && r.Generation == other.Generation &&
-		r.SealedMissing == other.SealedMissing && proto.Equal(r.HistoryIdentity, other.HistoryIdentity)
+		r.SealedMissing == other.SealedMissing && r.RuntimeSealed == other.RuntimeSealed && proto.Equal(r.HistoryIdentity, other.HistoryIdentity)
 }
 
 func (r *startOperationRecord) response() *runtime.StartOperationResponse {
@@ -124,7 +128,7 @@ func (r *startOperationRecord) response() *runtime.StartOperationResponse {
 		result = proto.Clone(r.Result).(*runtime.StartResponse)
 	}
 	return &runtime.StartOperationResponse{OperationID: r.OperationID, RequestFingerprint: r.RequestFingerprint,
-		DeadlineUnixMillis: r.DeadlineUnixMillis, State: r.State, Result: result}
+		DeadlineUnixMillis: r.DeadlineUnixMillis, State: r.State, Result: result, RuntimeFenced: r.RuntimeSealed}
 }
 
 // Caller holds startOperationMu for every journal operation. A stable flock
@@ -553,6 +557,9 @@ func (h *sandboxService) GetStartOperation(ctx context.Context, request *runtime
 	if err := validateStartOperationIdentity(request.OperationID, request.RequestFingerprint, request.DeadlineUnixMillis); err != nil {
 		return nil, err
 	}
+	if request.SealRuntime && (!request.SealMissing || request.HistoryIdentity == nil) {
+		return nil, status.Error(codes.InvalidArgument, "runtime seal requires complete allocation and missing-operation fence")
+	}
 	h.startOperationMu.Lock()
 	j, err := h.openStartOperationJournal()
 	var record *startOperationRecord
@@ -585,7 +592,7 @@ func (h *sandboxService) GetStartOperation(ctx context.Context, request *runtime
 		return &runtime.StartOperationResponse{OperationID: request.OperationID, RequestFingerprint: request.RequestFingerprint,
 			DeadlineUnixMillis: request.DeadlineUnixMillis, State: runtime.StartOperationState_START_OPERATION_STATE_UNKNOWN}, nil
 	}
-	if !proto.Equal(record.HistoryIdentity, request.HistoryIdentity) || record.RequestFingerprint != request.RequestFingerprint || record.DeadlineUnixMillis != request.DeadlineUnixMillis {
+	if (request.SealRuntime && !record.RuntimeSealed) || !proto.Equal(record.HistoryIdentity, request.HistoryIdentity) || record.RequestFingerprint != request.RequestFingerprint || record.DeadlineUnixMillis != request.DeadlineUnixMillis {
 		return nil, status.Error(codes.FailedPrecondition, "start query identity mismatch")
 	}
 	return h.startOperationResult(ctx, record)
@@ -602,6 +609,15 @@ func (h *sandboxService) sealMissingStartOperation(
 	if !h.recoveryReady.Load() {
 		return nil, fmt.Errorf("physical recovery is incomplete")
 	}
+	if request.SealRuntime {
+		installed, err := j.loadHistory()
+		if err != nil || installed == nil || installed.Boundary.Authority != request.HistoryIdentity.Authority {
+			return nil, status.Error(codes.FailedPrecondition, "runtime fence requires installed matching history authority")
+		}
+		if err := j.checkRuntimeFence(ctx, request.OperationID, request.HistoryIdentity, true); err != nil {
+			return nil, err
+		}
+	}
 	id := "sbox-" + request.OperationID
 	checkCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
@@ -613,6 +629,9 @@ func (h *sandboxService) sealMissingStartOperation(
 	if _, err := h.sandboxManager.Get(id); !errors.Is(err, errord.ErrNotFound) {
 		return nil, fmt.Errorf("physical sandbox absence cannot be confirmed")
 	}
+	if request.SealRuntime && len(h.sandboxManager.ListPhysicalIntents()) != 0 {
+		return nil, fmt.Errorf("runtime fence requires an empty node physical-intent inventory")
+	}
 	for _, intent := range h.sandboxManager.ListPhysicalIntents() {
 		if intent == nil || intent.ID == id {
 			return nil, fmt.Errorf("physical intent cannot be excluded")
@@ -621,7 +640,10 @@ func (h *sandboxService) sealMissingStartOperation(
 	if _, err := os.Lstat(filepath.Join(h.config.RootDir, "containers", id)); !errors.Is(err, os.ErrNotExist) {
 		return nil, fmt.Errorf("physical metadata absence cannot be confirmed")
 	}
-	for name := range h.config.PluginConfig.RuntimeConfig.RuntimeBinary {
+	for name, binary := range h.config.PluginConfig.RuntimeConfig.RuntimeBinary {
+		if binary == "" {
+			continue
+		}
 		handler, ok := h.serviceHandler.Get(name)
 		if !ok {
 			return nil, fmt.Errorf("configured runtime is unavailable")
@@ -629,6 +651,9 @@ func (h *sandboxService) sealMissingStartOperation(
 		states, err := handler.List(checkCtx)
 		if err != nil {
 			return nil, fmt.Errorf("runtime inventory is unknown")
+		}
+		if request.SealRuntime && len(states) != 0 {
+			return nil, fmt.Errorf("runtime fence requires an empty native runtime inventory")
 		}
 		for _, state := range states {
 			if state == nil || state.ID == id {
@@ -642,7 +667,7 @@ func (h *sandboxService) sealMissingStartOperation(
 	record := &startOperationRecord{Version: 1, OperationID: request.OperationID,
 		RequestFingerprint: request.RequestFingerprint, PayloadFingerprint: strings.Repeat("0", 64),
 		DeadlineUnixMillis: request.DeadlineUnixMillis, SandboxID: id, Generation: uuid.NewString(),
-		State: runtime.StartOperationState_START_OPERATION_STATE_PENDING, SealedMissing: true, HistoryIdentity: request.HistoryIdentity}
+		State: runtime.StartOperationState_START_OPERATION_STATE_PENDING, SealedMissing: true, RuntimeSealed: request.SealRuntime, HistoryIdentity: request.HistoryIdentity}
 	if err := j.admit(record); err != nil {
 		return nil, err
 	}
@@ -733,7 +758,8 @@ func (h *sandboxService) StartOperation(ctx context.Context, request *runtime.St
 		var createErr error
 		if operationCtx.Err() == nil {
 			result, createErr = h.createSandbox(operationCtx, start, createOptions{
-				resourceGeneration: record.Generation,
+				resourceGeneration:    record.Generation,
+				durableStartAdmission: true,
 				beforeSideEffects: func() error {
 					if err := operationCtx.Err(); err != nil {
 						return err

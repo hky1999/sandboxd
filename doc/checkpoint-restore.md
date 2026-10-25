@@ -566,3 +566,6 @@ must additionally persist terminal intent and prove that no Environment or
 restore-queue reference still authorizes this artifact. Timeout and TTL alone
 never authorize deletion or budget release. Results lost after exact deletion
 replay the same request; another generation or digest cannot be substituted.
+
+
+缺失节点本地创建日志时，检查点恢复目标仍属于结果未知，不能凭空库存回收。匹配协议可使用[Runtime持久负向围栏](scheduler-runtime-negative-fence.md)封住未登记的目标Runtime；已有恢复操作、检查点引用和其他代际均保持原归属，不能以新围栏改写其原结果。

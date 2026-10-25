@@ -399,6 +399,13 @@ func (d *Daemon) cleanupPreparationResources() error {
 	if err := d.verifyPreparationParentLocked(); err != nil {
 		return err
 	}
+	// A released preparation already removed its directory. A new entry at
+	// that path is foreign even if the filesystem recycled the same inode.
+	if p.Phase == "released" {
+		if _, err := os.Lstat(p.Directory); !os.IsNotExist(err) {
+			return fmt.Errorf("released preparation directory reappeared")
+		}
+	}
 	birth, err := readDirectoryBirth(p.Directory)
 	if err == nil {
 		if p.Birth == nil || *birth != *p.Birth {

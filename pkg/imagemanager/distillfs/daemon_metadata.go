@@ -39,6 +39,9 @@ func daemonMetadataDigest(meta DaemonMeta) (string, error) {
 func (d *Daemon) persistDaemonMetadata() error {
 	d.metaPersistMu.Lock()
 	defer d.metaPersistMu.Unlock()
+	if d.retiredByManager.Load() {
+		return fmt.Errorf("original daemon allocation was retired")
+	}
 	meta := d.meta
 	meta.PhysicalIdentity = clonePhysicalIdentity(meta.PhysicalIdentity)
 	meta.Preparation = clonePreparation(meta.Preparation)

@@ -554,20 +554,51 @@ func (mgr *manager) createPreparedDaemon(opts *DaemonCreateOpt, owner Preparatio
 	}
 	mgr.mu.Lock()
 	if d, ok := mgr.daemons[opts.ID]; ok {
-		mgr.mu.Unlock()
-		if bind != nil {
-			d.mu.Lock()
-			defer d.mu.Unlock()
-			if err := d.bindOriginalMount(bind); err != nil {
+		d.mu.Lock()
+		physical, preparation := d.originalPhysicalIdentity(), d.originalPreparation()
+		settled := physical != nil && physical.Phase == "released" || physical == nil && preparation != nil && preparation.Phase == "released"
+		if settled {
+			// Keep the mapping locked across original cleanup and replacement.
+			// Unknown, active and partly published generations never enter here.
+			if err := d.ensurePhysicalPublication(); err != nil {
+				d.mu.Unlock()
+				mgr.mu.Unlock()
 				return err
 			}
-			if p := d.originalPhysicalIdentity(); p == nil || p.Phase != "running" {
-				return fmt.Errorf("existing original preparation cannot be dispatched again")
+			if err := mgr.cleanupDaemonResourcesLocked(d); err != nil {
+				d.mu.Unlock()
+				mgr.mu.Unlock()
+				return fmt.Errorf("retire cached original allocation: %w", err)
 			}
+			// An already queued publisher must finish before this final fence.
+			// It cannot resurrect the old record under the next allocation.
+			d.metaPersistMu.Lock()
+			if _, err := os.Lstat(d.savedPath); !os.IsNotExist(err) {
+				d.metaPersistMu.Unlock()
+				d.mu.Unlock()
+				mgr.mu.Unlock()
+				return fmt.Errorf("retired daemon metadata absence is unconfirmed")
+			}
+			d.retiredByManager.Store(true)
+			d.metaPersistMu.Unlock()
+			delete(mgr.daemons, opts.ID)
+			delete(mgr.recovered, opts.ID)
+			d.mu.Unlock()
+		} else {
+			mgr.mu.Unlock()
+			defer d.mu.Unlock()
+			if bind != nil {
+				if err := d.bindOriginalMount(bind); err != nil {
+					return err
+				}
+				if p := d.originalPhysicalIdentity(); p == nil || p.Phase != "running" {
+					return fmt.Errorf("existing original preparation cannot be dispatched again")
+				}
+			}
+			d.updateExpired()
+			d.mountFailed.Store(false)
+			return nil
 		}
-		d.updateExpired()
-		d.mountFailed.Store(false)
-		return nil
 	}
 	d, err := mgr.newDaemon(opts)
 	if err != nil {
@@ -632,6 +663,11 @@ func (mgr *manager) cleanupDaemonResources(d *Daemon) error {
 	defer release()
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	return mgr.cleanupDaemonResourcesLocked(d)
+}
+
+// Caller holds mgr.mu, d.mu and the original root ownership capability.
+func (mgr *manager) cleanupDaemonResourcesLocked(d *Daemon) error {
 	if d.releasePending || d.getState() != DaemonStateStopped || d.IsAlive() {
 		return fmt.Errorf("daemon cleanup is not confirmed stopped")
 	}
@@ -720,7 +756,7 @@ func (mgr *manager) gcDaemons() {
 
 		// Re-check and clean up: only delete daemons still marked as failed.
 		for _, d := range failedDaemons {
-			if !d.mountFailed.Load() {
+			if mgr.daemons[d.meta.ID] != d || !d.mountFailed.Load() {
 				continue
 			}
 			logrus.WithFields(d.daemonLogFields()).Info("gc: cleaning daemon with failed mount")
