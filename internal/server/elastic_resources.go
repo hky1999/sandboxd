@@ -48,13 +48,14 @@ type elasticBounds struct {
 
 // These units match StartRequest.Resources, not Linux cgroup file units.
 type elasticResourcePolicy struct {
-	Version int           `json:"version"`
-	CPU     elasticBounds `json:"CPU"`    // millicores
-	Memory  elasticBounds `json:"Memory"` // MiB
+	Version          int             `json:"version"`
+	MemoryMinimumMiB json.RawMessage `json:"memory_minimum_mib,omitempty"`
+	CPU              elasticBounds   `json:"CPU"`    // millicores
+	Memory           elasticBounds   `json:"Memory"` // MiB
 }
 
 // This label is persisted by the existing metadata/checkpoint path. A new
-// sandbox must start at initial; a restore may retain a later effective limit.
+// sandbox must start at initial; a restore may use any persisted allowed limit.
 // Never accept a policy whose promised hard limits this node cannot enforce.
 func validateElasticResources(req *runtime.StartRequest, cfg config.Config, restoring bool) error {
 	raw, ok := req.Labels[elasticResourcesLabel]
@@ -76,8 +77,20 @@ func validateElasticResources(req *runtime.StartRequest, cfg config.Config, rest
 	if err := decoder.Decode(new(any)); err != io.EOF {
 		return fmt.Errorf("elastic resource policy must contain exactly one JSON object")
 	}
-	if policy.Version != 1 {
+	if policy.Version != 1 && policy.Version != 2 {
 		return fmt.Errorf("unsupported elastic resource policy version %d", policy.Version)
+	}
+	if policy.Version == 1 && len(policy.MemoryMinimumMiB) != 0 {
+		return fmt.Errorf("version 1 cannot declare an independent memory minimum")
+	}
+	memoryMinimum := policy.Memory.Initial
+	if policy.Version == 2 {
+		var minimum uint64
+		if len(policy.MemoryMinimumMiB) == 0 || json.Unmarshal(policy.MemoryMinimumMiB, &minimum) != nil ||
+			minimum == 0 || float64(minimum) > policy.Memory.Initial {
+			return fmt.Errorf("version 2 requires a positive whole-MiB minimum no greater than birth")
+		}
+		memoryMinimum = float64(minimum)
 	}
 	for name, bounds := range map[string]elasticBounds{"CPU": policy.CPU, "Memory": policy.Memory} {
 		// Avoid quota clamping and float-to-int64 overflow in resourcesToLinux.
@@ -91,8 +104,12 @@ func validateElasticResources(req *runtime.StartRequest, cfg config.Config, rest
 			math.Trunc(bounds.Initial) != bounds.Initial || math.Trunc(bounds.Ceiling) != bounds.Ceiling {
 			return fmt.Errorf("invalid elastic %s initial/ceiling", name)
 		}
+		floor := bounds.Initial
+		if name == "Memory" {
+			floor = memoryMinimum
+		}
 		current, found := req.Resources[name]
-		if !found || math.IsNaN(current) || math.IsInf(current, 0) || current < bounds.Initial || current > bounds.Ceiling ||
+		if !found || math.IsNaN(current) || math.IsInf(current, 0) || current < floor || current > bounds.Ceiling ||
 			(!restoring && current != bounds.Initial) {
 			return fmt.Errorf("elastic %s effective limit does not match policy", name)
 		}

@@ -275,7 +275,7 @@ func (h *sandboxService) resourceOperationSucceeded(stats *runtime.StatsResponse
 }
 
 // elasticTargetWithinPolicy validates that the target limits respect the
-// persisted elastic policy: floor (initial) and ceiling. The floor is read
+// persisted elastic policy: explicit minimum (or initial) and ceiling. The floor is read
 // from the policy the sandbox was created with, never from the request.
 func (h *sandboxService) elasticTargetWithinPolicy(metadataLabels map[string]string, target *runtime.ResourceLimits) error {
 	targetConfig := &runtime.StartRequest{

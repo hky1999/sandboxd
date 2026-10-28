@@ -172,8 +172,8 @@ func TestIsMountpoint(t *testing.T) {
 	assert.ErrorContains(t, err, "can't get dev NO. of parent dir")
 	assert.False(t, m)
 
-	// Test mountpoint false
-	m, err = IsMountpoint("/tmp")
+	// An ordinary child directory remains a non-mountpoint even when /tmp is mounted separately.
+	m, err = IsMountpoint(t.TempDir())
 	assert.NoError(t, err)
 	assert.False(t, m)
 
