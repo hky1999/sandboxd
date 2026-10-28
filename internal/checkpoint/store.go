@@ -122,7 +122,7 @@ func PublishAt(directory string, source SourceIdentity, build func(string) error
 	if err != nil {
 		return Fact{}, err
 	}
-	manifest := Manifest{SourceGeneration: source.SourceGeneration, Version: manifestVersion, CheckpointID: source.CheckpointID,
+	manifest := Manifest{SourceResourceRevision: source.SourceResourceRevision, SourceGeneration: source.SourceGeneration, Version: manifestVersion, CheckpointID: source.CheckpointID,
 		SourceID: source.SourceID, Runtime: source.Runtime, RootfsSHA256: source.RootfsSHA256,
 		LeaveRunning: source.LeaveRunning, IncludeFilesystem: source.IncludeFilesystem,
 		ImageSHA256: imageDigest, ImageSize: imageSize}
@@ -264,6 +264,9 @@ func MatchSource(fact Fact, source SourceIdentity) (Fact, error) {
 }
 
 func validateSourceIdentity(checkpointID string, source SourceIdentity) error {
+	if source.SourceResourceRevision > 0 && source.SourceGeneration == "" {
+		return fmt.Errorf("resource-conditioned checkpoint needs original generation: %w", errord.ErrInvalidArgument)
+	}
 	if source.CheckpointID != checkpointID || source.SourceID == "" || source.Runtime == "" {
 		return fmt.Errorf("checkpoint source identity is incomplete: %w", errord.ErrInvalidArgument)
 	}
@@ -277,6 +280,9 @@ func validateSourceIdentity(checkpointID string, source SourceIdentity) error {
 }
 
 func validateManifest(checkpointID string, manifest Manifest) error {
+	if manifest.SourceResourceRevision > 0 && manifest.SourceGeneration == "" {
+		return fmt.Errorf("resource-conditioned checkpoint has no original generation: %w", errord.ErrFailedPrecondition)
+	}
 	if manifest.ResourceLimitsSHA256 != "" || manifest.ResourceLimitsSize != 0 {
 		if len(manifest.ResourceLimitsSHA256) != sha256.Size*2 || manifest.ResourceLimitsSize <= 0 || manifest.ResourceLimitsSize > 64<<10 {
 			return fmt.Errorf("resource limits manifest is invalid: %w", errord.ErrFailedPrecondition)

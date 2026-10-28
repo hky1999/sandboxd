@@ -39,6 +39,7 @@ const (
 	SandboxService_CollectHistory_FullMethodName           = "/runtime.v1.SandboxService/CollectHistory"
 	SandboxService_Checkpoint_FullMethodName               = "/runtime.v1.SandboxService/Checkpoint"
 	SandboxService_CheckpointIfGeneration_FullMethodName   = "/runtime.v1.SandboxService/CheckpointIfGeneration"
+	SandboxService_CheckpointIfResources_FullMethodName    = "/runtime.v1.SandboxService/CheckpointIfResources"
 	SandboxService_Pause_FullMethodName                    = "/runtime.v1.SandboxService/Pause"
 	SandboxService_Resume_FullMethodName                   = "/runtime.v1.SandboxService/Resume"
 	SandboxService_Restore_FullMethodName                  = "/runtime.v1.SandboxService/Restore"
@@ -77,6 +78,8 @@ type SandboxServiceClient interface {
 	// request's source sandbox and expected_generation. Fails on old servers
 	// instead of silently ignoring the generation precondition.
 	CheckpointIfGeneration(ctx context.Context, in *CheckpointIfGenerationRequest, opts ...grpc.CallOption) (*CheckpointResponse, error)
+	// Compare the original resource revision under the physical lock; never fall back.
+	CheckpointIfResources(ctx context.Context, in *CheckpointIfResourcesRequest, opts ...grpc.CallOption) (*CheckpointResponse, error)
 	// Pause freezes all tasks in a running sandbox without terminating it.
 	// The sandbox keeps its identity, network, and control-plane linkage;
 	// Resume unfreezes it. This is the short-window parking primitive that
@@ -177,6 +180,16 @@ func (c *sandboxServiceClient) CheckpointIfGeneration(ctx context.Context, in *C
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(CheckpointResponse)
 	err := c.cc.Invoke(ctx, SandboxService_CheckpointIfGeneration_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *sandboxServiceClient) CheckpointIfResources(ctx context.Context, in *CheckpointIfResourcesRequest, opts ...grpc.CallOption) (*CheckpointResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CheckpointResponse)
+	err := c.cc.Invoke(ctx, SandboxService_CheckpointIfResources_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -345,6 +358,8 @@ type SandboxServiceServer interface {
 	// request's source sandbox and expected_generation. Fails on old servers
 	// instead of silently ignoring the generation precondition.
 	CheckpointIfGeneration(context.Context, *CheckpointIfGenerationRequest) (*CheckpointResponse, error)
+	// Compare the original resource revision under the physical lock; never fall back.
+	CheckpointIfResources(context.Context, *CheckpointIfResourcesRequest) (*CheckpointResponse, error)
 	// Pause freezes all tasks in a running sandbox without terminating it.
 	// The sandbox keeps its identity, network, and control-plane linkage;
 	// Resume unfreezes it. This is the short-window parking primitive that
@@ -408,6 +423,9 @@ func (UnimplementedSandboxServiceServer) Checkpoint(context.Context, *Checkpoint
 }
 func (UnimplementedSandboxServiceServer) CheckpointIfGeneration(context.Context, *CheckpointIfGenerationRequest) (*CheckpointResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method CheckpointIfGeneration not implemented")
+}
+func (UnimplementedSandboxServiceServer) CheckpointIfResources(context.Context, *CheckpointIfResourcesRequest) (*CheckpointResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method CheckpointIfResources not implemented")
 }
 func (UnimplementedSandboxServiceServer) Pause(context.Context, *PauseRequest) (*PauseResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Pause not implemented")
@@ -576,6 +594,24 @@ func _SandboxService_CheckpointIfGeneration_Handler(srv interface{}, ctx context
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(SandboxServiceServer).CheckpointIfGeneration(ctx, req.(*CheckpointIfGenerationRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SandboxService_CheckpointIfResources_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CheckpointIfResourcesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SandboxServiceServer).CheckpointIfResources(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SandboxService_CheckpointIfResources_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SandboxServiceServer).CheckpointIfResources(ctx, req.(*CheckpointIfResourcesRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -862,6 +898,10 @@ var SandboxService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "CheckpointIfGeneration",
 			Handler:    _SandboxService_CheckpointIfGeneration_Handler,
+		},
+		{
+			MethodName: "CheckpointIfResources",
+			Handler:    _SandboxService_CheckpointIfResources_Handler,
 		},
 		{
 			MethodName: "Pause",

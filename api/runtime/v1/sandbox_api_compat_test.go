@@ -174,6 +174,7 @@ func TestSchedulerResourceExtensionNumbers(t *testing.T) {
 	descriptor.MessageType = slices.DeleteFunc(descriptor.MessageType, func(m *descriptorpb.DescriptorProto) bool {
 		return m.GetName() == "DeleteIfGenerationRequest" || m.GetName() == "DeleteIfGenerationResponse"
 	})
+	projectCheckpointResources(t, descriptor)
 	// Validate then project only this additive conditional-checkpoint contract.
 	foundCheckpointRequest := false
 	for _, message := range descriptor.MessageType {
@@ -579,5 +580,72 @@ func TestAgentDXUpstreamWireCompatibility(t *testing.T) {
 				t.Fatalf("changed upstream method %s.%s", service.GetName(), method.GetName())
 			}
 		}
+	}
+}
+
+// projectCheckpointResources validates and removes only the additive scheduler resource condition.
+func projectCheckpointResources(t *testing.T, descriptor *descriptorpb.FileDescriptorProto) {
+	t.Helper()
+	found := false
+	for _, message := range descriptor.MessageType {
+		if message.GetName() != "CheckpointIfResourcesRequest" {
+			continue
+		}
+		if found || len(message.Field) != 3 || len(message.NestedType) != 0 || len(message.EnumType) != 0 {
+			t.Fatal("unexpected resource-conditioned checkpoint request")
+		}
+		found = true
+		names := []string{"checkpoint", "expected_generation", "expected_revision"}
+		kinds := []descriptorpb.FieldDescriptorProto_Type{descriptorpb.FieldDescriptorProto_TYPE_MESSAGE, descriptorpb.FieldDescriptorProto_TYPE_STRING, descriptorpb.FieldDescriptorProto_TYPE_UINT64}
+		for i, name := range names {
+			field := message.Field[i]
+			if field.GetName() != name || field.GetNumber() != int32(i+1) || field.GetType() != kinds[i] || field.GetLabel() != descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL || field.OneofIndex != nil || field.GetProto3Optional() {
+				t.Fatal("unexpected original resource condition wire field")
+			}
+			if i == 0 && field.GetTypeName() != "."+descriptor.GetPackage()+".CheckpointRequest" {
+				t.Fatal("unexpected checkpoint command type")
+			}
+			if i != 0 && field.GetTypeName() != "" {
+				t.Fatal("unexpected scalar condition type")
+			}
+		}
+	}
+	if !found {
+		t.Fatal("missing separate resource checkpoint message")
+	}
+	descriptor.MessageType = slices.DeleteFunc(descriptor.MessageType, func(m *descriptorpb.DescriptorProto) bool { return m.GetName() == "CheckpointIfResourcesRequest" })
+	rpcFound := false
+	for _, service := range descriptor.Service {
+		service.Method = slices.DeleteFunc(service.Method, func(m *descriptorpb.MethodDescriptorProto) bool {
+			if m.GetName() != "CheckpointIfResources" {
+				return false
+			}
+			if rpcFound || service.GetName() != "SandboxService" || m.GetInputType() != "."+descriptor.GetPackage()+".CheckpointIfResourcesRequest" || m.GetOutputType() != "."+descriptor.GetPackage()+".CheckpointResponse" || m.GetClientStreaming() || m.GetServerStreaming() {
+				t.Fatal("unexpected resource-conditioned checkpoint RPC")
+			}
+			rpcFound = true
+			return true
+		})
+	}
+	if !rpcFound {
+		t.Fatal("missing separate resource checkpoint RPC")
+	}
+	responseFound := false
+	for _, message := range descriptor.MessageType {
+		if message.GetName() != "CheckpointResponse" {
+			continue
+		}
+		if responseFound || len(message.Field) != 7 {
+			t.Fatal("unexpected resource-conditioned checkpoint reply")
+		}
+		responseFound = true
+		field := message.Field[6]
+		if field.GetName() != "source_resource_revision" || field.GetJsonName() != "sourceResourceRevision" || field.GetNumber() != 7 || field.GetType() != descriptorpb.FieldDescriptorProto_TYPE_UINT64 || field.GetLabel() != descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL || field.OneofIndex != nil || field.GetProto3Optional() {
+			t.Fatal("unexpected committed resource revision reply field")
+		}
+		message.Field = message.Field[:6]
+	}
+	if !responseFound {
+		t.Fatal("missing checkpoint resource reply")
 	}
 }

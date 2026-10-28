@@ -18,6 +18,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	runtimeSpec "github.com/opencontainers/runtime-spec/specs-go"
@@ -45,7 +46,7 @@ func (h *sandboxService) Checkpoint(
 	ctx context.Context,
 	request *runtime.CheckpointRequest,
 ) (*runtime.CheckpointResponse, error) {
-	return h.checkpoint(ctx, request, "")
+	return h.checkpoint(ctx, request, "", 0)
 }
 
 // CheckpointIfGeneration checkpoints only the physical incarnation identified
@@ -64,7 +65,18 @@ func (h *sandboxService) CheckpointIfGeneration(
 	if err := validateExpectedGeneration(request.ExpectedGeneration); err != nil {
 		return nil, checkpointGRPCError(err)
 	}
-	return h.checkpoint(ctx, request.Checkpoint, request.ExpectedGeneration)
+	return h.checkpoint(ctx, request.Checkpoint, request.ExpectedGeneration, 0)
+}
+
+// CheckpointIfResources compares a required original revision inside the same physical lock.
+func (h *sandboxService) CheckpointIfResources(ctx context.Context, request *runtime.CheckpointIfResourcesRequest) (*runtime.CheckpointResponse, error) {
+	if request == nil || request.ExpectedRevision == 0 {
+		return nil, checkpointGRPCError(fmt.Errorf("positive original resource revision required: %w", errord.ErrInvalidArgument))
+	}
+	if err := validateExpectedGeneration(request.ExpectedGeneration); err != nil {
+		return nil, checkpointGRPCError(err)
+	}
+	return h.checkpoint(ctx, request.Checkpoint, request.ExpectedGeneration, request.ExpectedRevision)
 }
 
 // validateExpectedGeneration enforces the conditional-precondition shape.
@@ -88,6 +100,7 @@ func (h *sandboxService) checkpoint(
 	ctx context.Context,
 	request *runtime.CheckpointRequest,
 	expectedGeneration string,
+	expectedResourceRevision uint64,
 ) (*runtime.CheckpointResponse, error) {
 	if request == nil || request.ID == "" || request.CheckpointDir == "" || request.CheckpointID == "" {
 		return nil, errord.ToGRPC(fmt.Errorf("id, checkpoint_dir, and checkpoint_id are required: %w", errord.ErrInvalidArgument))
@@ -120,6 +133,9 @@ func (h *sandboxService) checkpoint(
 			request.CheckpointID, existing.Manifest.SourceGeneration, expectedGeneration,
 			errord.ErrFailedPrecondition))
 	}
+	if artifactErr == nil && existing.Manifest.SourceResourceRevision != expectedResourceRevision {
+		return nil, checkpointGRPCError(fmt.Errorf("checkpoint belongs to a different original resource revision: %w", errord.ErrFailedPrecondition))
+	}
 	sandbox, err := h.sandboxManager.Get(request.ID)
 	if err != nil {
 		if artifactErr == nil && errors.Is(err, errord.ErrNotFound) {
@@ -148,13 +164,14 @@ func (h *sandboxService) checkpoint(
 		return nil, checkpointGRPCError(err)
 	}
 	source := checkpoint.SourceIdentity{
-		SourceGeneration:  sandbox.Metadata.Labels[resourceGenerationLabel],
-		CheckpointID:      request.CheckpointID,
-		SourceID:          request.ID,
-		Runtime:           sandbox.Metadata.RuntimeHandler,
-		RootfsSHA256:      hex.EncodeToString(identity[:]),
-		LeaveRunning:      request.LeaveRunning,
-		IncludeFilesystem: request.IncludeFilesystem,
+		SourceResourceRevision: expectedResourceRevision,
+		SourceGeneration:       sandbox.Metadata.Labels[resourceGenerationLabel],
+		CheckpointID:           request.CheckpointID,
+		SourceID:               request.ID,
+		Runtime:                sandbox.Metadata.RuntimeHandler,
+		RootfsSHA256:           hex.EncodeToString(identity[:]),
+		LeaveRunning:           request.LeaveRunning,
+		IncludeFilesystem:      request.IncludeFilesystem,
 	}
 	if artifactErr == nil {
 		exact, matchErr := checkpoint.MatchSource(existing, source)
@@ -177,7 +194,7 @@ func (h *sandboxService) checkpoint(
 		return nil, checkpointGRPCError(fmt.Errorf("runtime %q does not support checkpoint: %w",
 			sandbox.Metadata.RuntimeHandler, errord.ErrNotImplemented))
 	}
-	fingerprint, err := checkpointSourceFingerprint(request, request.CheckpointID, source.SourceGeneration)
+	fingerprint, err := checkpointSourceFingerprint(request, request.CheckpointID, source.SourceGeneration, source.SourceResourceRevision)
 	if err != nil {
 		return nil, checkpointGRPCError(err)
 	}
@@ -377,8 +394,8 @@ func prepareCheckpointOutputDirectory(path string) (*checkpointDirectory, error)
 func checkpointResponse(fact checkpoint.Fact) *runtime.CheckpointResponse {
 	return &runtime.CheckpointResponse{
 		Success: true, ArtifactPath: fact.Paths.Image,
-		SourceGeneration: fact.Manifest.SourceGeneration,
-		ArtifactSize:     fact.Manifest.ImageSize, ArtifactSha256: fact.Manifest.ImageSHA256,
+		SourceGeneration: fact.Manifest.SourceGeneration, SourceResourceRevision: fact.Manifest.SourceResourceRevision,
+		ArtifactSize: fact.Manifest.ImageSize, ArtifactSha256: fact.Manifest.ImageSHA256,
 	}
 }
 
@@ -1110,6 +1127,12 @@ func (h *sandboxService) executeCheckpoint(
 		h.checkpointState.Complete(attempt, err)
 		return
 	}
+	if source.SourceResourceRevision > 0 {
+		if err := h.checkCheckpointResources(key.SandboxID, source.SourceGeneration, source.SourceResourceRevision); err != nil {
+			h.checkpointState.Complete(attempt, err)
+			return
+		}
+	}
 	_, err := checkpoint.PublishAt(checkpointDir, source, func(imagePath string) error {
 		// W7-P1.1: snapshot the effective cgroup limits BEFORE the runtime
 		// checkpoint (sandbox still alive) so the restore can re-apply them
@@ -1156,13 +1179,25 @@ func checkpointFingerprint(request *runtime.CheckpointRequest, canonicalDir stri
 // the physical source generation captured for this attempt, so the same
 // checkpoint key cannot merge attempts made across physical generations.
 // Both the legacy and the conditional RPC use the captured generation.
-func checkpointSourceFingerprint(request *runtime.CheckpointRequest, canonicalDir, sourceGeneration string) (string, error) {
+func checkpointSourceFingerprint(request *runtime.CheckpointRequest, canonicalDir, sourceGeneration string, sourceResourceRevision uint64) (string, error) {
 	base, err := checkpointFingerprint(request, canonicalDir)
 	if err != nil {
 		return "", err
 	}
 	// base is a fixed-length hexadecimal digest, so concatenating the
 	// generation is unambiguous.
+	if sourceResourceRevision > 0 {
+		value, err := json.Marshal(struct {
+			Base       string
+			Generation string
+			Revision   uint64
+		}{base, sourceGeneration, sourceResourceRevision})
+		if err != nil {
+			return "", err
+		}
+		sum := sha256.Sum256(value)
+		return hex.EncodeToString(sum[:]), nil
+	}
 	sum := sha256.Sum256([]byte(base + sourceGeneration))
 	return hex.EncodeToString(sum[:]), nil
 }

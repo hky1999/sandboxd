@@ -36,6 +36,8 @@ service SandboxService {
   // request's source sandbox and expected_generation. Fails on old servers
   // instead of silently ignoring the generation precondition.
   rpc CheckpointIfGeneration(CheckpointIfGenerationRequest) returns (CheckpointResponse) {}
+  // Compare the original resource revision under the physical lock; never fall back.
+  rpc CheckpointIfResources(CheckpointIfResourcesRequest) returns (CheckpointResponse) {}
   // Pause freezes all tasks in a running sandbox without terminating it.
   // The sandbox keeps its identity, network, and control-plane linkage;
   // Resume unfreezes it. This is the short-window parking primitive that
@@ -393,6 +395,8 @@ message CheckpointResponse {
   string artifact_sha256 = 5;
   // Physical lifetime bound to the published source manifest; empty for legacy artifacts.
   string source_generation = 6;
+  // Original revision actually compared during this capture; zero for legacy generation-only calls.
+  uint64 source_resource_revision = 7;
 }
 
 // CheckpointIfGenerationRequest checkpoints one exact physical incarnation.
@@ -402,6 +406,13 @@ message CheckpointIfGenerationRequest {
   // ExpectedGeneration must equal the source sandbox's current
   // akernel.scheduler/resource-generation value at checkpoint time.
   string expected_generation = 2;
+}
+
+// CheckpointIfResources requires a separate RPC so older daemons cannot ignore the condition.
+message CheckpointIfResourcesRequest {
+  CheckpointRequest checkpoint = 1;
+  string expected_generation = 2;
+  uint64 expected_revision = 3;
 }
 
 // PauseRequest targets one running sandbox. Resume takes the same shape.

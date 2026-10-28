@@ -569,3 +569,11 @@ replay the same request; another generation or digest cannot be substituted.
 
 
 缺失节点本地创建日志时，检查点恢复目标仍属于结果未知，不能凭空库存回收。匹配协议可使用[Runtime持久负向围栏](scheduler-runtime-negative-fence.md)封住未登记的目标Runtime；已有恢复操作、检查点引用和其他代际均保持原归属，不能以新围栏改写其原结果。
+
+## 调度器条件资源检查点候选
+
+当前为未发布候选契约，完整质量、部署及物理竞争尚待验收。沙箱守护进程sandboxd使用独立CheckpointIfResources RPC，要求原expected_generation和正值expected_revision；不支持时不能退回CheckpointIfGeneration或旧Checkpoint，以免旧服务忽略条件仍开始捕获。物理资源锁排除了同一沙箱的资源调整、删除及替换后，守护进程才重新核对原代际、持久资源修订号、分组绑定、冻结状态和未结资源操作；未知、损坏或变化均拒绝，不写检查点。
+
+成功制品manifest及回复保存sourceResourceRevision／source_resource_revision，请求指纹包含原修订号。完整制品重放只接受相同条件；缺失、变更或降为仅代际条件均拒绝。原生命周期revision与物理资源revision分开使用，不能因为数值相等就互相替代。既有仅代际RPC保留原合同，不自动取得新条件能力。
+
+此条件不等同于全沙箱活动的内核原子证明。调度器仍须完成协作封印、完整活动基线与最后读取；真实守护进程在途竞争和物理恢复要另行保存证据。

@@ -141,12 +141,12 @@ func TestCheckpointIfGenerationReplaysAbsentSourceByGeneration(t *testing.T) {
 // physical source generation.
 func TestCheckpointSourceFingerprintBindsGeneration(t *testing.T) {
 	request := &runtime.CheckpointRequest{ID: "elastic", CheckpointID: "case", CheckpointDir: "checkpoints/case"}
-	stable, err := checkpointSourceFingerprint(request, "checkpoints/case", "generation-1")
+	stable, err := checkpointSourceFingerprint(request, "checkpoints/case", "generation-1", 0)
 	require.NoError(t, err)
-	repeat, err := checkpointSourceFingerprint(request, "checkpoints/case", "generation-1")
+	repeat, err := checkpointSourceFingerprint(request, "checkpoints/case", "generation-1", 0)
 	require.NoError(t, err)
 	require.Equal(t, stable, repeat)
-	changed, err := checkpointSourceFingerprint(request, "checkpoints/case", "generation-2")
+	changed, err := checkpointSourceFingerprint(request, "checkpoints/case", "generation-2", 0)
 	require.NoError(t, err)
 	require.NotEqual(t, stable, changed)
 }
@@ -159,9 +159,9 @@ func TestCheckpointBeginRejectsFingerprintChangeForSameKey(t *testing.T) {
 	// fingerprint contract under test needs a real one.
 	h.checkpointState = checkpointstate.NewCoordinator()
 	request := &runtime.CheckpointRequest{ID: "elastic", CheckpointID: "case", CheckpointDir: "checkpoints/case"}
-	oldGeneration, err := checkpointSourceFingerprint(request, "checkpoints/case", "old-gen")
+	oldGeneration, err := checkpointSourceFingerprint(request, "checkpoints/case", "old-gen", 0)
 	require.NoError(t, err)
-	newGeneration, err := checkpointSourceFingerprint(request, "checkpoints/case", "new-gen")
+	newGeneration, err := checkpointSourceFingerprint(request, "checkpoints/case", "new-gen", 0)
 	require.NoError(t, err)
 	require.NotEqual(t, oldGeneration, newGeneration)
 	key := checkpointstate.CheckpointKey{SandboxID: "elastic", CheckpointID: "case"}
