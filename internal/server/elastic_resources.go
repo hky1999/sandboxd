@@ -117,31 +117,69 @@ func validateElasticResources(req *runtime.StartRequest, cfg config.Config, rest
 	return nil
 }
 
+// requiresResourceBirthRegistration 将固定执行的身份登记与弹性操作授权分开。
+// 未托管执行和其他运行时继续使用原路径；已声明 agent-dx 归属的 runsc
+// 执行必须携带完整且与本次准备元数据一致的归属，不能静默跳过登记。
+func requiresResourceBirthRegistration(start svc.StartConfig, metadata *runtime.SandboxMetadata) (bool, error) {
+	if start.Annotations[elasticResourcesLabel] != "" {
+		return true, nil
+	}
+	ownership := []string{"adx.environment_id", "adx.runtime_id", "adx.generation"}
+	managed := false
+	for _, key := range ownership {
+		managed = managed || start.Annotations[key] != ""
+	}
+	if !managed {
+		return false, nil
+	}
+	if metadata == nil {
+		return false, fmt.Errorf("固定资源出生登记缺少本次准备的元数据")
+	}
+	if metadata.RuntimeHandler != config.RuntimeNameRunsc {
+		return false, nil
+	}
+	for _, key := range ownership {
+		if start.Annotations[key] == "" || metadata.Labels[key] != start.Annotations[key] {
+			return false, fmt.Errorf("固定资源出生登记的 %s 归属缺失或不一致", key)
+		}
+	}
+	return true, nil
+}
+
 // Read the effective leaf cgroup limits before any workload process is started.
 // A setter returning nil alone is not proof that initial limits were applied.
-// The elastic path additionally persists the observed limits as birth evidence
+// 弹性执行及具有完整 agent-dx 归属的固定 runsc 执行都保存出生证据。
+// The registered path additionally persists the observed limits as birth evidence
 // on the prepared metadata before the runtime handler runs; any failure there
 // must stop the handler rather than start an unevidenced incarnation.
 func (h *sandboxService) verifyPreparedElasticLimits(start svc.StartConfig, phase string, metadata *runtime.SandboxMetadata) error {
-	if start.Annotations[elasticResourcesLabel] == "" {
+	required, err := requiresResourceBirthRegistration(start, metadata)
+	if err != nil {
+		return err
+	}
+	if !required {
 		return nil
 	}
+	kind := "elastic"
+	if start.Annotations[elasticResourcesLabel] == "" {
+		kind = "fixed"
+	}
 	if start.CgroupPath == "" || h.cgroupMgr == nil || start.Resources == nil {
-		return fmt.Errorf("elastic %s requires prepared cgroup limits", phase)
+		return fmt.Errorf("%s %s requires prepared cgroup limits", kind, phase)
 	}
 	actual, err := h.cgroupMgr.Stats(start.CgroupPath)
 	if err != nil {
-		return fmt.Errorf("read elastic %s limits: %w", phase, err)
+		return fmt.Errorf("read %s %s limits: %w", kind, phase, err)
 	}
 	// Numeric equality alone is not proof: with MemoryLimitKnown false the
 	// number is a legacy fallback that must never become birth evidence.
 	if !actual.CPULimitsKnown || !actual.MemoryLimitKnown {
-		return fmt.Errorf("elastic %s cgroup readback cannot prove requested limits", phase)
+		return fmt.Errorf("%s %s cgroup readback cannot prove requested limits", kind, phase)
 	}
 	if actual.CPUQuotaUsec != start.Resources.CpuQuota ||
 		actual.CPUPeriodUsec != start.Resources.CpuPeriod ||
 		actual.MemoryLimitBytes != uint64(start.Resources.MemoryLimitInBytes) {
-		return fmt.Errorf("elastic %s cgroup readback does not match requested limits", phase)
+		return fmt.Errorf("%s %s cgroup readback does not match requested limits", kind, phase)
 	}
 	// The evidence binds the observation to this incarnation's prepared
 	// identity: a fresh nonempty generation, still in the INTENT phase. It is
@@ -151,7 +189,7 @@ func (h *sandboxService) verifyPreparedElasticLimits(start svc.StartConfig, phas
 	if metadata == nil || h.sandboxManager == nil || metadata.ID != start.ID ||
 		generation == "" || metadata.Labels[resourceGenerationLabel] != generation ||
 		metadata.PhysicalPhase != runtime.SandboxPhysicalPhase_SANDBOX_PHYSICAL_PHASE_INTENT {
-		return fmt.Errorf("elastic %s birth evidence requires prepared INTENT metadata for this generation", phase)
+		return fmt.Errorf("%s %s birth evidence requires prepared INTENT metadata for this generation", kind, phase)
 	}
 	evidence, err := json.Marshal(birthResourceEvidence{
 		SchemaVersion:      birthResourceEvidenceSchemaVersion,
@@ -164,7 +202,7 @@ func (h *sandboxService) verifyPreparedElasticLimits(start svc.StartConfig, phas
 		MemoryLimitBytes:   actual.MemoryLimitBytes,
 	})
 	if err != nil {
-		return fmt.Errorf("encode elastic %s birth evidence: %w", phase, err)
+		return fmt.Errorf("encode %s %s birth evidence: %w", kind, phase, err)
 	}
 	if metadata.Labels == nil {
 		metadata.Labels = make(map[string]string)
@@ -173,7 +211,7 @@ func (h *sandboxService) verifyPreparedElasticLimits(start svc.StartConfig, phas
 	// Persist while still INTENT so the durable record names the observed
 	// limits before the handler could claim any runtime fact.
 	if err := h.sandboxManager.PersistMetadata(start.ID, metadata); err != nil {
-		return fmt.Errorf("persist elastic %s birth evidence: %w", phase, err)
+		return fmt.Errorf("persist %s %s birth evidence: %w", kind, phase, err)
 	}
 	logrus.WithFields(logrus.Fields{
 		"sandbox_id": start.ID, "resource_generation": generation,

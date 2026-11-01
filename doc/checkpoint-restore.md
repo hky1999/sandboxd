@@ -577,3 +577,5 @@ replay the same request; another generation or digest cannot be substituted.
 成功制品manifest及回复保存sourceResourceRevision／source_resource_revision，请求指纹包含原修订号。完整制品重放只接受相同条件；缺失、变更或降为仅代际条件均拒绝。原生命周期revision与物理资源revision分开使用，不能因为数值相等就互相替代。既有仅代际RPC保留原合同，不自动取得新条件能力。
 
 此条件不等同于全沙箱活动的内核原子证明。调度器仍须完成协作封印、完整活动基线与最后读取；真实守护进程在途竞争和物理恢复要另行保存证据。
+
+具有完整且与准备元数据一致的 `adx.environment_id`、`adx.runtime_id`、`adx.generation` 归属的固定资源 runsc 执行，也必须在运行时处理器调用前完成实际叶子 CPU／内存限额回读、INTENT 出生证据持久保存及资源修订 1 登记。开始与恢复均绑定本次 sandbox ID、全新 resource generation 和 cgroup 设备号及 inode；缺失、不同归属、回读未知或持久失败阻止处理器。固定资源登记不写入弹性策略，不授权 ResizeResources 或 ShrinkResources。其他运行时和没有 agent-dx 归属的执行保持原路径。查询与重启不得补造旧缺失或损坏的修订记录，损坏继续公开待定；cgroup 路径复用不得公开可信位置。

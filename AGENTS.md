@@ -326,3 +326,5 @@ verified limits and an unfrozen sandbox.
 资源配置 `cgroup_io_accounting`（JSON为 `cgroupIOAccounting`）默认关闭。显式开启时要求cgroup管理已启用、`cgroup_cache_size`为正数且后端为cgroup v2；无效配置在初始化原状态或资源模块前拒绝。向沙箱分组委派cpu、memory及适用的pids时，还必须在挂载根至沙箱父分组的每一层要求并开启io，缺少控制器或写入失败都不能静默忽略。此功能只提供I/O统计前提，不写io.max，不承诺带宽隔离或恢复性能。部署入口同样须提供io委派；已有未知资源及预算不能通过重启或换目录处理。源码测试不替代真实恢复全程I/O和物理归属验收。
 
 完成的物理退役及匹配的持久完成回执也授权精确清理该代际的资源修订记录。清理不接触cgroup，不解冻旧执行或替换执行，不删除退役回执。首次清理失败后，条件删除回执重放、服务重开及后台恢复会继续尝试；目录同步失败后的缺失文件也须补做目录同步。损坏、身份不符、非规范文件名或符号链接记录保留。缺少沙箱、未完成回执或其他代际的回执都不授权清理。这是退役元数据补清理，不是按年龄回收幂等或旧请求拒绝记录。
+
+具有完整且与准备元数据一致的 `adx.environment_id`、`adx.runtime_id`、`adx.generation` 归属的固定资源 runsc 执行，也必须在运行时处理器调用前完成实际叶子 CPU／内存限额回读、INTENT 出生证据持久保存及资源修订 1 登记。开始与恢复均绑定本次 sandbox ID、全新 resource generation 和 cgroup 设备号及 inode；缺失、不同归属、回读未知或持久失败阻止处理器。固定资源登记不写入弹性策略，不授权 ResizeResources 或 ShrinkResources。其他运行时和没有 agent-dx 归属的执行保持原路径。查询与重启不得补造旧缺失或损坏的修订记录，损坏继续公开待定；cgroup 路径复用不得公开可信位置。

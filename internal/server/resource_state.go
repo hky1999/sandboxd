@@ -241,7 +241,7 @@ func (h *sandboxService) saveResourceOperationState(state *resourceOperationStat
 }
 
 // initResourceOperationState initializes revision 1 for a freshly prepared
-// elastic incarnation, after its birth evidence and before the runtime
+// registered incarnation, after its birth evidence and before the runtime
 // handler is allowed to claim any physical fact. The cgroup identity is
 // proven by stat: a path that cannot be resolved leaves the incarnation
 // without revision state and creation fails rather than recording an
@@ -291,17 +291,22 @@ func (h *sandboxService) initResourceOperationState(id, generation, cgroupPath s
 }
 
 // initializeResourceRevision creates revision 1 for a freshly prepared
-// elastic incarnation, after its birth evidence and before the runtime
+// registered incarnation, after its birth evidence and before the runtime
 // handler runs — so the incarnation can never be published without proven
 // revision state. Restore shares this hook: it owns a new physical
 // generation and starts a new revision, never the checkpoint's old identity.
 func (h *sandboxService) initializeResourceRevision(start svc.StartConfig, metadata *runtime.SandboxMetadata) error {
-	if start.Annotations[elasticResourcesLabel] == "" {
+	required, err := requiresResourceBirthRegistration(start, metadata)
+	if err != nil {
+		return err
+	}
+	if !required {
 		return nil
 	}
 	generation := start.Annotations[resourceGenerationLabel]
 	if metadata == nil || metadata.ID != start.ID ||
-		generation == "" || metadata.Labels[resourceGenerationLabel] != generation {
+		generation == "" || metadata.Labels[resourceGenerationLabel] != generation ||
+		metadata.PhysicalPhase != runtime.SandboxPhysicalPhase_SANDBOX_PHYSICAL_PHASE_INTENT {
 		return fmt.Errorf("resource revision initialization requires prepared INTENT metadata for this generation")
 	}
 	return h.initResourceOperationState(start.ID, generation, start.CgroupPath)
