@@ -28,6 +28,8 @@ artifact ownership, failure semantics, and compatibility requirements.
 
 ## Selection and configuration
 
+`plugin.runtime.runsc.cli_gomaxprocs` optionally sets `GOMAXPROCS` for host-side runsc CLI invocations. Zero preserves the inherited environment; positive values from 1 through 1024 override only that variable. This can reduce process-startup overhead during concurrent restores on many-core hosts. The Sentry keeps its independent scheduler configuration, and sandbox CPU quotas and restore concurrency limits are unchanged. Measure the setting with the deployed runtime bundle and workload before choosing a node-wide value.
+
 A start request selects a runtime by name. Each adapter must have an entry
 under `plugin.runtime.runtime_binary`. Runsc uses systrap by default. Select
 the KVM platform node-wide only on a host with usable nested or hardware
@@ -39,6 +41,8 @@ platform = "kvm"
 ```
 
 The only accepted values are `systrap` and `kvm`; omitting the setting selects `systrap`. Runc additionally uses `plugin.runtime.runc` for its shim, state root, and optional KVM device. Kata uses `plugin.runtime.kata`. Firecracker uses `plugin.runtime.firecracker` and requires `plugin.runtime.filestore_dir`. An unavailable optional adapter is omitted while the other runtimes remain usable.
+
+`plugin.runtime.firecracker.shutdown_grace_period_ms` controls how long deletion waits for the VMM to exit after the best-effort guest shutdown request, before sending host termination signals. Zero preserves the 2000ms default; explicit positive values range from 1 to 10000ms. A shorter value can reduce disposal latency for ephemeral sandboxes, but may interrupt guest shutdown sooner; it does not add a filesystem synchronization guarantee. Process-identity checks and signal escalation remain active. Failure to stop the owned VMM or clean up virtio-fs returns an error and retains sandbox resources for retry.
 
 Firecracker expects KVM at `/dev/kvm`. Its kernel must include virtio block,
 virtio net, vsock, EROFS, ext4, overlayfs, devtmpfs, and the cgroup controllers
