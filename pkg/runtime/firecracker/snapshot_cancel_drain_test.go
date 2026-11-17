@@ -35,7 +35,7 @@ func TestSnapshotCancellationKeepsChargeUntilNativeReply(t *testing.T) {
 	result := make(chan error, 1)
 	go func() {
 		result <- withFirecrackerProcessInCheckpointCgroup(
-			"/sandbox/owned", 42,
+			"/sandbox/owned", "/snapshot/owned", 42,
 			func() error { return newFirecrackerAPI(socket).createSnapshot(ctx, "state", "memory", "", "Full") },
 			func(group string, _ int) error {
 				if group == "/sandbox/owned" {
